@@ -40,6 +40,14 @@ bump!(shift_node, SHIFT_NODES);
 bump!(ctx_clone, CTX_CLONES);
 bump!(infer_hit, INFER_HITS);
 
+pub fn inst_nodes() -> u64 {
+    INST_NODES.with(|c| c.get())
+}
+
+pub fn whnf_calls() -> u64 {
+    WHNF_CALLS.with(|c| c.get())
+}
+
 pub fn report() {
     if !enabled() {
         return;

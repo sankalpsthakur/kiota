@@ -133,8 +133,18 @@ impl<'e> Checker<'e> {
         Rc::as_ptr(e) as usize
     }
 
-    fn cacheable(ctx: &Ctx, e: &Expr) -> bool {
-        ctx.is_empty() && expr::is_closed(e)
+    fn cacheable(_ctx: &Ctx, _e: &Expr) -> bool {
+        // The whnf stack is context-pure: whnf/whnf_core/whnf_major never
+        // infer types (try_iota/try_quot/try_nat_extension/try_dite and
+        // reduce_nat_arg are all pure reduction over the expression and the
+        // environment), so a de Bruijn term's whnf is the same term in every
+        // context. Pointer identity is structural identity through the
+        // interner, so a ptr-keyed cache is sound under binders as well.
+        // (is_def_eq is NOT context-pure — proof irrelevance infers types —
+        // and keeps its own stricter gate.) Requiring closed terms in an
+        // empty context meant the caches were dead inside declaration
+        // bodies, which is where reduction actually happens.
+        true
     }
 
     fn name_str(&self, n: u32) -> &str {
@@ -233,6 +243,8 @@ impl<'e> Checker<'e> {
         if std::env::var_os("KIOTA_TRACE_DECL").is_some() {
             eprintln!("DECL {kind} {}", self.name_str(name));
         }
+        let decl_inst0 = crate::stats::inst_nodes();
+        let decl_whnf0 = crate::stats::whnf_calls();
         // Native quot/inductive/ctor/rec kinds are validated elsewhere.
         let level_params = ci.level_params();
         {
@@ -266,6 +278,18 @@ impl<'e> Checker<'e> {
                 return reject(format!(
                     "{kind} {name}: value type does not match declared type"
                 ));
+            }
+        }
+        if std::env::var_os("KIOTA_DECL_STATS").is_some() {
+            let di = crate::stats::inst_nodes() - decl_inst0;
+            let dw = crate::stats::whnf_calls() - decl_whnf0;
+            if di > 100_000 || dw > 1_000_000 {
+                eprintln!(
+                    "DECLSTATS {} inst=+{} whnf=+{}",
+                    self.name_str(name),
+                    di,
+                    dw
+                );
             }
         }
         Ok(())

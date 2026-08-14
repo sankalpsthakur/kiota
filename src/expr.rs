@@ -295,18 +295,33 @@ pub fn shift(e: &Expr, by: i32, cutoff: u32) -> Expr {
 /// opened above the substitution site, i.e. args need to be shifted by `depth`
 /// when they replace a bvar).
 pub fn instantiate(e: &Expr, args: &[Expr]) -> Expr {
-    instantiate_core(e, args, 0)
+    // Proof bodies are DAG-shared through the interner: the same subterm
+    // reaches many occurrences, and without a memo each occurrence pays a
+    // full traversal. The grind perf tests amplify a shared simp-lemma
+    // application thousands of times; keying on (node, depth) — args are
+    // fixed within one call — visits each unique node once.
+    let mut memo = rustc_hash::FxHashMap::default();
+    instantiate_core(e, args, 0, &mut memo)
 }
 
-fn instantiate_core(e: &Expr, args: &[Expr], depth: u32) -> Expr {
+fn instantiate_core(
+    e: &Expr,
+    args: &[Expr],
+    depth: u32,
+    memo: &mut rustc_hash::FxHashMap<(usize, u32), Expr>,
+) -> Expr {
     // Every loose bvar is bound above `depth`, so neither the substitution nor
     // the renumbering below can reach into this subterm. Returning it whole is
     // what turns O(term size) per binder into O(path length).
     if loose_bvar_range(e) <= depth {
         return e.clone();
     }
+    let key = (Rc::as_ptr(e) as usize, depth);
+    if let Some(r) = memo.get(&key) {
+        return r.clone();
+    }
     crate::stats::inst_node();
-    match &***e {
+    let r = match &***e {
         ExprData::BVar(i) => {
             if *i >= depth && ((*i - depth) as usize) < args.len() {
                 let a = &args[(*i - depth) as usize];
@@ -319,26 +334,28 @@ fn instantiate_core(e: &Expr, args: &[Expr], depth: u32) -> Expr {
         }
         ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => e.clone(),
         ExprData::App(f, a) => app(
-            instantiate_core(f, args, depth),
-            instantiate_core(a, args, depth),
+            instantiate_core(f, args, depth, memo),
+            instantiate_core(a, args, depth, memo),
         ),
         ExprData::Lam(bi, ty, body) => lam(
             *bi,
-            instantiate_core(ty, args, depth),
-            instantiate_core(body, args, depth + 1),
+            instantiate_core(ty, args, depth, memo),
+            instantiate_core(body, args, depth + 1, memo),
         ),
         ExprData::Pi(bi, ty, body) => pi(
             *bi,
-            instantiate_core(ty, args, depth),
-            instantiate_core(body, args, depth + 1),
+            instantiate_core(ty, args, depth, memo),
+            instantiate_core(body, args, depth + 1, memo),
         ),
         ExprData::Let(ty, val, body) => let_(
-            instantiate_core(ty, args, depth),
-            instantiate_core(val, args, depth),
-            instantiate_core(body, args, depth + 1),
+            instantiate_core(ty, args, depth, memo),
+            instantiate_core(val, args, depth, memo),
+            instantiate_core(body, args, depth + 1, memo),
         ),
-        ExprData::Proj(s, i, v) => proj(*s, *i, instantiate_core(v, args, depth)),
-    }
+        ExprData::Proj(s, i, v) => proj(*s, *i, instantiate_core(v, args, depth, memo)),
+    };
+    memo.insert(key, r.clone());
+    r
 }
 
 /// Single-substitution convenience (beta / zeta): replace bvar 0 with `arg`.
