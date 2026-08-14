@@ -954,6 +954,21 @@ impl<'e> Checker<'e> {
                     }
                 }
             }
+            (ExprData::Proj(s1, i1, v1), ExprData::Proj(s2, i2, v2)) => {
+                // Congruence for projections. Without this, two projections of
+                // structures that are equal but not syntactically identical
+                // never get compared field-wise: neither side has a Const head,
+                // so the delta path below cannot fire either, and the terms are
+                // reported unequal. Init.Prelude reaches exactly that case in
+                // Classical.em, where `Classical.choose` unfolds to a `.val`
+                // projection of `indefiniteDescription`.
+                //
+                // Falls through rather than returning false, so structure eta
+                // and the reductions below still get their turn.
+                if s1 == s2 && i1 == i2 && self.is_def_eq(ctx, v1, v2)? {
+                    return Ok(true);
+                }
+            }
             (ExprData::Const(n1, u1), ExprData::Const(n2, u2)) => {
                 if n1 == n2
                     && u1.len() == u2.len()
