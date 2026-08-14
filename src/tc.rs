@@ -231,6 +231,15 @@ impl<'e> Checker<'e> {
         if let Some(value) = ci.value() {
             let vt = self.infer_type(&ctx, value)?;
             if !self.is_def_eq(&ctx, &vt, typ)? {
+                if std::env::var_os("KIOTA_DEBUG").is_some() {
+                    return reject(format!(
+                        "{kind} {name}: value type does not match declared type\n  got:      {}\n  expected: {}\n  got_whnf: {}\n  exp_whnf: {}",
+                        self.pp_budget(&vt, 40),
+                        self.pp_budget(typ, 40),
+                        self.pp_budget(&self.whnf(&ctx, &vt).unwrap_or_else(|_| vt.clone()), 40),
+                        self.pp_budget(&self.whnf(&ctx, typ).unwrap_or_else(|_| typ.clone()), 40),
+                    ));
+                }
                 return reject(format!(
                     "{kind} {name}: value type does not match declared type"
                 ));
@@ -939,9 +948,15 @@ impl<'e> Checker<'e> {
                             return Ok(true);
                         }
                     }
-                } else if matches!((&**h1, &**h2), (ExprData::BVar(i), ExprData::BVar(j)) if i == j)
-                    && a1.len() == a2.len()
-                {
+                } else if Rc::ptr_eq(&h1, &h2) && a1.len() == a2.len() {
+                    // Congruence under any shared head, not just a bound
+                    // variable. Heads are interned, so pointer equality means
+                    // the same term. Restricting this to BVar left `f x` and
+                    // `f y` uncomparable whenever `f` was, say, a projection:
+                    // the Const arm does not apply, and the delta path below
+                    // cannot fire because neither head is a Const. Init hits
+                    // this at Std.Iterator.step, where the shared head is
+                    // `Std.Internal.idOpaque ….0[Subtype]`.
                     let mut all = true;
                     for (x, y) in a1.iter().zip(a2.iter()) {
                         if !self.is_def_eq(ctx, x, y)? {
