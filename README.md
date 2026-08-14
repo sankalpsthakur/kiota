@@ -66,9 +66,9 @@ Set `KIOTA_DEBUG=1` to print both sides of an application-type mismatch.
 
 ## Tests
 
-In-repo fixtures under `tests/fixtures/` (accept/reject NDJSON). Optional
-full tutorial walk if `LEAN_ARENA_TESTS` points at an unpacked arena
-tarball.
+`cargo test` runs the fixtures in `tests/fixtures/`. Those pin iota
+field-then-rec order and a few reject cases. The arena is the public
+scoreboard, not a cloned in-repo harness.
 
 ## License
 
