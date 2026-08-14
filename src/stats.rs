@@ -56,3 +56,53 @@ pub fn report() {
         g(&CTX_CLONES),
     );
 }
+
+/// `KIOTA_TRACE_NEQ=1` logs every definitional-equality comparison that comes
+/// back false. Reading the *smallest* failing pair is how the projection and
+/// shared-head congruence gaps were found: the outer failures are just the
+/// enclosing terms, and the innermost one names the actual defect. Note that
+/// the printed forms are budget-truncated, so diff them with care — a "first
+/// divergence" computed on truncated output can be an artifact.
+pub fn trace_neq() -> bool {
+    thread_local! {
+        static ON: bool = std::env::var_os("KIOTA_TRACE_NEQ").is_some();
+    }
+    ON.with(|b| *b)
+}
+
+thread_local! {
+    static VERBOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable verbose defeq tracing while checking the named declaration.
+/// `KIOTA_TRACE_TARGET` selects which declaration (default: fixF_eq).
+pub fn set_verbose_target(name: &str) {
+    let on = std::env::var("KIOTA_TRACE_TARGET")
+        .map(|t| name.contains(&t))
+        .unwrap_or_else(|_| name.contains("fixF_eq"));
+    VERBOSE.with(|c| c.set(on));
+}
+
+pub fn verbose() -> bool {
+    VERBOSE.with(|c| c.get())
+}
+
+thread_local! {
+    static THEOREM_DELTA_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Scope theorem-unfolding to the decl currently being checked, so a single
+/// theorem can be unfolded without letting the delta path tear through every
+/// large proof body in the environment. With `KIOTA_THEOREM_DELTA_TARGET` set,
+/// theorem delta applies only while checking a decl whose name contains the
+/// substring; unset means the scope is global (current behavior).
+pub fn set_theorem_delta_scope(name: &str) {
+    let on = std::env::var("KIOTA_THEOREM_DELTA_TARGET")
+        .map(|t| name.contains(&t))
+        .unwrap_or(true);
+    THEOREM_DELTA_SCOPE.with(|c| c.set(on));
+}
+
+pub fn theorem_delta_in_scope() -> bool {
+    THEOREM_DELTA_SCOPE.with(|c| c.get())
+}

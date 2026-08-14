@@ -29,6 +29,11 @@ pub struct Checker<'e> {
     whnf_cache: RefCell<FxHashMap<usize, Expr>>,
     whnf_core_cache: RefCell<FxHashMap<usize, Expr>>,
     defeq_cache: RefCell<FxHashMap<(usize, usize), bool>>,
+    /// `(const name, levels)` to unfolded value, memoized like the C++ kernel's
+    /// `m_unfold`. The delta path can unfold the same def/theorem at the same
+    /// levels over and over; re-instantiating a large body each time (O(size)
+    /// `instantiate_level_params`) is what made `_proof_1_1` blow up.
+    unfold_cache: RefCell<FxHashMap<(u32, Vec<Level>), Expr>>,
     /// `(context id, term)` to inferred type. Unlike the caches above this one
     /// works under binders, which is where the redundancy actually is: a term
     /// shared by the DAG is otherwise re-inferred once per occurrence, so a
@@ -120,6 +125,7 @@ impl<'e> Checker<'e> {
             whnf_core_cache: RefCell::new(FxHashMap::default()),
             defeq_cache: RefCell::new(FxHashMap::default()),
             infer_cache: RefCell::new(FxHashMap::default()),
+            unfold_cache: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -140,7 +146,17 @@ impl<'e> Checker<'e> {
     }
 
     fn pp(&self, e: &Expr) -> String {
-        self.pp_budget(e, 24)
+        self.pp_budget(e, Self::pp_default_budget())
+    }
+
+    /// The printer elides once it runs out of budget, which is fine for a
+    /// rejection message and misleading when diffing two terms. Raise it with
+    /// `KIOTA_PP_BUDGET` when the elision is hiding the difference.
+    fn pp_default_budget() -> i32 {
+        std::env::var("KIOTA_PP_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(24)
     }
 
     fn pp_budget(&self, e: &Expr, budget: i32) -> String {
@@ -210,6 +226,13 @@ impl<'e> Checker<'e> {
             .env
             .get(name)
             .ok_or_else(|| TcError::Other(format!("missing const {name}")))?;
+        if std::env::var_os("KIOTA_TRACE_VERBOSE").is_some() {
+            crate::stats::set_verbose_target(self.name_str(name));
+        }
+        crate::stats::set_theorem_delta_scope(self.name_str(name));
+        if std::env::var_os("KIOTA_TRACE_DECL").is_some() {
+            eprintln!("DECL {kind} {}", self.name_str(name));
+        }
         // Native quot/inductive/ctor/rec kinds are validated elsewhere.
         let level_params = ci.level_params();
         {
@@ -690,6 +713,30 @@ impl<'e> Checker<'e> {
         }
     }
 
+    /// WHNF for recursor major premises: like `whnf`, but delta-unfolds
+    /// theorem values too (via `unfold_delta`). Lean's kernel unfolds any
+    /// constant with a value — theorems included — when it needs the
+    /// constructor of a `rec` major premise; without this, majors headed by
+    /// a theorem (e.g. `Acc.inv … x h` well-founded recursion proofs, or
+    /// `_proof` lemmas wrapping `Acc.intro`) never reach a constructor and
+    /// the iota rule never fires. Kept off the hot `whnf` path: only the
+    /// major-premise position of a recursor pays for theorem unfolding.
+    fn whnf_major(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        let mut cur = e.clone();
+        loop {
+            let core = self.whnf_core(ctx, &cur)?;
+            let (head, _) = expr::unfold_apps(&core);
+            if let ExprData::Const(n, us) = &**head {
+                if let Some(unfolded) = self.unfold_delta(*n, us)? {
+                    let (_, args) = expr::unfold_apps(&core);
+                    cur = expr::apps(unfolded, &args);
+                    continue;
+                }
+            }
+            return Ok(core);
+        }
+    }
+
     /// beta/zeta/proj/iota reduction to whnf, WITHOUT unfolding delta.
     fn whnf_core(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         let cache = Self::cacheable(ctx, e);
@@ -822,22 +869,61 @@ impl<'e> Checker<'e> {
         }
     }
 
+    /// Delta for `whnf`: Defs only. The full `whnf` (used everywhere, hot,
+    /// uncached under binders) must NOT unfold theorem values — their proof
+    /// terms are huge and instantiating them per call explodes (grind-ring-5
+    /// went from 1s to >2min). The is_def_eq delta path below is the cold,
+    /// targeted path; it may unfold theorems via `unfold_delta`.
     fn unfold_def(&self, n: u32, us: &[Level]) -> R<Option<Expr>> {
         match self.env.get(n) {
             Some(ConstantInfo::Def {
                 level_params,
                 value,
-                hints,
                 ..
             }) => {
-                if *hints == ReducibilityHints::Opaque {
-                    // still transparent for kernel defeq; unfold anyway.
+                let key = (n, us.to_vec());
+                if let Some(r) = self.unfold_cache.borrow().get(&key) {
+                    return Ok(Some(r.clone()));
                 }
                 let subst = level::subst_map(level_params, us);
-                Ok(Some(expr::instantiate_level_params(value, &subst)))
+                let r = expr::instantiate_level_params(value, &subst);
+                self.unfold_cache.borrow_mut().insert(key, r.clone());
+                Ok(Some(r))
             }
-            Some(ConstantInfo::Theorem { .. }) => Ok(None),
             Some(ConstantInfo::Opaque { .. }) => Ok(None),
+            _ => Ok(None),
+        }
+    }
+
+    /// Delta for the is_def_eq delta path: Defs AND theorems. Lean's kernel
+    /// unfolds any constant with a value (`is_delta` checks only `has_value`),
+    /// theorem bodies included — e.g. `Acc.inv` reduces on `Acc.intro`, which
+    /// `WellFounded.fixF_eq` needs. Only the cold delta path does this; the
+    /// hot `whnf` loop stays Def-only for performance.
+    fn unfold_delta(&self, n: u32, us: &[Level]) -> R<Option<Expr>> {
+        if let Some(r) = self.unfold_def(n, us)? {
+            return Ok(Some(r));
+        }
+        if std::env::var_os("KIOTA_NO_THEOREM_DELTA").is_some()
+            || !crate::stats::theorem_delta_in_scope()
+        {
+            return Ok(None);
+        }
+        match self.env.get(n) {
+            Some(ConstantInfo::Theorem {
+                level_params,
+                value,
+                ..
+            }) => {
+                let key = (n, us.to_vec());
+                if let Some(r) = self.unfold_cache.borrow().get(&key) {
+                    return Ok(Some(r.clone()));
+                }
+                let subst = level::subst_map(level_params, us);
+                let r = expr::instantiate_level_params(value, &subst);
+                self.unfold_cache.borrow_mut().insert(key, r.clone());
+                Ok(Some(r))
+            }
             _ => Ok(None),
         }
     }
@@ -855,9 +941,20 @@ impl<'e> Checker<'e> {
     }
 
     fn is_delta_reducible(&self, n: u32) -> bool {
-        // Theorems are not unfolded (`unfold_def` returns None). Treating them as
-        // delta-reducible made `delta_step` a no-op and `is_def_eq_core` loop.
-        matches!(self.env.get(n), Some(ConstantInfo::Def { .. }))
+        // Lean's kernel unfolds any constant with a value, theorems included
+        // (see `is_delta`/`unfold_definition` in the C++ kernel, which check
+        // only `has_value`). Theorems must be paired with `unfold_def` actually
+        // returning their value; making them reducible alone made `delta_step`
+        // a no-op and `is_def_eq_core` loop. Opaque/quot/inductive/recursor
+        // constants have no kernel value and stay irreducible.
+        //
+        // `KIOTA_NO_THEOREM_DELTA` must keep this consistent with
+        // `unfold_delta`; an unfold guard that claims reducibility while
+        // `delta_step` returns the term unchanged loops forever.
+        let is_thm = matches!(self.env.get(n), Some(ConstantInfo::Theorem { .. }))
+            && std::env::var_os("KIOTA_NO_THEOREM_DELTA").is_none()
+            && crate::stats::theorem_delta_in_scope();
+        matches!(self.env.get(n), Some(ConstantInfo::Def { .. })) || is_thm
     }
 
     // ---------------- Definitional equality ----------------
@@ -889,6 +986,32 @@ impl<'e> Checker<'e> {
     }
 
     fn is_def_eq_core(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        if !crate::stats::trace_neq() {
+            return self.is_def_eq_core_go(ctx, a, b);
+        }
+        let r = self.is_def_eq_core_go(ctx, a, b);
+        if let Ok(false) = r {
+            eprintln!("NEQ[{}]  {}   ###   {}", ctx.len(), self.pp(a), self.pp(b));
+        }
+        r
+    }
+
+    fn is_def_eq_core_go(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        if crate::stats::verbose() {
+            let binders = ctx
+                .tys
+                .iter()
+                .map(|t| self.pp_budget(t, 14))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            eprintln!(
+                "DEFEQ[{}:{}]  {}   ###   {}",
+                ctx.len(),
+                binders,
+                self.pp_budget(a, 60),
+                self.pp_budget(b, 60),
+            );
+        }
         if Rc::ptr_eq(a, b) || a == b {
             return Ok(true);
         }
@@ -948,24 +1071,38 @@ impl<'e> Checker<'e> {
                             return Ok(true);
                         }
                     }
-                } else if Rc::ptr_eq(&h1, &h2) && a1.len() == a2.len() {
+                } else if a1.len() == a2.len() {
                     // Congruence under any shared head, not just a bound
-                    // variable. Heads are interned, so pointer equality means
-                    // the same term. Restricting this to BVar left `f x` and
-                    // `f y` uncomparable whenever `f` was, say, a projection:
-                    // the Const arm does not apply, and the delta path below
-                    // cannot fire because neither head is a Const. Init hits
-                    // this at Std.Iterator.step, where the shared head is
-                    // `Std.Internal.idOpaque ….0[Subtype]`.
-                    let mut all = true;
-                    for (x, y) in a1.iter().zip(a2.iter()) {
-                        if !self.is_def_eq(ctx, x, y)? {
-                            all = false;
-                            break;
+                    // variable or a Const. Restricting this to BVar left
+                    // `f x` and `f y` uncomparable whenever `f` was, say, a
+                    // projection: the Const arm does not apply, and the delta
+                    // path below cannot fire because neither head is a Const.
+                    // Init hits this at Std.Iterator.step, where the shared
+                    // head is `Std.Internal.idOpaque ….0[Subtype]`.
+                    //
+                    // Pointer-equal heads are the common case; when they
+                    // differ but are *definitionally* equal we must still
+                    // compare, otherwise a pair like
+                    //   `(Nat.rec … #1).0[PProd] #2` vs
+                    //   `(Nat.rec … (#1+0)).0[PProd] #2`
+                    // dies at the delta path's `(None, None)` dead end
+                    // (neither spine head is a Const). Two Const heads are
+                    // left to the delta path, which handles unfolding.
+                    let head_eq = Rc::ptr_eq(&h1, &h2)
+                        || (!matches!(&**h1, ExprData::Const(..))
+                            && !matches!(&**h2, ExprData::Const(..))
+                            && self.is_def_eq(ctx, &h1, &h2)?);
+                    if head_eq {
+                        let mut all = true;
+                        for (x, y) in a1.iter().zip(a2.iter()) {
+                            if !self.is_def_eq(ctx, x, y)? {
+                                all = false;
+                                break;
+                            }
                         }
-                    }
-                    if all {
-                        return Ok(true);
+                        if all {
+                            return Ok(true);
+                        }
                     }
                 }
             }
@@ -1075,6 +1212,15 @@ impl<'e> Checker<'e> {
         } else {
             None
         };
+        if std::env::var_os("KIOTA_TRACE_DELTA").is_some() {
+            eprintln!(
+                "DELTA n1={:?} n2={:?}  {}   ###   {}",
+                n1.map(|n| self.name_str(n).to_string()),
+                n2.map(|n| self.name_str(n).to_string()),
+                self.pp_budget(a, 60),
+                self.pp_budget(b, 60),
+            );
+        }
         match (n1, n2) {
             (Some(x), Some(y)) if x == y => {
                 // Same head const but arg/universe mismatch already failed above;
@@ -1115,7 +1261,7 @@ impl<'e> Checker<'e> {
     fn delta_step(&self, e: &Expr) -> R<Expr> {
         let (head, args) = expr::unfold_apps(e);
         if let ExprData::Const(n, us) = &**head {
-            if let Some(u) = self.unfold_def(*n, us)? {
+            if let Some(u) = self.unfold_delta(*n, us)? {
                 return Ok(expr::apps(u, &args));
             }
         }
@@ -1202,7 +1348,7 @@ impl<'e> Checker<'e> {
 
         let k_like = self.is_k_like(&all)?;
 
-        let major_w = self.whnf(ctx, major)?;
+        let major_w = self.whnf_major(ctx, major)?;
         let (mhead, margs) = expr::unfold_apps(&major_w);
 
         let ctor = match &**mhead {
@@ -1549,16 +1695,25 @@ impl<'e> Checker<'e> {
         } else {
             return Ok(None);
         };
+        // The rec call is wrapped in one lambda per field-type binder, so
+        // everything taken from the outer ctx (params, motives, minors, field)
+        // must be shifted under those binders. `indices` come from the field
+        // type body, which was evaluated under `ctx` plus the same binders, so
+        // they are already at the right depth. Skipping the shift left e.g.
+        // `Acc.rec … (Acc.intro …)`'s continuation with stale bvars for the
+        // carrier/relation, producing `Acc.rec #8 #7 …` under two lambdas
+        // where `#8 #7` no longer denote them.
+        let shift_by = binders.len() as i32;
         let rec = expr::const_(rec_name, us.to_vec());
         let mut rec_app = rec;
         for p in params {
-            rec_app = expr::app(rec_app, p.clone());
+            rec_app = expr::app(rec_app, expr::shift(p, shift_by, 0));
         }
         for m in motives {
-            rec_app = expr::app(rec_app, m.clone());
+            rec_app = expr::app(rec_app, expr::shift(m, shift_by, 0));
         }
         for m in minors {
-            rec_app = expr::app(rec_app, m.clone());
+            rec_app = expr::app(rec_app, expr::shift(m, shift_by, 0));
         }
         for ix in indices {
             rec_app = expr::app(rec_app, ix.clone());
