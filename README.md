@@ -73,37 +73,27 @@ it, however clean keys 1 and 2 are.
 
 Ranked by what actually moves the arena key, not by effort.
 
-1. **`Nat.add_assoc`.** The current blocker, and it is one defect showing
-   up twice: whole-module `Init` stops there, and so does
-   `perf/grind-ring-5`, the only perf export still rejected. It sits in
-   the structural-recursion encoding — a `match_1_1` auxiliary applied to
-   a `Nat.below` motive, where the inferred and declared types disagree
-   over a beta redex. Fixing it should take ranking key 2 from 2 to 1 and
-   push `Init` further in one go.
-2. **`undecidability/subject-reduction-redex`** — the other false reject.
-3. **Then mathlib**, which is the only thing that changes the rank at all,
-   and where the bar is not "completes" but 868 G instructions
-   (sokonanoda, with PGO and `target-cpu=native`).
-4. **Closures and `-j4`.** Substitution is still eager; the loose-bvar
-   range only skips traversals that provably change nothing. The top of
-   the board evaluates through closures and runs four threads.
+1. **`Array.foldlM_toList.aux._unary`** (Init, deep). The current init
+   blocker after Nat.add_assoc, Std.Iterator.step and WellFounded.fixF_eq
+   all fell to theorem transparency (see below). A stuck
+   `PSigma.casesOn` inside a `Nat.le` argument vs a plain successor --
+   same investigation recipe applies.
+2. **mathlib end-to-end.** Unknown bug count; the feedback loop is a
+   sub-second init rejection, so each bug is a small experiment.
+3. **Closures.** The board splits: eager implementations cluster at
+   7,900-10,500 G instructions, closure-based ones at 868-2,842 G.
 
-### On `Init`
+## Fixed this week (was on this list)
 
-`Init` is declined in the arena config, so until now nobody had run it.
-Doing so was worth more than any amount of profiling: it does not time
-out, it **rejects in 0.8s**, and each fix moves it visibly deeper.
-
-| after | rejects at |
-| --- | --- |
-| `343dfbc` (before this work) | `Classical.em` |
-| projection congruence | `Std.Iterator.step`, declaration 2510 |
-| shared-head congruence | `Nat.add_assoc` |
-
-Both fixes were missing congruence arms in `is_def_eq`, not performance
-problems. That is the honest shape of the gap: the corpora are out of
-reach because of defects, and the speed question only starts once one of
-them typechecks end to end.
+- `Nat.add_assoc` / `WellFounded.fixF_eq` / `subject-reduction-redex`:
+  Lean's kernel unfolds any constant with a value, theorems included.
+  kiota now does this in the cold defeq delta path (`unfold_delta`)
+  and at recursor major premises (`whnf_major`) -- but not in the hot
+  `whnf`, where eager theorem unfolding is a known 100x blowup.
+- grind-ring-5 went 0.05s-reject -> 196s-accept -> **2.3s-accept** when
+  `instantiate_core` gained a per-call (node, depth) memo: proof bodies
+  are DAG-shared through the interner, and each shared occurrence was
+  paying a full substitution traversal.
 
 ## Building
 
