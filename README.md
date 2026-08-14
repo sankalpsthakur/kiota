@@ -73,18 +73,37 @@ it, however clean keys 1 and 2 are.
 
 Ranked by what actually moves the arena key, not by effort.
 
-1. **mathlib at all.** This is the only thing that changes the rank.
-   Everything below is a prerequisite or a tie-break. The bar is not
-   "completes" but 868 G instructions — sokonanoda, with PGO and
-   `target-cpu=native`.
-2. **Closures.** Substitution is still eager; the loose-bvar range only
-   avoids the traversals that provably change nothing. The checkers at
-   the top of the board describe closure-based conversion (sokonanoda,
-   and nanoclo's delayed substitutions), which is what keeps a term from
-   being rebuilt at all.
-3. **`grind-ring-5`, `subject-reduction-redex`** — two false rejects, the
-   whole of the gap on ranking key 2.
-4. **Parallel declaration checking.** The top three all run `-j4`.
+1. **`Nat.add_assoc`.** The current blocker, and it is one defect showing
+   up twice: whole-module `Init` stops there, and so does
+   `perf/grind-ring-5`, the only perf export still rejected. It sits in
+   the structural-recursion encoding — a `match_1_1` auxiliary applied to
+   a `Nat.below` motive, where the inferred and declared types disagree
+   over a beta redex. Fixing it should take ranking key 2 from 2 to 1 and
+   push `Init` further in one go.
+2. **`undecidability/subject-reduction-redex`** — the other false reject.
+3. **Then mathlib**, which is the only thing that changes the rank at all,
+   and where the bar is not "completes" but 868 G instructions
+   (sokonanoda, with PGO and `target-cpu=native`).
+4. **Closures and `-j4`.** Substitution is still eager; the loose-bvar
+   range only skips traversals that provably change nothing. The top of
+   the board evaluates through closures and runs four threads.
+
+### On `Init`
+
+`Init` is declined in the arena config, so until now nobody had run it.
+Doing so was worth more than any amount of profiling: it does not time
+out, it **rejects in 0.8s**, and each fix moves it visibly deeper.
+
+| after | rejects at |
+| --- | --- |
+| `343dfbc` (before this work) | `Classical.em` |
+| projection congruence | `Std.Iterator.step`, declaration 2510 |
+| shared-head congruence | `Nat.add_assoc` |
+
+Both fixes were missing congruence arms in `is_def_eq`, not performance
+problems. That is the honest shape of the gap: the corpora are out of
+reach because of defects, and the speed question only starts once one of
+them typechecks end to end.
 
 ## Building
 
