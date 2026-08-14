@@ -1,5 +1,7 @@
 # lkc — a from-scratch Lean 4 kernel checker (experimental)
 
+Repository: https://github.com/sankalpsthakur/lkc
+
 `lkc` is an independent Lean 4 kernel type-checker written in Rust for the
 [Lean Kernel Arena](https://arena.lean-lang.org/). It reads `lean4export`
 NDJSON and re-checks every declaration. Exported recursor `k` flags and
