@@ -137,6 +137,9 @@ pub struct Environment {
     pub consts: FxHashMap<u32, ConstantInfo>,
     /// Inductive type name → recursor name, filled in by the parser.
     pub rec_of: FxHashMap<u32, u32>,
+    /// Recursor → every recursor in its inductive block (`.rec`, `.rec_1`, …),
+    /// sorted so main comes first. Used for nested ι, not for trusting RHS.
+    pub rec_group: FxHashMap<u32, Vec<u32>>,
 }
 
 impl Environment {

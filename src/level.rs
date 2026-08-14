@@ -169,6 +169,16 @@ pub fn leq(l1: &Level, l2: &Level, diff: i64) -> bool {
     if let Max(a, b) = &**l2 {
         return leq(l1, a, diff) || leq(l1, b, diff);
     }
+    if let (IMax(a1, b1), IMax(a2, b2)) = (&**l1, &**l2) {
+        // Matching rhs (structurally or by leq): both 0 when that param is 0.
+        if b1 == b2 || (leq(b1, b2, 0) && leq(b2, b1, 0)) {
+            return leq(
+                &max(a1.clone(), b1.clone()),
+                &max(a2.clone(), b2.clone()),
+                diff,
+            );
+        }
+    }
     if let IMax(a, b) = &**l1 {
         // l1's value is 0 (if b=0) or max(a,b) (otherwise); must hold in both cases.
         return leq(&zero(), l2, diff) && leq(&max(a.clone(), b.clone()), l2, diff);
@@ -196,8 +206,26 @@ pub fn pp(l: &Level) -> String {
     }
 }
 
+/// Push `succ` through `max` so `succ(max u v)` meets `max (succ v) (succ u)`.
+pub fn normalize(l: &Level) -> Level {
+    match &**l {
+        LevelData::Zero | LevelData::Param(_) => l.clone(),
+        LevelData::Succ(a) => {
+            let a = normalize(a);
+            match &*a {
+                LevelData::Max(x, y) => max(succ(x.clone()), succ(y.clone())),
+                _ => succ(a),
+            }
+        }
+        LevelData::Max(a, b) => max(normalize(a), normalize(b)),
+        LevelData::IMax(a, b) => imax(normalize(a), normalize(b)),
+    }
+}
+
 pub fn is_def_eq(l1: &Level, l2: &Level) -> bool {
-    leq(l1, l2, 0) && leq(l2, l1, 0)
+    let a = normalize(l1);
+    let b = normalize(l2);
+    leq(&a, &b, 0) && leq(&b, &a, 0)
 }
 
 pub fn is_zero(l: &Level) -> bool {
@@ -233,5 +261,25 @@ mod tests {
         let s = succ(u.clone());
         // imax u (succ u) = max u (succ u) = succ u
         assert_eq!(imax(u.clone(), s.clone()), s);
+    }
+
+    #[test]
+    fn succ_max_commutes_under_imax() {
+        let u = param(1967);
+        let v = param(517);
+        let w = param(6);
+        let lhs = imax(succ(max(u.clone(), v.clone())), w.clone());
+        let rhs = imax(max(succ(v), succ(u)), w);
+        assert!(is_def_eq(&lhs, &rhs), "{} vs {}", pp(&lhs), pp(&rhs));
+    }
+
+    #[test]
+    fn max_assoc_comm_under_imax() {
+        let u6 = param(6);
+        let u22 = param(22);
+        let u128 = param(128);
+        let lhs = max(u22.clone(), max(u128.clone(), succ(u6.clone())));
+        let rhs = max(max(succ(u6), u22), u128);
+        assert!(is_def_eq(&lhs, &rhs), "{} vs {}", pp(&lhs), pp(&rhs));
     }
 }

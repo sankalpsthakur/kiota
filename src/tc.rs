@@ -567,6 +567,38 @@ impl<'e> Checker<'e> {
         Ok(r)
     }
 
+    /// WHNF plus cheap delta: abbrevs and low-height defs (`ctorIdx`,
+    /// `casesOn`). Does not unfold `brecOn` helpers such as `modCore.go`.
+    fn whnf_for_defeq(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        let mut cur = self.whnf_core(ctx, e)?;
+        loop {
+            let (head, args) = expr::unfold_apps(&cur);
+            let n = match &*head {
+                ExprData::Const(n, us) => (*n, us.clone()),
+                _ => return Ok(cur),
+            };
+            let cheap = match self.env.get(n.0) {
+                Some(ConstantInfo::Def {
+                    hints: ReducibilityHints::Abbrev,
+                    ..
+                }) => true,
+                Some(ConstantInfo::Def {
+                    hints: ReducibilityHints::Regular(h),
+                    ..
+                }) if *h <= 2 => true,
+                _ => false,
+            };
+            if !cheap {
+                return Ok(cur);
+            }
+            if let Some(u) = self.unfold_def(n.0, &n.1)? {
+                cur = self.whnf_core(ctx, &expr::apps(u, &args))?;
+                continue;
+            }
+            return Ok(cur);
+        }
+    }
+
     /// beta/zeta/proj/iota reduction to whnf, WITHOUT unfolding delta.
     fn whnf_core(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         let cache = Self::cacheable(ctx, e);
@@ -755,8 +787,8 @@ impl<'e> Checker<'e> {
                 return Ok(r);
             }
         }
-        let aw = self.whnf_core(ctx, a)?;
-        let bw = self.whnf_core(ctx, b)?;
+        let aw = self.whnf_for_defeq(ctx, a)?;
+        let bw = self.whnf_for_defeq(ctx, b)?;
         let r = self.is_def_eq_core(ctx, &aw, &bw)?;
         if let Some(k) = key {
             self.defeq_cache.borrow_mut().insert(k, r);
@@ -767,6 +799,14 @@ impl<'e> Checker<'e> {
     fn is_def_eq_core(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         if Rc::ptr_eq(a, b) || a == b {
             return Ok(true);
+        }
+        if let Some((zero, succ)) = self.nat_ctors() {
+            if let (Some(x), Some(y)) = (
+                nat::numeral_value(a, zero, succ),
+                nat::numeral_value(b, zero, succ),
+            ) {
+                return Ok(x == y);
+            }
         }
         // Structural match without delta.
         match (&**a, &**b) {
@@ -1018,6 +1058,12 @@ impl<'e> Checker<'e> {
                 ),
                 _ => return Ok(None),
             };
+        let rec_owns_ctor = |cname: u32| -> bool {
+            match self.env.get(rname) {
+                Some(ConstantInfo::Recursor { rules, .. }) => rules.iter().any(|r| r.ctor == cname),
+                _ => false,
+            }
+        };
         let major_pos = (num_params + num_motives + num_minors + num_indices) as usize;
         if args.len() <= major_pos {
             return Ok(None);
@@ -1040,7 +1086,9 @@ impl<'e> Checker<'e> {
                     induct,
                     num_params: cnp,
                     ..
-                }) if all.contains(induct) => Some((*cname, *cnp, margs.clone())),
+                }) if all.contains(induct) || rec_owns_ctor(*cname) => {
+                    Some((*cname, *cnp, margs.clone()))
+                }
                 _ => None,
             },
             _ => None,
@@ -1059,13 +1107,13 @@ impl<'e> Checker<'e> {
             return Ok(None);
         };
 
-        let fields = if ctor_args.len() >= cnp as usize {
-            ctor_args[cnp as usize..].to_vec()
-        } else {
+        if (ctor_args.len() as u32) < cnp {
             return Ok(None);
-        };
+        }
+        let ctor_params = &ctor_args[..cnp as usize];
+        let fields = &ctor_args[cnp as usize..];
 
-        let minor_idx = self.ctor_minor_index(cname, &all);
+        let minor_idx = self.ctor_minor_index(cname, rname, &all);
         if minor_idx >= minors.len() {
             return Ok(None);
         }
@@ -1076,11 +1124,12 @@ impl<'e> Checker<'e> {
             &level_params,
             &all,
             params,
+            ctor_params,
             motives,
             minors,
             minors[minor_idx].clone(),
             cname,
-            &fields,
+            fields,
         )?;
         Ok(Some(expr::apps(rhs, rest)))
     }
@@ -1207,8 +1256,52 @@ impl<'e> Checker<'e> {
         }
     }
 
-    fn ctor_minor_index(&self, cname: u32, all: &[u32]) -> usize {
+    fn rec_group(&self, rname: u32) -> Vec<u32> {
+        self.env
+            .rec_group
+            .get(&rname)
+            .cloned()
+            .unwrap_or_else(|| vec![rname])
+    }
+
+    fn rec_for_ctor_in_group(&self, cname: u32, rname: u32) -> Option<u32> {
+        for rec in self.rec_group(rname) {
+            if let Some(ConstantInfo::Recursor { rules, .. }) = self.env.get(rec) {
+                if rules.iter().any(|r| r.ctor == cname) {
+                    return Some(rec);
+                }
+            }
+        }
+        None
+    }
+
+    fn nested_rec_for(&self, type_name: u32, rname: u32) -> Option<u32> {
+        let ctors = match self.env.get(type_name) {
+            Some(ConstantInfo::InductiveType { ctors, .. }) => ctors,
+            _ => return None,
+        };
+        for c in ctors {
+            if let Some(rec) = self.rec_for_ctor_in_group(*c, rname) {
+                return Some(rec);
+            }
+        }
+        None
+    }
+
+    fn ctor_minor_index(&self, cname: u32, rname: u32, all: &[u32]) -> usize {
         let mut idx = 0usize;
+        for rec in self.rec_group(rname) {
+            if let Some(ConstantInfo::Recursor { rules, .. }) = self.env.get(rec) {
+                for rule in rules {
+                    if rule.ctor == cname {
+                        return idx;
+                    }
+                    idx += 1;
+                }
+            }
+        }
+        // Fallback: main-type ctor order (non-nested groups).
+        idx = 0;
         for t in all {
             let ctors = match self.env.get(*t) {
                 Some(ConstantInfo::InductiveType { ctors, .. }) => ctors,
@@ -1232,24 +1325,24 @@ impl<'e> Checker<'e> {
         level_params: &[u32],
         all: &[u32],
         params: &[Expr],
+        ctor_params: &[Expr],
         motives: &[Expr],
         minors: &[Expr],
         minor: Expr,
         cname: u32,
         fields: &[Expr],
     ) -> R<Expr> {
-        let (ctor_lp, ctor_typ, cnp) = match self.env.get(cname) {
+        let (ctor_lp, ctor_typ) = match self.env.get(cname) {
             Some(ConstantInfo::Constructor {
-                level_params,
-                typ,
-                num_params,
-                ..
-            }) => (level_params.clone(), typ.clone(), *num_params),
+                level_params, typ, ..
+            }) => (level_params.clone(), typ.clone()),
             _ => return Ok(minor),
         };
         let subst = level::subst_map(&ctor_lp, us);
         let mut ct = expr::instantiate_level_params(&ctor_typ, &subst);
-        for p in params.iter().take(cnp as usize) {
+        // Nested ctors (Array.mk, List.cons) carry their own params on the
+        // major; the outer recursor's params may be empty (Syntax).
+        for p in ctor_params {
             let (_, _, body) = self.ensure_pi(ctx, &ct)?;
             ct = expr::instantiate1(&body, p);
         }
@@ -1309,15 +1402,28 @@ impl<'e> Checker<'e> {
         }
         let (head, iargs) = expr::unfold_apps(&ty);
         let target = match &*head {
-            ExprData::Const(n, _) if all.contains(n) => *n,
+            ExprData::Const(n, _) => *n,
             _ => return Ok(None),
         };
-        let nparams = params.len();
-        if iargs.len() < nparams {
+        let (rec_name, indices): (u32, &[Expr]) = if all.contains(&target) {
+            let nparams = params.len();
+            if iargs.len() < nparams {
+                return Ok(None);
+            }
+            (
+                self.env.rec_of.get(&target).copied().unwrap_or(rname),
+                &iargs[nparams..],
+            )
+        } else if self.occurs_any(&ty, all) {
+            // Only `F … I …` (e.g. `Array Syntax`), not `List Preresolved`.
+            if let Some(nrec) = self.nested_rec_for(target, rname) {
+                (nrec, &[][..])
+            } else {
+                return Ok(None);
+            }
+        } else {
             return Ok(None);
-        }
-        let indices = &iargs[nparams..];
-        let rec_name = self.env.rec_of.get(&target).copied().unwrap_or(rname);
+        };
         let rec = expr::const_(rec_name, us.to_vec());
         let mut rec_app = rec;
         for p in params {
@@ -1824,7 +1930,7 @@ impl<'e> Checker<'e> {
                     // itself (see tutorial/054_reduceCtorType).
                     match &*cur2 {
                         ExprData::Pi(_, dom, body) => {
-                            self.check_arg_positive(&c2, dom, &all)?;
+                            self.check_arg_positive(&c2, dom, &all, num_params)?;
                             let ds = self.infer_type(&c2, dom)?;
                             if let Ok(field_lvl) = self.ensure_sort(&c2, &ds) {
                                 // Only reject when both universes are closed numerals;
@@ -1893,7 +1999,7 @@ impl<'e> Checker<'e> {
         let w = self.whnf(ctx, e).unwrap_or_else(|_| e.clone());
         match &*w {
             ExprData::Pi(_, dom, body) => {
-                self.check_arg_positive(ctx, dom, bound)?;
+                self.check_arg_positive(ctx, dom, bound, 0)?;
                 let mut ctx2 = ctx.clone();
                 ctx2.push(dom.clone());
                 self.check_positivity(&ctx2, body, bound, _strict_pos_ok)
@@ -1902,11 +2008,16 @@ impl<'e> Checker<'e> {
         }
     }
 
-    /// Check that one constructor argument type (which may itself be a
-    /// function type) is strictly positive: `bound` names may not occur in
-    /// any nested domain, and may only occur in the final head position as a
-    /// direct, non-nested recursive occurrence `I params.. indices..`.
-    fn check_arg_positive(&self, ctx: &Ctx, arg_ty: &Expr, bound: &[u32]) -> R<()> {
+    /// Strict positivity: `bound` may not occur in a Pi domain. Direct
+    /// `I params..` is allowed. Nested `F … (I params) …` is allowed when `F`
+    /// is a previously defined inductive and `I`'s parameters are uniform.
+    fn check_arg_positive(
+        &self,
+        ctx: &Ctx,
+        arg_ty: &Expr,
+        bound: &[u32],
+        num_params: u32,
+    ) -> R<()> {
         let mut cur = self.whnf(ctx, arg_ty).unwrap_or_else(|_| arg_ty.clone());
         let mut ctx2 = ctx.clone();
         loop {
@@ -1923,21 +2034,53 @@ impl<'e> Checker<'e> {
                 _ => break,
             }
         }
-        if !self.occurs_any(&cur, bound) {
-            return Ok(());
-        }
-        let (h, args) = expr::unfold_apps(&cur);
-        if let ExprData::Const(n, _) = &*h {
-            if bound.contains(n) {
-                for a in &args {
-                    if self.occurs_any(a, bound) {
-                        return decline("nested inductive occurrence");
-                    }
-                }
-                return Ok(());
+        self.check_positive_spine(&ctx2, &cur, bound, num_params)
+    }
+
+    fn expected_param_args(&self, ctx: &Ctx, num_params: u32) -> Vec<Expr> {
+        (0..num_params)
+            .map(|i| expr::bvar((ctx.len() as u32).saturating_sub(1 + i)))
+            .collect()
+    }
+
+    fn check_uniform_i(&self, ctx: &Ctx, args: &[Expr], bound: &[u32], num_params: u32) -> R<()> {
+        for a in args {
+            if self.occurs_any(a, bound) {
+                return reject("nested inductive occurrence in an index");
             }
         }
-        decline("occurrence of inductive type in unsupported position")
+        if (args.len() as u32) < num_params {
+            return reject("nested inductive applied to too few parameters");
+        }
+        let expected = self.expected_param_args(ctx, num_params);
+        for (a, e) in args.iter().zip(expected.iter()) {
+            if !self.is_def_eq(ctx, a, e).unwrap_or(false) {
+                return reject("non-uniform nested inductive parameter");
+            }
+        }
+        Ok(())
+    }
+
+    fn check_positive_spine(&self, ctx: &Ctx, e: &Expr, bound: &[u32], num_params: u32) -> R<()> {
+        if !self.occurs_any(e, bound) {
+            return Ok(());
+        }
+        let (h, args) = expr::unfold_apps(e);
+        match &*h {
+            ExprData::Const(n, _) if bound.contains(n) => {
+                self.check_uniform_i(ctx, &args, bound, num_params)
+            }
+            ExprData::Const(n, _) => match self.env.get(*n) {
+                Some(ConstantInfo::InductiveType { .. }) => {
+                    for a in &args {
+                        self.check_positive_spine(ctx, a, bound, num_params)?;
+                    }
+                    Ok(())
+                }
+                _ => reject("occurrence of inductive type in unsupported position"),
+            },
+            _ => reject("occurrence of inductive type in unsupported position"),
+        }
     }
 
     fn occurs_any(&self, e: &Expr, names: &[u32]) -> bool {

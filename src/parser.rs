@@ -477,6 +477,20 @@ impl Parser {
                 )));
             }
         }
+        {
+            let mut group: Vec<u32> = recs.iter().map(|r| Self::get_u32(r, "name")).collect();
+            group.sort_by_key(|n| {
+                rec_sort_key(
+                    self.names
+                        .get(*n as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                )
+            });
+            for n in &group {
+                self.env.rec_group.insert(*n, group.clone());
+            }
+        }
         for t in &type_names {
             if !self.env.rec_of.contains_key(t) {
                 let tstr = self
@@ -591,3 +605,18 @@ impl Parser {
 }
 
 fn kind_or_direct(_v: &Value) {}
+
+/// `.rec` first, then `.rec_1`, `.rec_2`, … so nested minors concatenate
+/// as main ctors then nested types in declaration order.
+fn rec_sort_key(name: &str) -> (u8, u32) {
+    if let Some((_, suf)) = name.rsplit_once(".rec_") {
+        if let Ok(n) = suf.parse::<u32>() {
+            return (1, n);
+        }
+        return (2, 0);
+    }
+    if name.ends_with(".rec") {
+        return (0, 0);
+    }
+    (3, 0)
+}

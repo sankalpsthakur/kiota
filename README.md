@@ -31,24 +31,22 @@ Against the arena tarball (non-mathlib):
 | --- | --- |
 | Tutorial good | **92/92** accept |
 | Tutorial bad | **46/46** reject |
+| `init-prelude` | **accept** |
 | Acc left/right, quot-right | accept |
-| `beta-ladder` | accept |
-| `init-prelude`, `grind-ring-5` | decline (`Lean.Syntax` nested) |
+| Perf goods | 14/16 accept; `app-lam` timeout; `grind-ring-5` reject |
 | `subject-reduction-redex` | reject |
-| Some perf tests | timeout (`app-lam`, `shared-subterm`, `discarded-argument-match`) |
+| Nested unused-param (bad) | reject (projection mismatch) |
 
-Soundness on finished reject tests: no known false accepts on the tutorial
-bad suite. Large corpora (`init`, `std`, `mathlib`, `cslib`, `cedar`) are
-**declined**, same policy as mini.
+Soundness: no known false accepts on the reject suite. Large corpora
+(`init`, `std`, `mathlib`, `cslib`, `cedar`) are still declined.
 
-On the arena ranking key (soundness, then completeness, then mathlib
-speed) this sits with **mini / evmlean**, not with sokonanoda. Not #1.
+On the arena ranking key this is ahead of mini on completeness, not
+competitive with sokonanoda on mathlib time. Not #1.
 
 ## What's missing (intentionally, for now)
 
-- Nested inductives (`Array`/`List` of `I`, needed for `Init.Prelude`)
-- Full native `Nat`/`String` (succ/add/mul/sub/pow/beq/ble/`dite` are in)
-- NbE / glued values
+- Full `Init` / mathlib (need more Nat + a values/NbE layer for time)
+- `subject-reduction-redex`, `grind-ring-5`
 - Parallel declaration checking
 
 ## Building
