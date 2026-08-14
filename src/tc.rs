@@ -52,6 +52,10 @@ thread_local! {
 /// equal contexts would only cost a cache miss, and interning rules that out.
 #[derive(Clone, Default)]
 struct Ctx {
+    /// Invariant: only ever extended through `push`, which keeps `id` in step.
+    /// Mutating this directly would leave `id` describing a different context
+    /// than `tys` holds, and the inference cache would then hand back a type
+    /// inferred under other bindings — a false accept, silently.
     tys: Vec<Expr>,
     id: u64,
 }
@@ -2193,5 +2197,96 @@ impl<'e> Checker<'e> {
             ExprData::Proj(_, _, v) => self.occurs_any(v, names),
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::level;
+
+    fn ty(n: u32) -> Expr {
+        expr::const_(n, vec![])
+    }
+
+    fn ctx_of(ns: &[u32]) -> Ctx {
+        let mut c = Ctx::new();
+        for n in ns {
+            c.push(ty(*n));
+        }
+        c
+    }
+
+    /// The inference cache is keyed on this id, so equal ids must mean equal
+    /// contexts. Anything weaker turns a cache hit into a type inferred under
+    /// the wrong bindings.
+    #[test]
+    fn ctx_id_identifies_the_binding_sequence() {
+        assert_eq!(Ctx::new().id, 0, "the empty context is the zero id");
+        assert_ne!(
+            ctx_of(&[1]).id,
+            0,
+            "a non-empty context is never the zero id"
+        );
+
+        // Same types pushed in the same order: same id, however they were built.
+        assert_eq!(ctx_of(&[1, 2, 3]).id, ctx_of(&[1, 2, 3]).id);
+        let mut grown = ctx_of(&[1, 2]);
+        grown.push(ty(3));
+        assert_eq!(grown.id, ctx_of(&[1, 2, 3]).id);
+
+        // Order is part of the identity: these bind different types at bvar 0.
+        assert_ne!(ctx_of(&[1, 2]).id, ctx_of(&[2, 1]).id);
+
+        // Same length, different types.
+        assert_ne!(ctx_of(&[1, 2]).id, ctx_of(&[1, 3]).id);
+
+        // A prefix is a different context from its extension.
+        assert_ne!(ctx_of(&[1, 2]).id, ctx_of(&[1, 2, 3]).id);
+
+        // Distinct types really are distinct pushes.
+        assert_ne!(ctx_of(&[1]).id, ctx_of(&[2]).id);
+    }
+
+    #[test]
+    fn ctx_id_tracks_every_push() {
+        let mut c = Ctx::new();
+        let mut seen = vec![c.id];
+        for n in 0..8u32 {
+            c.push(ty(n));
+            assert_eq!(c.len(), n as usize + 1);
+            assert!(
+                !seen.contains(&c.id),
+                "push must not reuse an ancestor's id"
+            );
+            seen.push(c.id);
+        }
+    }
+
+    #[test]
+    fn ctx_indexes_from_the_bottom() {
+        let c = ctx_of(&[7, 8, 9]);
+        assert!(Rc::ptr_eq(&c[0], &ty(7)));
+        assert!(Rc::ptr_eq(&c[2], &ty(9)));
+        // local_ty reads bvar i as the i-th binder from the top.
+        let t0 = local_ty(&c, 0).unwrap();
+        assert!(Rc::ptr_eq(&t0, &ty(9)), "bvar 0 is the innermost binder");
+        let t2 = local_ty(&c, 2).unwrap();
+        assert!(Rc::ptr_eq(&t2, &ty(7)));
+        assert!(local_ty(&c, 3).is_none());
+    }
+
+    #[test]
+    fn ctx_id_is_insensitive_to_cloning() {
+        let a = ctx_of(&[1, 2]);
+        let b = a.clone();
+        assert_eq!(a.id, b.id);
+        let mut c = b.clone();
+        c.push(expr::sort(level::zero()));
+        assert_eq!(
+            a.id, b.id,
+            "extending a clone must not disturb the original"
+        );
+        assert_ne!(c.id, a.id);
     }
 }
