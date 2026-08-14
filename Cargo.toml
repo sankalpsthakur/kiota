@@ -1,0 +1,15 @@
+[package]
+name = "lkc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde_json = "1"
+rustc-hash = "2"
+num-bigint = "0.5.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "unwind"
+codegen-units = 1

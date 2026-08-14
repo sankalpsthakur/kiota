@@ -1,0 +1,3 @@
+/target
+*.ndjson
+.DS_Store
