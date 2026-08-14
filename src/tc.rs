@@ -84,7 +84,7 @@ impl<'e> Checker<'e> {
         if budget <= 0 {
             return "…".into();
         }
-        match &**e {
+        match &***e {
             ExprData::BVar(i) => format!("#{i}"),
             ExprData::Sort(l) => format!("Sort({})", level::pp(l)),
             ExprData::Const(n, us) => {
@@ -180,7 +180,7 @@ impl<'e> Checker<'e> {
 
     fn ensure_sort(&self, ctx: &Ctx, e: &Expr) -> R<Level> {
         let w = self.whnf(ctx, e)?;
-        match &*w {
+        match &**w {
             ExprData::Sort(l) => Ok(l.clone()),
             _ => reject("expected a sort"),
         }
@@ -188,7 +188,7 @@ impl<'e> Checker<'e> {
 
     fn ensure_pi(&self, ctx: &Ctx, e: &Expr) -> R<(BinderInfo, Expr, Expr)> {
         let w = self.whnf(ctx, e)?;
-        match &*w {
+        match &**w {
             ExprData::Pi(bi, ty, body) => Ok((*bi, ty.clone(), body.clone())),
             _ => reject("expected a function type"),
         }
@@ -197,7 +197,8 @@ impl<'e> Checker<'e> {
     // ---------------- Type inference ----------------
 
     pub fn infer_type(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
-        match &**e {
+        crate::stats::infer_call();
+        match &***e {
             ExprData::BVar(i) => {
                 local_ty(ctx, *i).ok_or_else(|| TcError::Other("bvar out of range".into()))
             }
@@ -228,7 +229,10 @@ impl<'e> Checker<'e> {
             ExprData::Lam(bi, ty, body) => {
                 let tt = self.infer_type(ctx, ty)?;
                 self.ensure_sort(ctx, &tt)?;
-                let mut ctx2 = ctx.clone();
+                let mut ctx2 = {
+                    crate::stats::ctx_clone();
+                    ctx.clone()
+                };
                 ctx2.push(ty.clone());
                 let bt = self.infer_type(&ctx2, body)?;
                 Ok(expr::pi(*bi, ty.clone(), bt))
@@ -236,7 +240,10 @@ impl<'e> Checker<'e> {
             ExprData::Pi(_bi, ty, body) => {
                 let tt = self.infer_type(ctx, ty)?;
                 let s1 = self.ensure_sort(ctx, &tt)?;
-                let mut ctx2 = ctx.clone();
+                let mut ctx2 = {
+                    crate::stats::ctx_clone();
+                    ctx.clone()
+                };
                 ctx2.push(ty.clone());
                 let bs = self.infer_type(&ctx2, body)?;
                 let s2 = self.ensure_sort(&ctx2, &bs)?;
@@ -288,7 +295,7 @@ impl<'e> Checker<'e> {
         let vt = self.infer_type(ctx, v)?;
         let vtw = self.whnf(ctx, &vt)?;
         let (head, args) = expr::unfold_apps(&vtw);
-        let (ind_name, us) = match &*head {
+        let (ind_name, us) = match &**head {
             ExprData::Const(n, us) => (*n, us.clone()),
             _ => return reject("projection of non-inductive value"),
         };
@@ -403,7 +410,7 @@ impl<'e> Checker<'e> {
     }
 
     fn occurs_bvar(e: &Expr, i: u32) -> bool {
-        match &**e {
+        match &***e {
             ExprData::BVar(j) => *j == i,
             ExprData::App(f, a) => Self::occurs_bvar(f, i) || Self::occurs_bvar(a, i),
             ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
@@ -473,7 +480,7 @@ impl<'e> Checker<'e> {
         }
         let tw = self.whnf(ctx, &ta)?;
         let (head, _) = expr::unfold_apps(&tw);
-        match &*head {
+        match &**head {
             ExprData::Const(n, _) if self.is_non_rec_structure(*n) => {
                 Ok(self.structure_num_fields(*n) == Some(0))
             }
@@ -509,7 +516,7 @@ impl<'e> Checker<'e> {
         let mt = self.infer_type(ctx, major)?;
         let mtw = self.whnf(ctx, &mt)?;
         let (thead, targs) = expr::unfold_apps(&mtw);
-        match &*thead {
+        match &**thead {
             ExprData::Const(n, _) if *n == tname => {
                 if targs.len() < num_params as usize {
                     return Ok(None);
@@ -539,6 +546,7 @@ impl<'e> Checker<'e> {
     // ---------------- Reduction ----------------
 
     pub fn whnf(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        crate::stats::whnf_call();
         let cache = Self::cacheable(ctx, e);
         if cache {
             let k = Self::ptr_key(e);
@@ -550,7 +558,7 @@ impl<'e> Checker<'e> {
         let r = loop {
             let core = self.whnf_core(ctx, &cur)?;
             let (head, _) = expr::unfold_apps(&core);
-            if let ExprData::Const(n, us) = &*head {
+            if let ExprData::Const(n, us) = &**head {
                 if let Some(unfolded) = self.unfold_def(*n, us)? {
                     let (_, args) = expr::unfold_apps(&core);
                     cur = expr::apps(unfolded, &args);
@@ -573,7 +581,7 @@ impl<'e> Checker<'e> {
         let mut cur = self.whnf_core(ctx, e)?;
         loop {
             let (head, args) = expr::unfold_apps(&cur);
-            let n = match &*head {
+            let n = match &**head {
                 ExprData::Const(n, us) => (*n, us.clone()),
                 _ => return Ok(cur),
             };
@@ -620,14 +628,14 @@ impl<'e> Checker<'e> {
     fn whnf_core_go(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         let mut cur = e.clone();
         loop {
-            match &*cur {
+            match &**cur {
                 ExprData::App(_, _) => {
                     let (head, args) = expr::unfold_apps(&cur);
-                    match &*head {
+                    match &**head {
                         ExprData::Lam(_, _, _) => {
                             let mut body = head.clone();
                             let mut i = 0;
-                            while let ExprData::Lam(_, _, b) = &*body.clone() {
+                            while let ExprData::Lam(_, _, b) = &**body.clone() {
                                 if i >= args.len() {
                                     break;
                                 }
@@ -651,7 +659,7 @@ impl<'e> Checker<'e> {
                         ExprData::Proj(sname, idx, v) => {
                             let vw = self.whnf(ctx, v)?;
                             let (phead, pargs) = expr::unfold_apps(&vw);
-                            if let ExprData::Const(cname, _us) = &*phead {
+                            if let ExprData::Const(cname, _us) = &**phead {
                                 if let Some(ConstantInfo::Constructor { num_params, .. }) =
                                     self.env.get(*cname)
                                 {
@@ -696,7 +704,7 @@ impl<'e> Checker<'e> {
                 ExprData::Proj(sname, idx, v) => {
                     let vw = self.whnf(ctx, v)?;
                     let (head, args) = expr::unfold_apps(&vw);
-                    if let ExprData::Const(cname, _us) = &*head {
+                    if let ExprData::Const(cname, _us) = &**head {
                         if let Some(ConstantInfo::Constructor { num_params, .. }) =
                             self.env.get(*cname)
                         {
@@ -772,6 +780,7 @@ impl<'e> Checker<'e> {
     // ---------------- Definitional equality ----------------
 
     pub fn is_def_eq(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        crate::stats::defeq_call();
         if Rc::ptr_eq(a, b) || a == b {
             return Ok(true);
         }
@@ -809,7 +818,7 @@ impl<'e> Checker<'e> {
             }
         }
         // Structural match without delta.
-        match (&**a, &**b) {
+        match (&***a, &***b) {
             (ExprData::Sort(l1), ExprData::Sort(l2)) => return Ok(level::is_def_eq(l1, l2)),
             (ExprData::BVar(i), ExprData::BVar(j)) if i == j => return Ok(true),
             (ExprData::Lit(x), ExprData::Lit(y)) => return Ok(x == y),
@@ -817,20 +826,26 @@ impl<'e> Checker<'e> {
                 if !self.is_def_eq(ctx, t1, t2)? {
                     return Ok(false);
                 }
-                let mut ctx2 = ctx.clone();
+                let mut ctx2 = {
+                    crate::stats::ctx_clone();
+                    ctx.clone()
+                };
                 ctx2.push(t1.clone());
                 return self.is_def_eq(&ctx2, b1, b2);
             }
             (ExprData::Lam(_, t1, b1), ExprData::Lam(_, t2, b2)) => {
                 let _ = self.is_def_eq(ctx, t1, t2)?; // domains needn't match strictly if only used for eta-shape; keep permissive
-                let mut ctx2 = ctx.clone();
+                let mut ctx2 = {
+                    crate::stats::ctx_clone();
+                    ctx.clone()
+                };
                 ctx2.push(t1.clone());
                 return self.is_def_eq(&ctx2, b1, b2);
             }
             (ExprData::App(_, _), ExprData::App(_, _)) => {
                 let (h1, a1) = expr::unfold_apps(a);
                 let (h2, a2) = expr::unfold_apps(b);
-                if let (ExprData::Const(n1, u1), ExprData::Const(n2, u2)) = (&*h1, &*h2) {
+                if let (ExprData::Const(n1, u1), ExprData::Const(n2, u2)) = (&**h1, &**h2) {
                     if n1 == n2
                         && a1.len() == a2.len()
                         && u1.len() == u2.len()
@@ -850,7 +865,7 @@ impl<'e> Checker<'e> {
                             return Ok(true);
                         }
                     }
-                } else if matches!((&*h1, &*h2), (ExprData::BVar(i), ExprData::BVar(j)) if i == j)
+                } else if matches!((&**h1, &**h2), (ExprData::BVar(i), ExprData::BVar(j)) if i == j)
                     && a1.len() == a2.len()
                 {
                     let mut all = true;
@@ -880,12 +895,15 @@ impl<'e> Checker<'e> {
         }
 
         // Eta for lambdas: one side a lambda, other not -> eta-expand other.
-        if let (ExprData::Lam(_, t1, _), _) = (&**a, &**b) {
-            if !matches!(&**b, ExprData::Lam(_, _, _)) {
+        if let (ExprData::Lam(_, t1, _), _) = (&***a, &***b) {
+            if !matches!(&***b, ExprData::Lam(_, _, _)) {
                 let b_app = expr::app(expr::shift(b, 1, 0), expr::bvar(0));
-                let mut ctx2 = ctx.clone();
+                let mut ctx2 = {
+                    crate::stats::ctx_clone();
+                    ctx.clone()
+                };
                 ctx2.push(t1.clone());
-                let a_body = if let ExprData::Lam(_, _, bd) = &**a {
+                let a_body = if let ExprData::Lam(_, _, bd) = &***a {
                     bd.clone()
                 } else {
                     unreachable!()
@@ -893,12 +911,15 @@ impl<'e> Checker<'e> {
                 return self.is_def_eq(&ctx2, &a_body, &b_app);
             }
         }
-        if let (_, ExprData::Lam(_, t2, _)) = (&**a, &**b) {
-            if !matches!(&**a, ExprData::Lam(_, _, _)) {
+        if let (_, ExprData::Lam(_, t2, _)) = (&***a, &***b) {
+            if !matches!(&***a, ExprData::Lam(_, _, _)) {
                 let a_app = expr::app(expr::shift(a, 1, 0), expr::bvar(0));
-                let mut ctx2 = ctx.clone();
+                let mut ctx2 = {
+                    crate::stats::ctx_clone();
+                    ctx.clone()
+                };
                 ctx2.push(t2.clone());
-                let b_body = if let ExprData::Lam(_, _, bd) = &**b {
+                let b_body = if let ExprData::Lam(_, _, bd) = &***b {
                     bd.clone()
                 } else {
                     unreachable!()
@@ -940,12 +961,12 @@ impl<'e> Checker<'e> {
         // Delta: unfold whichever side has higher (or any) delta height, retry.
         let (h1, _) = expr::unfold_apps(a);
         let (h2, _) = expr::unfold_apps(b);
-        let n1 = if let ExprData::Const(n, _) = &*h1 {
+        let n1 = if let ExprData::Const(n, _) = &**h1 {
             Some(*n)
         } else {
             None
         };
-        let n2 = if let ExprData::Const(n, _) = &*h2 {
+        let n2 = if let ExprData::Const(n, _) = &**h2 {
             Some(*n)
         } else {
             None
@@ -989,7 +1010,7 @@ impl<'e> Checker<'e> {
 
     fn delta_step(&self, e: &Expr) -> R<Expr> {
         let (head, args) = expr::unfold_apps(e);
-        if let ExprData::Const(n, us) = &*head {
+        if let ExprData::Const(n, us) = &**head {
             if let Some(u) = self.unfold_def(*n, us)? {
                 return Ok(expr::apps(u, &args));
             }
@@ -1002,7 +1023,7 @@ impl<'e> Checker<'e> {
         // and we compare each field of a against `proj(b, i)`, plus check
         // b's type matches.
         let (ha, argsa) = expr::unfold_apps(a);
-        let (cname, num_params) = match &*ha {
+        let (cname, num_params) = match &**ha {
             ExprData::Const(n, _) => match self.env.get(*n) {
                 Some(ConstantInfo::Constructor {
                     induct, num_params, ..
@@ -1034,7 +1055,7 @@ impl<'e> Checker<'e> {
     }
 
     fn try_iota(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
-        let (rname, us) = match &**head {
+        let (rname, us) = match &***head {
             ExprData::Const(n, us) => (*n, us.clone()),
             _ => return Ok(None),
         };
@@ -1080,7 +1101,7 @@ impl<'e> Checker<'e> {
         let major_w = self.whnf(ctx, major)?;
         let (mhead, margs) = expr::unfold_apps(&major_w);
 
-        let ctor = match &*mhead {
+        let ctor = match &**mhead {
             ExprData::Const(cname, _) => match self.env.get(*cname) {
                 Some(ConstantInfo::Constructor {
                     induct,
@@ -1166,7 +1187,7 @@ impl<'e> Checker<'e> {
         }
         loop {
             match self.whnf(&ctx, &cur) {
-                Ok(w) => match &*w {
+                Ok(w) => match &**w {
                     ExprData::Pi(_, dom, body) => {
                         ctx.push(dom.clone());
                         cur = body.clone();
@@ -1193,7 +1214,7 @@ impl<'e> Checker<'e> {
         let mut nfields = 0u32;
         let mut ct = ctor_typ;
         loop {
-            match &*ct {
+            match &**ct {
                 ExprData::Pi(_, _, body) => {
                     nfields += 1;
                     ct = body.clone();
@@ -1231,7 +1252,7 @@ impl<'e> Checker<'e> {
         let mt = self.infer_type(ctx, major)?;
         let mtw = self.whnf(ctx, &mt)?;
         let (thead, targs) = expr::unfold_apps(&mtw);
-        match &*thead {
+        match &**thead {
             ExprData::Const(n, us) if *n == tname => {
                 let subst = level::subst_map(&ctor_lp, us);
                 let mut ct = expr::instantiate_level_params(&ctor_typ, &subst);
@@ -1391,7 +1412,7 @@ impl<'e> Checker<'e> {
         let mut binders: Vec<Expr> = Vec::new();
         let mut tctx = ctx.clone();
         loop {
-            match &*ty {
+            match &**ty {
                 ExprData::Pi(_, dom, body) => {
                     binders.push(dom.clone());
                     tctx.push(dom.clone());
@@ -1401,7 +1422,7 @@ impl<'e> Checker<'e> {
             }
         }
         let (head, iargs) = expr::unfold_apps(&ty);
-        let target = match &*head {
+        let target = match &**head {
             ExprData::Const(n, _) => *n,
             _ => return Ok(None),
         };
@@ -1451,7 +1472,7 @@ impl<'e> Checker<'e> {
     }
 
     fn try_quot(&self, _ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
-        let n = match &**head {
+        let n = match &***head {
             ExprData::Const(n, _) => *n,
             _ => return Ok(None),
         };
@@ -1486,7 +1507,7 @@ impl<'e> Checker<'e> {
         }
         let q = &args[q_idx];
         let (qhead, qargs) = expr::unfold_apps(q);
-        let is_mk = matches!(&*qhead, ExprData::Const(cn,_) if matches!(self.env.get(*cn), Some(ConstantInfo::Quot{kind: QuotKind::Ctor,..})));
+        let is_mk = matches!(&**qhead, ExprData::Const(cn,_) if matches!(self.env.get(*cn), Some(ConstantInfo::Quot{kind: QuotKind::Ctor,..})));
         if !is_mk || qargs.len() < 3 {
             return Ok(None);
         }
@@ -1511,7 +1532,7 @@ impl<'e> Checker<'e> {
 
     /// Native Nat reductions (minimal): succ/add/beq/OfNat.
     fn try_nat_extension(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
-        let n = match &**head {
+        let n = match &***head {
             ExprData::Const(n, _) => *n,
             _ => return Ok(None),
         };
@@ -1738,7 +1759,7 @@ impl<'e> Checker<'e> {
             return Ok(None);
         };
         let ty = self.whnf(ctx, &args[ty_i])?;
-        if !matches!(&*ty, ExprData::Const(t, _) if *t == nat_ty) {
+        if !matches!(&**ty, ExprData::Const(t, _) if *t == nat_ty) {
             return Ok(None);
         }
         let op = match name {
@@ -1760,7 +1781,7 @@ impl<'e> Checker<'e> {
     /// `ite` drops the proof. Fires in `whnf_core` so height-based delta
     /// cannot unfold `modCore.go` before the instance constructor is seen.
     fn try_dite(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
-        let n = match &**head {
+        let n = match &***head {
             ExprData::Const(n, _) => *n,
             _ => return Ok(None),
         };
@@ -1775,7 +1796,7 @@ impl<'e> Checker<'e> {
         }
         let inst = self.whnf(ctx, &args[2])?;
         let (ih, iargs) = expr::unfold_apps(&inst);
-        let iname = match &*ih {
+        let iname = match &**ih {
             ExprData::Const(cn, _) => self.name_str(*cn),
             _ => return Ok(None),
         };
@@ -1928,7 +1949,7 @@ impl<'e> Checker<'e> {
                 loop {
                     // Only walk *manifest* Pis — do not whnf the constructor type
                     // itself (see tutorial/054_reduceCtorType).
-                    match &*cur2 {
+                    match &**cur2 {
                         ExprData::Pi(_, dom, body) => {
                             self.check_arg_positive(&c2, dom, &all, num_params)?;
                             let ds = self.infer_type(&c2, dom)?;
@@ -1952,7 +1973,7 @@ impl<'e> Checker<'e> {
                     }
                 }
                 let (head, args) = expr::unfold_apps(&cur2);
-                match &*head {
+                match &**head {
                     ExprData::Const(n, us) if n == tname => {
                         let expected: Vec<Level> =
                             shared_lp.iter().map(|p| level::param(*p)).collect();
@@ -1997,10 +2018,13 @@ impl<'e> Checker<'e> {
     /// strictly positive in the names being defined (`bound`).
     fn check_positivity(&self, ctx: &Ctx, e: &Expr, bound: &[u32], _strict_pos_ok: bool) -> R<()> {
         let w = self.whnf(ctx, e).unwrap_or_else(|_| e.clone());
-        match &*w {
+        match &**w {
             ExprData::Pi(_, dom, body) => {
                 self.check_arg_positive(ctx, dom, bound, 0)?;
-                let mut ctx2 = ctx.clone();
+                let mut ctx2 = {
+                    crate::stats::ctx_clone();
+                    ctx.clone()
+                };
                 ctx2.push(dom.clone());
                 self.check_positivity(&ctx2, body, bound, _strict_pos_ok)
             }
@@ -2019,9 +2043,12 @@ impl<'e> Checker<'e> {
         num_params: u32,
     ) -> R<()> {
         let mut cur = self.whnf(ctx, arg_ty).unwrap_or_else(|_| arg_ty.clone());
-        let mut ctx2 = ctx.clone();
+        let mut ctx2 = {
+            crate::stats::ctx_clone();
+            ctx.clone()
+        };
         loop {
-            match &*cur {
+            match &**cur {
                 ExprData::Pi(_, dom, body) => {
                     if self.occurs_any(dom, bound) {
                         return reject(
@@ -2066,7 +2093,7 @@ impl<'e> Checker<'e> {
             return Ok(());
         }
         let (h, args) = expr::unfold_apps(e);
-        match &*h {
+        match &**h {
             ExprData::Const(n, _) if bound.contains(n) => {
                 self.check_uniform_i(ctx, &args, bound, num_params)
             }
@@ -2084,7 +2111,7 @@ impl<'e> Checker<'e> {
     }
 
     fn occurs_any(&self, e: &Expr, names: &[u32]) -> bool {
-        match &**e {
+        match &***e {
             ExprData::Const(n, _) => names.contains(n),
             ExprData::App(f, a) => self.occurs_any(f, names) || self.occurs_any(a, names),
             ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {

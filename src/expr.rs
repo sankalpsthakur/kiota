@@ -31,10 +31,76 @@ pub enum ExprData {
     Lit(Lit),
 }
 
-pub type Expr = Rc<ExprData>;
+/// An interned node: the term itself plus the one derived fact the hot paths
+/// need constantly. `loose` is the smallest `k` such that every loose bvar in
+/// the node has index `< k` (0 = closed). It is computed once at intern time
+/// from the children's own `loose` values, so reading it is a field load rather
+/// than a traversal or a hash lookup.
+pub struct ExprNode {
+    data: ExprData,
+    loose: u32,
+}
+
+impl std::ops::Deref for ExprNode {
+    type Target = ExprData;
+    #[inline(always)]
+    fn deref(&self) -> &ExprData {
+        &self.data
+    }
+}
+
+impl std::fmt::Debug for ExprNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.data.fmt(f)
+    }
+}
+
+// Every node is created through `intern`, which returns the existing
+// allocation for a structurally equal node. So identity is address equality,
+// and that is already the invariant `node_eq` relies on for children.
+impl PartialEq for ExprNode {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+impl Eq for ExprNode {}
+impl Hash for ExprNode {
+    #[inline(always)]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self as *const ExprNode as usize).hash(state)
+    }
+}
+
+pub type Expr = Rc<ExprNode>;
 
 fn ptr(e: &Expr) -> usize {
     Rc::as_ptr(e) as usize
+}
+
+/// The smallest `k` such that every loose bvar in `e` has index `< k`.
+/// Zero means `e` is closed.
+///
+/// This is the quantity that makes eager substitution affordable: a subterm
+/// whose range is `<= depth` cannot be touched by a substitution at `depth`,
+/// so `instantiate`/`shift` can return it whole instead of rebuilding it.
+#[inline(always)]
+pub fn loose_bvar_range(e: &Expr) -> u32 {
+    e.loose
+}
+
+/// Computed once per node, from children that already carry their own range.
+fn loose_of(d: &ExprData) -> u32 {
+    match d {
+        ExprData::BVar(i) => *i + 1,
+        ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => 0,
+        ExprData::App(f, a) => f.loose.max(a.loose),
+        ExprData::Lam(_, ty, body) | ExprData::Pi(_, ty, body) => {
+            ty.loose.max(body.loose.saturating_sub(1))
+        }
+        ExprData::Let(ty, val, body) => ty.loose.max(val.loose).max(body.loose.saturating_sub(1)),
+        ExprData::Proj(_, _, v) => v.loose,
+    }
 }
 
 fn hash_node(d: &ExprData) -> u64 {
@@ -132,7 +198,8 @@ impl Interner {
                 }
             }
         }
-        let e = Rc::new(d);
+        let loose = loose_of(&d);
+        let e = Rc::new(ExprNode { data: d, loose });
         self.buckets.entry(h).or_default().push(e.clone());
         e
     }
@@ -177,43 +244,10 @@ pub fn lit_str(s: impl Into<String>) -> Expr {
     intern(ExprData::Lit(Lit::Str(Rc::new(s.into()))))
 }
 
-thread_local! {
-    static CLOSED: RefCell<FxHashMap<usize, bool>> = RefCell::new(FxHashMap::default());
-}
-
-/// True when `e` has no loose bvars. Memoized on interned pointers.
+/// True when `e` has no loose bvars.
+#[inline(always)]
 pub fn is_closed(e: &Expr) -> bool {
-    closed_at(e, 0)
-}
-
-fn closed_at(e: &Expr, depth: u32) -> bool {
-    if depth == 0 {
-        let k = ptr(e);
-        if let Some(c) = CLOSED.with(|m| m.borrow().get(&k).copied()) {
-            return c;
-        }
-        let c = closed_at_go(e, 0);
-        CLOSED.with(|m| {
-            m.borrow_mut().insert(k, c);
-        });
-        return c;
-    }
-    closed_at_go(e, depth)
-}
-
-fn closed_at_go(e: &Expr, depth: u32) -> bool {
-    match &**e {
-        ExprData::BVar(i) => *i < depth,
-        ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => true,
-        ExprData::App(f, a) => closed_at(f, depth) && closed_at(a, depth),
-        ExprData::Lam(_, ty, body) | ExprData::Pi(_, ty, body) => {
-            closed_at(ty, depth) && closed_at(body, depth + 1)
-        }
-        ExprData::Let(ty, val, body) => {
-            closed_at(ty, depth) && closed_at(val, depth) && closed_at(body, depth + 1)
-        }
-        ExprData::Proj(_, _, v) => closed_at(v, depth),
-    }
+    e.loose == 0
 }
 
 pub fn apps(f: Expr, args: &[Expr]) -> Expr {
@@ -230,7 +264,12 @@ pub fn shift(e: &Expr, by: i32, cutoff: u32) -> Expr {
     if by == 0 {
         return e.clone();
     }
-    match &**e {
+    // Every loose bvar is below the cutoff, so nothing here moves.
+    if loose_bvar_range(e) <= cutoff {
+        return e.clone();
+    }
+    crate::stats::shift_node();
+    match &***e {
         ExprData::BVar(i) => {
             if *i >= cutoff {
                 bvar((*i as i64 + by as i64) as u32)
@@ -260,7 +299,14 @@ pub fn instantiate(e: &Expr, args: &[Expr]) -> Expr {
 }
 
 fn instantiate_core(e: &Expr, args: &[Expr], depth: u32) -> Expr {
-    match &**e {
+    // Every loose bvar is bound above `depth`, so neither the substitution nor
+    // the renumbering below can reach into this subterm. Returning it whole is
+    // what turns O(term size) per binder into O(path length).
+    if loose_bvar_range(e) <= depth {
+        return e.clone();
+    }
+    crate::stats::inst_node();
+    match &***e {
         ExprData::BVar(i) => {
             if *i >= depth && ((*i - depth) as usize) < args.len() {
                 let a = &args[(*i - depth) as usize];
@@ -301,7 +347,7 @@ pub fn instantiate1(e: &Expr, arg: &Expr) -> Expr {
 }
 
 pub fn instantiate_level_params(e: &Expr, subst: &rustc_hash::FxHashMap<u32, Level>) -> Expr {
-    match &**e {
+    match &***e {
         ExprData::BVar(_) | ExprData::Lit(_) => e.clone(),
         ExprData::Sort(l) => sort(crate::level::instantiate(l, subst)),
         ExprData::Const(n, us) => const_(
@@ -338,7 +384,7 @@ pub fn unfold_apps(e: &Expr) -> (Expr, Vec<Expr>) {
     let mut args = Vec::new();
     let mut cur = e.clone();
     loop {
-        match &*cur {
+        match &**cur {
             ExprData::App(f, a) => {
                 args.push(a.clone());
                 cur = f.clone();
@@ -390,5 +436,160 @@ mod tests {
             lam(BinderInfo::Default, sort(level::zero()), bvar(0)),
             const_(1, vec![])
         )));
+    }
+
+    fn s0() -> Expr {
+        sort(level::zero())
+    }
+
+    #[test]
+    fn loose_range_counts_the_highest_free_index() {
+        assert_eq!(loose_bvar_range(&bvar(0)), 1);
+        assert_eq!(loose_bvar_range(&bvar(3)), 4);
+        assert_eq!(loose_bvar_range(&const_(1, vec![])), 0);
+        // A binder discharges exactly one level.
+        assert_eq!(
+            loose_bvar_range(&lam(BinderInfo::Default, s0(), bvar(0))),
+            0
+        );
+        assert_eq!(
+            loose_bvar_range(&lam(BinderInfo::Default, s0(), bvar(2))),
+            2
+        );
+        // The binder does not cover the domain, only the body.
+        assert_eq!(
+            loose_bvar_range(&lam(BinderInfo::Default, bvar(4), bvar(0))),
+            5
+        );
+        assert_eq!(
+            loose_bvar_range(&app(bvar(1), bvar(6))),
+            7,
+            "app takes the max of both sides"
+        );
+        assert_eq!(
+            loose_bvar_range(&let_(bvar(2), bvar(1), bvar(3))),
+            3,
+            "only the let body is under the binder"
+        );
+        assert_eq!(loose_bvar_range(&proj(0, 0, bvar(5))), 6);
+    }
+
+    /// Reference substitution with no short-circuit, used to prove the fast
+    /// path in `instantiate_core` never changes a result.
+    fn instantiate_ref(e: &Expr, args: &[Expr], depth: u32) -> Expr {
+        match &***e {
+            ExprData::BVar(i) => {
+                if *i >= depth && ((*i - depth) as usize) < args.len() {
+                    shift_ref(&args[(*i - depth) as usize], depth as i32, 0)
+                } else if *i >= depth {
+                    bvar(*i - args.len() as u32)
+                } else {
+                    e.clone()
+                }
+            }
+            ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => e.clone(),
+            ExprData::App(f, a) => app(
+                instantiate_ref(f, args, depth),
+                instantiate_ref(a, args, depth),
+            ),
+            ExprData::Lam(bi, ty, b) => lam(
+                *bi,
+                instantiate_ref(ty, args, depth),
+                instantiate_ref(b, args, depth + 1),
+            ),
+            ExprData::Pi(bi, ty, b) => pi(
+                *bi,
+                instantiate_ref(ty, args, depth),
+                instantiate_ref(b, args, depth + 1),
+            ),
+            ExprData::Let(ty, v, b) => let_(
+                instantiate_ref(ty, args, depth),
+                instantiate_ref(v, args, depth),
+                instantiate_ref(b, args, depth + 1),
+            ),
+            ExprData::Proj(s, i, v) => proj(*s, *i, instantiate_ref(v, args, depth)),
+        }
+    }
+
+    fn shift_ref(e: &Expr, by: i32, cutoff: u32) -> Expr {
+        if by == 0 {
+            return e.clone();
+        }
+        match &***e {
+            ExprData::BVar(i) => {
+                if *i >= cutoff {
+                    bvar((*i as i64 + by as i64) as u32)
+                } else {
+                    e.clone()
+                }
+            }
+            ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => e.clone(),
+            ExprData::App(f, a) => app(shift_ref(f, by, cutoff), shift_ref(a, by, cutoff)),
+            ExprData::Lam(bi, ty, b) => {
+                lam(*bi, shift_ref(ty, by, cutoff), shift_ref(b, by, cutoff + 1))
+            }
+            ExprData::Pi(bi, ty, b) => {
+                pi(*bi, shift_ref(ty, by, cutoff), shift_ref(b, by, cutoff + 1))
+            }
+            ExprData::Let(ty, v, b) => let_(
+                shift_ref(ty, by, cutoff),
+                shift_ref(v, by, cutoff),
+                shift_ref(b, by, cutoff + 1),
+            ),
+            ExprData::Proj(s, i, v) => proj(*s, *i, shift_ref(v, by, cutoff)),
+        }
+    }
+
+    /// Deterministic pseudo-random terms over a small alphabet, deep enough to
+    /// exercise nested binders and every node kind.
+    fn gen(seed: &mut u64, depth: u32) -> Expr {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let pick = (*seed >> 33) % if depth == 0 { 3 } else { 8 };
+        match pick {
+            0 => bvar((*seed >> 13) as u32 % 6),
+            1 => const_((*seed >> 17) as u32 % 3, vec![]),
+            2 => s0(),
+            3 => app(gen(seed, depth - 1), gen(seed, depth - 1)),
+            4 => lam(
+                BinderInfo::Default,
+                gen(seed, depth - 1),
+                gen(seed, depth - 1),
+            ),
+            5 => pi(
+                BinderInfo::Default,
+                gen(seed, depth - 1),
+                gen(seed, depth - 1),
+            ),
+            6 => let_(
+                gen(seed, depth - 1),
+                gen(seed, depth - 1),
+                gen(seed, depth - 1),
+            ),
+            _ => proj(0, 0, gen(seed, depth - 1)),
+        }
+    }
+
+    #[test]
+    fn short_circuit_never_changes_substitution() {
+        let mut seed = 0x5EED_1234_u64;
+        for _ in 0..400 {
+            let e = gen(&mut seed, 5);
+            let a0 = gen(&mut seed, 3);
+            let a1 = gen(&mut seed, 3);
+            for args in [vec![a0.clone()], vec![a0.clone(), a1.clone()]] {
+                assert!(
+                    Rc::ptr_eq(&instantiate(&e, &args), &instantiate_ref(&e, &args, 0)),
+                    "instantiate diverged from the reference"
+                );
+            }
+            for cutoff in 0..4u32 {
+                assert!(
+                    Rc::ptr_eq(&shift(&e, 2, cutoff), &shift_ref(&e, 2, cutoff)),
+                    "shift diverged from the reference at cutoff {cutoff}"
+                );
+            }
+        }
     }
 }

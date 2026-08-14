@@ -8,7 +8,7 @@ use num_bigint::BigUint;
 
 /// Direct `Lit::Nat` payload, if any.
 pub fn as_lit(e: &Expr) -> Option<&BigUint> {
-    match &**e {
+    match &***e {
         ExprData::Lit(Lit::Nat(n)) => Some(n),
         _ => None,
     }
@@ -61,8 +61,8 @@ pub fn pred(e: &Expr, zero: u32, succ: u32) -> Option<Expr> {
         }
         return Some(mk_lit(n - 1u32));
     }
-    match &**e {
-        ExprData::App(f, a) if matches!(&**f, ExprData::Const(s, us) if *s == succ && us.is_empty()) => {
+    match &***e {
+        ExprData::App(f, a) if matches!(&***f, ExprData::Const(s, us) if *s == succ && us.is_empty()) => {
             Some(a.clone())
         }
         ExprData::Const(z, us) if *z == zero && us.is_empty() => None,
@@ -79,7 +79,7 @@ pub fn is_zero(e: &Expr, zero: u32) -> bool {
     if let Some(n) = as_lit(e) {
         return *n == BigUint::from(0u32);
     }
-    matches!(&**e, ExprData::Const(z, us) if *z == zero && us.is_empty())
+    matches!(&***e, ExprData::Const(z, us) if *z == zero && us.is_empty())
 }
 
 /// `lit 1`, `Nat.succ Nat.zero`, or `Nat.succ (lit 0)`.
@@ -87,9 +87,9 @@ pub fn is_one(e: &Expr, zero: u32, succ: u32) -> bool {
     if let Some(n) = as_lit(e) {
         return *n == BigUint::from(1u32);
     }
-    match &**e {
+    match &***e {
         ExprData::App(f, a) => {
-            matches!(&**f, ExprData::Const(s, us) if *s == succ && us.is_empty())
+            matches!(&***f, ExprData::Const(s, us) if *s == succ && us.is_empty())
                 && is_zero(a, zero)
         }
         _ => false,
@@ -104,9 +104,9 @@ pub fn numeral_value(e: &Expr, zero: u32, succ: u32) -> Option<BigUint> {
     if is_zero(e, zero) {
         return Some(BigUint::from(0u32));
     }
-    match &**e {
+    match &***e {
         ExprData::App(f, a) => {
-            if matches!(&**f, ExprData::Const(s, us) if *s == succ && us.is_empty()) {
+            if matches!(&***f, ExprData::Const(s, us) if *s == succ && us.is_empty()) {
                 let v = numeral_value(a, zero, succ)?;
                 return Some(succ_value(&v));
             }
@@ -121,7 +121,7 @@ pub fn of_nat_value(args: &[Expr], nat_ty: u32) -> Option<Expr> {
     if args.len() < 3 {
         return None;
     }
-    match &*args[0] {
+    match &**args[0] {
         ExprData::Const(t, _) if *t == nat_ty => {
             if as_lit(&args[1]).is_some() {
                 Some(args[1].clone())
@@ -299,9 +299,9 @@ mod tests {
     #[test]
     fn mk_succ_builds_app() {
         let s = mk_succ(3, lit(0));
-        match &*s {
+        match &**s {
             ExprData::App(f, a) => {
-                assert!(matches!(&**f, ExprData::Const(3, us) if us.is_empty()));
+                assert!(matches!(&***f, ExprData::Const(3, us) if us.is_empty()));
                 assert_eq!(as_lit(a).map(|n| n.clone()), Some(BigUint::from(0u32)));
             }
             _ => panic!("expected app"),

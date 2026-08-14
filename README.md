@@ -20,34 +20,64 @@ reference sketch, see [mini](https://github.com/nomeata/lean-mini-kernel).
 - Recursor K-like-ness is **recomputed**. Exported `k` is ignored.
 - Iota is rebuilt from constructor fields, then rec-calls, in Lean's
   field-then-rec order. Exported recursor RHS is ignored.
-- Incomplete on purpose: nested inductives, full `Init`, and mathlib are
-  declined until the checker can accept them honestly.
+- Nested inductives are checked, not declined: a nested occurrence must
+  apply the datatype's own parameters, so `E.mk : (w : W) → L (E ⟨false⟩)
+  → E w` is rejected.
+- Incomplete on purpose: full `Init`, `Std`, and mathlib are out of reach
+  on time and are declined.
 
 ## Local score (2026-08-14)
 
-Against the arena tarball (non-mathlib):
+Full replay of the published arena tarball — all 178 exports, every one
+run, nothing skipped. Binary built from the pinned rev at `343dfbc`.
+Measured on macOS/arm64 without `perf`, so wall time is indicative and
+instruction counts — the arena's actual ranking metric — are not measured
+here at all.
 
-| Suite | Result |
-| --- | --- |
-| Tutorial good | **92/92** accept |
-| Tutorial bad | **46/46** reject |
-| `init-prelude` | **accept** |
-| Acc left/right, quot-right | accept |
-| Perf goods | 14/16 accept; `app-lam` timeout; `grind-ring-5` reject |
-| `subject-reduction-redex` | reject |
-| Nested unused-param (bad) | reject (projection mismatch) |
+| Suite | Good (accept) | Bad (reject) | Wall |
+| --- | --- | --- | --- |
+| tutorial | **92/92** | **46/46** | 8.5s |
+| perf | 14/16 | **2/2** | 39.7s |
+| undecidability | 3/4 | — | 0.3s |
+| root | **4/4** | **14/14** | 1.7s |
+| **total** | **113/116** | **62/62** | **50.2s** |
 
-Soundness: no known false accepts on the reject suite. Large corpora
-(`init`, `std`, `mathlib`, `cslib`, `cedar`) are still declined.
+Soundness is clean: **62/62 bad exports rejected, zero false accepts.**
+The three good exports not accepted:
 
-On the arena ranking key this is ahead of mini on completeness, not
-competitive with sokonanoda on mathlib time. Not #1.
+| Test | Outcome | Reason |
+| --- | --- | --- |
+| `perf/app-lam` | timeout | eager substitution is O(n²) here — still running at 10 min, so this is a blowup, not a tight budget |
+| `perf/grind-ring-5` | reject | `Lean.Grind.Semiring.add_zero` type mismatch |
+| `undecidability/subject-reduction-redex` | reject | compares the endpoints the annotation exists to avoid |
 
-## What's missing (intentionally, for now)
+Outside the tarball, `nested-nonuniform-param` (`either`) rejects with
+`non-uniform nested inductive parameter` in 0.01s. Large corpora
+(`init`, `std`, `mathlib`, `cslib`, `cedar`) are declined on time.
 
-- Full `Init` / mathlib (need more Nat + a values/NbE layer for time)
-- `subject-reduction-redex`, `grind-ring-5`
-- Parallel declaration checking
+Scored on the arena's ranking key that is `(0 bad-not-rejected,
+2 good-not-accepted, no mathlib, 6 declines)` — **9th of 17**, ahead of
+mini (same completeness, 20 declines) and ahead of `official-v4.28.0`
+and `still-nanoda`, which process mathlib but have false accepts.
+Not #1: rank 3 is mathlib instruction count, and a checker that declines
+mathlib sorts below every checker that processes it.
+
+## What's missing
+
+Ranked by what actually moves the arena key, not by effort.
+
+1. **Delayed substitution.** `instantiate` rebuilds the term eagerly, so
+   type-inferring nested lambdas costs O(n²). `perf/app-lam` is written to
+   probe exactly this ("whether this cost arises depends on the checker's
+   binder representation") and is the one export that times out. The same
+   change is the precondition for mathlib — the checkers at the top of the
+   board describe closure-based conversion (sokonanoda, and nanoclo's
+   delayed substitutions) rather than eager substitution.
+2. **`grind-ring-5`, `subject-reduction-redex`** — two false rejects, the
+   only gap on ranking key 2.
+3. **Parallel declaration checking.** The top three all run `-j4`.
+4. **Then** mathlib, where the bar is not "completes" but 868 G instructions
+   (sokonanoda, with PGO and `target-cpu=native`).
 
 ## Building
 
