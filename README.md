@@ -31,22 +31,25 @@ Against the arena tarball (non-mathlib):
 | --- | --- |
 | Tutorial good | **92/92** accept |
 | Tutorial bad | **46/46** reject |
-| Remaining completeness | `init-prelude` (`noConfusion_of_Nat.aux`), Acc matcher `step.match_1` (`n+1` vs `Nat.succ`), some perf timeouts |
+| Acc left/right, quot-right | accept |
+| `beta-ladder` | accept |
+| `init-prelude`, `grind-ring-5` | decline (`Lean.Syntax` nested) |
+| `subject-reduction-redex` | reject |
+| Some perf tests | timeout (`app-lam`, `shared-subterm`, `discarded-argument-match`) |
 
 Soundness on finished reject tests: no known false accepts on the tutorial
 bad suite. Large corpora (`init`, `std`, `mathlib`, `cslib`, `cedar`) are
 **declined**, same policy as mini.
 
 On the arena ranking key (soundness, then completeness, then mathlib
-speed) this sits with **mini / evmlean**, not with sokonanoda.
+speed) this sits with **mini / evmlean**, not with sokonanoda. Not #1.
 
 ## What's missing (intentionally, for now)
 
-- Nested and mutual inductives
-- Native `Nat` / `String` kernel extensions
-- Hash-consing, WHNF/defeq caches, NbE / glued values
+- Nested inductives (`Array`/`List` of `I`, needed for `Init.Prelude`)
+- Full native `Nat`/`String` (succ/add/mul/sub/pow/beq/ble/`dite` are in)
+- NbE / glued values
 - Parallel declaration checking
-- Anything that needs `Init.Prelude` (`Fin.noConfusionType` and friends)
 
 ## Building
 

@@ -23,7 +23,10 @@ fn main() {
     // otherwise blow the default 8MB stack).
     let mut bytes = Vec::new();
     if use_stdin || path.is_none() {
-        std::io::stdin().lock().read_to_end(&mut bytes).expect("read stdin");
+        std::io::stdin()
+            .lock()
+            .read_to_end(&mut bytes)
+            .expect("read stdin");
     } else {
         let mut f = std::fs::File::open(path.unwrap()).expect("open input");
         f.read_to_end(&mut bytes).expect("read file");
@@ -43,8 +46,9 @@ fn main() {
             }
         })
         .expect("spawn worker thread");
-    let result: Result<(), tc::TcError> =
-        handle.join().unwrap_or_else(|_| Err(tc::TcError::Other("worker thread panicked".into())));
+    let result: Result<(), tc::TcError> = handle
+        .join()
+        .unwrap_or_else(|_| Err(tc::TcError::Other("worker thread panicked".into())));
 
     match result {
         Ok(()) => std::process::exit(EXIT_ACCEPT),

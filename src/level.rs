@@ -140,7 +140,11 @@ pub fn instantiate(l: &Level, subst: &rustc_hash::FxHashMap<u32, Level>) -> Leve
 }
 
 pub fn subst_map(level_params: &[u32], us: &[Level]) -> rustc_hash::FxHashMap<u32, Level> {
-    level_params.iter().copied().zip(us.iter().cloned()).collect()
+    level_params
+        .iter()
+        .copied()
+        .zip(us.iter().cloned())
+        .collect()
 }
 
 /// Decide l1 <= l2 + diff, where params are treated as universally quantified

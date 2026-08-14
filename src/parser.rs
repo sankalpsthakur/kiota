@@ -1,5 +1,5 @@
 use crate::env::{ConstantInfo, Environment, QuotKind, RecRule, ReducibilityHints};
-use crate::expr::{self, BinderInfo, Expr, Lit};
+use crate::expr::{self, BinderInfo, Expr};
 use crate::level::{self, Level};
 use crate::tc::{Checker, TcError};
 use num_bigint::BigUint;
@@ -48,7 +48,12 @@ impl Parser {
     fn get_vec_u32(v: &Value, k: &str) -> Vec<u32> {
         v.get(k)
             .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|e| e.as_u64()).map(|n| n as u32).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.as_u64())
+                    .map(|n| n as u32)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -157,10 +162,10 @@ impl Parser {
         } else if let Some(n) = v.get("natVal") {
             let s = n.as_str().unwrap_or("0");
             let n: BigUint = s.parse().unwrap_or_default();
-            Rc::new(crate::expr::ExprData::Lit(Lit::Nat(n)))
+            expr::lit_nat(n)
         } else if let Some(s) = v.get("strVal") {
             let s = s.as_str().unwrap_or("").to_string();
-            Rc::new(crate::expr::ExprData::Lit(Lit::Str(Rc::new(s))))
+            expr::lit_str(s)
         } else if let Some(m) = v.get("mdata") {
             // Metadata wraps an expr; ignore metadata, use inner expr.
             self.expr_at(Self::get_u32(m, "expr"))
@@ -187,7 +192,10 @@ impl Parser {
         if self.env.get(name).is_some() {
             return Err(TcError::Reject(format!(
                 "duplicate declaration of {}",
-                self.names.get(name as usize).map(|s| s.as_str()).unwrap_or("?")
+                self.names
+                    .get(name as usize)
+                    .map(|s| s.as_str())
+                    .unwrap_or("?")
             )));
         }
         Ok(())
@@ -201,8 +209,14 @@ impl Parser {
         match kind {
             "axiomDecl" | "axiom" => {
                 let is_unsafe = Self::get_bool(v, "isUnsafe");
-                self.env
-                    .insert(name, ConstantInfo::Axiom { level_params, typ, is_unsafe });
+                self.env.insert(
+                    name,
+                    ConstantInfo::Axiom {
+                        level_params,
+                        typ,
+                        is_unsafe,
+                    },
+                );
             }
             "defnDecl" | "def" => {
                 let value = self.expr_at(Self::get_u32(v, "value"));
@@ -221,20 +235,37 @@ impl Parser {
                 let is_unsafe = Self::get_str(v, "safety") == "unsafe";
                 self.env.insert(
                     name,
-                    ConstantInfo::Def { level_params, typ, value, hints, is_unsafe },
+                    ConstantInfo::Def {
+                        level_params,
+                        typ,
+                        value,
+                        hints,
+                        is_unsafe,
+                    },
                 );
             }
             "thmDecl" | "theorem" => {
                 let value = self.expr_at(Self::get_u32(v, "value"));
-                self.env
-                    .insert(name, ConstantInfo::Theorem { level_params, typ, value });
+                self.env.insert(
+                    name,
+                    ConstantInfo::Theorem {
+                        level_params,
+                        typ,
+                        value,
+                    },
+                );
             }
             "opaqueDecl" | "opaque" => {
                 let value = self.expr_at(Self::get_u32(v, "value"));
                 let is_unsafe = Self::get_str(v, "safety") == "unsafe";
                 self.env.insert(
                     name,
-                    ConstantInfo::Opaque { level_params, typ, value, is_unsafe },
+                    ConstantInfo::Opaque {
+                        level_params,
+                        typ,
+                        value,
+                        is_unsafe,
+                    },
                 );
             }
             _ => {}
@@ -254,15 +285,33 @@ impl Parser {
         let level_params = Self::get_vec_u32(v, "levelParams");
         let typ = self.expr_at(Self::get_u32(v, "type"));
         self.reject_if_dup(name)?;
-        self.env
-            .insert(name, ConstantInfo::Quot { kind, level_params, typ });
+        self.env.insert(
+            name,
+            ConstantInfo::Quot {
+                kind,
+                level_params,
+                typ,
+            },
+        );
         Ok(())
     }
 
     fn handle_inductive_block(&mut self, v: &Value) -> Result<(), TcError> {
-        let types = v.get("types").and_then(|x| x.as_array()).cloned().unwrap_or_default();
-        let ctors = v.get("ctors").and_then(|x| x.as_array()).cloned().unwrap_or_default();
-        let recs = v.get("recs").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+        let types = v
+            .get("types")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let ctors = v
+            .get("ctors")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let recs = v
+            .get("recs")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
 
         for t in &types {
             let name = Self::get_u32(t, "name");
@@ -354,19 +403,37 @@ impl Parser {
             );
         }
 
-        // Recursor names are reserved: each inductive `I` in the group must have
-        // a recursor named `I.rec`. Exported `k` / rule payloads are not trusted;
-        // we only record the mapping from type → recursor for iota.
+        // Recursor names: each inductive `I` needs `I.rec`. Nested auxiliaries
+        // are exported as `I.rec_1`, `I.rec_2`, … — accept those, do not treat
+        // them as a second `I.rec`. Exported `k` / rule payloads are not trusted.
         let type_names: Vec<u32> = types.iter().map(|t| Self::get_u32(t, "name")).collect();
+        let nested = types.iter().any(|t| Self::get_u32(t, "numNested") > 0);
         let mut seen_rec_for: FxHashSet<u32> = FxHashSet::default();
         for r in &recs {
             let rname = Self::get_u32(r, "name");
-            let rstr = self.names.get(rname as usize).map(|s| s.as_str()).unwrap_or("");
+            let rstr = self
+                .names
+                .get(rname as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("");
             let mut matched = None;
+            let mut aux = false;
             for t in &type_names {
-                let tstr = self.names.get(*t as usize).map(|s| s.as_str()).unwrap_or("");
+                let tstr = self
+                    .names
+                    .get(*t as usize)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
                 if rstr == format!("{tstr}.rec") {
                     matched = Some(*t);
+                    break;
+                }
+                let prefix = format!("{tstr}.rec_");
+                if rstr.starts_with(&prefix)
+                    && rstr[prefix.len()..].bytes().all(|b| b.is_ascii_digit())
+                {
+                    matched = Some(*t);
+                    aux = true;
                     break;
                 }
             }
@@ -375,13 +442,18 @@ impl Parser {
                     "recursor `{rstr}` is not named `I.rec` for an inductive in this group"
                 )));
             };
-            if !seen_rec_for.insert(t) {
-                return Err(TcError::Reject(format!("duplicate recursor for type {t}")));
+            if !aux {
+                if !seen_rec_for.insert(t) {
+                    return Err(TcError::Reject(format!("duplicate recursor for type {t}")));
+                }
+                self.env.rec_of.insert(t, rname);
             }
-            self.env.rec_of.insert(t, rname);
             let all = Self::get_vec_u32(r, "all");
             let num_motives = Self::get_u32(r, "numMotives");
-            if num_motives as usize != all.len() && num_motives as usize != type_names.len() {
+            let motives_ok = num_motives as usize == all.len()
+                || num_motives as usize == type_names.len()
+                || (nested && num_motives as usize >= type_names.len());
+            if !motives_ok {
                 return Err(TcError::Reject(format!(
                     "recursor `{rstr}` has numMotives={num_motives} but group size is {}",
                     type_names.len()
@@ -394,7 +466,12 @@ impl Parser {
                 }
             }
             let num_minors = Self::get_u32(r, "numMinors");
-            if num_minors != nctors {
+            let minors_ok = if nested {
+                num_minors >= nctors
+            } else {
+                num_minors == nctors
+            };
+            if !minors_ok {
                 return Err(TcError::Reject(format!(
                     "recursor `{rstr}` has numMinors={num_minors} but constructor count is {nctors}"
                 )));
@@ -402,7 +479,11 @@ impl Parser {
         }
         for t in &type_names {
             if !self.env.rec_of.contains_key(t) {
-                let tstr = self.names.get(*t as usize).map(|s| s.as_str()).unwrap_or("?");
+                let tstr = self
+                    .names
+                    .get(*t as usize)
+                    .map(|s| s.as_str())
+                    .unwrap_or("?");
                 return Err(TcError::Reject(format!(
                     "inductive `{tstr}` is missing a recursor named `{tstr}.rec`"
                 )));
@@ -496,7 +577,11 @@ impl Parser {
     }
 
     fn annotate(&self, name: u32, e: TcError) -> TcError {
-        let nm = self.names.get(name as usize).map(|s| s.as_str()).unwrap_or("?");
+        let nm = self
+            .names
+            .get(name as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("?");
         match e {
             TcError::Reject(m) => TcError::Reject(format!("[{nm}] {m}")),
             TcError::Decline(m) => TcError::Decline(format!("[{nm}] {m}")),

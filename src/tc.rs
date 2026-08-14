@@ -1,7 +1,9 @@
 use crate::env::{ConstantInfo, Environment, QuotKind, ReducibilityHints};
 use crate::expr::{self, BinderInfo, Expr, ExprData, Lit};
 use crate::level::{self, Level};
+use crate::nat;
 use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 #[derive(Debug)]
@@ -24,6 +26,9 @@ pub struct Checker<'e> {
     pub names: &'e [std::rc::Rc<String>],
     pub nat_ref: Option<u32>,
     pub string_ref: Option<u32>,
+    whnf_cache: RefCell<FxHashMap<usize, Expr>>,
+    whnf_core_cache: RefCell<FxHashMap<usize, Expr>>,
+    defeq_cache: RefCell<FxHashMap<(usize, usize), bool>>,
 }
 
 type Ctx = Vec<Expr>; // ctx[len-1-i] = raw (unshifted) type recorded for bvar i
@@ -44,7 +49,23 @@ impl<'e> Checker<'e> {
         nat_ref: Option<u32>,
         string_ref: Option<u32>,
     ) -> Self {
-        Checker { env, names, nat_ref, string_ref }
+        Checker {
+            env,
+            names,
+            nat_ref,
+            string_ref,
+            whnf_cache: RefCell::new(FxHashMap::default()),
+            whnf_core_cache: RefCell::new(FxHashMap::default()),
+            defeq_cache: RefCell::new(FxHashMap::default()),
+        }
+    }
+
+    fn ptr_key(e: &Expr) -> usize {
+        Rc::as_ptr(e) as usize
+    }
+
+    fn cacheable(ctx: &Ctx, e: &Expr) -> bool {
+        ctx.is_empty() && expr::is_closed(e)
     }
 
     fn name_str(&self, n: u32) -> &str {
@@ -91,10 +112,18 @@ impl<'e> Checker<'e> {
                 s
             }
             ExprData::Lam(_, ty, body) => {
-                format!("(λ {}. {})", self.pp_budget(ty, budget - 1), self.pp_budget(body, budget - 1))
+                format!(
+                    "(λ {}. {})",
+                    self.pp_budget(ty, budget - 1),
+                    self.pp_budget(body, budget - 1)
+                )
             }
             ExprData::Pi(_, ty, body) => {
-                format!("(Π {}. {})", self.pp_budget(ty, budget - 1), self.pp_budget(body, budget - 1))
+                format!(
+                    "(Π {}. {})",
+                    self.pp_budget(ty, budget - 1),
+                    self.pp_budget(body, budget - 1)
+                )
             }
             ExprData::Let(ty, val, body) => format!(
                 "(let {} := {}; {})",
@@ -102,7 +131,12 @@ impl<'e> Checker<'e> {
                 self.pp_budget(val, budget - 1),
                 self.pp_budget(body, budget - 1)
             ),
-            ExprData::Proj(s, i, v) => format!("{}.{}[{}]", self.pp_budget(v, budget - 1), i, self.name_str(*s)),
+            ExprData::Proj(s, i, v) => format!(
+                "{}.{}[{}]",
+                self.pp_budget(v, budget - 1),
+                i,
+                self.name_str(*s)
+            ),
             ExprData::Lit(Lit::Nat(n)) => n.to_string(),
             ExprData::Lit(Lit::Str(s)) => format!("{s:?}"),
         }
@@ -268,9 +302,12 @@ impl<'e> Checker<'e> {
             _ => return reject("projection: not a single-constructor inductive"),
         };
         let ctor_ci = match self.env.get(ctor_name) {
-            Some(ConstantInfo::Constructor { level_params, typ, num_fields, .. }) => {
-                (level_params.clone(), typ.clone(), *num_fields)
-            }
+            Some(ConstantInfo::Constructor {
+                level_params,
+                typ,
+                num_fields,
+                ..
+            }) => (level_params.clone(), typ.clone(), *num_fields),
             _ => return reject("projection: bad constructor"),
         };
         let (ctor_lp, ctor_typ, num_fields) = ctor_ci;
@@ -459,9 +496,9 @@ impl<'e> Checker<'e> {
             return Ok(None);
         }
         let (ctors, num_params) = match self.env.get(tname) {
-            Some(ConstantInfo::InductiveType { ctors, num_params, .. }) => {
-                (ctors.clone(), *num_params)
-            }
+            Some(ConstantInfo::InductiveType {
+                ctors, num_params, ..
+            }) => (ctors.clone(), *num_params),
             _ => return Ok(None),
         };
         let cname = ctors[0];
@@ -502,8 +539,15 @@ impl<'e> Checker<'e> {
     // ---------------- Reduction ----------------
 
     pub fn whnf(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        let cache = Self::cacheable(ctx, e);
+        if cache {
+            let k = Self::ptr_key(e);
+            if let Some(r) = self.whnf_cache.borrow().get(&k) {
+                return Ok(r.clone());
+            }
+        }
         let mut cur = e.clone();
-        loop {
+        let r = loop {
             let core = self.whnf_core(ctx, &cur)?;
             let (head, _) = expr::unfold_apps(&core);
             if let ExprData::Const(n, us) = &*head {
@@ -513,12 +557,35 @@ impl<'e> Checker<'e> {
                     continue;
                 }
             }
-            return Ok(core);
+            break core;
+        };
+        if cache {
+            self.whnf_cache
+                .borrow_mut()
+                .insert(Self::ptr_key(e), r.clone());
         }
+        Ok(r)
     }
 
     /// beta/zeta/proj/iota reduction to whnf, WITHOUT unfolding delta.
     fn whnf_core(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        let cache = Self::cacheable(ctx, e);
+        if cache {
+            let k = Self::ptr_key(e);
+            if let Some(r) = self.whnf_core_cache.borrow().get(&k) {
+                return Ok(r.clone());
+            }
+        }
+        let r = self.whnf_core_go(ctx, e)?;
+        if cache {
+            self.whnf_core_cache
+                .borrow_mut()
+                .insert(Self::ptr_key(e), r.clone());
+        }
+        Ok(r)
+    }
+
+    fn whnf_core_go(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         let mut cur = e.clone();
         loop {
             match &*cur {
@@ -547,6 +614,28 @@ impl<'e> Checker<'e> {
                             cur = expr::apps(reduced, rest);
                             continue;
                         }
+                        // Class projections: `HAdd.hAdd` / `OfNat.ofNat` unfold to
+                        // `s.i` applied to further args; reduce the proj head first.
+                        ExprData::Proj(sname, idx, v) => {
+                            let vw = self.whnf(ctx, v)?;
+                            let (phead, pargs) = expr::unfold_apps(&vw);
+                            if let ExprData::Const(cname, _us) = &*phead {
+                                if let Some(ConstantInfo::Constructor { num_params, .. }) =
+                                    self.env.get(*cname)
+                                {
+                                    let fi = (*num_params + *idx) as usize;
+                                    if fi < pargs.len() {
+                                        cur = expr::apps(pargs[fi].clone(), &args);
+                                        continue;
+                                    }
+                                }
+                            }
+                            if !Rc::ptr_eq(&vw, v) {
+                                cur = expr::apps(expr::proj(*sname, *idx, vw), &args);
+                                continue;
+                            }
+                            return Ok(cur);
+                        }
                         _ => {
                             if let Some(r) = self.try_iota(ctx, &head, &args)? {
                                 cur = r;
@@ -556,7 +645,11 @@ impl<'e> Checker<'e> {
                                 cur = r;
                                 continue;
                             }
-                            if let Some(r) = self.try_nat_extension(&head, &args)? {
+                            if let Some(r) = self.try_nat_extension(ctx, &head, &args)? {
+                                cur = r;
+                                continue;
+                            }
+                            if let Some(r) = self.try_dite(ctx, &head, &args)? {
                                 cur = r;
                                 continue;
                             }
@@ -588,17 +681,16 @@ impl<'e> Checker<'e> {
                     cur = expr::proj(*sname, *idx, vw);
                     continue;
                 }
+                // Expand one Nat lit step for iota/defeq, then return (do not
+                // re-enter try_nat_extension on the expansion — that would
+                // oscillate with succ(lit n) → lit(n+1)).
                 ExprData::Lit(Lit::Nat(n)) => {
                     if let Some((zero, succ)) = self.nat_ctors() {
                         if n == &num_bigint::BigUint::from(0u32) {
                             return Ok(expr::const_(zero, vec![]));
                         }
                         let pred = n - 1u32;
-                        cur = expr::app(
-                            expr::const_(succ, vec![]),
-                            Rc::new(ExprData::Lit(Lit::Nat(pred))),
-                        );
-                        continue;
+                        return Ok(expr::app(expr::const_(succ, vec![]), expr::lit_nat(pred)));
                     }
                     return Ok(cur);
                 }
@@ -609,7 +701,12 @@ impl<'e> Checker<'e> {
 
     fn unfold_def(&self, n: u32, us: &[Level]) -> R<Option<Expr>> {
         match self.env.get(n) {
-            Some(ConstantInfo::Def { level_params, value, hints, .. }) => {
+            Some(ConstantInfo::Def {
+                level_params,
+                value,
+                hints,
+                ..
+            }) => {
                 if *hints == ReducibilityHints::Opaque {
                     // still transparent for kernel defeq; unfold anyway.
                 }
@@ -646,9 +743,25 @@ impl<'e> Checker<'e> {
         if Rc::ptr_eq(a, b) || a == b {
             return Ok(true);
         }
+        let cache = ctx.is_empty() && expr::is_closed(a) && expr::is_closed(b);
+        let key = if cache {
+            let (ka, kb) = (Self::ptr_key(a), Self::ptr_key(b));
+            Some(if ka <= kb { (ka, kb) } else { (kb, ka) })
+        } else {
+            None
+        };
+        if let Some(k) = key {
+            if let Some(&r) = self.defeq_cache.borrow().get(&k) {
+                return Ok(r);
+            }
+        }
         let aw = self.whnf_core(ctx, a)?;
         let bw = self.whnf_core(ctx, b)?;
-        self.is_def_eq_core(ctx, &aw, &bw)
+        let r = self.is_def_eq_core(ctx, &aw, &bw)?;
+        if let Some(k) = key {
+            self.defeq_cache.borrow_mut().insert(k, r);
+        }
+        Ok(r)
     }
 
     fn is_def_eq_core(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
@@ -681,7 +794,10 @@ impl<'e> Checker<'e> {
                     if n1 == n2
                         && a1.len() == a2.len()
                         && u1.len() == u2.len()
-                        && u1.iter().zip(u2.iter()).all(|(x, y)| level::is_def_eq(x, y))
+                        && u1
+                            .iter()
+                            .zip(u2.iter())
+                            .all(|(x, y)| level::is_def_eq(x, y))
                     {
                         let mut all = true;
                         for (x, y) in a1.iter().zip(a2.iter()) {
@@ -712,7 +828,10 @@ impl<'e> Checker<'e> {
             (ExprData::Const(n1, u1), ExprData::Const(n2, u2)) => {
                 if n1 == n2
                     && u1.len() == u2.len()
-                    && u1.iter().zip(u2.iter()).all(|(x, y)| level::is_def_eq(x, y))
+                    && u1
+                        .iter()
+                        .zip(u2.iter())
+                        .all(|(x, y)| level::is_def_eq(x, y))
                 {
                     return Ok(true);
                 }
@@ -726,7 +845,11 @@ impl<'e> Checker<'e> {
                 let b_app = expr::app(expr::shift(b, 1, 0), expr::bvar(0));
                 let mut ctx2 = ctx.clone();
                 ctx2.push(t1.clone());
-                let a_body = if let ExprData::Lam(_, _, bd) = &**a { bd.clone() } else { unreachable!() };
+                let a_body = if let ExprData::Lam(_, _, bd) = &**a {
+                    bd.clone()
+                } else {
+                    unreachable!()
+                };
                 return self.is_def_eq(&ctx2, &a_body, &b_app);
             }
         }
@@ -735,7 +858,11 @@ impl<'e> Checker<'e> {
                 let a_app = expr::app(expr::shift(a, 1, 0), expr::bvar(0));
                 let mut ctx2 = ctx.clone();
                 ctx2.push(t2.clone());
-                let b_body = if let ExprData::Lam(_, _, bd) = &**b { bd.clone() } else { unreachable!() };
+                let b_body = if let ExprData::Lam(_, _, bd) = &**b {
+                    bd.clone()
+                } else {
+                    unreachable!()
+                };
                 return self.is_def_eq(&ctx2, &a_app, &b_body);
             }
         }
@@ -773,8 +900,16 @@ impl<'e> Checker<'e> {
         // Delta: unfold whichever side has higher (or any) delta height, retry.
         let (h1, _) = expr::unfold_apps(a);
         let (h2, _) = expr::unfold_apps(b);
-        let n1 = if let ExprData::Const(n, _) = &*h1 { Some(*n) } else { None };
-        let n2 = if let ExprData::Const(n, _) = &*h2 { Some(*n) } else { None };
+        let n1 = if let ExprData::Const(n, _) = &*h1 {
+            Some(*n)
+        } else {
+            None
+        };
+        let n2 = if let ExprData::Const(n, _) = &*h2 {
+            Some(*n)
+        } else {
+            None
+        };
         match (n1, n2) {
             (Some(x), Some(y)) if x == y => {
                 // Same head const but arg/universe mismatch already failed above;
@@ -829,7 +964,9 @@ impl<'e> Checker<'e> {
         let (ha, argsa) = expr::unfold_apps(a);
         let (cname, num_params) = match &*ha {
             ExprData::Const(n, _) => match self.env.get(*n) {
-                Some(ConstantInfo::Constructor { induct, num_params, .. }) => (*induct, *num_params),
+                Some(ConstantInfo::Constructor {
+                    induct, num_params, ..
+                }) => (*induct, *num_params),
                 _ => return Ok(None),
             },
             _ => return Ok(None),
@@ -887,8 +1024,8 @@ impl<'e> Checker<'e> {
         }
         let params = &args[..num_params as usize];
         let motives = &args[num_params as usize..(num_params + num_motives) as usize];
-        let minors =
-            &args[(num_params + num_motives) as usize..(num_params + num_motives + num_minors) as usize];
+        let minors = &args
+            [(num_params + num_motives) as usize..(num_params + num_motives + num_minors) as usize];
         let major = &args[major_pos];
         let rest = &args[major_pos + 1..];
 
@@ -899,11 +1036,11 @@ impl<'e> Checker<'e> {
 
         let ctor = match &*mhead {
             ExprData::Const(cname, _) => match self.env.get(*cname) {
-                Some(ConstantInfo::Constructor { induct, num_params: cnp, .. })
-                    if all.contains(induct) =>
-                {
-                    Some((*cname, *cnp, margs.clone()))
-                }
+                Some(ConstantInfo::Constructor {
+                    induct,
+                    num_params: cnp,
+                    ..
+                }) if all.contains(induct) => Some((*cname, *cnp, margs.clone())),
                 _ => None,
             },
             _ => None,
@@ -957,7 +1094,10 @@ impl<'e> Checker<'e> {
         let tname = all[0];
         let (ctors, num_params, typ) = match self.env.get(tname) {
             Some(ConstantInfo::InductiveType {
-                ctors, num_params, typ, ..
+                ctors,
+                num_params,
+                typ,
+                ..
             }) => (ctors.clone(), *num_params, typ.clone()),
             _ => return Ok(false),
         };
@@ -1024,15 +1164,18 @@ impl<'e> Checker<'e> {
     ) -> R<Option<(u32, u32, Vec<Expr>)>> {
         let tname = all[0];
         let (ctors, _num_params) = match self.env.get(tname) {
-            Some(ConstantInfo::InductiveType { ctors, num_params, .. }) if ctors.len() == 1 => {
-                (ctors.clone(), *num_params)
-            }
+            Some(ConstantInfo::InductiveType {
+                ctors, num_params, ..
+            }) if ctors.len() == 1 => (ctors.clone(), *num_params),
             _ => return Ok(None),
         };
         let cname = ctors[0];
         let (ctor_lp, ctor_typ, cnp) = match self.env.get(cname) {
             Some(ConstantInfo::Constructor {
-                level_params, typ, num_params: cnp, ..
+                level_params,
+                typ,
+                num_params: cnp,
+                ..
             }) => (level_params.clone(), typ.clone(), *cnp),
             _ => return Ok(None),
         };
@@ -1097,7 +1240,10 @@ impl<'e> Checker<'e> {
     ) -> R<Expr> {
         let (ctor_lp, ctor_typ, cnp) = match self.env.get(cname) {
             Some(ConstantInfo::Constructor {
-                level_params, typ, num_params, ..
+                level_params,
+                typ,
+                num_params,
+                ..
             }) => (level_params.clone(), typ.clone(), *num_params),
             _ => return Ok(minor),
         };
@@ -1146,7 +1292,9 @@ impl<'e> Checker<'e> {
         field: &Expr,
         field_ty: &Expr,
     ) -> R<Option<Expr>> {
-        let mut ty = self.whnf(ctx, field_ty).unwrap_or_else(|_| field_ty.clone());
+        let mut ty = self
+            .whnf(ctx, field_ty)
+            .unwrap_or_else(|_| field_ty.clone());
         let mut binders: Vec<Expr> = Vec::new();
         let mut tctx = ctx.clone();
         loop {
@@ -1201,8 +1349,20 @@ impl<'e> Checker<'e> {
             ExprData::Const(n, _) => *n,
             _ => return Ok(None),
         };
-        let is_lift = matches!(self.env.get(n), Some(ConstantInfo::Quot { kind: QuotKind::Lift, .. }));
-        let is_ind = matches!(self.env.get(n), Some(ConstantInfo::Quot { kind: QuotKind::Ind, .. }));
+        let is_lift = matches!(
+            self.env.get(n),
+            Some(ConstantInfo::Quot {
+                kind: QuotKind::Lift,
+                ..
+            })
+        );
+        let is_ind = matches!(
+            self.env.get(n),
+            Some(ConstantInfo::Quot {
+                kind: QuotKind::Ind,
+                ..
+            })
+        );
         if !is_lift && !is_ind {
             return Ok(None);
         }
@@ -1210,7 +1370,11 @@ impl<'e> Checker<'e> {
         //   Quot.lift f h (Quot.mk r a) ==> f a
         // Quot.ind  : {α} {r} {β : Quot r → Prop} (h : ∀ a, β (Quot.mk r a)) (q) → β q
         //   Quot.ind h (Quot.mk r a) ==> h a
-        let (f_idx, q_idx, is_lift2) = if is_lift { (3usize, 5usize, true) } else { (3usize, 4usize, false) };
+        let (f_idx, q_idx, is_lift2) = if is_lift {
+            (3usize, 5usize, true)
+        } else {
+            (3usize, 4usize, false)
+        };
         if args.len() <= q_idx {
             return Ok(None);
         }
@@ -1231,8 +1395,307 @@ impl<'e> Checker<'e> {
         Ok(Some(expr::apps(result, rest)))
     }
 
-    fn try_nat_extension(&self, _head: &Expr, _args: &[Expr]) -> R<Option<Expr>> {
-        Ok(None)
+    /// Whnf a Nat argument without expanding an existing nat lit to `succ`.
+    fn reduce_nat_arg(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        if nat::as_lit(e).is_some() {
+            return Ok(e.clone());
+        }
+        self.whnf(ctx, e)
+    }
+
+    /// Native Nat reductions (minimal): succ/add/beq/OfNat.
+    fn try_nat_extension(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
+        let n = match &**head {
+            ExprData::Const(n, _) => *n,
+            _ => return Ok(None),
+        };
+        let name = self.name_str(n);
+        match name {
+            "Nat.succ" if !args.is_empty() => {
+                let a = self.reduce_nat_arg(ctx, &args[0])?;
+                if let Some(v) = nat::as_lit(&a) {
+                    let r = nat::mk_lit(nat::succ_value(v));
+                    return Ok(Some(expr::apps(r, &args[1..])));
+                }
+                if let Some((zero, succ)) = self.nat_ctors() {
+                    if let Some(v) = nat::numeral_value(&a, zero, succ) {
+                        let r = nat::mk_lit(nat::succ_value(&v));
+                        return Ok(Some(expr::apps(r, &args[1..])));
+                    }
+                }
+                Ok(None)
+            }
+            "Nat.add" if args.len() >= 2 => {
+                let a = self.reduce_nat_arg(ctx, &args[0])?;
+                let b = self.reduce_nat_arg(ctx, &args[1])?;
+                if let (Some(x), Some(y)) = (nat::as_lit(&a), nat::as_lit(&b)) {
+                    let r = nat::mk_lit(nat::add_values(x, y));
+                    return Ok(Some(expr::apps(r, &args[2..])));
+                }
+                if let Some((zero, succ)) = self.nat_ctors() {
+                    if let (Some(x), Some(y)) = (
+                        nat::numeral_value(&a, zero, succ),
+                        nat::numeral_value(&b, zero, succ),
+                    ) {
+                        let r = nat::mk_lit(nat::add_values(&x, &y));
+                        return Ok(Some(expr::apps(r, &args[2..])));
+                    }
+                    if nat::is_zero(&b, zero) {
+                        return Ok(Some(expr::apps(a, &args[2..])));
+                    }
+                    if nat::is_zero(&a, zero) {
+                        return Ok(Some(expr::apps(b, &args[2..])));
+                    }
+                    if nat::is_one(&b, zero, succ) {
+                        let r = nat::mk_succ(succ, a);
+                        return Ok(Some(expr::apps(r, &args[2..])));
+                    }
+                    if let Some(p) = nat::pred(&b, zero, succ) {
+                        let add = expr::apps(expr::const_(n, vec![]), &[a, p]);
+                        let r = nat::mk_succ(succ, add);
+                        return Ok(Some(expr::apps(r, &args[2..])));
+                    }
+                    if let Some(p) = nat::pred(&a, zero, succ) {
+                        let add = expr::apps(expr::const_(n, vec![]), &[p, b]);
+                        let r = nat::mk_succ(succ, add);
+                        return Ok(Some(expr::apps(r, &args[2..])));
+                    }
+                }
+                Ok(None)
+            }
+            "Nat.mul" if args.len() >= 2 => {
+                let a = self.reduce_nat_arg(ctx, &args[0])?;
+                let b = self.reduce_nat_arg(ctx, &args[1])?;
+                if let (Some(x), Some(y)) = (nat::as_lit(&a), nat::as_lit(&b)) {
+                    let r = nat::mk_lit(nat::mul_values(x, y));
+                    return Ok(Some(expr::apps(r, &args[2..])));
+                }
+                let Some((zero, succ)) = self.nat_ctors() else {
+                    return Ok(None);
+                };
+                if let (Some(x), Some(y)) = (
+                    nat::numeral_value(&a, zero, succ),
+                    nat::numeral_value(&b, zero, succ),
+                ) {
+                    let r = nat::mk_lit(nat::mul_values(&x, &y));
+                    return Ok(Some(expr::apps(r, &args[2..])));
+                }
+                if nat::is_zero(&a, zero) || nat::is_zero(&b, zero) {
+                    return Ok(Some(expr::apps(nat::mk_lit(0u32.into()), &args[2..])));
+                }
+                if let Some(p) = nat::pred(&b, zero, succ) {
+                    let mul = expr::apps(expr::const_(n, vec![]), &[a.clone(), p]);
+                    if let Some(add) = self.find_name("Nat.add") {
+                        let r = expr::apps(expr::const_(add, vec![]), &[mul, a]);
+                        return Ok(Some(expr::apps(r, &args[2..])));
+                    }
+                }
+                if let Some(p) = nat::pred(&a, zero, succ) {
+                    let mul = expr::apps(expr::const_(n, vec![]), &[p, b.clone()]);
+                    if let Some(add) = self.find_name("Nat.add") {
+                        let r = expr::apps(expr::const_(add, vec![]), &[mul, b]);
+                        return Ok(Some(expr::apps(r, &args[2..])));
+                    }
+                }
+                Ok(None)
+            }
+            "Nat.sub" if args.len() >= 2 => {
+                let a = self.reduce_nat_arg(ctx, &args[0])?;
+                let b = self.reduce_nat_arg(ctx, &args[1])?;
+                if let (Some(x), Some(y)) = (nat::as_lit(&a), nat::as_lit(&b)) {
+                    let r = nat::mk_lit(nat::sub_values(x, y));
+                    return Ok(Some(expr::apps(r, &args[2..])));
+                }
+                if let Some((zero, succ)) = self.nat_ctors() {
+                    if nat::is_zero(&b, zero) {
+                        return Ok(Some(expr::apps(a, &args[2..])));
+                    }
+                    if nat::is_zero(&a, zero) {
+                        return Ok(Some(expr::apps(nat::mk_lit(0u32.into()), &args[2..])));
+                    }
+                    if let (Some(pa), Some(pb)) =
+                        (nat::pred(&a, zero, succ), nat::pred(&b, zero, succ))
+                    {
+                        let r = expr::apps(expr::const_(n, vec![]), &[pa, pb]);
+                        return Ok(Some(expr::apps(r, &args[2..])));
+                    }
+                }
+                Ok(None)
+            }
+            "Nat.pow" if args.len() >= 2 => {
+                let a = self.reduce_nat_arg(ctx, &args[0])?;
+                let b = self.reduce_nat_arg(ctx, &args[1])?;
+                if let (Some(x), Some(y)) = (nat::as_lit(&a), nat::as_lit(&b)) {
+                    if let Some(v) = nat::pow_values(x, y) {
+                        return Ok(Some(expr::apps(nat::mk_lit(v), &args[2..])));
+                    }
+                }
+                let Some((zero, succ)) = self.nat_ctors() else {
+                    return Ok(None);
+                };
+                if nat::is_zero(&b, zero) {
+                    return Ok(Some(expr::apps(nat::mk_lit(1u32.into()), &args[2..])));
+                }
+                if let Some(p) = nat::pred(&b, zero, succ) {
+                    let pow = expr::apps(expr::const_(n, vec![]), &[a.clone(), p]);
+                    if let Some(mul) = self.find_name("Nat.mul") {
+                        let r = expr::apps(expr::const_(mul, vec![]), &[pow, a]);
+                        return Ok(Some(expr::apps(r, &args[2..])));
+                    }
+                }
+                Ok(None)
+            }
+            "HAdd.hAdd" | "Add.add" | "HMul.hMul" | "Mul.mul" | "HPow.hPow" | "Pow.pow"
+                if args.len() >= 2 =>
+            {
+                if let Some(r) = self.try_hbin_nat(ctx, name, args)? {
+                    return Ok(Some(r));
+                }
+                Ok(None)
+            }
+            "Nat.ble" if args.len() >= 2 => {
+                let a = self.reduce_nat_arg(ctx, &args[0])?;
+                let b = self.reduce_nat_arg(ctx, &args[1])?;
+                let (va, vb) = if let Some((zero, succ)) = self.nat_ctors() {
+                    (
+                        nat::numeral_value(&a, zero, succ),
+                        nat::numeral_value(&b, zero, succ),
+                    )
+                } else {
+                    (nat::as_lit(&a).cloned(), nat::as_lit(&b).cloned())
+                };
+                if let (Some(x), Some(y)) = (va, vb) {
+                    let tname = if nat::ble_values(&x, &y) {
+                        "Bool.true"
+                    } else {
+                        "Bool.false"
+                    };
+                    if let Some(bn) = self.find_name(tname) {
+                        return Ok(Some(expr::apps(expr::const_(bn, vec![]), &args[2..])));
+                    }
+                }
+                Ok(None)
+            }
+            "Nat.beq" if args.len() >= 2 => {
+                let a = self.reduce_nat_arg(ctx, &args[0])?;
+                let b = self.reduce_nat_arg(ctx, &args[1])?;
+                let (va, vb) = if let Some((zero, succ)) = self.nat_ctors() {
+                    (
+                        nat::numeral_value(&a, zero, succ),
+                        nat::numeral_value(&b, zero, succ),
+                    )
+                } else {
+                    (nat::as_lit(&a).cloned(), nat::as_lit(&b).cloned())
+                };
+                if let (Some(x), Some(y)) = (va, vb) {
+                    let tname = if nat::beq_values(&x, &y) {
+                        "Bool.true"
+                    } else {
+                        "Bool.false"
+                    };
+                    if let Some(bn) = self.find_name(tname) {
+                        return Ok(Some(expr::apps(expr::const_(bn, vec![]), &args[2..])));
+                    }
+                }
+                Ok(None)
+            }
+            "OfNat.ofNat" if args.len() >= 3 => {
+                let Some(nat_ty) = self.nat_ref else {
+                    return Ok(None);
+                };
+                let ty = self.whnf(ctx, &args[0])?;
+                let mut stripped = args.to_vec();
+                stripped[0] = ty;
+                if let Some(v) = nat::of_nat_value(&stripped, nat_ty) {
+                    return Ok(Some(expr::apps(v, &args[3..])));
+                }
+                if let Some(v) = nat::of_nat_value(args, nat_ty) {
+                    return Ok(Some(expr::apps(v, &args[3..])));
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Class methods `HAdd.hAdd` / `Add.add` / `HMul.hMul` / `Mul.mul` on `Nat`.
+    fn try_hbin_nat(&self, ctx: &Ctx, name: &str, args: &[Expr]) -> R<Option<Expr>> {
+        let (ty_i, lhs_i, need) = match name {
+            "HAdd.hAdd" | "HMul.hMul" | "HPow.hPow" => (0usize, 4usize, 6usize),
+            "Add.add" | "Mul.mul" | "Pow.pow" => (0usize, 2usize, 4usize),
+            _ => return Ok(None),
+        };
+        if args.len() < need {
+            return Ok(None);
+        }
+        let Some(nat_ty) = self.nat_ref else {
+            return Ok(None);
+        };
+        let ty = self.whnf(ctx, &args[ty_i])?;
+        if !matches!(&*ty, ExprData::Const(t, _) if *t == nat_ty) {
+            return Ok(None);
+        }
+        let op = match name {
+            "HAdd.hAdd" | "Add.add" => "Nat.add",
+            "HMul.hMul" | "Mul.mul" => "Nat.mul",
+            "HPow.hPow" | "Pow.pow" => "Nat.pow",
+            _ => return Ok(None),
+        };
+        let Some(opn) = self.find_name(op) else {
+            return Ok(None);
+        };
+        let lhs = args[lhs_i].clone();
+        let rhs = args[lhs_i + 1].clone();
+        let r = expr::apps(expr::const_(opn, vec![]), &[lhs, rhs]);
+        Ok(Some(expr::apps(r, &args[need..])))
+    }
+
+    /// `dite α c (isTrue p h) t e → t h` and `isFalse` → `e h`.
+    /// `ite` drops the proof. Fires in `whnf_core` so height-based delta
+    /// cannot unfold `modCore.go` before the instance constructor is seen.
+    fn try_dite(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
+        let n = match &**head {
+            ExprData::Const(n, _) => *n,
+            _ => return Ok(None),
+        };
+        let name = self.name_str(n);
+        let is_dite = name == "dite";
+        let is_ite = name == "ite";
+        if !is_dite && !is_ite {
+            return Ok(None);
+        }
+        if args.len() < 5 {
+            return Ok(None);
+        }
+        let inst = self.whnf(ctx, &args[2])?;
+        let (ih, iargs) = expr::unfold_apps(&inst);
+        let iname = match &*ih {
+            ExprData::Const(cn, _) => self.name_str(*cn),
+            _ => return Ok(None),
+        };
+        let is_true = matches!(iname, "Decidable.isTrue" | "isTrue");
+        let is_false = matches!(iname, "Decidable.isFalse" | "isFalse");
+        if !is_true && !is_false {
+            return Ok(None);
+        }
+        let proof = match iargs.last() {
+            Some(p) => p.clone(),
+            None => return Ok(None),
+        };
+        let branch = if is_true { &args[3] } else { &args[4] };
+        let reduced = if is_dite {
+            expr::app(branch.clone(), proof)
+        } else {
+            branch.clone()
+        };
+        Ok(Some(expr::apps(reduced, &args[5..])))
+    }
+
+    fn find_name(&self, s: &str) -> Option<u32> {
+        self.names
+            .iter()
+            .position(|n| n.as_str() == s)
+            .map(|i| i as u32)
     }
 
     // ---------------- Inductive/recursor validation ----------------
@@ -1243,9 +1706,13 @@ impl<'e> Checker<'e> {
             .get(first_name)
             .ok_or_else(|| TcError::Other("missing inductive".into()))?;
         let (typ, num_params, all, shared_lp) = match ci {
-            ConstantInfo::InductiveType { typ, num_params, all, level_params, .. } => {
-                (typ.clone(), *num_params, all.clone(), level_params.clone())
-            }
+            ConstantInfo::InductiveType {
+                typ,
+                num_params,
+                all,
+                level_params,
+                ..
+            } => (typ.clone(), *num_params, all.clone(), level_params.clone()),
             _ => return Ok(()),
         };
         {
@@ -1274,9 +1741,13 @@ impl<'e> Checker<'e> {
         let mut infos: FxHashMap<u32, TInfo> = FxHashMap::default();
         for tname in &all {
             let (t_np, t_ni, t_typ, t_lp) = match self.env.get(*tname) {
-                Some(ConstantInfo::InductiveType { num_params, num_indices, typ, level_params, .. }) => {
-                    (*num_params, *num_indices, typ.clone(), level_params.clone())
-                }
+                Some(ConstantInfo::InductiveType {
+                    num_params,
+                    num_indices,
+                    typ,
+                    level_params,
+                    ..
+                }) => (*num_params, *num_indices, typ.clone(), level_params.clone()),
                 _ => continue,
             };
             if t_np != num_params {
@@ -1301,7 +1772,14 @@ impl<'e> Checker<'e> {
                 cur2 = body;
             }
             let sort_lvl = self.ensure_sort(&c2, &cur2)?;
-            infos.insert(*tname, TInfo { num_params: t_np, num_indices: t_ni, sort: sort_lvl });
+            infos.insert(
+                *tname,
+                TInfo {
+                    num_params: t_np,
+                    num_indices: t_ni,
+                    sort: sort_lvl,
+                },
+            );
         }
 
         for tname in &all {
@@ -1309,12 +1787,18 @@ impl<'e> Checker<'e> {
                 Some(ConstantInfo::InductiveType { ctors, .. }) => ctors.clone(),
                 _ => continue,
             };
-            let t_sort = infos.get(tname).map(|i| i.sort.clone()).unwrap_or_else(level::zero);
+            let t_sort = infos
+                .get(tname)
+                .map(|i| i.sort.clone())
+                .unwrap_or_else(level::zero);
             for cname in &ctors {
                 let (c_lp, c_typ, c_np) = match self.env.get(*cname) {
-                    Some(ConstantInfo::Constructor { level_params, typ, num_params, .. }) => {
-                        (level_params.clone(), typ.clone(), *num_params)
-                    }
+                    Some(ConstantInfo::Constructor {
+                        level_params,
+                        typ,
+                        num_params,
+                        ..
+                    }) => (level_params.clone(), typ.clone(), *num_params),
                     _ => continue,
                 };
                 if c_lp != shared_lp {
@@ -1328,7 +1812,9 @@ impl<'e> Checker<'e> {
                 for i in 0..num_params {
                     let (_, dom, body) = self.ensure_pi(&c2, &cur2)?;
                     if !self.is_def_eq(&c2, &dom, &param_ctx[i as usize])? {
-                        return reject("constructor parameter telescope does not match inductive type");
+                        return reject(
+                            "constructor parameter telescope does not match inductive type",
+                        );
                     }
                     c2.push(dom);
                     cur2 = body;
@@ -1362,14 +1848,24 @@ impl<'e> Checker<'e> {
                 let (head, args) = expr::unfold_apps(&cur2);
                 match &*head {
                     ExprData::Const(n, us) if n == tname => {
-                        let expected: Vec<Level> = shared_lp.iter().map(|p| level::param(*p)).collect();
+                        let expected: Vec<Level> =
+                            shared_lp.iter().map(|p| level::param(*p)).collect();
                         if us.len() != expected.len()
-                            || !us.iter().zip(expected.iter()).all(|(a, b)| level::is_def_eq(a, b))
+                            || !us
+                                .iter()
+                                .zip(expected.iter())
+                                .all(|(a, b)| level::is_def_eq(a, b))
                         {
-                            return reject("constructor conclusion applies inductive type at wrong universes");
+                            return reject(
+                                "constructor conclusion applies inductive type at wrong universes",
+                            );
                         }
                     }
-                    _ => return reject("constructor conclusion is not the inductive type being defined"),
+                    _ => {
+                        return reject(
+                            "constructor conclusion is not the inductive type being defined",
+                        )
+                    }
                 }
                 let t_ni = infos.get(tname).map(|i| i.num_indices).unwrap_or(0);
                 if args.len() != (num_params + t_ni) as usize {
@@ -1417,7 +1913,9 @@ impl<'e> Checker<'e> {
             match &*cur {
                 ExprData::Pi(_, dom, body) => {
                     if self.occurs_any(dom, bound) {
-                        return reject("non-positive (negative) occurrence in constructor argument");
+                        return reject(
+                            "non-positive (negative) occurrence in constructor argument",
+                        );
                     }
                     ctx2.push(dom.clone());
                     cur = self.whnf(&ctx2, body).unwrap_or_else(|_| body.clone());
@@ -1457,4 +1955,3 @@ impl<'e> Checker<'e> {
         }
     }
 }
-
