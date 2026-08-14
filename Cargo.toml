@@ -1,11 +1,19 @@
 [package]
-name = "lkc"
+name = "kiota"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "From-scratch Lean 4 kernel checker (experimental) for the Lean Kernel Arena"
-repository = "https://github.com/sankalpsthakur/lkc"
+description = "From-scratch Lean 4 kernel that re-derives K-likeness and iota"
+repository = "https://github.com/sankalpsthakur/kiota"
 readme = "README.md"
+
+[lib]
+name = "kiota"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kiota"
+path = "src/main.rs"
 
 [dependencies]
 serde_json = "1"

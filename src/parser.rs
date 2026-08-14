@@ -477,7 +477,7 @@ impl Parser {
             let nat_ref = self.name_by_str.get("Nat").copied();
             let string_ref = self.name_by_str.get("String").copied();
             for n in names {
-                Checker::new(&self.env, nat_ref, string_ref)
+                Checker::new(&self.env, &self.names, nat_ref, string_ref)
                     .check_inductive_group(n)
                     .map_err(|e| self.annotate(n, e))?;
             }
@@ -490,7 +490,7 @@ impl Parser {
         let name = Self::get_u32(d, "name");
         let nat_ref = self.name_by_str.get("Nat").copied();
         let string_ref = self.name_by_str.get("String").copied();
-        Checker::new(&self.env, nat_ref, string_ref)
+        Checker::new(&self.env, &self.names, nat_ref, string_ref)
             .check_decl(name, kind)
             .map_err(|e| self.annotate(name, e))
     }

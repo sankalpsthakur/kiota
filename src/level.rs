@@ -182,6 +182,16 @@ pub fn leq(l1: &Level, l2: &Level, diff: i64) -> bool {
     }
 }
 
+pub fn pp(l: &Level) -> String {
+    match &**l {
+        LevelData::Zero => "0".into(),
+        LevelData::Succ(a) => format!("succ({})", pp(a)),
+        LevelData::Max(a, b) => format!("max({},{})", pp(a), pp(b)),
+        LevelData::IMax(a, b) => format!("imax({},{})", pp(a), pp(b)),
+        LevelData::Param(n) => format!("u{n}"),
+    }
+}
+
 pub fn is_def_eq(l1: &Level, l2: &Level) -> bool {
     leq(l1, l2, 0) && leq(l2, l1, 0)
 }

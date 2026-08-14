@@ -21,6 +21,7 @@ fn decline<T>(msg: impl Into<String>) -> R<T> {
 
 pub struct Checker<'e> {
     pub env: &'e Environment,
+    pub names: &'e [std::rc::Rc<String>],
     pub nat_ref: Option<u32>,
     pub string_ref: Option<u32>,
 }
@@ -37,8 +38,74 @@ fn local_ty(ctx: &Ctx, i: u32) -> Option<Expr> {
 }
 
 impl<'e> Checker<'e> {
-    pub fn new(env: &'e Environment, nat_ref: Option<u32>, string_ref: Option<u32>) -> Self {
-        Checker { env, nat_ref, string_ref }
+    pub fn new(
+        env: &'e Environment,
+        names: &'e [std::rc::Rc<String>],
+        nat_ref: Option<u32>,
+        string_ref: Option<u32>,
+    ) -> Self {
+        Checker { env, names, nat_ref, string_ref }
+    }
+
+    fn name_str(&self, n: u32) -> &str {
+        self.names
+            .get(n as usize)
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("?")
+    }
+
+    fn pp(&self, e: &Expr) -> String {
+        self.pp_budget(e, 24)
+    }
+
+    fn pp_budget(&self, e: &Expr, budget: i32) -> String {
+        if budget <= 0 {
+            return "…".into();
+        }
+        match &**e {
+            ExprData::BVar(i) => format!("#{i}"),
+            ExprData::Sort(l) => format!("Sort({})", level::pp(l)),
+            ExprData::Const(n, us) => {
+                if us.is_empty() {
+                    self.name_str(*n).to_string()
+                } else {
+                    let ls: Vec<String> = us.iter().map(level::pp).collect();
+                    format!("{} .{{{}}}", self.name_str(*n), ls.join(","))
+                }
+            }
+            ExprData::App(_, _) => {
+                let (h, args) = expr::unfold_apps(e);
+                let mut s = self.pp_budget(&h, budget - 1);
+                for a in args {
+                    s.push(' ');
+                    let inner = self.pp_budget(&a, budget - 1);
+                    if inner.contains(' ') {
+                        s.push('(');
+                        s.push_str(&inner);
+                        s.push(')');
+                    } else {
+                        s.push_str(&inner);
+                    }
+                }
+                s
+            }
+            ExprData::Lam(_, ty, body) => {
+                format!("(λ {}. {})", self.pp_budget(ty, budget - 1), self.pp_budget(body, budget - 1))
+            }
+            ExprData::Pi(_, ty, body) => {
+                format!("(Π {}. {})", self.pp_budget(ty, budget - 1), self.pp_budget(body, budget - 1))
+            }
+            ExprData::Let(ty, val, body) => format!(
+                "(let {} := {}; {})",
+                self.pp_budget(ty, budget - 1),
+                self.pp_budget(val, budget - 1),
+                self.pp_budget(body, budget - 1)
+            ),
+            ExprData::Proj(s, i, v) => format!("{}.{}[{}]", self.pp_budget(v, budget - 1), i, self.name_str(*s)),
+            ExprData::Lit(Lit::Nat(n)) => n.to_string(),
+            ExprData::Lit(Lit::Str(s)) => format!("{s:?}"),
+        }
     }
 
     pub fn check_decl(&self, name: u32, kind: &str) -> R<()> {
@@ -107,6 +174,19 @@ impl<'e> Checker<'e> {
                 let (_, dom, body) = self.ensure_pi(ctx, &ft)?;
                 let at = self.infer_type(ctx, a)?;
                 if !self.is_def_eq(ctx, &at, &dom)? {
+                    if std::env::var_os("KIOTA_DEBUG").is_some() {
+                        let atw = self.whnf(ctx, &at).unwrap_or_else(|_| at.clone());
+                        let dw = self.whnf(ctx, &dom).unwrap_or_else(|_| dom.clone());
+                        return reject(format!(
+                            "application argument type mismatch\n  got:      {}\n  expected: {}\n  got_whnf: {}\n  exp_whnf: {}\n  fun:      {}\n  arg:      {}",
+                            self.pp(&at),
+                            self.pp(&dom),
+                            self.pp(&atw),
+                            self.pp(&dw),
+                            self.pp(f),
+                            self.pp(a),
+                        ));
+                    }
                     return reject("application argument type mismatch");
                 }
                 Ok(expr::instantiate1(&body, a))
@@ -1027,7 +1107,11 @@ impl<'e> Checker<'e> {
             let (_, _, body) = self.ensure_pi(ctx, &ct)?;
             ct = expr::instantiate1(&body, p);
         }
+        // Lean iota: apply every constructor field first, then one rec-call
+        // per recursive field, in field order. Interleaving (field, rec, field)
+        // is wrong as soon as two fields are recursive (RBTree.red, etc.).
         let mut result = minor;
+        let mut rec_calls: Vec<Expr> = Vec::new();
         let mut cctx = ctx.clone();
         for f in fields {
             let (_, dom, body) = match self.ensure_pi(&cctx, &ct) {
@@ -1038,10 +1122,13 @@ impl<'e> Checker<'e> {
             if let Some(rec_call) =
                 self.mk_rec_call(&cctx, rname, us, all, params, motives, minors, f, &dom)?
             {
-                result = expr::app(result, rec_call);
+                rec_calls.push(rec_call);
             }
             cctx.push(dom);
             ct = expr::instantiate1(&body, f);
+        }
+        for rec_call in rec_calls {
+            result = expr::app(result, rec_call);
         }
         let _ = (level_params,);
         Ok(result)

@@ -1,55 +1,75 @@
-# lkc — a from-scratch Lean 4 kernel checker (experimental)
+# kiota
 
-Repository: https://github.com/sankalpsthakur/lkc
+An independent Lean 4 kernel, written in Rust, for the
+[Lean Kernel Arena](https://arena.lean-lang.org/).
+The name is **K + iota**: those two recursor knobs are recomputed,
+not read from the export.
 
-`lkc` is an independent Lean 4 kernel type-checker written in Rust for the
-[Lean Kernel Arena](https://arena.lean-lang.org/). It reads `lean4export`
-NDJSON and re-checks every declaration. Exported recursor `k` flags and
-iota RHS terms are **not trusted** — K-like-ness is recomputed, and iota
-is implemented from first principles.
+This is an **experimental** checker. It is **not** a nanoda fork and it is
+**not** competitive with sokonanoda / nanoclo / official on mathlib. It
+exists to be a second implementation that does not trust exported recursor
+`k` flags or iota RHS terms.
 
-## Local ranking (2026-08-14)
+If you want the world's fastest kernel, use
+[sokonanoda](https://github.com/intgrah/sokonanoda). If you want a tiny
+reference sketch, see [mini](https://github.com/nomeata/lean-mini-kernel).
 
-Against the arena's downloadable tarball
-(`lean-arena-tests.tar.gz`, 178 tests, excludes corpora > 10 MB):
+## Thesis
+
+- From-scratch term language, universes, WHNF, and definitional equality.
+- Recursor K-like-ness is **recomputed**. Exported `k` is ignored.
+- Iota is rebuilt from constructor fields, then rec-calls, in Lean's
+  field-then-rec order. Exported recursor RHS is ignored.
+- Incomplete on purpose: nested inductives, full `Init`, and mathlib are
+  declined until the checker can accept them honestly.
+
+## Local score (2026-08-14)
+
+Against the arena tarball (non-mathlib):
 
 | Suite | Result |
 | --- | --- |
-| Tutorial good | **91/92** accept (`RBTree.id_spec` still fails) |
+| Tutorial good | **92/92** accept |
 | Tutorial bad | **46/46** reject |
-| All good | **105** accept, **7** incorrect reject, **4** timeout (treated as decline) |
-| All bad | **61** reject, **0** incorrect accept, **1** timeout |
+| Remaining completeness | `init-prelude` (`noConfusion_of_Nat.aux`), Acc matcher `step.match_1` (`n+1` vs `Nat.succ`), some perf timeouts |
 
-Soundness on finished reject tests: **61/61**. Completeness on
-non-timeout accept tests: **105/112**.
+Soundness on finished reject tests: no known false accepts on the tutorial
+bad suite. Large corpora (`init`, `std`, `mathlib`, `cslib`, `cedar`) are
+**declined**, same policy as mini.
 
-The 7 remaining completeness misses:
+On the arena ranking key (soundness, then completeness, then mathlib
+speed) this sits with **mini / evmlean**, not with sokonanoda.
 
-- `init-prelude` — `Fin.noConfusionType` (prelude still out of reach)
-- `tutorial/080_RBTree.id_spec`
-- `perf/beta-ladder`, `perf/grind-ring-5`
-- `undecidability/alg-conv-trans-acc-{left,right}`, `subject-reduction-redex`
+## What's missing (intentionally, for now)
 
-Large real-world corpora (`init`, `std`, `mathlib`, `cslib`, `cedar`) are
-declined, same policy as `mini`.
-
-This is a fresh implementation (not a fork of `nanoda_lib`). On the
-arena's lexicographic ranking (soundness, then completeness bugs, then
-mathlib speed, then declines) a 0-soundness-failure entry sits with
-`mini` / `evmlean` rather than the mathlib-speed leaders.
+- Nested and mutual inductives
+- Native `Nat` / `String` kernel extensions
+- Hash-consing, WHNF/defeq caches, NbE / glued values
+- Parallel declaration checking
+- Anything that needs `Init.Prelude` (`Fin.noConfusionType` and friends)
 
 ## Building
 
 ```
+cargo test
 cargo build --release
 ```
 
-## Running
-
 ```
-./target/release/lkc path/to/export.ndjson
-# or
-./target/release/lkc --use-stdin < export.ndjson
+./target/release/kiota path/to/export.ndjson
+./target/release/kiota --use-stdin < export.ndjson
 ```
 
-Exit codes: `0` accept, `1` reject, `2` decline, anything else = error.
+Exit codes: `0` accept, `1` reject, `2` decline.
+
+Set `KIOTA_DEBUG=1` to print both sides of an application-type mismatch.
+
+## Tests
+
+In-repo fixtures under `tests/fixtures/` (accept/reject NDJSON). Optional
+full tutorial walk if `LEAN_ARENA_TESTS` points at an unpacked arena
+tarball.
+
+## License
+
+Apache-2.0

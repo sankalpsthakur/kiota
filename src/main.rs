@@ -1,9 +1,5 @@
-mod env;
-mod expr;
-mod level;
-mod parser;
-mod tc;
-
+use kiota::parser;
+use kiota::tc;
 use std::io::{BufReader, Cursor, Read};
 
 const EXIT_ACCEPT: i32 = 0;
