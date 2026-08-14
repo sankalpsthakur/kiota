@@ -29,9 +29,67 @@ pub struct Checker<'e> {
     whnf_cache: RefCell<FxHashMap<usize, Expr>>,
     whnf_core_cache: RefCell<FxHashMap<usize, Expr>>,
     defeq_cache: RefCell<FxHashMap<(usize, usize), bool>>,
+    /// `(context id, term)` to inferred type. Unlike the caches above this one
+    /// works under binders, which is where the redundancy actually is: a term
+    /// shared by the DAG is otherwise re-inferred once per occurrence, so a
+    /// term applied to two identical arguments doubles the work at every level.
+    infer_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
 }
 
-type Ctx = Vec<Expr>; // ctx[len-1-i] = raw (unshifted) type recorded for bvar i
+thread_local! {
+    /// Maps `(parent id, pushed type)` to the id of the extended context, so
+    /// that two contexts built from the same sequence of types share an id.
+    static CTX_IDS: RefCell<FxHashMap<(u64, usize), u64>> = RefCell::new(FxHashMap::default());
+    static CTX_NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// `ctx[len-1-i]` is the raw (unshifted) type recorded for bvar `i`.
+///
+/// The `id` is what makes a type-inference cache possible. Keying on depth
+/// alone would be unsound — two contexts of equal length bind different types
+/// — so each context carries an identity interned from the sequence of types
+/// that built it. Equal ids therefore imply equal contexts; distinct ids for
+/// equal contexts would only cost a cache miss, and interning rules that out.
+#[derive(Clone, Default)]
+struct Ctx {
+    tys: Vec<Expr>,
+    id: u64,
+}
+
+impl Ctx {
+    fn new() -> Self {
+        Ctx::default()
+    }
+
+    fn push(&mut self, ty: Expr) {
+        let key = (self.id, Rc::as_ptr(&ty) as usize);
+        self.id = CTX_IDS.with(|m| {
+            *m.borrow_mut().entry(key).or_insert_with(|| {
+                CTX_NEXT.with(|c| {
+                    let v = c.get();
+                    c.set(v + 1);
+                    v
+                })
+            })
+        });
+        self.tys.push(ty);
+    }
+
+    fn len(&self) -> usize {
+        self.tys.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tys.is_empty()
+    }
+}
+
+impl std::ops::Index<usize> for Ctx {
+    type Output = Expr;
+    fn index(&self, i: usize) -> &Expr {
+        &self.tys[i]
+    }
+}
 
 fn local_ty(ctx: &Ctx, i: u32) -> Option<Expr> {
     let n = ctx.len();
@@ -57,6 +115,7 @@ impl<'e> Checker<'e> {
             whnf_cache: RefCell::new(FxHashMap::default()),
             whnf_core_cache: RefCell::new(FxHashMap::default()),
             defeq_cache: RefCell::new(FxHashMap::default()),
+            infer_cache: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -159,7 +218,7 @@ impl<'e> Checker<'e> {
             }
         }
         let typ = ci.typ();
-        let ctx: Ctx = Vec::new();
+        let ctx: Ctx = Ctx::new();
         let sort = self.infer_type(&ctx, typ)?;
         let lvl = self.ensure_sort(&ctx, &sort)?;
         if kind == "theorem" && !level::is_def_eq(&lvl, &level::zero()) {
@@ -198,6 +257,17 @@ impl<'e> Checker<'e> {
 
     pub fn infer_type(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         crate::stats::infer_call();
+        let key = (ctx.id, Self::ptr_key(e));
+        if let Some(t) = self.infer_cache.borrow().get(&key) {
+            crate::stats::infer_hit();
+            return Ok(t.clone());
+        }
+        let t = self.infer_type_uncached(ctx, e)?;
+        self.infer_cache.borrow_mut().insert(key, t.clone());
+        Ok(t)
+    }
+
+    fn infer_type_uncached(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         match &***e {
             ExprData::BVar(i) => {
                 local_ty(ctx, *i).ok_or_else(|| TcError::Other("bvar out of range".into()))
@@ -1174,7 +1244,7 @@ impl<'e> Checker<'e> {
         if ctors.len() != 1 {
             return Ok(false);
         }
-        let mut ctx: Ctx = Vec::new();
+        let mut ctx: Ctx = Ctx::new();
         let mut cur = typ;
         for _ in 0..num_params {
             match self.ensure_pi(&ctx, &cur) {
@@ -1852,7 +1922,7 @@ impl<'e> Checker<'e> {
             }
         }
         // Shared parameter telescope, taken from the first type's arity.
-        let mut param_ctx: Ctx = Vec::new();
+        let mut param_ctx: Ctx = Ctx::new();
         let mut cur = typ.clone();
         for _ in 0..num_params {
             let (_, dom, body) = self.ensure_pi(&param_ctx, &cur)?;
@@ -1883,7 +1953,7 @@ impl<'e> Checker<'e> {
             if t_lp != shared_lp {
                 return reject("inconsistent universe parameters across mutual inductive group");
             }
-            let mut c2: Ctx = Vec::new();
+            let mut c2: Ctx = Ctx::new();
             let mut cur2 = t_typ.clone();
             for i in 0..t_np {
                 let (_, dom, body) = self.ensure_pi(&c2, &cur2)?;
@@ -1934,7 +2004,7 @@ impl<'e> Checker<'e> {
                 if c_np != num_params {
                     return reject("constructor numParams does not match inductive type");
                 }
-                let mut c2: Ctx = Vec::new();
+                let mut c2: Ctx = Ctx::new();
                 let mut cur2 = c_typ.clone();
                 for i in 0..num_params {
                     let (_, dom, body) = self.ensure_pi(&c2, &cur2)?;
