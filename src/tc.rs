@@ -1658,7 +1658,12 @@ impl<'e> Checker<'e> {
             {
                 rec_calls.push(rec_call);
             }
-            cctx.push(dom);
+            // `instantiate1` discharges the binder that `ensure_pi` peeled,
+            // so the next `ct` lives at the same depth as this one. Pushing
+            // `dom` here grew the context anyway, leaving every later field
+            // checked one binder too deep — the whole spine came out with
+            // indices uniformly off by one, which is how Init's
+            // Array.foldlM_toList.aux._unary failed.
             ct = expr::instantiate1(&body, f);
         }
         for rec_call in rec_calls {
@@ -2429,6 +2434,36 @@ mod tests {
     /// The inference cache is keyed on this id, so equal ids must mean equal
     /// contexts. Anything weaker turns a cache hit into a type inferred under
     /// the wrong bindings.
+    /// `iota_from_first_principles` walks a constructor's fields by peeling
+    /// one Pi at a time and instantiating the binder with the field. Because
+    /// `instantiate1` discharges that binder, the residual type stays at the
+    /// caller's depth — the loop must not also extend the context. It used to,
+    /// so the k-th field was processed k binders too deep and the resulting
+    /// spine carried indices uniformly off by one.
+    #[test]
+    fn instantiate1_keeps_the_type_at_the_same_depth() {
+        let s0 = expr::sort(level::zero());
+        // (Π A. Π B. #1 #0), the shape of a two-field constructor type.
+        let inner = expr::pi(
+            expr::BinderInfo::Default,
+            s0.clone(),
+            expr::app(expr::bvar(1), expr::bvar(0)),
+        );
+        let ct = expr::pi(expr::BinderInfo::Default, s0.clone(), inner);
+        let field = expr::const_(7, vec![]);
+
+        let body = match &**ct {
+            ExprData::Pi(_, _, b) => b.clone(),
+            _ => unreachable!(),
+        };
+        let next = expr::instantiate1(&body, &field);
+        assert_eq!(
+            expr::loose_bvar_range(&next),
+            expr::loose_bvar_range(&ct),
+            "instantiating the peeled binder must not deepen the residual type"
+        );
+    }
+
     #[test]
     fn ctx_id_identifies_the_binding_sequence() {
         assert_eq!(Ctx::new().id, 0, "the empty context is the zero id");
