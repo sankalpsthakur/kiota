@@ -70,6 +70,7 @@ fn main() {
                 p.run(reader)
             });
             kiota::stats::report();
+            kiota::stats::report_inst();
             let result = match outcome {
                 Ok(r) => r,
                 Err(_) => Err(tc::TcError::Other("panic during checking".into())),

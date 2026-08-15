@@ -300,6 +300,7 @@ pub fn instantiate(e: &Expr, args: &[Expr]) -> Expr {
     // full traversal. The grind perf tests amplify a shared simp-lemma
     // application thousands of times; keying on (node, depth) — args are
     // fixed within one call — visits each unique node once.
+    crate::stats::inst_call();
     let mut memo = rustc_hash::FxHashMap::default();
     instantiate_core(e, args, 0, &mut memo)
 }
@@ -314,10 +315,12 @@ fn instantiate_core(
     // the renumbering below can reach into this subterm. Returning it whole is
     // what turns O(term size) per binder into O(path length).
     if loose_bvar_range(e) <= depth {
+        crate::stats::inst_skip();
         return e.clone();
     }
     let key = (Rc::as_ptr(e) as usize, depth);
     if let Some(r) = memo.get(&key) {
+        crate::stats::inst_memo_hit();
         return r.clone();
     }
     crate::stats::inst_node();

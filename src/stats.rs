@@ -114,3 +114,30 @@ pub fn set_theorem_delta_scope(name: &str) {
 pub fn theorem_delta_in_scope() -> bool {
     THEOREM_DELTA_SCOPE.with(|c| c.get())
 }
+
+thread_local! {
+    static INST_CALLS: Cell<u64> = const { Cell::new(0) };
+    static INST_SKIP: Cell<u64> = const { Cell::new(0) };
+    static INST_MEMO_HIT: Cell<u64> = const { Cell::new(0) };
+}
+
+bump!(inst_call, INST_CALLS);
+bump!(inst_skip, INST_SKIP);
+bump!(inst_memo_hit, INST_MEMO_HIT);
+
+/// Substitution detail: how many top-level `instantiate` calls were made, how
+/// many returned a subterm whole on the loose-bvar check, and how many hit the
+/// per-call memo. `inst_nodes` counts the nodes actually rebuilt.
+pub fn report_inst() {
+    if !enabled() {
+        return;
+    }
+    let g = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|x| x.get());
+    eprintln!(
+        "INST calls={} skip={} memo_hit={} rebuilt={}",
+        g(&INST_CALLS),
+        g(&INST_SKIP),
+        g(&INST_MEMO_HIT),
+        g(&INST_NODES),
+    );
+}
