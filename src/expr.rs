@@ -278,7 +278,14 @@ pub fn shift(e: &Expr, by: i32, cutoff: u32) -> Expr {
             }
         }
         ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => e.clone(),
-        ExprData::App(f, a) => app(shift(f, by, cutoff), shift(a, by, cutoff)),
+        ExprData::App(_, _) => {
+            let (head, args_app) = unfold_apps(e);
+            let mut result = shift(&head, by, cutoff);
+            for a in &args_app {
+                result = app(result, shift(a, by, cutoff));
+            }
+            result
+        }
         ExprData::Lam(bi, ty, body) => lam(*bi, shift(ty, by, cutoff), shift(body, by, cutoff + 1)),
         ExprData::Pi(bi, ty, body) => pi(*bi, shift(ty, by, cutoff), shift(body, by, cutoff + 1)),
         ExprData::Let(ty, val, body) => let_(
@@ -336,10 +343,14 @@ fn instantiate_core(
             }
         }
         ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => e.clone(),
-        ExprData::App(f, a) => app(
-            instantiate_core(f, args, depth, memo),
-            instantiate_core(a, args, depth, memo),
-        ),
+        ExprData::App(_, _) => {
+            let (head, args_app) = unfold_apps(e);
+            let mut result = instantiate_core(&head, args, depth, memo);
+            for a in &args_app {
+                result = app(result, instantiate_core(a, args, depth, memo));
+            }
+            result
+        }
         ExprData::Lam(bi, ty, body) => lam(
             *bi,
             instantiate_core(ty, args, depth, memo),
@@ -376,10 +387,14 @@ pub fn instantiate_level_params(e: &Expr, subst: &rustc_hash::FxHashMap<u32, Lev
                 .map(|l| crate::level::instantiate(l, subst))
                 .collect(),
         ),
-        ExprData::App(f, a) => app(
-            instantiate_level_params(f, subst),
-            instantiate_level_params(a, subst),
-        ),
+        ExprData::App(_, _) => {
+            let (head, args_app) = unfold_apps(e);
+            let mut result = instantiate_level_params(&head, subst);
+            for a in &args_app {
+                result = app(result, instantiate_level_params(a, subst));
+            }
+            result
+        }
         ExprData::Lam(bi, ty, body) => lam(
             *bi,
             instantiate_level_params(ty, subst),

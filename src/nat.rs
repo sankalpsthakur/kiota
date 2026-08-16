@@ -74,46 +74,80 @@ pub fn beq_values(a: &BigUint, b: &BigUint) -> bool {
     a == b
 }
 
-/// `Nat.zero` or `lit 0`.
-pub fn is_zero(e: &Expr, zero: u32) -> bool {
+/// `Nat.zero` or `lit 0` or `OfNat.ofNat Nat 0 inst`.
+pub fn is_zero(e: &Expr, zero: u32, ofnat: Option<u32>) -> bool {
     if let Some(n) = as_lit(e) {
         return *n == BigUint::from(0u32);
     }
-    matches!(&***e, ExprData::Const(z, us) if *z == zero && us.is_empty())
+    if matches!(&***e, ExprData::Const(z, us) if *z == zero && us.is_empty()) {
+        return true;
+    }
+    if let Some(ofn) = ofnat {
+        let (head, args) = expr::unfold_apps(e);
+        if let ExprData::Const(c, _) = &**head {
+            if *c == ofn && args.len() >= 2 {
+                if let Some(n) = as_lit(&args[1]) {
+                    return *n == BigUint::from(0u32);
+                }
+            }
+        }
+    }
+    false
 }
 
-/// `lit 1`, `Nat.succ Nat.zero`, or `Nat.succ (lit 0)`.
-pub fn is_one(e: &Expr, zero: u32, succ: u32) -> bool {
+/// `lit 1`, `Nat.succ Nat.zero`, `Nat.succ (lit 0)`, or `OfNat.ofNat Nat 1 inst`.
+pub fn is_one(e: &Expr, zero: u32, succ: u32, ofnat: Option<u32>) -> bool {
     if let Some(n) = as_lit(e) {
         return *n == BigUint::from(1u32);
     }
     match &***e {
         ExprData::App(f, a) => {
-            matches!(&***f, ExprData::Const(s, us) if *s == succ && us.is_empty())
-                && is_zero(a, zero)
+            if matches!(&***f, ExprData::Const(s, us) if *s == succ && us.is_empty())
+                && is_zero(a, zero, ofnat)
+            {
+                return true;
+            }
         }
-        _ => false,
+        _ => {}
     }
+    if let Some(ofn) = ofnat {
+        let (head, args) = expr::unfold_apps(e);
+        if let ExprData::Const(c, _) = &**head {
+            if *c == ofn && args.len() >= 2 {
+                if let Some(n) = as_lit(&args[1]) {
+                    return *n == BigUint::from(1u32);
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Interpret a closed numeral: lit, zero, or a finite `succ` tower over those.
-pub fn numeral_value(e: &Expr, zero: u32, succ: u32) -> Option<BigUint> {
+pub fn numeral_value(e: &Expr, zero: u32, succ: u32, ofnat: Option<u32>) -> Option<BigUint> {
     if let Some(n) = as_lit(e) {
         return Some(n.clone());
     }
-    if is_zero(e, zero) {
+    if is_zero(e, zero, ofnat) {
         return Some(BigUint::from(0u32));
     }
-    match &***e {
-        ExprData::App(f, a) => {
-            if matches!(&***f, ExprData::Const(s, us) if *s == succ && us.is_empty()) {
-                let v = numeral_value(a, zero, succ)?;
-                return Some(succ_value(&v));
-            }
-            None
+    let (head, args) = expr::unfold_apps(e);
+    if let ExprData::Const(s, us) = &**head {
+        if *s == succ && us.is_empty() && args.len() == 1 {
+            let v = numeral_value(&args[0], zero, succ, ofnat)?;
+            return Some(succ_value(&v));
         }
-        _ => None,
     }
+    if let Some(ofn) = ofnat {
+        if let ExprData::Const(c, _) = &**head {
+            if *c == ofn && args.len() >= 2 {
+                if let Some(n) = as_lit(&args[1]) {
+                    return Some(n.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `OfNat.ofNat` head applied to at least `[α, n, inst, …]`: return `n` when `α` is `Nat`.
@@ -228,25 +262,25 @@ mod tests {
     #[test]
     fn is_zero_lit_and_const() {
         let zero = 10u32;
-        assert!(is_zero(&lit(0), zero));
-        assert!(!is_zero(&lit(1), zero));
-        assert!(is_zero(&expr::const_(zero, vec![]), zero));
-        assert!(!is_zero(&expr::const_(11, vec![]), zero));
+        assert!(is_zero(&lit(0), zero, None));
+        assert!(!is_zero(&lit(1), zero, None));
+        assert!(is_zero(&expr::const_(zero, vec![]), zero, None));
+        assert!(!is_zero(&expr::const_(11, vec![]), zero, None));
     }
 
     #[test]
     fn is_one_shapes() {
         let zero = 10u32;
         let succ = 11u32;
-        assert!(is_one(&lit(1), zero, succ));
-        assert!(!is_one(&lit(0), zero, succ));
-        assert!(!is_one(&lit(2), zero, succ));
+        assert!(is_one(&lit(1), zero, succ, None));
+        assert!(!is_one(&lit(0), zero, succ, None));
+        assert!(!is_one(&lit(2), zero, succ, None));
         let succ_zero = expr::app(expr::const_(succ, vec![]), expr::const_(zero, vec![]));
-        assert!(is_one(&succ_zero, zero, succ));
+        assert!(is_one(&succ_zero, zero, succ, None));
         let succ_lit0 = expr::app(expr::const_(succ, vec![]), lit(0));
-        assert!(is_one(&succ_lit0, zero, succ));
+        assert!(is_one(&succ_lit0, zero, succ, None));
         let succ_lit1 = expr::app(expr::const_(succ, vec![]), lit(1));
-        assert!(!is_one(&succ_lit1, zero, succ));
+        assert!(!is_one(&succ_lit1, zero, succ, None));
     }
 
     #[test]
@@ -254,18 +288,18 @@ mod tests {
         let zero = 10u32;
         let succ = 11u32;
         assert_eq!(
-            numeral_value(&expr::const_(zero, vec![]), zero, succ),
+            numeral_value(&expr::const_(zero, vec![]), zero, succ, None),
             Some(BigUint::from(0u32))
         );
         let one = expr::app(expr::const_(succ, vec![]), expr::const_(zero, vec![]));
-        assert_eq!(numeral_value(&one, zero, succ), Some(BigUint::from(1u32)));
+        assert_eq!(numeral_value(&one, zero, succ, None), Some(BigUint::from(1u32)));
         let two = expr::app(expr::const_(succ, vec![]), one);
-        assert_eq!(numeral_value(&two, zero, succ), Some(BigUint::from(2u32)));
+        assert_eq!(numeral_value(&two, zero, succ, None), Some(BigUint::from(2u32)));
         assert_eq!(
-            numeral_value(&lit(5), zero, succ),
+            numeral_value(&lit(5), zero, succ, None),
             Some(BigUint::from(5u32))
         );
-        assert!(numeral_value(&expr::bvar(0), zero, succ).is_none());
+        assert!(numeral_value(&expr::bvar(0), zero, succ, None).is_none());
     }
 
     #[test]

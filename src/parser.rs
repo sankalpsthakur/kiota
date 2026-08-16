@@ -583,6 +583,14 @@ impl Parser {
 
     fn check_last(&mut self, d: &Value, kind: &str) -> Result<(), TcError> {
         let name = Self::get_u32(d, "name");
+        if std::env::var_os("KIOTA_PROGRESS").is_some() {
+            static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let c = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if c >= 3225 && c <= 3235 {
+                let nm = self.names.get(name as usize).map(|s| s.as_str()).unwrap_or("?");
+                eprintln!("#{c} {kind} {nm}");
+            }
+        }
         let nat_ref = self.name_by_str.get("Nat").copied();
         let string_ref = self.name_by_str.get("String").copied();
         Checker::new(&self.env, &self.names, nat_ref, string_ref)
