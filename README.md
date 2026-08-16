@@ -1,119 +1,95 @@
 # kiota
 
-An independent Lean 4 kernel, written in Rust, for the
-[Lean Kernel Arena](https://arena.lean-lang.org/).
-The name is **K + iota**: those two recursor knobs are recomputed,
-not read from the export.
+A **from-scratch Lean 4 kernel checker in Rust**, built as an independent implementation for the [Lean Kernel Arena](https://arena.lean-lang.org/).
 
-This is an **experimental** checker. It is **not** a nanoda fork and it is
-**not** competitive with sokonanoda / nanoclo / official on mathlib. It
-exists to be a second implementation that does not trust exported recursor
-`k` flags or iota RHS terms.
+It deliberately does not trust two pieces of recursor metadata from exported terms: the K-like flag and iota right-hand sides. Kiota recomputes both.
 
-If you want the world's fastest kernel, use
-[sokonanoda](https://github.com/intgrah/sokonanoda). If you want a tiny
-reference sketch, see [mini](https://github.com/nomeata/lean-mini-kernel).
+> **Arena-validated snapshot (`84b2fc4`)**  
+> **116/116 valid exports accepted · 62/62 invalid exports rejected · zero false accepts on the published tarball**
+>
+> That revision was merged into the Lean Kernel Arena in [leanprover/lean-kernel-arena#131](https://github.com/leanprover/lean-kernel-arena/pull/131). Current `main` is ahead of that snapshot.
 
-## Thesis
+Kiota is experimental. It is not a nanoda fork, and it is not currently competitive with sokonanoda / nanoclo / the official kernel on full-mathlib throughput. The point is a second implementation with different trust boundaries.
 
-- From-scratch term language, universes, WHNF, and definitional equality.
-- Recursor K-like-ness is **recomputed**. Exported `k` is ignored.
-- Iota is rebuilt from constructor fields, then rec-calls, in Lean's
-  field-then-rec order. Exported recursor RHS is ignored.
-- Nested inductives are checked, not declined: a nested occurrence must
-  apply the datatype's own parameters, so `E.mk : (w : W) → L (E ⟨false⟩)
-  → E w` is rejected.
-- Incomplete on purpose: full `Init`, `Std`, and mathlib are out of reach
-  on time and are declined.
+## Why another kernel checker?
 
-## Local score (2026-08-14)
+A kernel checker is the last line between a proof-producing tool and “this theorem is actually accepted by the logic.” Independent implementations are useful because they can fail differently.
 
-Full replay of the published arena tarball — all 178 exports, every one
-run, nothing skipped. Binary built from `90ee8cf`. Measured on
-macOS/arm64 without `perf`, so wall time is indicative and instruction
-counts — the arena's actual ranking metric — are not measured here.
+Kiota's design choices are intentionally explicit:
 
-| Suite | Good (accept) | Bad (reject) | Wall |
-| --- | --- | --- | --- |
-| tutorial | **92/92** | **46/46** | 5.3s |
-| perf | 15/16 | **2/2** | 5.8s |
-| undecidability | 3/4 | — | 0.2s |
-| root | **4/4** | **14/14** | 0.8s |
-| **total** | **114/116** | **62/62** | **12.1s** |
+- **From-scratch term language, universes, WHNF and definitional equality.**
+- **Recursor K-like-ness is recomputed.** Exported `k` is ignored.
+- **Iota reduction is rebuilt** from constructor fields and recursive calls in Lean's field-then-rec order. Exported recursor RHS terms are ignored.
+- **Nested inductives are checked rather than blanket-declined.** A nested occurrence must apply the datatype's own parameters correctly.
+- **Failure is allowed to be explicit.** Unsupported large corpora can be declined rather than guessed through.
 
-Soundness is clean: **62/62 bad exports rejected, zero false accepts.**
-The two good exports not accepted:
+The name is **K + iota**: the two recursor knobs Kiota recomputes.
 
-| Test | Outcome | Reason |
-| --- | --- | --- |
-| `perf/grind-ring-5` | reject | `Lean.Grind.Semiring.add_zero` type mismatch |
-| `undecidability/subject-reduction-redex` | reject | compares the endpoints the annotation exists to avoid |
+## The result that got it into the Arena
 
-`perf/app-lam` used to time out — it did not finish in ten minutes — and
-now accepts in 0.08s. It probes two separate costs, and the checker had
-both: no inference cache at all (so a DAG-shared term is re-inferred per
-occurrence, doubling work per level) and substitution that rebuilt
-subterms it could not change. Nodes now carry a loose-bvar range so
-substitution skips those subterms, and inference is memoised on
-`(context id, term)`. The whole sweep went from 50.2s to 12.1s.
+The published Lean Kernel Arena tarball contains 116 valid exports and 62 deliberately invalid exports. At `84b2fc4`, Kiota replayed the whole set and produced:
 
-Outside the tarball, `nested-nonuniform-param` (`either`) rejects with
-`non-uniform nested inductive parameter` in 0.01s. Large corpora
-(`init`, `std`, `mathlib`, `cslib`, `cedar`) are declined on time.
+| Suite | Result |
+| --- | --- |
+| Valid exports | **116 / 116 accepted** |
+| Invalid exports | **62 / 62 rejected** |
+| False accepts | **0** |
 
-On the arena's ranking key that is `(0 bad-not-rejected,
-2 good-not-accepted, no mathlib, 5 declines)` — **9th of 17**, ahead of
-mini (same completeness, 20 declines) and ahead of `official-v4.28.0`
-and `still-nanoda`, which process mathlib but have false accepts.
-Not #1, and not close: ranking key 3 is mathlib instruction count, and a
-checker that declines mathlib sorts below every checker that processes
-it, however clean keys 1 and 2 are.
+The last two valid failures fell to three fixes:
 
-## What's missing
+1. **Theorem transparency.** Lean's kernel can unfold constants with values, theorems included. Kiota now does that in the cold definitional-equality delta path and at recursor major premises without eagerly unfolding theorems in the hot WHNF path.
+2. **Substitution memoization.** `grind-ring-5` went from roughly **196 s → 2.3 s** after `instantiate_core` gained a per-call `(node, depth)` memo. Proof bodies are DAG-shared through the interner; repeated occurrences had been paying the same substitution traversal repeatedly.
+3. **Iota context depth.** The constructor-field walk stopped deepening its context while instantiating the binder it had just peeled, fixing de Bruijn indices that were uniformly off by one.
 
-Ranked by what actually moves the arena key, not by effort.
+The important claim is deliberately narrow: **the Arena snapshot rejected every bad export and accepted every good export in that published test tarball.** It is not a claim that Kiota is complete or fast enough for full mathlib.
 
-1. **`Array.foldlM_toList.aux._unary`** (Init, deep). The current init
-   blocker after Nat.add_assoc, Std.Iterator.step and WellFounded.fixF_eq
-   all fell to theorem transparency (see below). A stuck
-   `PSigma.casesOn` inside a `Nat.le` argument vs a plain successor --
-   same investigation recipe applies.
-2. **mathlib end-to-end.** Unknown bug count; the feedback loop is a
-   sub-second init rejection, so each bug is a small experiment.
-3. **Closures.** The board splits: eager implementations cluster at
-   7,900-10,500 G instructions, closure-based ones at 868-2,842 G.
+## Current frontier
 
-## Fixed this week (was on this list)
+The next independent target is not another toy test. It is:
 
-- `Nat.add_assoc` / `WellFounded.fixF_eq` / `subject-reduction-redex`:
-  Lean's kernel unfolds any constant with a value, theorems included.
-  kiota now does this in the cold defeq delta path (`unfold_delta`)
-  and at recursor major premises (`whnf_major`) -- but not in the hot
-  `whnf`, where eager theorem unfolding is a known 100x blowup.
-- grind-ring-5 went 0.05s-reject -> 196s-accept -> **2.3s-accept** when
-  `instantiate_core` gained a per-call (node, depth) memo: proof bodies
-  are DAG-shared through the interner, and each shared occurrence was
-  paying a full substitution traversal.
+**121/121 good · 62/62 bad · 0 declines · completed mathlib benchmark**
+
+Current `main` is already beyond the Arena-pinned revision and is working through larger-corpus blockers, exact Nat reductions, numeral handling and definitional-equality performance.
+
+The performance gap also points toward a deeper architectural question. Eager implementations cluster far above closure-based kernels on full-corpus instruction counts. Kiota currently keeps an eager representation; moving more evaluation behind closures is likely the next major throughput step after correctness coverage.
 
 ## Building
 
-```
+```bash
 cargo test
 cargo build --release
 ```
 
-```
+Run an exported environment:
+
+```bash
 ./target/release/kiota path/to/export.ndjson
 ./target/release/kiota --use-stdin < export.ndjson
 ```
 
-Exit codes: `0` accept, `1` reject, `2` decline.
+Exit codes:
+
+- `0` — accept
+- `1` — reject
+- `2` — decline
 
 Set `KIOTA_DEBUG=1` to print both sides of an application-type mismatch.
 
-## Tests
+## What to read in the code
 
-`cargo test` runs the fixtures in `tests/fixtures/`.
+If you are exploring kernel implementation rather than just running the binary, the interesting paths are:
+
+- `src/tc.rs` — type checking and definitional equality
+- `src/expr.rs` — term representation / interning
+- `src/nat.rs` — exact natural-number reductions
+- `src/parser.rs` — exported-term ingestion
+- `src/stats.rs` — checker statistics
+
+## Related implementations
+
+If you want the fastest kernel checker in the Arena, look at [sokonanoda](https://github.com/intgrah/sokonanoda). If you want a tiny reference sketch, see [lean-mini-kernel](https://github.com/nomeata/lean-mini-kernel).
+
+Kiota exists in the middle: small enough to reason about, independent enough to be interesting, and increasingly complete against real Lean exports.
 
 ## License
 
