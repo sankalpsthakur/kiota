@@ -824,6 +824,10 @@ impl<'e> Checker<'e> {
                                 cur = r;
                                 continue;
                             }
+                            if let Some(r) = self.try_omega_combo(ctx, &head, &args)? {
+                                cur = r;
+                                continue;
+                            }
                             if let Some(r) = self.try_dite(ctx, &head, &args)? {
                                 cur = r;
                                 continue;
@@ -2210,25 +2214,38 @@ impl<'e> Checker<'e> {
         if args.len() < need {
             return Ok(None);
         }
-        let Some(nat_ty) = self.nat_ref else {
-            return Ok(None);
-        };
         let ty = self.whnf(ctx, &args[ty_i])?;
-        if !matches!(&**ty, ExprData::Const(t, _) if *t == nat_ty) {
-            return Ok(None);
-        }
-        let op = match name {
-            "HAdd.hAdd" | "Add.add" => "Nat.add",
-            "HMul.hMul" | "Mul.mul" => "Nat.mul",
-            "HPow.hPow" | "Pow.pow" => "Nat.pow",
-            "HSub.hSub" | "Sub.sub" => "Nat.sub",
-            "HMod.hMod" | "Mod.mod" => "Nat.mod",
-            "HDiv.hDiv" | "Div.div" => "Nat.div",
-            "HShiftLeft.hShiftLeft" | "ShiftLeft.shiftLeft" => "Nat.shiftLeft",
-            "HShiftRight.hShiftRight" | "ShiftRight.shiftRight" => "Nat.shiftRight",
+        let ty_name = match &**ty {
+            ExprData::Const(t, _) => self.name_str(*t),
             _ => return Ok(None),
         };
-        let Some(opn) = self.find_name(op) else {
+        let is_nat = self
+            .nat_ref
+            .is_some_and(|n| matches!(&**ty, ExprData::Const(t, _) if *t == n));
+        let is_combo = ty_name == "LinearCombo" || ty_name.ends_with(".LinearCombo");
+        if !is_nat && !is_combo {
+            return Ok(None);
+        }
+        let op = if is_combo {
+            match name {
+                "HAdd.hAdd" | "Add.add" => "LinearCombo.add",
+                "HSub.hSub" | "Sub.sub" => "LinearCombo.sub",
+                _ => return Ok(None),
+            }
+        } else {
+            match name {
+                "HAdd.hAdd" | "Add.add" => "Nat.add",
+                "HMul.hMul" | "Mul.mul" => "Nat.mul",
+                "HPow.hPow" | "Pow.pow" => "Nat.pow",
+                "HSub.hSub" | "Sub.sub" => "Nat.sub",
+                "HMod.hMod" | "Mod.mod" => "Nat.mod",
+                "HDiv.hDiv" | "Div.div" => "Nat.div",
+                "HShiftLeft.hShiftLeft" | "ShiftLeft.shiftLeft" => "Nat.shiftLeft",
+                "HShiftRight.hShiftRight" | "ShiftRight.shiftRight" => "Nat.shiftRight",
+                _ => return Ok(None),
+            }
+        };
+        let Some(opn) = self.find_name_ending(op) else {
             return Ok(None);
         };
         let lhs = args[lhs_i].clone();
@@ -2283,6 +2300,94 @@ impl<'e> Checker<'e> {
             .iter()
             .position(|n| n.as_str() == s)
             .map(|i| i as u32)
+    }
+
+    fn find_name_ending(&self, suffix: &str) -> Option<u32> {
+        self.names
+            .iter()
+            .position(|n| {
+                let s = n.as_str();
+                s == suffix || s.ends_with(&format!(".{suffix}"))
+            })
+            .map(|i| i as u32)
+    }
+
+    /// Reduce Lean.Omega.LinearCombo eval/add/sub so omega reflection
+    /// proofs (e.g. utf8DecodeChar assemble) can see `eval (a - b)` as
+    /// `a.const - b.const + dot …`.
+    fn try_omega_combo(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
+        let n = match &***head {
+            ExprData::Const(n, _) => *n,
+            _ => return Ok(None),
+        };
+        let name = self.name_str(n);
+        if !name.contains("LinearCombo") {
+            return Ok(None);
+        }
+        let ends = |s: &str| name == s || name.ends_with(&format!(".{s}"));
+        let Some(combo) = self.find_name_ending("LinearCombo") else {
+            return Ok(None);
+        };
+        if ends("LinearCombo.eval") && args.len() >= 2 {
+            let lc = self.whnf(ctx, &args[0])?;
+            let values = args[1].clone();
+            let cnst = expr::proj(combo, 0, lc.clone());
+            let coeffs = expr::proj(combo, 1, lc);
+            let Some(dot) = self.find_name_ending("Coeffs.dot") else {
+                return Ok(None);
+            };
+            let dotted = expr::apps(expr::const_(dot, vec![]), &[coeffs, values]);
+            let Some(iadd) = self.find_name_ending("Int.add") else {
+                return Ok(None);
+            };
+            let sum = expr::apps(expr::const_(iadd, vec![]), &[cnst, dotted]);
+            return Ok(Some(expr::apps(sum, &args[2..])));
+        }
+        if (ends("LinearCombo.sub") || ends("LinearCombo.add")) && args.len() >= 2 {
+            let a = args[0].clone();
+            let b = args[1].clone();
+            let Some(mk) = self.find_name_ending("LinearCombo.mk") else {
+                return Ok(None);
+            };
+            let ac = expr::proj(combo, 0, a.clone());
+            let bc = expr::proj(combo, 0, b.clone());
+            let aco = expr::proj(combo, 1, a);
+            let bco = expr::proj(combo, 1, b);
+            let (const_, coeffs) = if ends("LinearCombo.sub") {
+                let Some(isub) = self.find_name_ending("Int.sub") else {
+                    return Ok(None);
+                };
+                let csub = self
+                    .find_name_ending("Coeffs.sub")
+                    .or_else(|| self.find_name_ending("IntList.sub"));
+                let coeffs = if let Some(csub) = csub {
+                    expr::apps(expr::const_(csub, vec![]), &[aco, bco])
+                } else if let Some(hsub) = self.find_name_ending("HSub.hSub") {
+                    expr::apps(expr::const_(hsub, vec![]), &[aco, bco])
+                } else {
+                    return Ok(None);
+                };
+                (expr::apps(expr::const_(isub, vec![]), &[ac, bc]), coeffs)
+            } else {
+                let Some(iadd) = self.find_name_ending("Int.add") else {
+                    return Ok(None);
+                };
+                let cadd = self
+                    .find_name_ending("Coeffs.add")
+                    .or_else(|| self.find_name_ending("IntList.add"));
+                let coeffs = if let Some(cadd) = cadd {
+                    expr::apps(expr::const_(cadd, vec![]), &[aco, bco])
+                } else if let Some(hadd) = self.find_name_ending("HAdd.hAdd") {
+                    expr::apps(expr::const_(hadd, vec![]), &[aco, bco])
+                } else {
+                    return Ok(None);
+                };
+                (expr::apps(expr::const_(iadd, vec![]), &[ac, bc]), coeffs)
+            };
+            let mked = expr::apps(expr::const_(mk, vec![]), &[const_, coeffs]);
+            return Ok(Some(expr::apps(mked, &args[2..])));
+        }
+        Ok(None)
     }
 
     fn string_to_byte_array(&self, s: &str) -> Option<Expr> {

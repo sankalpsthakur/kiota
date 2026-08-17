@@ -5,5 +5,12 @@ description: |
 version: "0.1.0"
 url: https://github.com/sankalpsthakur/kiota
 ref: main
-build: cargo build --release
+build: |
+  ROOT=$(cd ../../../.. && pwd)
+  "$ROOT/lka.py" build-test init-prelude
+  mkdir -p "$PWD/pgo"
+  RUSTFLAGS="-C target-cpu=native -Cprofile-generate=$PWD/pgo" cargo build --release
+  ./target/release/kiota "$ROOT/_build/tests/init-prelude.ndjson" >/dev/null || true
+  llvm-profdata merge -o "$PWD/pgo/merged.profdata" "$PWD/pgo"
+  RUSTFLAGS="-C target-cpu=native -Cprofile-use=$PWD/pgo/merged.profdata" cargo build --release
 run: timeout 3600 ./target/release/kiota "$IN"

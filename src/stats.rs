@@ -86,8 +86,9 @@ thread_local! {
 /// `KIOTA_TRACE_TARGET` selects which declaration (default: fixF_eq).
 pub fn set_verbose_target(name: &str) {
     let on = std::env::var("KIOTA_TRACE_TARGET")
-        .map(|t| name.contains(&t))
-        .unwrap_or_else(|_| name.contains("fixF_eq"));
+        .ok()
+        .filter(|t| !t.is_empty())
+        .is_some_and(|t| name.contains(&t));
     VERBOSE.with(|c| c.set(on));
 }
 

@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use kiota::parser;
 use kiota::tc;
 use std::io::{BufReader, Cursor, Read, Write};
