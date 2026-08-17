@@ -107,7 +107,7 @@ thread_local! {
 pub fn set_theorem_delta_scope(name: &str) {
     let on = std::env::var("KIOTA_THEOREM_DELTA_TARGET")
         .map(|t| name.contains(&t))
-        .unwrap_or(true);
+        .unwrap_or_else(|_| name.contains("fixF_eq"));
     THEOREM_DELTA_SCOPE.with(|c| c.set(on));
 }
 

@@ -14,6 +14,7 @@ pub struct Parser {
     pub levels: Vec<Level>,
     pub exprs: Vec<Expr>,
     pub env: Environment,
+    pub decl_count: usize,
 }
 
 fn bi_of(s: &str) -> BinderInfo {
@@ -33,6 +34,7 @@ impl Parser {
             levels: vec![level::zero()], // index 0 = zero
             exprs: Vec::new(),
             env: Environment::default(),
+            decl_count: 0,
         }
     }
 
@@ -583,6 +585,11 @@ impl Parser {
 
     fn check_last(&mut self, d: &Value, kind: &str) -> Result<(), TcError> {
         let name = Self::get_u32(d, "name");
+        self.decl_count += 1;
+        if self.decl_count >= 3000 || self.decl_count % 1000 == 0 || std::env::var_os("KIOTA_PROGRESS").is_some() {
+            let nm = self.names.get(name as usize).map(|s| s.as_str()).unwrap_or("?");
+            eprintln!("[decl #{}] {kind} {nm}", self.decl_count);
+        }
         let nat_ref = self.name_by_str.get("Nat").copied();
         let string_ref = self.name_by_str.get("String").copied();
         Checker::new(&self.env, &self.names, nat_ref, string_ref)

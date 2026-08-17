@@ -38,6 +38,59 @@ pub fn sub_values(a: &BigUint, b: &BigUint) -> BigUint {
     }
 }
 
+pub fn div_values(a: &BigUint, b: &BigUint) -> BigUint {
+    if *b == BigUint::from(0u32) {
+        BigUint::from(0u32)
+    } else {
+        a / b
+    }
+}
+
+pub fn mod_values(a: &BigUint, b: &BigUint) -> BigUint {
+    if *b == BigUint::from(0u32) {
+        a.clone()
+    } else {
+        a % b
+    }
+}
+
+pub fn shift_left_values(a: &BigUint, b: &BigUint) -> Option<BigUint> {
+    if *b == BigUint::from(0u32) {
+        return Some(a.clone());
+    }
+    if b.bits() > 16 {
+        return None;
+    }
+    let shift = b.to_u64_digits().first().copied().unwrap_or(0) as usize;
+    if shift > 100_000 {
+        return None;
+    }
+    Some(a << shift)
+}
+
+pub fn shift_right_values(a: &BigUint, b: &BigUint) -> BigUint {
+    if *b == BigUint::from(0u32) {
+        return a.clone();
+    }
+    if b.bits() > 16 {
+        return BigUint::from(0u32);
+    }
+    let shift = b.to_u64_digits().first().copied().unwrap_or(0) as usize;
+    a >> shift
+}
+
+pub fn land_values(a: &BigUint, b: &BigUint) -> BigUint {
+    a & b
+}
+
+pub fn lor_values(a: &BigUint, b: &BigUint) -> BigUint {
+    a | b
+}
+
+pub fn xor_values(a: &BigUint, b: &BigUint) -> BigUint {
+    a ^ b
+}
+
 pub fn ble_values(a: &BigUint, b: &BigUint) -> bool {
     a <= b
 }
