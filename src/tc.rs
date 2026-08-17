@@ -2,6 +2,7 @@ use crate::env::{ConstantInfo, Environment, QuotKind, ReducibilityHints};
 use crate::expr::{self, BinderInfo, Expr, ExprData, Lit};
 use crate::level::{self, Level};
 use crate::nat;
+use num_bigint::{BigInt, BigUint, Sign};
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -16,6 +17,64 @@ pub type R<T> = Result<T, TcError>;
 
 fn reject<T>(msg: impl Into<String>) -> R<T> {
     Err(TcError::Reject(msg.into()))
+}
+
+/// Lean `Int.ediv` (Euclidean). `y = 0` yields `0`.
+fn int_ediv(a: &BigInt, b: &BigInt) -> BigInt {
+    if b.sign() == Sign::NoSign {
+        return BigInt::from(0);
+    }
+    let a_neg = a.sign() == Sign::Minus;
+    let b_neg = b.sign() == Sign::Minus;
+    let babs = BigInt::from(b.magnitude().clone());
+    if !a_neg && !b_neg {
+        a / b
+    } else if !a_neg && b_neg {
+        -(a / &babs)
+    } else if a_neg && !b_neg {
+        let m: BigInt = -a - BigInt::from(1);
+        let q: BigInt = m / b + BigInt::from(1);
+        -q
+    } else {
+        let m: BigInt = -a - BigInt::from(1);
+        m / babs + BigInt::from(1)
+    }
+}
+
+#[cfg(test)]
+mod closed_int_tests {
+    use super::*;
+
+    #[test]
+    fn ediv_matches_lean_tidy_div() {
+        let n = BigInt::from(4294967296u64);
+        let k = BigInt::from(64);
+        assert_eq!(int_ediv(&-&n, &k), -BigInt::from(67108864));
+        assert_eq!(-int_ediv(&-&n, &k), BigInt::from(67108864));
+        assert_eq!(int_ediv(&n, &k), BigInt::from(67108864));
+        assert_eq!(int_ediv(&BigInt::from(-12), &BigInt::from(7)), BigInt::from(-2));
+        assert_eq!(int_ediv(&BigInt::from(12), &BigInt::from(-7)), BigInt::from(-1));
+        assert_eq!(int_ediv(&BigInt::from(12), &BigInt::from(0)), BigInt::from(0));
+    }
+
+    #[test]
+    fn gcd_64_then_0() {
+        assert_eq!(
+            num_bigint_gcd(&BigUint::from(64u32), &BigUint::from(0u32)),
+            BigUint::from(64u32)
+        );
+    }
+}
+
+fn num_bigint_gcd(a: &BigUint, b: &BigUint) -> BigUint {
+    let mut x = a.clone();
+    let mut y = b.clone();
+    while y != BigUint::from(0u32) {
+        let r = &x % &y;
+        x = y;
+        y = r;
+    }
+    x
 }
 fn decline<T>(msg: impl Into<String>) -> R<T> {
     Err(TcError::Decline(msg.into()))
@@ -828,6 +887,14 @@ impl<'e> Checker<'e> {
                                 cur = r;
                                 continue;
                             }
+                            if let Some(r) = self.try_omega_constraint(ctx, &head, &args)? {
+                                cur = r;
+                                continue;
+                            }
+                            if let Some(r) = self.try_intlist(ctx, &head, &args)? {
+                                cur = r;
+                                continue;
+                            }
                             if let Some(r) = self.try_dite(ctx, &head, &args)? {
                                 cur = r;
                                 continue;
@@ -984,6 +1051,13 @@ impl<'e> Checker<'e> {
         let r = self.is_def_eq_core_go(ctx, a, b)?;
         if !r && crate::stats::trace_neq() {
             eprintln!("NEQ[{}]  {}   ###   {}", ctx.len(), self.pp_budget(a, 60), self.pp_budget(b, 60));
+        }
+        if !r && std::env::var_os("KIOTA_TRACE_NEG").is_some() {
+            let pa = self.pp_budget(a, 40);
+            let pb = self.pp_budget(b, 40);
+            if pa.contains("4294967296") || pb.contains("4294967296") {
+                eprintln!("NEQ32[{}]  {pa}   ###   {pb}", ctx.len());
+            }
         }
         Ok(r)
     }
@@ -2196,6 +2270,77 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
+            "Int.neg" if !args.is_empty() => {
+                // Only when the argument is ≤ 0, so the result is a
+                // non-negative `OfNat`. Negating a positive OfNat would
+                // rebuild `Int.neg (OfNat n)` and loop in WHNF.
+                if let Some(v) = self.closed_int_value(ctx, &args[0])? {
+                    if v.sign() != Sign::Plus {
+                        if let Some(r) = self.mk_closed_int(&-v) {
+                            return Ok(Some(expr::apps(r, &args[1..])));
+                        }
+                    }
+                }
+                // Peel the *raw* argument. Full WHNF would unfold the inner
+                // `Int.neg` to `Int.rec` and the double-neg cancel would miss.
+                if let Some(inner) = self.peel_int_neg(&args[0]) {
+                    let inner_w = self.whnf(ctx, &inner)?;
+                    if self.is_closed_int_numeral(&inner_w) {
+                        return Ok(Some(expr::apps(inner_w, &args[1..])));
+                    }
+                }
+                Ok(None)
+            }
+            "Int.ediv" | "Int.div" if args.len() >= 2 => {
+                if let (Some(a), Some(b)) = (
+                    self.closed_int_value(ctx, &args[0])?,
+                    self.closed_int_value(ctx, &args[1])?,
+                ) {
+                    if let Some(r) = self.mk_closed_int(&int_ediv(&a, &b)) {
+                        return Ok(Some(expr::apps(r, &args[2..])));
+                    }
+                }
+                Ok(None)
+            }
+            "HDiv.hDiv" if args.len() >= 6 => {
+                let ty = self.whnf(ctx, &args[0])?;
+                let ty_name = match &**ty {
+                    ExprData::Const(t, _) => self.name_str(*t),
+                    _ => return Ok(None),
+                };
+                if ty_name == "Int" || ty_name.ends_with(".Int") {
+                    if let (Some(a), Some(b)) = (
+                        self.closed_int_value(ctx, &args[4])?,
+                        self.closed_int_value(ctx, &args[5])?,
+                    ) {
+                        if let Some(r) = self.mk_closed_int(&int_ediv(&a, &b)) {
+                            return Ok(Some(expr::apps(r, &args[6..])));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            "Int.natAbs" if !args.is_empty() => {
+                if let Some(v) = self.closed_int_value(ctx, &args[0])? {
+                    return Ok(Some(expr::apps(
+                        expr::lit_nat(v.magnitude().clone()),
+                        &args[1..],
+                    )));
+                }
+                Ok(None)
+            }
+            "Nat.gcd" if args.len() >= 2 => {
+                if let (Some(a), Some(b)) = (
+                    self.closed_nat_value(ctx, &args[0])?,
+                    self.closed_nat_value(ctx, &args[1])?,
+                ) {
+                    return Ok(Some(expr::apps(
+                        expr::lit_nat(num_bigint_gcd(&a, &b)),
+                        &args[2..],
+                    )));
+                }
+                Ok(None)
+            }
             "Neg.neg" if args.len() >= 3 => {
                 let ty = self.whnf(ctx, &args[0])?;
                 let ty_name = match &**ty {
@@ -2205,11 +2350,46 @@ impl<'e> Checker<'e> {
                 if ty_name != "Int" && !ty_name.ends_with(".Int") {
                     return Ok(None);
                 }
+                if let Some(inner) = self.peel_int_neg(&args[2]) {
+                    let inner_w = self.whnf(ctx, &inner)?;
+                    let closed = self.is_closed_int_numeral(&inner_w);
+                    if std::env::var_os("KIOTA_TRACE_NEG").is_some() {
+                        eprintln!(
+                            "NEG Neg.neg peel inner={} closed={closed}",
+                            self.pp_budget(&inner_w, 24)
+                        );
+                    }
+                    if closed {
+                        return Ok(Some(expr::apps(inner_w, &args[3..])));
+                    }
+                }
                 let Some(ineg) = self.find_name_ending("Int.neg") else {
                     return Ok(None);
                 };
                 let r = expr::app(expr::const_(ineg, vec![]), args[2].clone());
                 return Ok(Some(expr::apps(r, &args[3..])));
+            }
+            "Nat.cast" | "NatCast.natCast" if args.len() >= 2 => {
+                let (ty_i, val_i) = if name == "Nat.cast" && args.len() >= 3 {
+                    (0usize, 2usize)
+                } else if name == "NatCast.natCast" && args.len() >= 3 {
+                    (0usize, 2usize)
+                } else {
+                    return Ok(None);
+                };
+                let ty = self.whnf(ctx, &args[ty_i])?;
+                let ty_name = match &**ty {
+                    ExprData::Const(t, _) => self.name_str(*t),
+                    _ => return Ok(None),
+                };
+                if ty_name == "Int" || ty_name.ends_with(".Int") {
+                    if let Some(n) = self.closed_nat_value(ctx, &args[val_i])? {
+                        if let Some(r) = self.mk_closed_int(&BigInt::from(n)) {
+                            return Ok(Some(expr::apps(r, &args[val_i + 1..])));
+                        }
+                    }
+                }
+                Ok(None)
             }
             "OfNat.ofNat" if args.len() >= 3 => {
                 let Some(nat_ty) = self.nat_ref else {
@@ -2345,6 +2525,186 @@ impl<'e> Checker<'e> {
         Ok(Some(expr::apps(reduced, &args[5..])))
     }
 
+    fn is_closed_int_list(&self, e: &Expr) -> bool {
+        if self.is_list_nil(e) {
+            return true;
+        }
+        if let Some((x, xs)) = self.list_cons_parts(e) {
+            return self.is_closed_int_numeral(&x) && self.is_closed_int_list(&xs);
+        }
+        false
+    }
+
+    fn is_list_nil(&self, e: &Expr) -> bool {
+        let (h, _) = expr::unfold_apps(e);
+        match &**h {
+            ExprData::Const(n, _) => {
+                let s = self.name_str(*n);
+                s == "List.nil" || s.ends_with(".List.nil")
+            }
+            _ => false,
+        }
+    }
+
+    fn list_cons_parts(&self, e: &Expr) -> Option<(Expr, Expr)> {
+        let (h, args) = expr::unfold_apps(e);
+        let s = match &**h {
+            ExprData::Const(n, _) => self.name_str(*n),
+            _ => return None,
+        };
+        if s != "List.cons" && !s.ends_with(".List.cons") {
+            return None;
+        }
+        // List.cons.{u} α x xs
+        if args.len() >= 3 {
+            Some((args[args.len() - 2].clone(), args[args.len() - 1].clone()))
+        } else if args.len() >= 2 {
+            Some((args[0].clone(), args[1].clone()))
+        } else {
+            None
+        }
+    }
+
+    fn int_zero(&self) -> Option<Expr> {
+        if let Some(ofnat) = self.find_name("OfNat.ofNat") {
+            if let Some(int_ty) = self.find_name_ending("Int") {
+                if let Some(inst) = self
+                    .find_name("instOfNat")
+                    .or_else(|| self.find_name_ending("instOfNatInt"))
+                {
+                    return Some(expr::apps(
+                        expr::const_(ofnat, vec![level::zero()]),
+                        &[
+                            expr::const_(int_ty, vec![]),
+                            expr::lit_nat(0u32.into()),
+                            expr::app(expr::const_(inst, vec![]), expr::lit_nat(0u32.into())),
+                        ],
+                    ));
+                }
+            }
+        }
+        Some(expr::lit_nat(0u32.into()))
+    }
+
+    /// `IntList`/`Coeffs` list algebra used by omega reflection.
+    fn try_intlist(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
+        let n = match &***head {
+            ExprData::Const(n, _) => *n,
+            _ => return Ok(None),
+        };
+        let name = self.name_str(n);
+        if !name.contains("IntList") && !name.contains("Coeffs") {
+            return Ok(None);
+        }
+        let ends = |s: &str| name == s || name.ends_with(&format!(".{s}"));
+        if (ends("IntList.sub") || ends("Coeffs.sub")) && args.len() >= 2 {
+            let a = self.whnf(ctx, &args[0])?;
+            let b = self.whnf(ctx, &args[1])?;
+            // Only closed lists. `IntList.sub_eq_add_neg` is ∀ xs ys and
+            // needs `xs - ys` to stay a `sub` under binders.
+            if self.is_closed_int_list(&a) && self.is_closed_int_list(&b) && self.is_list_nil(&b)
+            {
+                return Ok(Some(expr::apps(a, &args[2..])));
+            }
+            return Ok(None);
+        }
+        if (ends("IntList.gcd") || ends("Coeffs.gcd")) && !args.is_empty() {
+            if let Some(g) = self.closed_int_list_gcd(ctx, &args[0])? {
+                return Ok(Some(expr::apps(expr::lit_nat(g), &args[1..])));
+            }
+        }
+        Ok(None)
+    }
+
+    fn option_view(&self, e: &Expr) -> Option<Option<Expr>> {
+        let (h, args) = expr::unfold_apps(e);
+        let name = match &**h {
+            ExprData::Const(n, _) => self.name_str(*n),
+            _ => return None,
+        };
+        if name == "Option.none" || name.ends_with(".Option.none") {
+            return Some(None);
+        }
+        if name == "Option.some" || name.ends_with(".Option.some") {
+            return args.last().cloned().map(Some);
+        }
+        None
+    }
+
+    fn constraint_mk_fields(&self, e: &Expr) -> Option<(Expr, Expr)> {
+        let (h, args) = expr::unfold_apps(e);
+        let name = match &**h {
+            ExprData::Const(n, _) => self.name_str(*n),
+            _ => return None,
+        };
+        if (name == "Constraint.mk" || name.ends_with(".Constraint.mk")) && args.len() >= 2 {
+            return Some((args[0].clone(), args[1].clone()));
+        }
+        None
+    }
+
+    fn option_merge_closed(
+        &self,
+        ctx: &Ctx,
+        a: &Expr,
+        b: &Expr,
+        take_max: bool,
+    ) -> R<Option<Expr>> {
+        let a = self.whnf(ctx, a)?;
+        let b = self.whnf(ctx, b)?;
+        match (self.option_view(&a), self.option_view(&b)) {
+            (Some(None), Some(None)) => Ok(Some(a)),
+            (Some(Some(_)), Some(None)) => Ok(Some(a)),
+            (Some(None), Some(Some(_))) => Ok(Some(b)),
+            (Some(Some(x)), Some(Some(y))) => {
+                let (Some(xv), Some(yv)) = (
+                    self.closed_int_value(ctx, &x)?,
+                    self.closed_int_value(ctx, &y)?,
+                ) else {
+                    return Ok(None);
+                };
+                let pick_a = if take_max { xv >= yv } else { xv <= yv };
+                Ok(Some(if pick_a { a } else { b }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// `Constraint.combine` on closed `mk`s: `max` of lower bounds, `min` of uppers.
+    fn try_omega_constraint(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
+        let n = match &***head {
+            ExprData::Const(n, _) => *n,
+            _ => return Ok(None),
+        };
+        let name = self.name_str(n);
+        if !name.contains("Constraint") {
+            return Ok(None);
+        }
+        let ends = |s: &str| name == s || name.ends_with(&format!(".{s}"));
+        if ends("Constraint.combine") && args.len() >= 2 {
+            let a = self.whnf(ctx, &args[0])?;
+            let b = self.whnf(ctx, &args[1])?;
+            let Some((alo, ahi)) = self.constraint_mk_fields(&a) else {
+                return Ok(None);
+            };
+            let Some((blo, bhi)) = self.constraint_mk_fields(&b) else {
+                return Ok(None);
+            };
+            let Some(lo) = self.option_merge_closed(ctx, &alo, &blo, true)? else {
+                return Ok(None);
+            };
+            let Some(hi) = self.option_merge_closed(ctx, &ahi, &bhi, false)? else {
+                return Ok(None);
+            };
+            let Some(mk) = self.find_name_ending("Constraint.mk") else {
+                return Ok(None);
+            };
+            let mked = expr::apps(expr::const_(mk, vec![]), &[lo, hi]);
+            return Ok(Some(expr::apps(mked, &args[2..])));
+        }
+        Ok(None)
+    }
+
     fn find_name(&self, s: &str) -> Option<u32> {
         self.names
             .iter()
@@ -2376,6 +2736,165 @@ impl<'e> Checker<'e> {
             return args.last().is_some_and(|a| self.is_closed_int_numeral(a));
         }
         false
+    }
+
+    /// `Int.neg x` or `Neg.neg Int _ x` → `x`. Used only to cancel a
+    /// second closed negation (`- - n = n`); open `n` must stay a `neg`
+    /// so `Int.neg_neg` still matches its recursor motive.
+    fn peel_int_neg(&self, e: &Expr) -> Option<Expr> {
+        let (h, args) = expr::unfold_apps(e);
+        let name = match &**h {
+            ExprData::Const(n, _) => self.name_str(*n),
+            _ => return None,
+        };
+        if name == "Int.neg" || name.ends_with(".Int.neg") {
+            return args.first().cloned();
+        }
+        if name == "Neg.neg" && args.len() >= 3 {
+            return Some(args[2].clone());
+        }
+        None
+    }
+
+    fn closed_nat_value(&self, ctx: &Ctx, e: &Expr) -> R<Option<BigUint>> {
+        let a = self.reduce_nat_arg(ctx, e)?;
+        if let Some(v) = nat::as_lit(&a) {
+            return Ok(Some(v.clone()));
+        }
+        if let Some((zero, succ)) = self.nat_ctors() {
+            if let Some(v) = nat::numeral_value(&a, zero, succ) {
+                return Ok(Some(v));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Closed `Int` numerals only. Open terms (e.g. `0 - n`) stay untouched
+    /// so lemmas like `Int.zero_sub` still see a `sub`.
+    fn closed_int_value(&self, ctx: &Ctx, e: &Expr) -> R<Option<BigInt>> {
+        if let ExprData::Lit(Lit::Nat(n)) = &***e {
+            return Ok(Some(BigInt::from(n.clone())));
+        }
+        let (h, args) = expr::unfold_apps(e);
+        let name = match &**h {
+            ExprData::Const(n, _) => self.name_str(*n),
+            _ => return Ok(None),
+        };
+        if name == "OfNat.ofNat" && args.len() >= 2 {
+            if let Some(n) = self.closed_nat_value(ctx, &args[1])? {
+                return Ok(Some(BigInt::from(n)));
+            }
+            return Ok(None);
+        }
+        if name == "Int.ofNat" || name.ends_with(".Int.ofNat") {
+            if let Some(n) = args.first() {
+                if let Some(v) = self.closed_nat_value(ctx, n)? {
+                    return Ok(Some(BigInt::from(v)));
+                }
+            }
+            return Ok(None);
+        }
+        if name == "Int.negSucc" || name.ends_with(".Int.negSucc") {
+            if let Some(n) = args.first() {
+                if let Some(v) = self.closed_nat_value(ctx, n)? {
+                    return Ok(Some(-BigInt::from(v) - 1));
+                }
+            }
+            return Ok(None);
+        }
+        if name == "Int.neg" || name.ends_with(".Int.neg") {
+            if let Some(a) = args.first() {
+                if let Some(v) = self.closed_int_value(ctx, a)? {
+                    return Ok(Some(-v));
+                }
+            }
+            return Ok(None);
+        }
+        if name == "Neg.neg" && args.len() >= 3 {
+            if let Some(v) = self.closed_int_value(ctx, &args[2])? {
+                return Ok(Some(-v));
+            }
+            return Ok(None);
+        }
+        if (name == "Int.ediv" || name.ends_with(".Int.ediv") || name == "Int.div")
+            && args.len() >= 2
+        {
+            if let (Some(a), Some(b)) = (
+                self.closed_int_value(ctx, &args[0])?,
+                self.closed_int_value(ctx, &args[1])?,
+            ) {
+                return Ok(Some(int_ediv(&a, &b)));
+            }
+            return Ok(None);
+        }
+        if name == "HDiv.hDiv" && args.len() >= 6 {
+            if let (Some(a), Some(b)) = (
+                self.closed_int_value(ctx, &args[4])?,
+                self.closed_int_value(ctx, &args[5])?,
+            ) {
+                return Ok(Some(int_ediv(&a, &b)));
+            }
+            return Ok(None);
+        }
+        if (name == "Nat.cast" || name == "NatCast.natCast") && args.len() >= 3 {
+            if let Some(n) = self.closed_nat_value(ctx, &args[2])? {
+                return Ok(Some(BigInt::from(n)));
+            }
+            return Ok(None);
+        }
+        if name == "NatCast.natCast" && args.len() >= 2 {
+            if let Some(n) = self.closed_nat_value(ctx, &args[1])? {
+                return Ok(Some(BigInt::from(n)));
+            }
+            return Ok(None);
+        }
+        Ok(None)
+    }
+
+    fn mk_closed_int(&self, v: &BigInt) -> Option<Expr> {
+        if v.sign() == Sign::Minus {
+            let pos = self.mk_closed_int(&-v)?;
+            let ineg = self.find_name_ending("Int.neg")?;
+            return Some(expr::app(expr::const_(ineg, vec![]), pos));
+        }
+        let n: BigUint = v.magnitude().clone();
+        let ofnat = self.find_name("OfNat.ofNat")?;
+        let int_ty = self.find_name_ending("Int")?;
+        let inst = self
+            .find_name("instOfNat")
+            .or_else(|| self.find_name_ending("instOfNatInt"))?;
+        let lit = expr::lit_nat(n);
+        Some(expr::apps(
+            expr::const_(ofnat, vec![level::zero()]),
+            &[
+                expr::const_(int_ty, vec![]),
+                lit.clone(),
+                expr::app(expr::const_(inst, vec![]), lit),
+            ],
+        ))
+    }
+
+    fn closed_int_list_gcd(&self, ctx: &Ctx, e: &Expr) -> R<Option<BigUint>> {
+        let mut cur = self.whnf(ctx, e)?;
+        let mut g = BigUint::from(0u32);
+        loop {
+            if self.is_list_nil(&cur) {
+                return Ok(Some(g));
+            }
+            let Some((x, xs)) = self.list_cons_parts(&cur) else {
+                return Ok(None);
+            };
+            let Some(v) = self.closed_int_value(ctx, &x)? else {
+                return Ok(None);
+            };
+            let abs = v.magnitude().clone();
+            g = if g == BigUint::from(0u32) {
+                abs
+            } else {
+                num_bigint_gcd(&g, &abs)
+            };
+            cur = self.whnf(ctx, &xs)?;
+        }
     }
 
     fn is_int_of_nat_zero(&self, e: &Expr) -> bool {
@@ -2431,8 +2950,11 @@ impl<'e> Checker<'e> {
             let values = args[1].clone();
             let (lhead, largs) = expr::unfold_apps(&lc);
             let lname = match &**lhead {
-                ExprData::Const(cn, _) => self.name_str(*cn),
-                _ => "",
+                ExprData::Const(cn, _) => self.name_str(*cn).to_string(),
+                ExprData::Proj(s, i, _) => {
+                    format!("proj:{}.{}", self.name_str(*s), i)
+                }
+                _ => format!("head:{}", self.pp_budget(&lhead, 20)),
             };
             let (cnst, coeffs) =
                 if (lname == "LinearCombo.mk" || lname.ends_with(".LinearCombo.mk"))
@@ -2445,11 +2967,24 @@ impl<'e> Checker<'e> {
                         expr::proj(combo, 1, lc),
                     )
                 };
-            let Some(dot) = self.find_name_ending("Coeffs.dot") else {
+            let dot = self.find_name_ending("Coeffs.dot");
+            let iadd = self.find_name_ending("Int.add");
+            if std::env::var_os("KIOTA_TRACE_OMEGA").is_some() {
+                eprintln!(
+                    "OMEGA eval nargs={} lname={lname} nargs_lc={} dot={} iadd={} cnst={} coeffs={}",
+                    args.len(),
+                    largs.len(),
+                    dot.is_some(),
+                    iadd.is_some(),
+                    self.pp_budget(&cnst, 28),
+                    self.pp_budget(&coeffs, 28),
+                );
+            }
+            let Some(dot) = dot else {
                 return Ok(None);
             };
             let dotted = expr::apps(expr::const_(dot, vec![]), &[coeffs, values]);
-            let Some(iadd) = self.find_name_ending("Int.add") else {
+            let Some(iadd) = iadd else {
                 return Ok(None);
             };
             let sum = expr::apps(expr::const_(iadd, vec![]), &[cnst, dotted]);

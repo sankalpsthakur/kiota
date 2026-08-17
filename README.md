@@ -59,9 +59,9 @@ substitution skips those subterms, and inference is memoised on
 
 Outside the tarball, `nested-nonuniform-param` (`either`) rejects with
 `non-uniform nested inductive parameter` in 0.01s. Large corpora are
-run, not declined. Init currently rejects at
-`ByteArray.utf8DecodeChar?.assemble₂._proof_1` (omega `LinearCombo`
-defeq) after getting past `UInt32.toNat_shiftLeft`.
+run, not declined. Init prefix through `utf8DecodeChar?.assemble₂`
+accepts (closed `Int.ediv` / `gcd` / `Constraint.combine`). Full Init
+is not yet walked end-to-end.
 
 On the 2026-08-14 published tarball the ranking key was `(0
 bad-not-rejected, 2 good-not-accepted, no mathlib, 5 declines)` —
