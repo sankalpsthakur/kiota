@@ -2183,6 +2183,34 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
+            "Int.sub" if args.len() >= 2 => {
+                let a = self.whnf(ctx, &args[0])?;
+                let b = self.whnf(ctx, &args[1])?;
+                // Only closed numerals — `Int.zero_sub` needs `0 - n` to stay
+                // a `sub` so its recursor motive matches.
+                if self.is_int_of_nat_zero(&a) && self.is_closed_int_numeral(&b) {
+                    if let Some(ineg) = self.find_name_ending("Int.neg") {
+                        let r = expr::app(expr::const_(ineg, vec![]), b);
+                        return Ok(Some(expr::apps(r, &args[2..])));
+                    }
+                }
+                Ok(None)
+            }
+            "Neg.neg" if args.len() >= 3 => {
+                let ty = self.whnf(ctx, &args[0])?;
+                let ty_name = match &**ty {
+                    ExprData::Const(t, _) => self.name_str(*t),
+                    _ => return Ok(None),
+                };
+                if ty_name != "Int" && !ty_name.ends_with(".Int") {
+                    return Ok(None);
+                }
+                let Some(ineg) = self.find_name_ending("Int.neg") else {
+                    return Ok(None);
+                };
+                let r = expr::app(expr::const_(ineg, vec![]), args[2].clone());
+                return Ok(Some(expr::apps(r, &args[3..])));
+            }
             "OfNat.ofNat" if args.len() >= 3 => {
                 let Some(nat_ty) = self.nat_ref else {
                     return Ok(None);
@@ -2223,13 +2251,35 @@ impl<'e> Checker<'e> {
             .nat_ref
             .is_some_and(|n| matches!(&**ty, ExprData::Const(t, _) if *t == n));
         let is_combo = ty_name == "LinearCombo" || ty_name.ends_with(".LinearCombo");
-        if !is_nat && !is_combo {
+        let is_int_name = |s: &str| s == "Int" || s.ends_with(".Int");
+        // HMul Int IntList IntList has first type Int — do not rewrite to Int.mul.
+        let is_int = if matches!(
+            name,
+            "HAdd.hAdd" | "HSub.hSub" | "HMul.hMul" | "HDiv.hDiv" | "HMod.hMod"
+        ) && args.len() >= 3
+        {
+            let t1 = self.whnf(ctx, &args[1])?;
+            let t2 = self.whnf(ctx, &args[2])?;
+            is_int_name(ty_name)
+                && matches!(&**t1, ExprData::Const(t, _) if is_int_name(self.name_str(*t)))
+                && matches!(&**t2, ExprData::Const(t, _) if is_int_name(self.name_str(*t)))
+        } else {
+            is_int_name(ty_name)
+        };
+        if !is_nat && !is_combo && !is_int {
             return Ok(None);
         }
         let op = if is_combo {
             match name {
                 "HAdd.hAdd" | "Add.add" => "LinearCombo.add",
                 "HSub.hSub" | "Sub.sub" => "LinearCombo.sub",
+                _ => return Ok(None),
+            }
+        } else if is_int {
+            match name {
+                "HAdd.hAdd" | "Add.add" => "Int.add",
+                "HSub.hSub" | "Sub.sub" => "Int.sub",
+                "HMul.hMul" | "Mul.mul" => "Int.mul",
                 _ => return Ok(None),
             }
         } else {
@@ -2302,6 +2352,54 @@ impl<'e> Checker<'e> {
             .map(|i| i as u32)
     }
 
+    fn is_closed_int_numeral(&self, e: &Expr) -> bool {
+        if let ExprData::Lit(Lit::Nat(_)) = &***e {
+            return true;
+        }
+        let (h, args) = expr::unfold_apps(e);
+        let name = match &**h {
+            ExprData::Const(n, _) => self.name_str(*n),
+            _ => return false,
+        };
+        if name == "OfNat.ofNat" && args.len() >= 2 {
+            return matches!(&**args[1], ExprData::Lit(Lit::Nat(_)));
+        }
+        if name == "Int.ofNat" || name.ends_with(".Int.ofNat") {
+            return !args.is_empty()
+                && matches!(&**args[0], ExprData::Lit(Lit::Nat(_)));
+        }
+        if name == "Int.negSucc" || name.ends_with(".Int.negSucc") {
+            return !args.is_empty()
+                && matches!(&**args[0], ExprData::Lit(Lit::Nat(_)));
+        }
+        if name == "Int.neg" || name.ends_with(".Int.neg") || name == "Neg.neg" {
+            return args.last().is_some_and(|a| self.is_closed_int_numeral(a));
+        }
+        false
+    }
+
+    fn is_int_of_nat_zero(&self, e: &Expr) -> bool {
+        if let ExprData::Lit(Lit::Nat(n)) = &***e {
+            return *n == num_bigint::BigUint::from(0u32);
+        }
+        let (h, args) = expr::unfold_apps(e);
+        let name = match &**h {
+            ExprData::Const(n, _) => self.name_str(*n),
+            _ => return false,
+        };
+        if name == "OfNat.ofNat" && args.len() >= 2 {
+            if let ExprData::Lit(Lit::Nat(n)) = &**args[1] {
+                return *n == num_bigint::BigUint::from(0u32);
+            }
+        }
+        if (name == "Int.ofNat" || name.ends_with(".Int.ofNat")) && !args.is_empty() {
+            if let ExprData::Lit(Lit::Nat(n)) = &**args[0] {
+                return *n == num_bigint::BigUint::from(0u32);
+            }
+        }
+        false
+    }
+
     fn find_name_ending(&self, suffix: &str) -> Option<u32> {
         self.names
             .iter()
@@ -2331,8 +2429,22 @@ impl<'e> Checker<'e> {
         if ends("LinearCombo.eval") && args.len() >= 2 {
             let lc = self.whnf(ctx, &args[0])?;
             let values = args[1].clone();
-            let cnst = expr::proj(combo, 0, lc.clone());
-            let coeffs = expr::proj(combo, 1, lc);
+            let (lhead, largs) = expr::unfold_apps(&lc);
+            let lname = match &**lhead {
+                ExprData::Const(cn, _) => self.name_str(*cn),
+                _ => "",
+            };
+            let (cnst, coeffs) =
+                if (lname == "LinearCombo.mk" || lname.ends_with(".LinearCombo.mk"))
+                    && largs.len() >= 2
+                {
+                    (largs[0].clone(), largs[1].clone())
+                } else {
+                    (
+                        expr::proj(combo, 0, lc.clone()),
+                        expr::proj(combo, 1, lc),
+                    )
+                };
             let Some(dot) = self.find_name_ending("Coeffs.dot") else {
                 return Ok(None);
             };
