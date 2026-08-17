@@ -48,6 +48,10 @@ pub fn whnf_calls() -> u64 {
     WHNF_CALLS.with(|c| c.get())
 }
 
+pub fn defeq_calls() -> u64 {
+    DEFEQ_CALLS.with(|c| c.get())
+}
+
 pub fn report() {
     if !enabled() {
         return;

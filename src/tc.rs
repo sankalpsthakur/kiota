@@ -98,6 +98,8 @@ pub struct Checker<'e> {
     /// shared by the DAG is otherwise re-inferred once per occurrence, so a
     /// term applied to two identical arguments doubles the work at every level.
     infer_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
+    /// `Nat.rec` peels of literals with `bits() >= 20` (`hugeFuel = 1e6`).
+    fuel_nat_peels: std::cell::Cell<u32>,
 }
 
 thread_local! {
@@ -185,6 +187,7 @@ impl<'e> Checker<'e> {
             defeq_cache: RefCell::new(FxHashMap::default()),
             infer_cache: RefCell::new(FxHashMap::default()),
             unfold_cache: RefCell::new(FxHashMap::default()),
+            fuel_nat_peels: std::cell::Cell::new(0),
         }
     }
 
@@ -296,6 +299,15 @@ impl<'e> Checker<'e> {
             .get(name)
             .ok_or_else(|| TcError::Other(format!("missing const {name}")))?;
         crate::stats::set_theorem_delta_scope(self.name_str(name));
+        self.fuel_nat_peels.set(0);
+        // Pointer-keyed WHNF/defeq/infer caches are only useful inside one
+        // declaration. Keeping them across decls is how `#3491`–`#3495`
+        // grew from ~0.9 GB to multi-GB before the next omega proof.
+        // `unfold_cache` is keyed by (const, levels) and is reused.
+        self.whnf_cache.borrow_mut().clear();
+        self.whnf_core_cache.borrow_mut().clear();
+        self.defeq_cache.borrow_mut().clear();
+        self.infer_cache.borrow_mut().clear();
         if std::env::var_os("KIOTA_TRACE_DECL").is_some() {
             eprintln!("DECL {kind} {}", self.name_str(name));
         }
@@ -1031,6 +1043,19 @@ impl<'e> Checker<'e> {
 
     pub fn is_def_eq(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         crate::stats::defeq_call();
+        if crate::stats::enabled() {
+            let n = crate::stats::defeq_calls();
+            if n > 0 && n % 20_000 == 0 {
+                eprintln!(
+                    "MEM defeq={n} whnf={} core={} defeqc={} unfold={} infer={}",
+                    self.whnf_cache.borrow().len(),
+                    self.whnf_core_cache.borrow().len(),
+                    self.defeq_cache.borrow().len(),
+                    self.unfold_cache.borrow().len(),
+                    self.infer_cache.borrow().len(),
+                );
+            }
+        }
         if Rc::ptr_eq(a, b) || a == b {
             return Ok(true);
         }
@@ -1393,6 +1418,11 @@ impl<'e> Checker<'e> {
         Ok(Some(true))
     }
 
+    /// `Poly.cancelAux hugeFuel` (`1e6`, 20 bits) needs O(|poly|) peels.
+    /// A million-step countdown of that fuel is the `#3256` hang; keep
+    /// this well above typical poly length and well below `1e6`.
+    const FUEL_NAT_LIT_PEEL_MAX: u32 = 2048;
+
     fn try_iota(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
         let (rname, us) = match &***head {
             ExprData::Const(n, us) => (*n, us.clone()),
@@ -1464,13 +1494,22 @@ impl<'e> Checker<'e> {
                         if n == &num_bigint::BigUint::from(0u32) {
                             Some((zero, 0, vec![]))
                         } else if n.bits() > 24 {
-                            // `Nat.rec` on a literal is one `succ` peel per
-                            // WHNF. Init's linear-arith `eagerReduce` peels
-                            // `1_000_000` (20 bits) and must be allowed;
-                            // `UInt32.toNat_shiftLeft` peels `2^32` (33 bits)
-                            // and hangs. Native Nat ops cover the closed
-                            // 32-bit cases.
+                            // `UInt32.toNat_shiftLeft` peels `2^32` (33 bits).
                             None
+                        } else if n.bits() >= 20 {
+                            // `hugeFuel = 1_000_000`. `cancelAux` needs
+                            // O(|poly|) successor peels; `#3256` counted
+                            // the fuel down by tens of thousands and
+                            // filled RAM. Do not cap 16–19 bit peels
+                            // here: `assemble₂._proof_2` needs those.
+                            let used = self.fuel_nat_peels.get();
+                            if used >= Self::FUEL_NAT_LIT_PEEL_MAX {
+                                None
+                            } else {
+                                self.fuel_nat_peels.set(used + 1);
+                                let pred = n - 1u32;
+                                Some((succ, 0, vec![expr::lit_nat(pred)]))
+                            }
                         } else {
                             let pred = n - 1u32;
                             Some((succ, 0, vec![expr::lit_nat(pred)]))
@@ -2613,7 +2652,44 @@ impl<'e> Checker<'e> {
                 return Ok(Some(expr::apps(expr::lit_nat(g), &args[1..])));
             }
         }
+        if (ends("IntList.combo") || ends("Coeffs.combo")) && args.len() >= 4 {
+            if let Some(r) = self.closed_coeffs_combo(
+                ctx, &args[0], &args[1], &args[2], &args[3],
+            )? {
+                return Ok(Some(expr::apps(r, &args[4..])));
+            }
+        }
         Ok(None)
+    }
+
+    fn closed_coeffs_combo(
+        &self,
+        ctx: &Ctx,
+        a: &Expr,
+        xs: &Expr,
+        b: &Expr,
+        ys: &Expr,
+    ) -> R<Option<Expr>> {
+        let (Some(av), Some(bv)) = (
+            self.closed_int_value(ctx, a)?,
+            self.closed_int_value(ctx, b)?,
+        ) else {
+            return Ok(None);
+        };
+        let (Some(xs), Some(ys)) = (
+            self.closed_int_list_values(ctx, xs)?,
+            self.closed_int_list_values(ctx, ys)?,
+        ) else {
+            return Ok(None);
+        };
+        let n = xs.len().max(ys.len());
+        let mut zs = Vec::with_capacity(n);
+        for i in 0..n {
+            let x = xs.get(i).cloned().unwrap_or_else(|| 0.into());
+            let y = ys.get(i).cloned().unwrap_or_else(|| 0.into());
+            zs.push(&av * x + &bv * y);
+        }
+        Ok(self.mk_closed_int_list(&zs))
     }
 
     fn option_view(&self, e: &Expr) -> Option<Option<Expr>> {
@@ -2702,7 +2778,117 @@ impl<'e> Checker<'e> {
             let mked = expr::apps(expr::const_(mk, vec![]), &[lo, hi]);
             return Ok(Some(expr::apps(mked, &args[2..])));
         }
+        if ends("Constraint.combo") && args.len() >= 4 {
+            if let Some(r) =
+                self.closed_constraint_combo(ctx, &args[0], &args[1], &args[2], &args[3])?
+            {
+                return Ok(Some(expr::apps(r, &args[4..])));
+            }
+        }
         Ok(None)
+    }
+
+    fn closed_option_int(
+        &self,
+        ctx: &Ctx,
+        e: &Expr,
+    ) -> R<Option<Option<num_bigint::BigInt>>> {
+        let e = self.whnf(ctx, e)?;
+        match self.option_view(&e) {
+            Some(None) => Ok(Some(None)),
+            Some(Some(x)) => Ok(self.closed_int_value(ctx, &x)?.map(Some)),
+            None => Ok(None),
+        }
+    }
+
+    fn mk_option_int(&self, v: Option<num_bigint::BigInt>) -> Option<Expr> {
+        let int_ty = expr::const_(self.find_name_ending("Int")?, vec![]);
+        match v {
+            None => {
+                let none = self.find_name("Option.none")?;
+                Some(expr::app(expr::const_(none, vec![level::zero()]), int_ty))
+            }
+            Some(n) => {
+                let some = self.find_name("Option.some")?;
+                let x = self.mk_closed_int(&n)?;
+                Some(expr::apps(
+                    expr::const_(some, vec![level::zero()]),
+                    &[int_ty, x],
+                ))
+            }
+        }
+    }
+
+    fn scale_constraint_bounds(
+        k: &num_bigint::BigInt,
+        lo: Option<num_bigint::BigInt>,
+        hi: Option<num_bigint::BigInt>,
+    ) -> (Option<num_bigint::BigInt>, Option<num_bigint::BigInt>) {
+        if k == &0.into() {
+            if let (Some(l), Some(h)) = (&lo, &hi) {
+                if h < l {
+                    return (lo, hi);
+                }
+            }
+            return (Some(0.into()), Some(0.into()));
+        }
+        if k > &0.into() {
+            (lo.map(|x| k * x), hi.map(|x| k * x))
+        } else {
+            (hi.map(|x| k * x), lo.map(|x| k * x))
+        }
+    }
+
+    fn closed_constraint_combo(
+        &self,
+        ctx: &Ctx,
+        a: &Expr,
+        x: &Expr,
+        b: &Expr,
+        y: &Expr,
+    ) -> R<Option<Expr>> {
+        let (Some(av), Some(bv)) = (
+            self.closed_int_value(ctx, a)?,
+            self.closed_int_value(ctx, b)?,
+        ) else {
+            return Ok(None);
+        };
+        let x = self.whnf(ctx, x)?;
+        let y = self.whnf(ctx, y)?;
+        let Some((xlo, xhi)) = self.constraint_mk_fields(&x) else {
+            return Ok(None);
+        };
+        let Some((ylo, yhi)) = self.constraint_mk_fields(&y) else {
+            return Ok(None);
+        };
+        let (Some(xlo), Some(xhi), Some(ylo), Some(yhi)) = (
+            self.closed_option_int(ctx, &xlo)?,
+            self.closed_option_int(ctx, &xhi)?,
+            self.closed_option_int(ctx, &ylo)?,
+            self.closed_option_int(ctx, &yhi)?,
+        ) else {
+            return Ok(None);
+        };
+        let (slo, shi) = Self::scale_constraint_bounds(&av, xlo, xhi);
+        let (tlo, thi) = Self::scale_constraint_bounds(&bv, ylo, yhi);
+        let lo = match (slo, tlo) {
+            (Some(p), Some(q)) => Some(p + q),
+            _ => None,
+        };
+        let hi = match (shi, thi) {
+            (Some(p), Some(q)) => Some(p + q),
+            _ => None,
+        };
+        let Some(mk) = self.find_name_ending("Constraint.mk") else {
+            return Ok(None);
+        };
+        let Some(lo_e) = self.mk_option_int(lo) else {
+            return Ok(None);
+        };
+        let Some(hi_e) = self.mk_option_int(hi) else {
+            return Ok(None);
+        };
+        Ok(Some(expr::apps(expr::const_(mk, vec![]), &[lo_e, hi_e])))
     }
 
     fn find_name(&self, s: &str) -> Option<u32> {
@@ -2929,6 +3115,108 @@ impl<'e> Checker<'e> {
             .map(|i| i as u32)
     }
 
+    fn linear_combo_mk_parts(&self, e: &Expr) -> Option<(Expr, Expr)> {
+        let (h, args) = expr::unfold_apps(e);
+        let name = match &**h {
+            ExprData::Const(n, _) => self.name_str(*n),
+            _ => return None,
+        };
+        if (name == "LinearCombo.mk" || name.ends_with(".LinearCombo.mk")) && args.len() >= 2 {
+            Some((args[args.len() - 2].clone(), args[args.len() - 1].clone()))
+        } else {
+            None
+        }
+    }
+
+    fn closed_int_list_values(&self, ctx: &Ctx, e: &Expr) -> R<Option<Vec<num_bigint::BigInt>>> {
+        let mut cur = self.whnf(ctx, e)?;
+        let (h, args) = expr::unfold_apps(&cur);
+        if let ExprData::Const(n, _) = &**h {
+            let name = self.name_str(*n);
+            if name.contains("ofList") && !args.is_empty() {
+                cur = self.whnf(ctx, args.last().unwrap())?;
+            }
+        }
+        let mut out = Vec::new();
+        loop {
+            if self.is_list_nil(&cur) {
+                return Ok(Some(out));
+            }
+            let Some((x, xs)) = self.list_cons_parts(&cur) else {
+                return Ok(None);
+            };
+            let Some(v) = self.closed_int_value(ctx, &x)? else {
+                return Ok(None);
+            };
+            out.push(v);
+            cur = self.whnf(ctx, &xs)?;
+        }
+    }
+
+    fn mk_closed_int_list(&self, vs: &[num_bigint::BigInt]) -> Option<Expr> {
+        let int_ty = self.find_name_ending("Int")?;
+        let nil = self.find_name("List.nil")?;
+        let cons = self.find_name("List.cons")?;
+        let ty = expr::const_(int_ty, vec![]);
+        let mut list = expr::app(expr::const_(nil, vec![level::zero()]), ty.clone());
+        for v in vs.iter().rev() {
+            let x = self.mk_closed_int(v)?;
+            list = expr::apps(
+                expr::const_(cons, vec![level::zero()]),
+                &[ty.clone(), x, list],
+            );
+        }
+        Some(list)
+    }
+
+    /// Closed `mk c₁ cs₁ ± mk c₂ cs₂` → `mk (c₁±c₂) (cs₁ ± cs₂)`.
+    /// `assemble₃` omega compares `eval (mk 0 [4096,64,1])` with
+    /// `eval ((mk 0 [4096]) + (mk 0 [0,64,1]))`.
+    fn closed_linear_combo_add_sub(
+        &self,
+        ctx: &Ctx,
+        a: &Expr,
+        b: &Expr,
+        is_sub: bool,
+    ) -> R<Option<Expr>> {
+        let Some((c1, cs1)) = self.linear_combo_mk_parts(a) else {
+            return Ok(None);
+        };
+        let Some((c2, cs2)) = self.linear_combo_mk_parts(b) else {
+            return Ok(None);
+        };
+        let (Some(k1), Some(k2)) = (
+            self.closed_int_value(ctx, &c1)?,
+            self.closed_int_value(ctx, &c2)?,
+        ) else {
+            return Ok(None);
+        };
+        let (Some(xs), Some(ys)) = (
+            self.closed_int_list_values(ctx, &cs1)?,
+            self.closed_int_list_values(ctx, &cs2)?,
+        ) else {
+            return Ok(None);
+        };
+        let k = if is_sub { k1 - k2 } else { k1 + k2 };
+        let n = xs.len().max(ys.len());
+        let mut zs = Vec::with_capacity(n);
+        for i in 0..n {
+            let x = xs.get(i).cloned().unwrap_or_else(|| 0.into());
+            let y = ys.get(i).cloned().unwrap_or_else(|| 0.into());
+            zs.push(if is_sub { x - y } else { x + y });
+        }
+        let Some(mk) = self.find_name_ending("LinearCombo.mk") else {
+            return Ok(None);
+        };
+        let Some(ck) = self.mk_closed_int(&k) else {
+            return Ok(None);
+        };
+        let Some(cl) = self.mk_closed_int_list(&zs) else {
+            return Ok(None);
+        };
+        Ok(Some(expr::apps(expr::const_(mk, vec![]), &[ck, cl])))
+    }
+
     /// Reduce Lean.Omega.LinearCombo eval/add/sub so omega reflection
     /// proofs (e.g. utf8DecodeChar assemble) can see `eval (a - b)` as
     /// `a.const - b.const + dot …`.
@@ -2991,8 +3279,12 @@ impl<'e> Checker<'e> {
             return Ok(Some(expr::apps(sum, &args[2..])));
         }
         if (ends("LinearCombo.sub") || ends("LinearCombo.add")) && args.len() >= 2 {
-            let a = args[0].clone();
-            let b = args[1].clone();
+            let is_sub = ends("LinearCombo.sub");
+            let a = self.whnf(ctx, &args[0])?;
+            let b = self.whnf(ctx, &args[1])?;
+            if let Some(r) = self.closed_linear_combo_add_sub(ctx, &a, &b, is_sub)? {
+                return Ok(Some(expr::apps(r, &args[2..])));
+            }
             let Some(mk) = self.find_name_ending("LinearCombo.mk") else {
                 return Ok(None);
             };
