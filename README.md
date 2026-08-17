@@ -23,8 +23,8 @@ reference sketch, see [mini](https://github.com/nomeata/lean-mini-kernel).
 - Nested inductives are checked, not declined: a nested occurrence must
   apply the datatype's own parameters, so `E.mk : (w : W) → L (E ⟨false⟩)
   → E w` is rejected.
-- Incomplete on purpose: full `Init`, `Std`, and mathlib are out of reach
-  on time and are declined.
+- Every arena suite is run. Large corpora (`init`, `std`, `mathlib`,
+  `cslib`, `cedar`) are no longer declined.
 
 ## Local score (2026-08-14)
 
@@ -58,16 +58,16 @@ substitution skips those subterms, and inference is memoised on
 `(context id, term)`. The whole sweep went from 50.2s to 12.1s.
 
 Outside the tarball, `nested-nonuniform-param` (`either`) rejects with
-`non-uniform nested inductive parameter` in 0.01s. Large corpora
-(`init`, `std`, `mathlib`, `cslib`, `cedar`) are declined on time.
+`non-uniform nested inductive parameter` in 0.01s. Large corpora are
+run, not declined. Init currently rejects at
+`ByteArray.utf8DecodeChar?.assemble₂._proof_1` (omega `LinearCombo`
+defeq) after getting past `UInt32.toNat_shiftLeft`.
 
-On the arena's ranking key that is `(0 bad-not-rejected,
-2 good-not-accepted, no mathlib, 5 declines)` — **9th of 17**, ahead of
-mini (same completeness, 20 declines) and ahead of `official-v4.28.0`
-and `still-nanoda`, which process mathlib but have false accepts.
-Not #1, and not close: ranking key 3 is mathlib instruction count, and a
-checker that declines mathlib sorts below every checker that processes
-it, however clean keys 1 and 2 are.
+On the 2026-08-14 published tarball the ranking key was `(0
+bad-not-rejected, 2 good-not-accepted, no mathlib, 5 declines)` —
+**9th of 17**. That decline count is now wrong: the YAML no longer
+skips those suites. Rank will move with whatever Init/mathlib actually
+do when the arena runs them.
 
 ## What's missing
 
