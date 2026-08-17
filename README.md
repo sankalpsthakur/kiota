@@ -49,7 +49,7 @@ The next independent target is not another toy test. It is:
 
 **121/121 good · 62/62 bad · 0 declines · completed mathlib benchmark**
 
-Current `main` is already beyond the Arena-pinned revision and is working through larger-corpus blockers, exact Nat reductions, numeral handling and definitional-equality performance.
+Current `main` includes the kernel that accepts Init.Prelude and an Init prefix through `utf8DecodeChar?.assemble₂` (closed `Int.ediv` / `gcd` / `Constraint.combine`). Full Init, std, mathlib, cslib and cedar are not yet walked end-to-end. The published arena pin still declines those five suites until they accept.
 
 The performance gap also points toward a deeper architectural question. Eager implementations cluster far above closure-based kernels on full-corpus instruction counts. Kiota currently keeps an eager representation; moving more evaluation behind closures is likely the next major throughput step after correctness coverage.
 

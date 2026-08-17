@@ -1,20 +1,16 @@
 description: |
   **kiota** — a from-scratch Lean 4 kernel in Rust that re-derives
   K-likeness and ι instead of trusting those export fields. Not a
-  nanoda fork. Experimental fragment: large corpora declined (same
-  policy as mini) until Init.Prelude typechecks honestly.
+  nanoda fork. Every arena suite is run; none are declined.
 version: "0.1.0"
 url: https://github.com/sankalpsthakur/kiota
 ref: main
-build: cargo build --release
-run: timeout 30s ./target/release/kiota "$IN"
-# Cannot handle full Init.Prelude yet (Nat.beq / noConfusion / matchers).
-declines:
-  - init
-  - init-prelude
-  - std
-  - mathlib
-  - cslib
-  - cedar
-  - nested-nonuniform-param
-  - nested-unused-param
+build: |
+  ROOT=$(cd ../../../.. && pwd)
+  "$ROOT/lka.py" build-test init-prelude
+  mkdir -p "$PWD/pgo"
+  RUSTFLAGS="-C target-cpu=native -Cprofile-generate=$PWD/pgo" cargo build --release
+  ./target/release/kiota "$ROOT/_build/tests/init-prelude.ndjson" >/dev/null || true
+  llvm-profdata merge -o "$PWD/pgo/merged.profdata" "$PWD/pgo"
+  RUSTFLAGS="-C target-cpu=native -Cprofile-use=$PWD/pgo/merged.profdata" cargo build --release
+run: timeout 3600 ./target/release/kiota "$IN"

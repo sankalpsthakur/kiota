@@ -1,6 +1,9 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use kiota::parser;
 use kiota::tc;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Cursor, Read, Write};
 
 const EXIT_ACCEPT: i32 = 0;
 const EXIT_REJECT: i32 = 1;
@@ -47,23 +50,29 @@ fn main() {
         }
     }
 
+    // Read all input up front so the actual checking work can run on a worker
+    // thread with a much larger stack (deeply nested terms in large proofs can
+    // otherwise blow the default 8MB stack).
+    let mut bytes = Vec::new();
+    if use_stdin || path.is_none() {
+        std::io::stdin()
+            .lock()
+            .read_to_end(&mut bytes)
+            .expect("read stdin");
+    } else {
+        let mut f = std::fs::File::open(path.unwrap()).expect("open input");
+        f.read_to_end(&mut bytes).expect("read file");
+    }
+
     let handle = std::thread::Builder::new()
-        .stack_size(64 * 1024 * 1024)
+        .stack_size(1024 * 1024 * 1024)
         .spawn(move || {
             let outcome = std::panic::catch_unwind(|| {
                 let mut p = parser::Parser::new();
-                if use_stdin || path.is_none() {
-                    let stdin = std::io::stdin();
-                    let reader = BufReader::with_capacity(8 * 1024 * 1024, stdin.lock());
-                    p.run(reader)
-                } else {
-                    let f = std::fs::File::open(path.unwrap()).expect("open input");
-                    let reader = BufReader::with_capacity(8 * 1024 * 1024, f);
-                    p.run(reader)
-                }
+                let reader = BufReader::new(Cursor::new(bytes));
+                p.run(reader)
             });
             kiota::stats::report();
-            kiota::stats::report_inst();
             let result = match outcome {
                 Ok(r) => r,
                 Err(_) => Err(tc::TcError::Other("panic during checking".into())),

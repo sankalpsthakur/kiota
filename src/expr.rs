@@ -278,14 +278,7 @@ pub fn shift(e: &Expr, by: i32, cutoff: u32) -> Expr {
             }
         }
         ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => e.clone(),
-        ExprData::App(_, _) => {
-            let (head, args_app) = unfold_apps(e);
-            let mut result = shift(&head, by, cutoff);
-            for a in &args_app {
-                result = app(result, shift(a, by, cutoff));
-            }
-            result
-        }
+        ExprData::App(f, a) => app(shift(f, by, cutoff), shift(a, by, cutoff)),
         ExprData::Lam(bi, ty, body) => lam(*bi, shift(ty, by, cutoff), shift(body, by, cutoff + 1)),
         ExprData::Pi(bi, ty, body) => pi(*bi, shift(ty, by, cutoff), shift(body, by, cutoff + 1)),
         ExprData::Let(ty, val, body) => let_(
@@ -307,7 +300,6 @@ pub fn instantiate(e: &Expr, args: &[Expr]) -> Expr {
     // full traversal. The grind perf tests amplify a shared simp-lemma
     // application thousands of times; keying on (node, depth) — args are
     // fixed within one call — visits each unique node once.
-    crate::stats::inst_call();
     let mut memo = rustc_hash::FxHashMap::default();
     instantiate_core(e, args, 0, &mut memo)
 }
@@ -322,12 +314,10 @@ fn instantiate_core(
     // the renumbering below can reach into this subterm. Returning it whole is
     // what turns O(term size) per binder into O(path length).
     if loose_bvar_range(e) <= depth {
-        crate::stats::inst_skip();
         return e.clone();
     }
     let key = (Rc::as_ptr(e) as usize, depth);
     if let Some(r) = memo.get(&key) {
-        crate::stats::inst_memo_hit();
         return r.clone();
     }
     crate::stats::inst_node();
@@ -343,14 +333,10 @@ fn instantiate_core(
             }
         }
         ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => e.clone(),
-        ExprData::App(_, _) => {
-            let (head, args_app) = unfold_apps(e);
-            let mut result = instantiate_core(&head, args, depth, memo);
-            for a in &args_app {
-                result = app(result, instantiate_core(a, args, depth, memo));
-            }
-            result
-        }
+        ExprData::App(f, a) => app(
+            instantiate_core(f, args, depth, memo),
+            instantiate_core(a, args, depth, memo),
+        ),
         ExprData::Lam(bi, ty, body) => lam(
             *bi,
             instantiate_core(ty, args, depth, memo),
@@ -387,14 +373,10 @@ pub fn instantiate_level_params(e: &Expr, subst: &rustc_hash::FxHashMap<u32, Lev
                 .map(|l| crate::level::instantiate(l, subst))
                 .collect(),
         ),
-        ExprData::App(_, _) => {
-            let (head, args_app) = unfold_apps(e);
-            let mut result = instantiate_level_params(&head, subst);
-            for a in &args_app {
-                result = app(result, instantiate_level_params(a, subst));
-            }
-            result
-        }
+        ExprData::App(f, a) => app(
+            instantiate_level_params(f, subst),
+            instantiate_level_params(a, subst),
+        ),
         ExprData::Lam(bi, ty, body) => lam(
             *bi,
             instantiate_level_params(ty, subst),
