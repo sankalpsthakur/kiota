@@ -98,8 +98,10 @@ pub struct Checker<'e> {
     /// shared by the DAG is otherwise re-inferred once per occurrence, so a
     /// term applied to two identical arguments doubles the work at every level.
     infer_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
-    /// `Nat.rec` peels of literals with `bits() >= 20` (`hugeFuel = 1e6`).
+    /// Consecutive `Nat.rec` peels of one `bits() >= 20` literal countdown.
     fuel_nat_peels: std::cell::Cell<u32>,
+    /// Last bits≥20 literal peeled; used to detect one hugeFuel countdown.
+    fuel_nat_last: std::cell::RefCell<Option<num_bigint::BigUint>>,
 }
 
 thread_local! {
@@ -188,6 +190,7 @@ impl<'e> Checker<'e> {
             infer_cache: RefCell::new(FxHashMap::default()),
             unfold_cache: RefCell::new(FxHashMap::default()),
             fuel_nat_peels: std::cell::Cell::new(0),
+            fuel_nat_last: std::cell::RefCell::new(None),
         }
     }
 
@@ -300,6 +303,7 @@ impl<'e> Checker<'e> {
             .ok_or_else(|| TcError::Other(format!("missing const {name}")))?;
         crate::stats::set_theorem_delta_scope(self.name_str(name));
         self.fuel_nat_peels.set(0);
+        *self.fuel_nat_last.borrow_mut() = None;
         // Pointer-keyed WHNF/defeq/infer caches are only useful inside one
         // declaration. Keeping them across decls is how `#3491`–`#3495`
         // grew from ~0.9 GB to multi-GB before the next omega proof.
@@ -1474,9 +1478,11 @@ impl<'e> Checker<'e> {
         Ok(Some(true))
     }
 
-    /// `Poly.cancelAux hugeFuel` (`1e6`, 20 bits) needs O(|poly|) peels.
-    /// A million-step countdown of that fuel is the `#3256` hang; keep
-    /// this well above typical poly length and well below `1e6`.
+    /// Cap one consecutive `Nat.rec` countdown of a `bits() >= 20` literal.
+    /// `Poly.cancelAux hugeFuel` (`1e6`) as a million-step countdown is the
+    /// `#3256` hang. A global-per-decl budget of 2048 false-rejects grind
+    /// `_proof_1_1` (`simp_cert` stuck vs `eagerReduce` true): that proof
+    /// does ~26382 hugeFuel peels as many short O(|poly|) countdowns.
     const FUEL_NAT_LIT_PEEL_MAX: u32 = 2048;
 
     fn try_iota(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
@@ -1553,16 +1559,20 @@ impl<'e> Checker<'e> {
                             // `UInt32.toNat_shiftLeft` peels `2^32` (33 bits).
                             None
                         } else if n.bits() >= 20 {
-                            // `hugeFuel = 1_000_000`. `cancelAux` needs
-                            // O(|poly|) successor peels; `#3256` counted
-                            // the fuel down by tens of thousands and
-                            // filled RAM. Do not cap 16–19 bit peels
-                            // here: `assemble₂._proof_2` needs those.
-                            let used = self.fuel_nat_peels.get();
-                            if used >= Self::FUEL_NAT_LIT_PEEL_MAX {
+                            // Count consecutive peels of one literal
+                            // (`n`, `n-1`, …). Do not cap 16–19 bit peels:
+                            // `assemble₂._proof_2` needs those.
+                            let consecutive = match self.fuel_nat_last.borrow().as_ref() {
+                                Some(prev) if *prev == n + 1u32 => {
+                                    self.fuel_nat_peels.get() + 1
+                                }
+                                _ => 1,
+                            };
+                            if consecutive > Self::FUEL_NAT_LIT_PEEL_MAX {
                                 None
                             } else {
-                                self.fuel_nat_peels.set(used + 1);
+                                self.fuel_nat_peels.set(consecutive);
+                                *self.fuel_nat_last.borrow_mut() = Some(n.clone());
                                 let pred = n - 1u32;
                                 Some((succ, 0, vec![expr::lit_nat(pred)]))
                             }
