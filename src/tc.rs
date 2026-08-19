@@ -782,24 +782,76 @@ impl<'e> Checker<'e> {
         self.whnf(ctx, e)
     }
 
-    /// WHNF for recursor major premises: like `whnf`, but delta-unfolds
-    /// theorem values too (via `unfold_delta`). Lean's kernel unfolds any
-    /// constant with a value — theorems included — when it needs the
-    /// constructor of a `rec` major premise; without this, majors headed by
-    /// a theorem (e.g. `Acc.inv … x h` well-founded recursion proofs, or
-    /// `_proof` lemmas wrapping `Acc.intro`) never reach a constructor and
-    /// the iota rule never fires. Kept off the hot `whnf` path: only the
-    /// major-premise position of a recursor pays for theorem unfolding.
-    fn whnf_major(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+    /// Congruence on unreduced applications of the same constant.
+    /// Full WHNF of `f 1 a` vs `f 1 (Acc.intro …)` unfolds `f` and iotas
+    /// Acc.rec on only the constructor side.
+    fn try_unreduced_const_congruence(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        let (h1, a1) = expr::unfold_apps(a);
+        let (h2, a2) = expr::unfold_apps(b);
+        let (ExprData::Const(n1, u1), ExprData::Const(n2, u2)) = (&**h1, &**h2) else {
+            return Ok(false);
+        };
+        if n1 != n2 || a1.len() != a2.len() || u1.len() != u2.len() {
+            return Ok(false);
+        }
+        if !u1.iter().zip(u2.iter()).all(|(x, y)| level::is_def_eq(x, y)) {
+            return Ok(false);
+        }
+        for (x, y) in a1.iter().zip(a2.iter()) {
+            if !self.is_def_eq(ctx, x, y)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn is_ctor_or_nat_lit_head(&self, e: &Expr) -> bool {
+        let (head, _) = expr::unfold_apps(e);
+        match &**head {
+            ExprData::Lit(Lit::Nat(_)) => true,
+            ExprData::Const(n, _) => {
+                matches!(self.env.get(*n), Some(ConstantInfo::Constructor { .. }))
+            }
+            _ => false,
+        }
+    }
+
+    /// Defs always. Acc.rec majors: beta-only unfold of a theorem wrapper
+    /// whose value is a constructor (`redex._proof_2 := Acc.intro`).
+    /// Component `Acc`, not substring (`lexAccessible` in grind-ring-5).
+    fn whnf_major(&self, ctx: &Ctx, e: &Expr, recursor: u32) -> R<Expr> {
+        let acc_rec = self
+            .name_str(recursor)
+            .split('.')
+            .any(|p| p == "Acc");
         let mut cur = e.clone();
         loop {
             let core = self.whnf_core(ctx, &cur)?;
             let (head, _) = expr::unfold_apps(&core);
             if let ExprData::Const(n, us) = &**head {
-                if let Some(unfolded) = self.unfold_delta(*n, us)? {
-                    let (_, args) = expr::unfold_apps(&core);
+                let (_, args) = expr::unfold_apps(&core);
+                if let Some(unfolded) = self.unfold_def(*n, us)? {
                     cur = expr::apps(unfolded, &args);
                     continue;
+                }
+                if acc_rec {
+                    if let Some(unfolded) = self.unfold_delta(*n, us, true)? {
+                        let mut body = unfolded;
+                        let mut i = 0;
+                        while i < args.len() {
+                            if let ExprData::Lam(_, _, b) = &**body {
+                                body = expr::instantiate1(b, &args[i]);
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        let next = expr::apps(body, &args[i..]);
+                        if self.is_ctor_or_nat_lit_head(&next) {
+                            cur = next;
+                            continue;
+                        }
+                    }
                 }
             }
             return Ok(core);
@@ -982,13 +1034,11 @@ impl<'e> Checker<'e> {
     /// theorem bodies included — e.g. `Acc.inv` reduces on `Acc.intro`, which
     /// `WellFounded.fixF_eq` needs. Only the cold delta path does this; the
     /// hot `whnf` loop stays Def-only for performance.
-    fn unfold_delta(&self, n: u32, us: &[Level]) -> R<Option<Expr>> {
+    fn unfold_delta(&self, n: u32, us: &[Level], theorems: bool) -> R<Option<Expr>> {
         if let Some(r) = self.unfold_def(n, us)? {
             return Ok(Some(r));
         }
-        if std::env::var_os("KIOTA_NO_THEOREM_DELTA").is_some()
-            || !crate::stats::theorem_delta_in_scope()
-        {
+        if !theorems || std::env::var_os("KIOTA_NO_THEOREM_DELTA").is_some() {
             return Ok(None);
         }
         match self.env.get(n) {
@@ -1064,6 +1114,10 @@ impl<'e> Checker<'e> {
         let key = (min_k, max_k);
         if let Some(&r) = self.defeq_cache.borrow().get(&key) {
             return Ok(r);
+        }
+        if self.try_unreduced_const_congruence(ctx, a, b)? {
+            self.defeq_cache.borrow_mut().insert(key, true);
+            return Ok(true);
         }
         let aw = self.whnf_for_defeq(ctx, a)?;
         let bw = self.whnf_for_defeq(ctx, b)?;
@@ -1375,7 +1429,9 @@ impl<'e> Checker<'e> {
     fn delta_step(&self, e: &Expr) -> R<Expr> {
         let (head, args) = expr::unfold_apps(e);
         if let ExprData::Const(n, us) = &**head {
-            if let Some(u) = self.unfold_delta(*n, us)? {
+            if let Some(u) =
+                self.unfold_delta(*n, us, crate::stats::theorem_delta_in_scope())?
+            {
                 return Ok(expr::apps(u, &args));
             }
         }
@@ -1470,7 +1526,7 @@ impl<'e> Checker<'e> {
 
         let k_like = self.is_k_like(&all)?;
 
-        let major_w = self.whnf_major(ctx, major)?;
+        let major_w = self.whnf_major(ctx, major, rname)?;
         let (mhead, margs) = expr::unfold_apps(&major_w);
 
         let ctor = match &**mhead {

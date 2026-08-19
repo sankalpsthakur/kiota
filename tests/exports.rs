@@ -46,6 +46,21 @@ fn proof_irrel_accepts() {
 }
 
 #[test]
+fn alg_conv_trans_acc_left_accepts() {
+    assert_accept("alg-conv-trans-acc-left.accept.ndjson");
+}
+
+#[test]
+fn alg_conv_trans_acc_right_accepts() {
+    assert_accept("alg-conv-trans-acc-right.accept.ndjson");
+}
+
+#[test]
+fn subject_reduction_redex_accepts() {
+    assert_accept("subject-reduction-redex.accept.ndjson");
+}
+
+#[test]
 fn rbtree_id_spec_accepts() {
     assert_accept("080_RBTree.id_spec.accept.ndjson");
 }
