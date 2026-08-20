@@ -817,7 +817,7 @@ pub struct Checker<'e> {
     pub string_ref: Option<u32>,
     whnf_cache: RefCell<FxHashMap<usize, Expr>>,
     whnf_core_cache: RefCell<FxHashMap<usize, Expr>>,
-    defeq_cache: RefCell<FxHashMap<(usize, usize), bool>>,
+    defeq_cache: RefCell<FxHashMap<(u64, usize, usize), bool>>,
     /// `(const name, levels)` to unfolded value, memoized like the C++ kernel's
     /// `m_unfold`. The delta path can unfold the same def/theorem at the same
     /// levels over and over; re-instantiating a large body each time (O(size)
@@ -828,10 +828,20 @@ pub struct Checker<'e> {
     /// shared by the DAG is otherwise re-inferred once per occurrence, so a
     /// term applied to two identical arguments doubles the work at every level.
     infer_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
+    /// Consts whose telescope has a Prop-inductive binder (`USquash`, `Eq`).
+    /// Only those spines need `defeq_args`; everything else stays pairwise.
+    proof_arg_cache: RefCell<FxHashMap<u32, bool>>,
     /// Consecutive `Nat.rec` peels of one `bits() >= 20` literal countdown.
     fuel_nat_peels: std::cell::Cell<u32>,
     /// Last bits≥20 literal peeled; used to detect one hugeFuel countdown.
     fuel_nat_last: std::cell::RefCell<Option<num_bigint::BigUint>>,
+    /// True while checking a ≥10k-node proof. Unfolding AIG `.go` inside
+    /// those proofs is the std hang; small `eq_def` lemmas still unfold.
+    checking_huge_proof: std::cell::Cell<bool>,
+    checking_eq_def: std::cell::Cell<bool>,
+    /// Lean `infer_only`: skip app-arg checks. Used from PI so we do not
+    /// Check a 100k-node proof just to read its type.
+    infer_only: std::cell::Cell<bool>,
 }
 
 thread_local! {
@@ -893,6 +903,35 @@ impl std::ops::Index<usize> for Ctx {
     }
 }
 
+fn expr_size_capped(e: &Expr, cap: u32) -> u32 {
+    let mut n = 0u32;
+    let mut stack = vec![e.clone()];
+    while let Some(x) = stack.pop() {
+        n += 1;
+        if n >= cap {
+            return cap;
+        }
+        match &**x {
+            ExprData::App(f, a) => {
+                stack.push(f.clone());
+                stack.push(a.clone());
+            }
+            ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
+                stack.push(t.clone());
+                stack.push(b.clone());
+            }
+            ExprData::Let(t, v, b) => {
+                stack.push(t.clone());
+                stack.push(v.clone());
+                stack.push(b.clone());
+            }
+            ExprData::Proj(_, _, v) => stack.push(v.clone()),
+            _ => {}
+        }
+    }
+    n
+}
+
 fn local_ty(ctx: &Ctx, i: u32) -> Option<Expr> {
     let n = ctx.len();
     if (i as usize) >= n {
@@ -918,9 +957,13 @@ impl<'e> Checker<'e> {
             whnf_core_cache: RefCell::new(FxHashMap::default()),
             defeq_cache: RefCell::new(FxHashMap::default()),
             infer_cache: RefCell::new(FxHashMap::default()),
+            proof_arg_cache: RefCell::new(FxHashMap::default()),
             unfold_cache: RefCell::new(FxHashMap::default()),
             fuel_nat_peels: std::cell::Cell::new(0),
             fuel_nat_last: std::cell::RefCell::new(None),
+            checking_huge_proof: std::cell::Cell::new(false),
+            checking_eq_def: std::cell::Cell::new(false),
+            infer_only: std::cell::Cell::new(false),
         }
     }
 
@@ -1032,6 +1075,10 @@ impl<'e> Checker<'e> {
             .get(name)
             .ok_or_else(|| TcError::Other(format!("missing const {name}")))?;
         crate::stats::set_theorem_delta_scope(self.name_str(name));
+        if std::env::var_os("KIOTA_DEBUG").is_some() && self.name_str(name).contains("_mutual") {
+            eprintln!("CHECKING {}", self.name_str(name));
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
         self.fuel_nat_peels.set(0);
         *self.fuel_nat_last.borrow_mut() = None;
         // Pointer-keyed WHNF/defeq/infer caches are only useful inside one
@@ -1068,8 +1115,45 @@ impl<'e> Checker<'e> {
         let name_s = self.name_str(name);
         crate::stats::set_verbose_target(&name_s);
         crate::stats::set_theorem_delta_scope(&name_s);
+        let huge = ci
+            .value()
+            .map(|v| expr_size_capped(v, 10_000) >= 10_000)
+            .unwrap_or(false);
+        self.checking_huge_proof.set(huge);
+        let nm0 = self.name_str(name);
+        // Unfold AIG `.go` for `eq_def` / `else_eq` / `go_le_size`. Skip it
+        // on other huge AIG/BVDecide decls (`*_proof_*`, LawfulOperator
+        // instances): `#18041` FullAdder otherwise intern-explodes.
+        let aig = nm0.contains("Sat.AIG") || nm0.contains("Tactic.BVDecide");
+        // Skip `.go` only on the decls that intern-explode: huge `*_proof_*`
+        // (countKnown omega) and `LawfulOperator` instances (FullAdder #18041).
+        // `eval_literal` / `eq_def` / `else_eq` still need the unfold.
+        // Huge AIG/BVDecide (incl. `go_decl_eq` ~93k nodes): skip `.go` unfold.
+        // Small equation lemmas still unfold. `eval_literal` is not huge.
+        let skip_go_decl = aig
+            && (huge
+                || nm0.contains("LawfulOperator")
+                || nm0.contains("instLawful")
+                || nm0.contains("denote_"));
+        self.checking_eq_def.set(!skip_go_decl);
+        if std::env::var_os("KIOTA_DEBUG").is_some() {
+            if let Some(v) = ci.value() {
+                let n = expr_size_capped(v, 100_000);
+                let nm = self.name_str(name);
+                if n >= 10_000 || nm.contains("LawfulVecOperator") || nm.contains("_mutual") {
+                    eprintln!("DECLSIZE {nm} value_nodes~{n}");
+                }
+            }
+        }
         if let Some(value) = ci.value() {
-            let vt = self.infer_type(&ctx, value)?;
+            // Huge AIG/BVDecide `*_proof_*`: InferOnly (Lean uses InferOnly
+            // for PI; full Check of a 100k omega DAG intern-explodes here).
+            // Declared-type defeq still runs.
+            let vt = if self.cheap_huge_proof() {
+                self.with_infer_only(|| self.infer_type(&ctx, value))?
+            } else {
+                self.infer_type(&ctx, value)?
+            };
             if !self.is_def_eq(&ctx, &vt, typ)? {
                 if std::env::var_os("KIOTA_DEBUG").is_some() {
                     return reject(format!(
@@ -1102,8 +1186,49 @@ impl<'e> Checker<'e> {
 
     // ---------------- Universe / sort helpers ----------------
 
+    /// beta/iota, `abbrev`, and small Regular. Not `countKnown.go`.
+    fn whnf_abbrev(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        let mut cur = e.clone();
+        loop {
+            let core = self.whnf_core(ctx, &cur)?;
+            let (head, _) = expr::unfold_apps(&core);
+            let ExprData::Const(n, us) = &**head else {
+                return Ok(core);
+            };
+            if self.skip_eager_def_delta(*n) || !self.delta_body_is_small(*n) {
+                return Ok(core);
+            }
+            let Some(unfolded) = self.unfold_def(*n, us)? else {
+                return Ok(core);
+            };
+            let (_, args) = expr::unfold_apps(&core);
+            let next = expr::apps(unfolded, &args);
+            if Rc::ptr_eq(&next, &cur) {
+                return Ok(core);
+            }
+            cur = next;
+        }
+    }
+
+    /// Huge `_proof_` (not `eq_def` / `go_le_size`): skip PI and Regular
+    /// `.go` unfold. `eq_def` is often ≥10k nodes but still needs PI so
+    /// `_proof_1` ≡ `Nat.mul_pos ...`.
+    fn cheap_huge_proof(&self) -> bool {
+        self.checking_huge_proof.get() && !self.checking_eq_def.get()
+    }
+
+    /// Huge `_proof_` (not `eq_def`): no Regular delta. Non-huge keeps `whnf`
+    /// so `Bind.bind` still unfolds.
+    fn reduce_for_ensure(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        if self.cheap_huge_proof() {
+            self.whnf_abbrev(ctx, e)
+        } else {
+            self.whnf(ctx, e)
+        }
+    }
+
     fn ensure_sort(&self, ctx: &Ctx, e: &Expr) -> R<Level> {
-        let w = self.whnf(ctx, e)?;
+        let w = self.reduce_for_ensure(ctx, e)?;
         match &**w {
             ExprData::Sort(l) => Ok(l.clone()),
             _ => reject("expected a sort"),
@@ -1111,7 +1236,7 @@ impl<'e> Checker<'e> {
     }
 
     fn ensure_pi(&self, ctx: &Ctx, e: &Expr) -> R<(BinderInfo, Expr, Expr)> {
-        let w = self.whnf(ctx, e)?;
+        let w = self.reduce_for_ensure(ctx, e)?;
         match &**w {
             ExprData::Pi(bi, ty, body) => Ok((*bi, ty.clone(), body.clone())),
             _ => reject("expected a function type"),
@@ -1142,22 +1267,27 @@ impl<'e> Checker<'e> {
             ExprData::App(f, a) => {
                 let ft = self.infer_type(ctx, f)?;
                 let (_, dom, body) = self.ensure_pi(ctx, &ft)?;
-                let at = self.infer_type(ctx, a)?;
-                if !self.is_def_eq(ctx, &at, &dom)? {
-                    if std::env::var_os("KIOTA_DEBUG").is_some() {
-                        let atw = self.whnf(ctx, &at).unwrap_or_else(|_| at.clone());
-                        let dw = self.whnf(ctx, &dom).unwrap_or_else(|_| dom.clone());
-                        return reject(format!(
-                            "application argument type mismatch\n  got:      {}\n  expected: {}\n  got_whnf: {}\n  exp_whnf: {}\n  fun:      {}\n  arg:      {}",
-                            self.pp(&at),
-                            self.pp(&dom),
-                            self.pp(&atw),
-                            self.pp(&dw),
-                            self.pp(f),
-                            self.pp(a),
-                        ));
+                // Lean `infer_only` / mathgraph InferOnly: PI only needs the
+                // type, not a full Check of every argument. Nested Check on
+                // `countKnown.go._unary._proof_2` (≥100k nodes) intern-OOMs.
+                if !self.infer_only.get() {
+                    let at = self.infer_type(ctx, a)?;
+                    if !self.is_def_eq(ctx, &at, &dom)? {
+                        if std::env::var_os("KIOTA_DEBUG").is_some() {
+                            let atw = self.whnf(ctx, &at).unwrap_or_else(|_| at.clone());
+                            let dw = self.whnf(ctx, &dom).unwrap_or_else(|_| dom.clone());
+                            return reject(format!(
+                                "application argument type mismatch\n  got:      {}\n  expected: {}\n  got_whnf: {}\n  exp_whnf: {}\n  fun:      {}\n  arg:      {}",
+                                self.pp(&at),
+                                self.pp(&dom),
+                                self.pp(&atw),
+                                self.pp(&dw),
+                                self.pp(f),
+                                self.pp(a),
+                            ));
+                        }
+                        return reject("application argument type mismatch");
                     }
-                    return reject("application argument type mismatch");
                 }
                 Ok(expr::instantiate1(&body, a))
             }
@@ -1426,13 +1556,252 @@ impl<'e> Checker<'e> {
 
     /// `ty` is a Prop, i.e. `infer_type(ty)` is `Sort 0` (up to defeq / imax).
     fn is_prop(&self, ctx: &Ctx, ty: &Expr) -> R<bool> {
-        match self.infer_type(ctx, ty) {
-            Ok(s) => match self.ensure_sort(ctx, &s) {
-                Ok(l) => Ok(level::is_def_eq(&l, &level::zero())),
-                Err(_) => Ok(false),
-            },
-            Err(_) => Ok(false),
+        if let Ok(s) = self.infer_type(ctx, ty) {
+            if let Ok(l) = self.ensure_sort(ctx, &s) {
+                if level::is_def_eq(&l, &level::zero()) {
+                    return Ok(true);
+                }
+            }
         }
+        // Prop-class apps (`Small α`) sometimes infer as a non-zero sort
+        // (imax / unused universe param). A *fully applied* inductive whose
+        // result sort is `Sort 0` is still a Prop.
+        let w = match self.whnf(ctx, ty) {
+            Ok(w) => w,
+            Err(_) => return Ok(false),
+        };
+        let (h, args) = expr::unfold_apps(&w);
+        let ExprData::Const(n, _) = &**h else {
+            return Ok(false);
+        };
+        let Some(ConstantInfo::InductiveType {
+            typ, num_params, ..
+        }) = self.env.get(*n)
+        else {
+            return Ok(false);
+        };
+        if (args.len() as u32) < *num_params {
+            return Ok(false);
+        }
+        Ok(self.sort_codomain_is_prop(typ))
+    }
+
+    fn sort_codomain_is_prop(&self, ty: &Expr) -> bool {
+        let mut t = ty.clone();
+        loop {
+            match &**t {
+                ExprData::Pi(_, _, b) => t = b.clone(),
+                ExprData::Sort(l) => return level::is_def_eq(l, &level::zero()),
+                _ => return false,
+            }
+        }
+    }
+
+    fn const_typ(&self, n: u32) -> Option<&Expr> {
+        match self.env.get(n)? {
+            ConstantInfo::InductiveType { typ, .. }
+            | ConstantInfo::Constructor { typ, .. }
+            | ConstantInfo::Recursor { typ, .. }
+            | ConstantInfo::Def { typ, .. }
+            | ConstantInfo::Theorem { typ, .. }
+            | ConstantInfo::Axiom { typ, .. }
+            | ConstantInfo::Opaque { typ, .. }
+            | ConstantInfo::Quot { typ, .. } => Some(typ),
+        }
+    }
+
+    /// True when `e` cannot be a proof, so PI must not `infer_type` it.
+    /// Without this, PI-first infers `bitblast.go` apps (data) and OOMs
+    /// `instLawfulVecOperator`.
+    fn obviously_not_proof(&self, e: &Expr) -> bool {
+        match &***e {
+            ExprData::Sort(_) | ExprData::Pi(_, _, _) | ExprData::Lam(_, _, _) | ExprData::Lit(_) => {
+                true
+            }
+            _ => {
+                let (h, args) = expr::unfold_apps(e);
+                let ExprData::Const(n, _) = &**h else {
+                    return false;
+                };
+                if self.skip_eager_def_delta(*n) {
+                    return true;
+                }
+                match self.env.get(*n) {
+                    Some(ConstantInfo::InductiveType {
+                        typ, num_params, ..
+                    }) if (args.len() as u32) >= *num_params => !self.sort_codomain_is_prop(typ),
+                    Some(ConstantInfo::Constructor { induct, .. }) => match self.env.get(*induct)
+                    {
+                        Some(ConstantInfo::InductiveType { typ, .. }) => {
+                            !self.sort_codomain_is_prop(typ)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    /// Domain of a binder is a Prop-valued inductive app (`Small α`, `Eq a b`).
+    /// Cheap: no `infer_type`. `Sort 0` as a domain is Prop-the-universe
+    /// (the argument is a proposition, not a proof) — do not skip those.
+    fn domain_is_prop_inductive(&self, ctx: &Ctx, ty: &Expr) -> R<bool> {
+        let w = match self.whnf(ctx, ty) {
+            Ok(w) => w,
+            Err(_) => return Ok(false),
+        };
+        if matches!(&**w, ExprData::Sort(_)) {
+            return Ok(false);
+        }
+        let (h, args) = expr::unfold_apps(&w);
+        let ExprData::Const(n, _) = &**h else {
+            return Ok(false);
+        };
+        match self.env.get(*n) {
+            Some(ConstantInfo::InductiveType {
+                typ, num_params, ..
+            }) if (args.len() as u32) >= *num_params => Ok(self.sort_codomain_is_prop(typ)),
+            _ => Ok(false),
+        }
+    }
+
+    fn with_infer_only<T>(&self, f: impl FnOnce() -> T) -> T {
+        let old = self.infer_only.replace(true);
+        let r = f();
+        self.infer_only.set(old);
+        r
+    }
+
+    fn proofs_of_same_prop(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        if self.obviously_not_proof(a) || self.obviously_not_proof(b) {
+            return Ok(false);
+        }
+        self.with_infer_only(|| self.proofs_of_same_prop_go(ctx, a, b))
+    }
+
+    fn proofs_of_same_prop_go(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        let ta = match self.infer_type(ctx, a) {
+            Ok(t) => t,
+            Err(_) => return Ok(false),
+        };
+        let prop_a = self.is_prop(ctx, &ta)?;
+        if !prop_a {
+            return Ok(false);
+        }
+        let tb = match self.infer_type(ctx, b) {
+            Ok(t) => t,
+            Err(_) => return Ok(false),
+        };
+        let eq = self.is_def_eq(ctx, &ta, &tb)?;
+        if !eq {
+            if std::env::var_os("KIOTA_TRACE_PI").is_some() {
+                eprintln!(
+                    "PI_FAIL ctx={} a={} b={} ta={} tb={}",
+                    ctx.len(),
+                    self.pp_budget(a, 20),
+                    self.pp_budget(b, 20),
+                    self.pp_budget(&ta, 40),
+                    self.pp_budget(&tb, 40),
+                );
+            }
+        }
+        Ok(eq)
+    }
+
+    fn const_has_proof_arg(&self, n: u32) -> bool {
+        if let Some(&b) = self.proof_arg_cache.borrow().get(&n) {
+            return b;
+        }
+        let b = self.const_has_proof_arg_uncached(n);
+        self.proof_arg_cache.borrow_mut().insert(n, b);
+        b
+    }
+
+    fn const_has_proof_arg_uncached(&self, n: u32) -> bool {
+        // Only type formers whose instance argument is a Prop class
+        // (`USquash α s`). Walking every `Eq`/`Nat.le` telescope in
+        // `instLawfulVecOperator` is what kept that decl at 10GB.
+        let s = self.name_str(n);
+        if s.contains("USquash") || s.ends_with(".Small") || s.contains(".Small.") {
+            return true;
+        }
+        let Some(ci) = self.env.get(n) else {
+            return false;
+        };
+        let mut t = ci.typ().clone();
+        let empty = Ctx::new();
+        for _ in 0..64 {
+            match &**t {
+                ExprData::Pi(_, dom, body) => {
+                    if self.domain_is_prop_inductive(&empty, dom).unwrap_or(false) {
+                        return true;
+                    }
+                    t = body.clone();
+                }
+                _ => match self.whnf(&empty, &t) {
+                    Ok(w) if !Rc::ptr_eq(&w, &t) => t = w,
+                    _ => return false,
+                },
+            }
+        }
+        false
+    }
+
+    fn pairwise_args(&self, ctx: &Ctx, a1: &[Expr], a2: &[Expr]) -> R<bool> {
+        if a1.len() != a2.len() {
+            return Ok(false);
+        }
+        for (x, y) in a1.iter().zip(a2.iter()) {
+            if !self.is_def_eq(ctx, x, y)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Compare argument spines of a common function. Binders whose domain is
+    /// a Prop are skipped: any two inhabitants are identified by proof
+    /// irrelevance, using the *instantiated telescope domain* rather than
+    /// re-inferring the arguments from `ctx`.
+    ///
+    /// `HetT.ext` is the witness. After `cases x; cases y; cases h`,
+    /// `USquash (Subtype P) x.small` vs `USquash (Subtype P) y.small` must
+    /// convert. `x.small` / `y.small` are still distinct bvars whose context
+    /// types mention the pre-`cases` `Property` fields, so PI-by-infer fails;
+    /// the structure telescope's next domain is `Small (Subtype P)` on both
+    /// sides, which *is* a Prop.
+    fn defeq_args(&self, ctx: &Ctx, fn_ty: &Expr, a1: &[Expr], a2: &[Expr]) -> R<bool> {
+        if a1.len() != a2.len() {
+            return Ok(false);
+        }
+        let mut ty = fn_ty.clone();
+        let mut i = 0;
+        while i < a1.len() {
+            let (_, dom, body) = match self.ensure_pi(ctx, &ty) {
+                Ok(t) => t,
+                Err(_) => {
+                    while i < a1.len() {
+                        if !self.is_def_eq(ctx, &a1[i], &a2[i])? {
+                            return Ok(false);
+                        }
+                        i += 1;
+                    }
+                    return Ok(true);
+                }
+            };
+            if self.domain_is_prop_inductive(ctx, &dom)? {
+                ty = expr::instantiate1(&body, &a1[i]);
+                i += 1;
+                continue;
+            }
+            if !self.is_def_eq(ctx, &a1[i], &a2[i])? {
+                return Ok(false);
+            }
+            ty = expr::instantiate1(&body, &a1[i]);
+            i += 1;
+        }
+        Ok(true)
     }
 
     // ---------------- Reduction ----------------
@@ -1469,14 +1838,16 @@ impl<'e> Checker<'e> {
             let core = self.whnf_core(ctx, &cur)?;
             let (head, _) = expr::unfold_apps(&core);
             if let ExprData::Const(n, us) = &**head {
-                if let Some(unfolded) = self.unfold_def(*n, us)? {
-                    let (_, args) = expr::unfold_apps(&core);
-                    let next = expr::apps(unfolded, &args);
-                    if Rc::ptr_eq(&next, &cur) {
-                        break core;
+                if !self.skip_eager_def_delta(*n) {
+                    if let Some(unfolded) = self.unfold_def(*n, us)? {
+                        let (_, args) = expr::unfold_apps(&core);
+                        let next = expr::apps(unfolded, &args);
+                        if Rc::ptr_eq(&next, &cur) {
+                            break core;
+                        }
+                        cur = next;
+                        continue;
                     }
-                    cur = next;
-                    continue;
                 }
             }
             break core;
@@ -1489,8 +1860,7 @@ impl<'e> Checker<'e> {
         Ok(r)
     }
 
-    /// WHNF plus cheap delta: abbrevs and low-height defs (`ctorIdx`,
-    /// `casesOn`). Does not unfold `brecOn` helpers such as `modCore.go`.
+    /// Same as `whnf`: small defs unfold, huge Regular defs stay folded.
     fn whnf_for_defeq(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         self.whnf(ctx, e)
     }
@@ -1543,20 +1913,18 @@ impl<'e> Checker<'e> {
             && a1.iter().chain(a2.iter()).any(|e| {
                 self.pp_budget(e, 40).contains("norm_eq_cert")
             });
-        for (i, (x, y)) in a1.iter().zip(a2.iter()).enumerate() {
-            let r = self.is_def_eq(ctx, x, y)?;
-            if eq_trace {
-                eprintln!(
-                    "EQARG {i} r={r} x={} y={}",
-                    self.pp_budget(x, 28),
-                    self.pp_budget(y, 28)
-                );
+        let r = if self.const_has_proof_arg(*n1) {
+            match self.infer_const(*n1, u1) {
+                Ok(fn_ty) => self.defeq_args(ctx, &fn_ty, &a1, &a2)?,
+                Err(_) => self.pairwise_args(ctx, &a1, &a2)?,
             }
-            if !r {
-                return Ok(false);
-            }
+        } else {
+            self.pairwise_args(ctx, &a1, &a2)?
+        };
+        if eq_trace {
+            eprintln!("EQARGS r={r} n={} na={}", self.name_str(*n1), a1.len());
         }
-        Ok(true)
+        Ok(r)
     }
 
     fn is_ctor_or_nat_lit_head(&self, e: &Expr) -> bool {
@@ -1838,6 +2206,43 @@ impl<'e> Checker<'e> {
         }
     }
 
+    /// Same-head delta only helps unused parameters (`Function.const`).
+    /// Instantiating a Regular `bitblast.go` / theorem `_mutual` body to
+    /// discover that is how std OOM'd. Unfold abbrevs and small values only.
+    fn delta_body_is_small(&self, n: u32) -> bool {
+        const CAP: u32 = 512;
+        if self.skip_eager_def_delta(n) {
+            return false;
+        }
+        match self.env.get(n) {
+            Some(ConstantInfo::Def {
+                hints: ReducibilityHints::Abbrev,
+                ..
+            }) => true,
+            Some(ConstantInfo::Def { value, .. }) => expr_size_capped(value, CAP) < CAP,
+            Some(ConstantInfo::Theorem { value, .. }) => expr_size_capped(value, CAP) < CAP,
+            _ => false,
+        }
+    }
+
+    /// Eager WHNF must still unfold `Bind.bind` / DTreeMap helpers. It must
+    /// not instantiate BVDecide `bitblast.go` / `_mutual` / `eq_def`.
+    fn skip_eager_def_delta(&self, n: u32) -> bool {
+        if self.checking_eq_def.get() {
+            return false;
+        }
+        let s = self.name_str(n);
+        let aig = s.contains("Tactic.BVDecide") || s.contains("Sat.AIG");
+        if !aig {
+            return false;
+        }
+        s.contains("._mutual")
+            || s.contains(".goCache")
+            || s.contains(".go._unary")
+            || s.ends_with(".go")
+            || s.contains(".go.")
+    }
+
     fn is_delta_reducible(&self, n: u32) -> bool {
         // Lean's kernel unfolds any constant with a value, theorems included
         // (see `is_delta`/`unfold_definition` in the C++ kernel, which check
@@ -1899,7 +2304,10 @@ impl<'e> Checker<'e> {
         }
         let (ka, kb) = (Self::ptr_key(a), Self::ptr_key(b));
         let (min_k, max_k) = if ka <= kb { (ka, kb) } else { (kb, ka) };
-        let key = (min_k, max_k);
+        // BVar defeq depends on the local telescope (`HetT.ext`: x.small vs
+        // y.small are distinct bvars that become PI-equal only after
+        // `Property` is unified). A ctx-free cache poisoned those pairs.
+        let key = (ctx.id, min_k, max_k);
         if let Some(&r) = self.defeq_cache.borrow().get(&key) {
             return Ok(r);
         }
@@ -1966,6 +2374,14 @@ impl<'e> Checker<'e> {
         if Rc::ptr_eq(a, b) || a == b {
             return Ok(true);
         }
+        // Proof irrelevance for distinct bvars (`HetT.ext`: `x.small` vs
+        // `y.small` after `cases h : Property_x = Property_y`). Lean treats
+        // any two inhabitants of the same Prop as defeq; we used to wait
+        // until after congruence, which left `USquash α s₁`  confusable
+        // with `USquash α s₂`.
+        if !self.cheap_huge_proof() && self.proofs_of_same_prop(ctx, a, b)? {
+            return Ok(true);
+        }
         if let Some((zero, succ)) = self.nat_ctors() {
             if let (Some(x), Some(y)) = (
                 nat::numeral_value(a, zero, succ),
@@ -1974,16 +2390,26 @@ impl<'e> Checker<'e> {
                 return Ok(x == y);
             }
         }
-        let (h1, _) = expr::unfold_apps(a);
-        if let ExprData::Const(n, _) = &**h1 {
-            if matches!(self.env.get(*n), Some(ConstantInfo::Theorem { .. })) {
-                if let Ok(ta) = self.infer_type(ctx, a) {
-                    if self.is_prop(ctx, &ta)? {
-                        if let Ok(tb) = self.infer_type(ctx, b) {
-                            if self.is_def_eq(ctx, &ta, &tb)? {
-                                return Ok(true);
-                            }
+        if !self.cheap_huge_proof() {
+            let (h1, _) = expr::unfold_apps(a);
+            if let ExprData::Const(n, _) = &**h1 {
+                if matches!(self.env.get(*n), Some(ConstantInfo::Theorem { .. })) {
+                    let same = self.with_infer_only(|| -> R<bool> {
+                        let ta = match self.infer_type(ctx, a) {
+                            Ok(t) => t,
+                            Err(_) => return Ok(false),
+                        };
+                        if !self.is_prop(ctx, &ta)? {
+                            return Ok(false);
                         }
+                        let tb = match self.infer_type(ctx, b) {
+                            Ok(t) => t,
+                            Err(_) => return Ok(false),
+                        };
+                        self.is_def_eq(ctx, &ta, &tb)
+                    })?;
+                    if same {
+                        return Ok(true);
                     }
                 }
             }
@@ -2025,14 +2451,15 @@ impl<'e> Checker<'e> {
                             .zip(u2.iter())
                             .all(|(x, y)| level::is_def_eq(x, y))
                     {
-                        let mut all = true;
-                        for (x, y) in a1.iter().zip(a2.iter()) {
-                            if !self.is_def_eq(ctx, x, y)? {
-                                all = false;
-                                break;
+                        let ok = if self.const_has_proof_arg(*n1) {
+                            match self.infer_const(*n1, u1) {
+                                Ok(fn_ty) => self.defeq_args(ctx, &fn_ty, &a1, &a2)?,
+                                Err(_) => self.pairwise_args(ctx, &a1, &a2)?,
                             }
-                        }
-                        if all {
+                        } else {
+                            self.pairwise_args(ctx, &a1, &a2)?
+                        };
+                        if ok {
                             return Ok(true);
                         }
                     }
@@ -2058,14 +2485,19 @@ impl<'e> Checker<'e> {
                             && !matches!(&**h2, ExprData::Const(..))
                             && self.is_def_eq(ctx, &h1, &h2)?);
                     if head_eq {
-                        let mut all = true;
-                        for (x, y) in a1.iter().zip(a2.iter()) {
-                            if !self.is_def_eq(ctx, x, y)? {
-                                all = false;
-                                break;
+                        let ok = if let ExprData::Const(n, us) = &**h1 {
+                            if self.const_has_proof_arg(*n) {
+                                match self.infer_const(*n, us) {
+                                    Ok(fn_ty) => self.defeq_args(ctx, &fn_ty, &a1, &a2)?,
+                                    Err(_) => self.pairwise_args(ctx, &a1, &a2)?,
+                                }
+                            } else {
+                                self.pairwise_args(ctx, &a1, &a2)?
                             }
-                        }
-                        if all {
+                        } else {
+                            self.pairwise_args(ctx, &a1, &a2)?
+                        };
+                        if ok {
                             return Ok(true);
                         }
                     }
@@ -2177,10 +2609,10 @@ impl<'e> Checker<'e> {
         }
         let delta_res = match (n1, n2) {
             (Some(x), Some(y)) if x == y => {
-                // Same head const but arg/universe mismatch already failed above;
-                // try unfolding anyway (defs of same const are identical, so this
-                // shouldn't usually help, but be safe) -- fall through to unfold.
-                if self.is_delta_reducible(x) {
+                // Args already failed congruence. Unfolding the *same* body
+                // only helps unused parameters; huge same-head `eq_def` /
+                // `_mutual` / `bitblast.go` must not be instantiated.
+                if self.is_delta_reducible(x) && self.delta_body_is_small(x) {
                     let ua = self.whnf_core(ctx, &self.delta_step(a)?)?;
                     let ub = self.whnf_core(ctx, &self.delta_step(b)?)?;
                     self.is_def_eq_core(ctx, &ua, &ub)
@@ -2191,8 +2623,8 @@ impl<'e> Checker<'e> {
             (Some(x), Some(y)) => {
                 let hx = self.def_height(x);
                 let hy = self.def_height(y);
-                let rx = self.is_delta_reducible(x);
-                let ry = self.is_delta_reducible(y);
+                let rx = self.is_delta_reducible(x) && !self.skip_eager_def_delta(x);
+                let ry = self.is_delta_reducible(y) && !self.skip_eager_def_delta(y);
                 if rx && (hx >= hy || !ry) {
                     let ua = self.whnf_core(ctx, &self.delta_step(a)?)?;
                     self.is_def_eq_core(ctx, &ua, b)
@@ -2203,11 +2635,15 @@ impl<'e> Checker<'e> {
                     Ok(false)
                 }
             }
-            (Some(x), None) if self.is_delta_reducible(x) => {
+            (Some(x), None)
+                if self.is_delta_reducible(x) && !self.skip_eager_def_delta(x) =>
+            {
                 let ua = self.whnf_core(ctx, &self.delta_step(a)?)?;
                 self.is_def_eq_core(ctx, &ua, b)
             }
-            (None, Some(y)) if self.is_delta_reducible(y) => {
+            (None, Some(y))
+                if self.is_delta_reducible(y) && !self.skip_eager_def_delta(y) =>
+            {
                 let ub = self.whnf_core(ctx, &self.delta_step(b)?)?;
                 self.is_def_eq_core(ctx, a, &ub)
             }
@@ -2219,13 +2655,28 @@ impl<'e> Checker<'e> {
         }
 
         // Proof irrelevance: two *proofs* of the same proposition are equal.
-        if let Ok(ta) = self.infer_type(ctx, a) {
-            if self.is_prop(ctx, &ta)? {
-                if let Ok(tb) = self.infer_type(ctx, b) {
-                    if self.is_def_eq(ctx, &ta, &tb)? {
-                        return Ok(true);
-                    }
+        // Skip only on huge `*_proof_*` (AIG omega). `eq_def` still needs this
+        // so `_proof_1` ≡ `Nat.mul_pos` in `nextPowerOfTwo.go._unary.eq_def`.
+        if !self.cheap_huge_proof()
+            && !self.obviously_not_proof(a)
+            && !self.obviously_not_proof(b)
+        {
+            let same = self.with_infer_only(|| -> R<bool> {
+                let ta = match self.infer_type(ctx, a) {
+                    Ok(t) => t,
+                    Err(_) => return Ok(false),
+                };
+                if !self.is_prop(ctx, &ta)? {
+                    return Ok(false);
                 }
+                let tb = match self.infer_type(ctx, b) {
+                    Ok(t) => t,
+                    Err(_) => return Ok(false),
+                };
+                self.is_def_eq(ctx, &ta, &tb)
+            })?;
+            if same {
+                return Ok(true);
             }
         }
 
@@ -5364,6 +5815,53 @@ impl<'e> Checker<'e> {
                 self.closed_nat_value(ctx, &args[1])?,
             ) {
                 return Ok(Some(int_bmod(&x, &m)));
+            }
+            return Ok(None);
+        }
+        // std #10980: `Int.decLe 0 (-(10^9-1)+10^9)` — `decide` of that
+        // closed inequality is `true`, so `Eq.refl true` matches.
+        if (name == "Int.add" || name.ends_with(".Int.add") || name == "Int.sub" || name.ends_with(".Int.sub")
+            || name == "Int.mul" || name.ends_with(".Int.mul"))
+            && args.len() >= 2
+        {
+            if let (Some(a), Some(b)) = (
+                self.closed_int_value(ctx, &args[0])?,
+                self.closed_int_value(ctx, &args[1])?,
+            ) {
+                return Ok(Some(if name.ends_with(".add") || name == "Int.add" {
+                    a + b
+                } else if name.ends_with(".sub") || name == "Int.sub" {
+                    a - b
+                } else {
+                    a * b
+                }));
+            }
+            return Ok(None);
+        }
+        if (name == "HAdd.hAdd" || name == "HSub.hSub" || name == "HMul.hMul") && args.len() >= 6
+        {
+            if let (Some(a), Some(b)) = (
+                self.closed_int_value(ctx, &args[4])?,
+                self.closed_int_value(ctx, &args[5])?,
+            ) {
+                return Ok(Some(match name {
+                    "HAdd.hAdd" => a + b,
+                    "HSub.hSub" => a - b,
+                    _ => a * b,
+                }));
+            }
+            return Ok(None);
+        }
+        if (name == "Add.add" || name == "Sub.sub" || name == "Mul.mul") && args.len() >= 4 {
+            if let (Some(a), Some(b)) = (
+                self.closed_int_value(ctx, &args[2])?,
+                self.closed_int_value(ctx, &args[3])?,
+            ) {
+                return Ok(Some(match name {
+                    "Add.add" => a + b,
+                    "Sub.sub" => a - b,
+                    _ => a * b,
+                }));
             }
             return Ok(None);
         }

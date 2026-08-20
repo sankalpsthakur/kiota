@@ -5,7 +5,7 @@ use crate::tc::{Checker, TcError};
 use num_bigint::BigUint;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 use std::rc::Rc;
 
 pub struct Parser {
@@ -586,9 +586,23 @@ impl Parser {
     fn check_last(&mut self, d: &Value, kind: &str) -> Result<(), TcError> {
         let name = Self::get_u32(d, "name");
         self.decl_count += 1;
-        if self.decl_count >= 3000 || self.decl_count % 1000 == 0 || std::env::var_os("KIOTA_PROGRESS").is_some() {
-            let nm = self.names.get(name as usize).map(|s| s.as_str()).unwrap_or("?");
+        let nm = self.names.get(name as usize).map(|s| s.as_str()).unwrap_or("?");
+        let debug = std::env::var_os("KIOTA_DEBUG").is_some();
+        if self.decl_count % 100 == 0
+            || std::env::var_os("KIOTA_PROGRESS").is_some()
+            || (debug && self.decl_count >= 18_000)
+        {
             eprintln!("[decl #{}] {kind} {nm}", self.decl_count);
+            let _ = std::io::stderr().flush();
+        }
+        if let Ok(max) = std::env::var("KIOTA_MAX_DECL") {
+            if let Ok(max_n) = max.parse::<usize>() {
+                if self.decl_count > max_n {
+                    return Err(TcError::Decline(format!(
+                        "KIOTA_MAX_DECL={max_n}"
+                    )));
+                }
+            }
         }
         let nat_ref = self.name_by_str.get("Nat").copied();
         let string_ref = self.name_by_str.get("String").copied();
