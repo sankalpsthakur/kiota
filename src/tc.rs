@@ -4,8 +4,13 @@ use crate::level::{self, Level};
 use crate::nat;
 use num_bigint::{BigInt, BigUint, Sign};
 use rustc_hash::FxHashMap;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+
+thread_local! {
+    static DEFEQ_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static WHNF_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
 
 #[derive(Debug)]
 pub enum TcError {
@@ -17,6 +22,51 @@ pub type R<T> = Result<T, TcError>;
 
 fn reject<T>(msg: impl Into<String>) -> R<T> {
     Err(TcError::Reject(msg.into()))
+}
+
+/// Lean `Int.pow m n`: `|m|^n` with sign `sign(m)^n`. `n = 0` yields `1`.
+fn int_pow(base: &BigInt, exp: &BigUint) -> Option<BigInt> {
+    if *exp == BigUint::from(0u32) {
+        return Some(BigInt::from(1));
+    }
+    if exp.bits() > 16 {
+        return None;
+    }
+    let e = exp.to_u32_digits().first().copied().unwrap_or(0);
+    let mag = base.magnitude().pow(e);
+    if base.sign() != Sign::Minus || e % 2 == 0 {
+        Some(BigInt::from(mag))
+    } else {
+        Some(-BigInt::from(mag))
+    }
+}
+
+/// Lean `Int.emod a (ofNat m)` for `m : Nat`: remainder in `[0, m)`. `m = 0` yields `a`.
+fn int_emod_nat(a: &BigInt, m: &BigUint) -> BigInt {
+    if *m == BigUint::from(0u32) {
+        return a.clone();
+    }
+    let mi = BigInt::from(m.clone());
+    let r = a % &mi;
+    if r.sign() == Sign::Minus {
+        r + mi
+    } else {
+        r
+    }
+}
+
+/// Lean `Int.bmod x m`: balanced remainder in `(-⌈m/2⌉, ⌊m/2⌋]`.
+fn int_bmod(x: &BigInt, m: &BigUint) -> BigInt {
+    if *m == BigUint::from(0u32) {
+        return x.clone();
+    }
+    let r = int_emod_nat(x, m);
+    let half = BigInt::from((m + 1u32) / 2u32);
+    if r < half {
+        r
+    } else {
+        r - BigInt::from(m.clone())
+    }
 }
 
 /// Lean `Int.ediv` (Euclidean). `y = 0` yields `0`.
@@ -41,6 +91,583 @@ fn int_ediv(a: &BigInt, b: &BigInt) -> BigInt {
     }
 }
 
+/// Lean `Int.emod a b`: remainder in `[0, |b|)`. `b = 0` yields `a`.
+fn int_emod(a: &BigInt, b: &BigInt) -> BigInt {
+    if b.sign() == Sign::NoSign {
+        return a.clone();
+    }
+    int_emod_nat(a, b.magnitude())
+}
+
+/// Lean `Int.Linear.cdiv a b` = `-((-a) / b)` (Euclidean `/`).
+fn int_cdiv(a: &BigInt, b: &BigInt) -> BigInt {
+    -int_ediv(&-a, b)
+}
+
+/// Lean `Int.Linear.cmod a b` = `-((-a) % b)`.
+fn int_cmod(a: &BigInt, b: &BigInt) -> BigInt {
+    -int_emod(&-a, b)
+}
+
+fn is_int_linear_ident(name: &str, ident: &str) -> bool {
+    if name == ident {
+        return true;
+    }
+    if !name.ends_with(ident) {
+        return false;
+    }
+    let rest = &name[..name.len() - ident.len()];
+    rest.ends_with('.') && (name.contains("Int.Linear") || name == ident)
+}
+
+/// Closed `Int.Linear.Poly` spine (larger `Var` first). Used to evaluate
+/// `combine_mul_k` without peeling `hugeFuel` `Nat.rec`. Do not intercept
+/// `Poly.beq'` itself: `beq'_eq` / grind need the `Poly.rec` unfolding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LinearPoly {
+    Num(BigInt),
+    Add(BigInt, BigUint, Box<LinearPoly>),
+}
+
+impl LinearPoly {
+    fn coeff(&self, x: &BigUint) -> BigInt {
+        match self {
+            LinearPoly::Num(_) => BigInt::from(0),
+            LinearPoly::Add(k, v, p) => {
+                if v == x {
+                    k.clone()
+                } else {
+                    p.coeff(x)
+                }
+            }
+        }
+    }
+
+    fn mul(&self, k: &BigInt) -> Self {
+        if k.sign() == Sign::NoSign {
+            return LinearPoly::Num(BigInt::from(0));
+        }
+        self.mul_nz(k)
+    }
+
+    fn mul_nz(&self, k: &BigInt) -> Self {
+        match self {
+            LinearPoly::Num(c) => LinearPoly::Num(k * c),
+            LinearPoly::Add(a, v, p) => {
+                LinearPoly::Add(k * a, v.clone(), Box::new(p.mul_nz(k)))
+            }
+        }
+    }
+
+    fn add_const(&self, k: &BigInt) -> Self {
+        match self {
+            LinearPoly::Num(c) => LinearPoly::Num(c + k),
+            LinearPoly::Add(a, v, p) => {
+                LinearPoly::Add(a.clone(), v.clone(), Box::new(p.add_const(k)))
+            }
+        }
+    }
+
+    fn combine_mul_k(a: &BigInt, b: &BigInt, p1: &Self, p2: &Self) -> Self {
+        if a.sign() == Sign::NoSign {
+            return p2.mul(b);
+        }
+        if b.sign() == Sign::NoSign {
+            return p1.mul(a);
+        }
+        Self::merge(a, b, p1, p2)
+    }
+
+    fn merge(a: &BigInt, b: &BigInt, p1: &Self, p2: &Self) -> Self {
+        match (p1, p2) {
+            (LinearPoly::Num(k1), LinearPoly::Num(k2)) => LinearPoly::Num(a * k1 + b * k2),
+            (LinearPoly::Num(_), LinearPoly::Add(a2, x2, p2t)) => LinearPoly::Add(
+                b * a2,
+                x2.clone(),
+                Box::new(Self::merge(a, b, p1, p2t)),
+            ),
+            (LinearPoly::Add(a1, x1, p1t), LinearPoly::Num(_)) => LinearPoly::Add(
+                a * a1,
+                x1.clone(),
+                Box::new(Self::merge(a, b, p1t, p2)),
+            ),
+            (LinearPoly::Add(a1, x1, p1t), LinearPoly::Add(a2, x2, p2t)) => {
+                if x1 == x2 {
+                    let c = a * a1 + b * a2;
+                    if c.sign() == Sign::NoSign {
+                        Self::merge(a, b, p1t, p2t)
+                    } else {
+                        LinearPoly::Add(c, x1.clone(), Box::new(Self::merge(a, b, p1t, p2t)))
+                    }
+                } else if x2 < x1 {
+                    LinearPoly::Add(
+                        a * a1,
+                        x1.clone(),
+                        Box::new(Self::merge(a, b, p1t, p2)),
+                    )
+                } else {
+                    LinearPoly::Add(
+                        b * a2,
+                        x2.clone(),
+                        Box::new(Self::merge(a, b, p1, p2t)),
+                    )
+                }
+            }
+        }
+    }
+
+    fn insert(&self, k: &BigInt, v: &BigUint) -> Self {
+        match self {
+            LinearPoly::Num(c) => {
+                LinearPoly::Add(k.clone(), v.clone(), Box::new(LinearPoly::Num(c.clone())))
+            }
+            LinearPoly::Add(k2, v2, p) => {
+                if v2 < v {
+                    LinearPoly::Add(k.clone(), v.clone(), Box::new(self.clone()))
+                } else if v == v2 {
+                    let s = k + k2;
+                    if s.sign() == Sign::NoSign {
+                        (**p).clone()
+                    } else {
+                        LinearPoly::Add(s, v2.clone(), p.clone())
+                    }
+                } else {
+                    LinearPoly::Add(k2.clone(), v2.clone(), Box::new(p.insert(k, v)))
+                }
+            }
+        }
+    }
+
+    fn beq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (LinearPoly::Num(a), LinearPoly::Num(b)) => a == b,
+            (LinearPoly::Add(k1, v1, p1), LinearPoly::Add(k2, v2, p2)) => {
+                k1 == k2 && v1 == v2 && p1.beq(p2)
+            }
+            _ => false,
+        }
+    }
+
+    fn lead_coeff(&self) -> BigInt {
+        match self {
+            LinearPoly::Add(a, _, _) => a.clone(),
+            LinearPoly::Num(_) => BigInt::from(1),
+        }
+    }
+
+    fn get_const(&self) -> BigInt {
+        match self {
+            LinearPoly::Num(k) => k.clone(),
+            LinearPoly::Add(_, _, p) => p.get_const(),
+        }
+    }
+
+    fn div_coeffs(&self, k: &BigInt) -> bool {
+        if k.sign() == Sign::NoSign {
+            return false;
+        }
+        match self {
+            LinearPoly::Num(_) => true,
+            LinearPoly::Add(a, _, p) => {
+                int_emod(a, k).sign() == Sign::NoSign && p.div_coeffs(k)
+            }
+        }
+    }
+
+    fn div(&self, k: &BigInt) -> Self {
+        match self {
+            LinearPoly::Num(c) => LinearPoly::Num(int_cdiv(c, k)),
+            LinearPoly::Add(a, v, p) => {
+                LinearPoly::Add(int_ediv(a, k), v.clone(), Box::new(p.div(k)))
+            }
+        }
+    }
+
+    fn nat_abs(k: &BigInt) -> BigInt {
+        BigInt::from(k.magnitude().clone())
+    }
+
+    fn normalize(&self) -> Self {
+        match self {
+            LinearPoly::Num(k) => LinearPoly::Num(k.clone()),
+            LinearPoly::Add(k, v, p) => p.normalize().insert(k, v),
+        }
+    }
+}
+
+/// Closed `Int.Linear.Expr`. `norm` = `toPoly'.norm` (insert-sort).
+#[derive(Clone, Debug)]
+enum LinearExpr {
+    Num(BigInt),
+    Var(BigUint),
+    Add(Box<LinearExpr>, Box<LinearExpr>),
+    Sub(Box<LinearExpr>, Box<LinearExpr>),
+    Neg(Box<LinearExpr>),
+    MulL(BigInt, Box<LinearExpr>),
+    MulR(Box<LinearExpr>, BigInt),
+}
+
+impl LinearExpr {
+    fn to_poly(&self) -> LinearPoly {
+        self.go(&BigInt::from(1), LinearPoly::Num(BigInt::from(0)))
+    }
+
+    fn go(&self, coeff: &BigInt, acc: LinearPoly) -> LinearPoly {
+        match self {
+            LinearExpr::Num(k) => {
+                if k.sign() == Sign::NoSign {
+                    acc
+                } else {
+                    acc.add_const(&(coeff * k))
+                }
+            }
+            LinearExpr::Var(v) => LinearPoly::Add(coeff.clone(), v.clone(), Box::new(acc)),
+            LinearExpr::Add(a, b) => a.go(coeff, b.go(coeff, acc)),
+            LinearExpr::Sub(a, b) => a.go(coeff, b.go(&-coeff, acc)),
+            LinearExpr::Neg(a) => a.go(&-coeff, acc),
+            LinearExpr::MulL(k, a) | LinearExpr::MulR(a, k) => {
+                if k.sign() == Sign::NoSign {
+                    acc
+                } else {
+                    a.go(&(coeff * k), acc)
+                }
+            }
+        }
+    }
+
+    fn norm(&self) -> LinearPoly {
+        self.to_poly().normalize()
+    }
+}
+
+fn is_commring_ident(name: &str, ident: &str) -> bool {
+    if !name.contains("CommRing") {
+        return false;
+    }
+    if name == ident {
+        return true;
+    }
+    if !name.ends_with(ident) {
+        return false;
+    }
+    let rest = &name[..name.len() - ident.len()];
+    rest.ends_with('.')
+}
+
+/// Closed `Lean.Grind.CommRing` monomials: smaller `Var` first (`Power.varLt`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CrPower {
+    x: BigUint,
+    k: BigUint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CrMon {
+    Unit,
+    Mult(CrPower, Box<CrMon>),
+}
+
+impl CrMon {
+    fn of_var(x: BigUint) -> Self {
+        CrMon::Mult(CrPower { x, k: BigUint::from(1u32) }, Box::new(CrMon::Unit))
+    }
+
+    fn of_pow(x: BigUint, k: BigUint) -> Self {
+        CrMon::Mult(CrPower { x, k }, Box::new(CrMon::Unit))
+    }
+
+    fn degree(&self) -> BigUint {
+        match self {
+            CrMon::Unit => BigUint::from(0u32),
+            CrMon::Mult(pw, m) => &pw.k + m.degree(),
+        }
+    }
+
+    fn var_lt(a: &CrPower, b: &CrPower) -> bool {
+        a.x < b.x
+    }
+
+    fn power_revlex(k1: &BigUint, k2: &BigUint) -> std::cmp::Ordering {
+        if k1 < k2 {
+            std::cmp::Ordering::Greater
+        } else if k2 < k1 {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    }
+
+    fn revlex(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (CrMon::Unit, CrMon::Unit) => std::cmp::Ordering::Equal,
+            (CrMon::Unit, CrMon::Mult(..)) => std::cmp::Ordering::Greater,
+            (CrMon::Mult(..), CrMon::Unit) => std::cmp::Ordering::Less,
+            (CrMon::Mult(pw1, m1), CrMon::Mult(pw2, m2)) => {
+                if pw1.x == pw2.x {
+                    m1.revlex(m2).then(Self::power_revlex(&pw1.k, &pw2.k))
+                } else if pw1.x < pw2.x {
+                    m1.revlex(other).then(std::cmp::Ordering::Less)
+                } else {
+                    self.revlex(m2).then(std::cmp::Ordering::Greater)
+                }
+            }
+        }
+    }
+
+    fn grevlex(&self, other: &Self) -> std::cmp::Ordering {
+        self.degree().cmp(&other.degree()).then(self.revlex(other))
+    }
+
+    fn concat(&self, other: &Self) -> Self {
+        match self {
+            CrMon::Unit => other.clone(),
+            CrMon::Mult(pw, m) => CrMon::Mult(pw.clone(), Box::new(m.concat(other))),
+        }
+    }
+
+    fn mul(&self, other: &Self) -> Self {
+        match (self, other) {
+            (m, CrMon::Unit) => m.clone(),
+            (CrMon::Unit, m) => m.clone(),
+            (CrMon::Mult(pw1, m1), CrMon::Mult(pw2, m2)) => {
+                if Self::var_lt(pw1, pw2) {
+                    CrMon::Mult(pw1.clone(), Box::new(m1.mul(other)))
+                } else if Self::var_lt(pw2, pw1) {
+                    CrMon::Mult(pw2.clone(), Box::new(self.mul(m2)))
+                } else {
+                    CrMon::Mult(
+                        CrPower {
+                            x: pw1.x.clone(),
+                            k: &pw1.k + &pw2.k,
+                        },
+                        Box::new(m1.mul(m2)),
+                    )
+                }
+            }
+        }
+    }
+
+    fn beq(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+/// Closed `Lean.Grind.CommRing.Poly`: decreasing `grevlex`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CrPoly {
+    Num(BigInt),
+    Add(BigInt, CrMon, Box<CrPoly>),
+}
+
+impl CrPoly {
+    fn of_mon(m: CrMon) -> Self {
+        CrPoly::Add(BigInt::from(1), m, Box::new(CrPoly::Num(BigInt::from(0))))
+    }
+
+    fn of_var(x: BigUint) -> Self {
+        Self::of_mon(CrMon::of_var(x))
+    }
+
+    fn add_const(&self, k: &BigInt) -> Self {
+        if k.sign() == Sign::NoSign {
+            return self.clone();
+        }
+        match self {
+            CrPoly::Num(c) => CrPoly::Num(c + k),
+            CrPoly::Add(a, m, p) => CrPoly::Add(a.clone(), m.clone(), Box::new(p.add_const(k))),
+        }
+    }
+
+    fn mul_const(&self, k: &BigInt) -> Self {
+        if k.sign() == Sign::NoSign {
+            return CrPoly::Num(BigInt::from(0));
+        }
+        if k == &BigInt::from(1) {
+            return self.clone();
+        }
+        match self {
+            CrPoly::Num(c) => CrPoly::Num(k * c),
+            CrPoly::Add(a, m, p) => CrPoly::Add(k * a, m.clone(), Box::new(p.mul_const(k))),
+        }
+    }
+
+    fn insert(&self, k: &BigInt, m: &CrMon) -> Self {
+        if k.sign() == Sign::NoSign {
+            return self.clone();
+        }
+        if matches!(m, CrMon::Unit) {
+            return self.add_const(k);
+        }
+        self.insert_go(k, m)
+    }
+
+    fn insert_go(&self, k: &BigInt, m: &CrMon) -> Self {
+        match self {
+            CrPoly::Num(c) => CrPoly::Add(k.clone(), m.clone(), Box::new(CrPoly::Num(c.clone()))),
+            CrPoly::Add(k2, m2, p) => match m.grevlex(m2) {
+                std::cmp::Ordering::Equal => {
+                    let s = k + k2;
+                    if s.sign() == Sign::NoSign {
+                        (**p).clone()
+                    } else {
+                        CrPoly::Add(s, m.clone(), p.clone())
+                    }
+                }
+                std::cmp::Ordering::Greater => {
+                    CrPoly::Add(k.clone(), m.clone(), Box::new(self.clone()))
+                }
+                std::cmp::Ordering::Less => {
+                    CrPoly::Add(k2.clone(), m2.clone(), Box::new(p.insert_go(k, m)))
+                }
+            },
+        }
+    }
+
+    fn concat(&self, other: &Self) -> Self {
+        match self {
+            CrPoly::Num(k) => other.add_const(k),
+            CrPoly::Add(k, m, p) => CrPoly::Add(k.clone(), m.clone(), Box::new(p.concat(other))),
+        }
+    }
+
+    fn combine(p1: &Self, p2: &Self) -> Self {
+        match (p1, p2) {
+            (CrPoly::Num(k1), CrPoly::Num(k2)) => CrPoly::Num(k1 + k2),
+            (CrPoly::Num(k1), CrPoly::Add(..)) => p2.add_const(k1),
+            (CrPoly::Add(..), CrPoly::Num(k2)) => p1.add_const(k2),
+            (CrPoly::Add(k1, m1, r1), CrPoly::Add(k2, m2, r2)) => match m1.grevlex(m2) {
+                std::cmp::Ordering::Equal => {
+                    let k = k1 + k2;
+                    let rest = Self::combine(r1, r2);
+                    if k.sign() == Sign::NoSign {
+                        rest
+                    } else {
+                        CrPoly::Add(k, m1.clone(), Box::new(rest))
+                    }
+                }
+                std::cmp::Ordering::Greater => {
+                    CrPoly::Add(k1.clone(), m1.clone(), Box::new(Self::combine(r1, p2)))
+                }
+                std::cmp::Ordering::Less => {
+                    CrPoly::Add(k2.clone(), m2.clone(), Box::new(Self::combine(p1, r2)))
+                }
+            },
+        }
+    }
+
+    fn mul_mon(&self, k: &BigInt, m: &CrMon) -> Self {
+        if k.sign() == Sign::NoSign {
+            return CrPoly::Num(BigInt::from(0));
+        }
+        if matches!(m, CrMon::Unit) {
+            return self.mul_const(k);
+        }
+        match self {
+            CrPoly::Num(c) => {
+                if c.sign() == Sign::NoSign {
+                    CrPoly::Num(BigInt::from(0))
+                } else {
+                    CrPoly::Add(
+                        k * c,
+                        m.clone(),
+                        Box::new(CrPoly::Num(BigInt::from(0))),
+                    )
+                }
+            }
+            CrPoly::Add(c, m2, p) => CrPoly::Add(
+                k * c,
+                m.mul(m2),
+                Box::new(p.mul_mon(k, m)),
+            ),
+        }
+    }
+
+    fn mul(&self, other: &Self) -> Self {
+        self.mul_go(other, &CrPoly::Num(BigInt::from(0)))
+    }
+
+    fn mul_go(&self, other: &Self, acc: &Self) -> Self {
+        match self {
+            CrPoly::Num(k) => Self::combine(acc, &other.mul_const(k)),
+            CrPoly::Add(k, m, p) => p.mul_go(other, &Self::combine(acc, &other.mul_mon(k, m))),
+        }
+    }
+
+    fn pow(&self, k: &BigUint) -> Option<Self> {
+        if *k == BigUint::from(0u32) {
+            return Some(CrPoly::Num(BigInt::from(1)));
+        }
+        if *k == BigUint::from(1u32) {
+            return Some(self.clone());
+        }
+        if k.bits() > 16 {
+            return None;
+        }
+        let km1 = k - 1u32;
+        let rec = self.pow(&km1)?;
+        Some(self.mul(&rec))
+    }
+
+    fn beq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (CrPoly::Num(a), CrPoly::Num(b)) => a == b,
+            (CrPoly::Add(k1, m1, p1), CrPoly::Add(k2, m2, p2)) => {
+                k1 == k2 && m1.beq(m2) && p1.beq(p2)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum CrExpr {
+    Num(BigInt),
+    NatCast(BigUint),
+    IntCast(BigInt),
+    Var(BigUint),
+    Neg(Box<CrExpr>),
+    Add(Box<CrExpr>, Box<CrExpr>),
+    Sub(Box<CrExpr>, Box<CrExpr>),
+    Mul(Box<CrExpr>, Box<CrExpr>),
+    Pow(Box<CrExpr>, BigUint),
+}
+
+impl CrExpr {
+    fn to_poly(&self) -> Option<CrPoly> {
+        match self {
+            CrExpr::Num(k) | CrExpr::IntCast(k) => Some(CrPoly::Num(k.clone())),
+            CrExpr::NatCast(k) => Some(CrPoly::Num(BigInt::from(k.clone()))),
+            CrExpr::Var(x) => Some(CrPoly::of_var(x.clone())),
+            CrExpr::Add(a, b) => Some(CrPoly::combine(&a.to_poly()?, &b.to_poly()?)),
+            CrExpr::Mul(a, b) => Some(a.to_poly()?.mul(&b.to_poly()?)),
+            CrExpr::Neg(a) => Some(a.to_poly()?.mul_const(&BigInt::from(-1))),
+            CrExpr::Sub(a, b) => {
+                let pb = b.to_poly()?.mul_const(&BigInt::from(-1));
+                Some(CrPoly::combine(&a.to_poly()?, &pb))
+            }
+            CrExpr::Pow(a, k) => {
+                if *k == BigUint::from(0u32) {
+                    return Some(CrPoly::Num(BigInt::from(1)));
+                }
+                match a.as_ref() {
+                    CrExpr::Num(n) | CrExpr::IntCast(n) => {
+                        Some(CrPoly::Num(int_pow(n, k)?))
+                    }
+                    CrExpr::NatCast(n) => {
+                        if k.bits() > 16 {
+                            return None;
+                        }
+                        let e = k.to_u32_digits().first().copied().unwrap_or(0);
+                        Some(CrPoly::Num(BigInt::from(n.pow(e))))
+                    }
+                    CrExpr::Var(x) => Some(CrPoly::of_mon(CrMon::of_pow(x.clone(), k.clone()))),
+                    _ => a.to_poly()?.pow(k),
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod closed_int_tests {
     use super::*;
@@ -58,11 +685,114 @@ mod closed_int_tests {
     }
 
     #[test]
+    fn pow_matches_lean_int_pow() {
+        assert_eq!(int_pow(&BigInt::from(2), &BigUint::from(63u32)).unwrap(), BigInt::from(1u64) << 63);
+        assert_eq!(int_pow(&BigInt::from(-2), &BigUint::from(3u32)).unwrap(), BigInt::from(-8));
+        assert_eq!(int_pow(&BigInt::from(-2), &BigUint::from(4u32)).unwrap(), BigInt::from(16));
+        assert_eq!(int_pow(&BigInt::from(5), &BigUint::from(0u32)).unwrap(), BigInt::from(1));
+    }
+
+    #[test]
+    fn bmod_two_pow_31_is_min_int32() {
+        let p31 = BigInt::from(1u64) << 31;
+        let p32 = BigUint::from(1u64) << 32;
+        assert_eq!(int_bmod(&p31, &p32), -p31);
+        assert_eq!(int_emod_nat(&BigInt::from(-5), &BigUint::from(3u32)), BigInt::from(1));
+    }
+
+    #[test]
     fn gcd_64_then_0() {
         assert_eq!(
             num_bigint_gcd(&BigUint::from(64u32), &BigUint::from(0u32)),
             BigUint::from(64u32)
         );
+    }
+
+    #[test]
+    fn tidy_int64_add_omega_payload() {
+        // `#20467`: lo=-(2^63-1), hi=2^64-1, coeffs=[0,0,-2^64,2^64]
+        // positivize then div-by-2^64 → (0,0) and [0,0,1,-1].
+        let p63: BigInt = BigInt::from(1u64) << 63;
+        let p64: BigInt = BigInt::from(1u128) << 64;
+        let lo: BigInt = BigInt::from(1) - &p63;
+        let hi: BigInt = &p64 - BigInt::from(1);
+        let leading: BigInt = -&p64;
+        assert!(leading.sign() == Sign::Minus);
+        let lo2 = -hi.clone();
+        let hi2 = -lo.clone();
+        let coeffs = vec![BigInt::from(0), BigInt::from(0), p64.clone(), -p64.clone()];
+        let g = p64.magnitude().clone();
+        let gk = BigInt::from(g);
+        let lo3 = -int_ediv(&(-&lo2), &gk);
+        let hi3 = int_ediv(&hi2, &gk);
+        assert_eq!(lo3, BigInt::from(0));
+        assert_eq!(hi3, BigInt::from(0));
+        let out: Vec<_> = coeffs.iter().map(|x| int_ediv(x, &gk)).collect();
+        assert_eq!(
+            out,
+            vec![
+                BigInt::from(0),
+                BigInt::from(0),
+                BigInt::from(1),
+                BigInt::from(-1)
+            ]
+        );
+    }
+
+    #[test]
+    fn combine_mul_k_cancels_diseq_subst_payload() {
+        // Init #17742: diseq_eq_subst_cert 1 p p (num 0) with
+        // p = add -1 1 (add 1 0 (num 0)) needs combine_mul_k(-1, 1, p, p) = num 0.
+        let p = LinearPoly::Add(
+            BigInt::from(-1),
+            BigUint::from(1u32),
+            Box::new(LinearPoly::Add(
+                BigInt::from(1),
+                BigUint::from(0u32),
+                Box::new(LinearPoly::Num(BigInt::from(0))),
+            )),
+        );
+        let a = p.coeff(&BigUint::from(1u32));
+        let b = p.coeff(&BigUint::from(1u32));
+        assert_eq!(a, BigInt::from(-1));
+        let r = LinearPoly::combine_mul_k(&b, &(-&a), &p, &p);
+        assert_eq!(r, LinearPoly::Num(BigInt::from(0)));
+        assert!(a.sign() != Sign::NoSign && LinearPoly::Num(BigInt::from(0)).beq(&r));
+    }
+
+    #[test]
+    fn commring_norm_cnstr_char_ordinal_payload() {
+        // Init #17755: norm_cnstr_cert (num 2^32) (var 0) (num 0)
+        //   (add (var 0) (intCast (-2^32)))
+        let p32: BigInt = BigInt::from(1u64) << 32;
+        let lhs = CrExpr::Num(p32.clone());
+        let rhs = CrExpr::Var(BigUint::from(0u32));
+        let lhs2 = CrExpr::Num(BigInt::from(0));
+        let rhs2 = CrExpr::Add(
+            Box::new(CrExpr::Var(BigUint::from(0u32))),
+            Box::new(CrExpr::IntCast(-p32)),
+        );
+        let a = CrExpr::Sub(Box::new(rhs), Box::new(lhs)).to_poly().unwrap();
+        let b = CrExpr::Sub(Box::new(rhs2), Box::new(lhs2)).to_poly().unwrap();
+        assert!(a.beq(&b), "{a:?} vs {b:?}");
+    }
+
+    #[test]
+    fn linear_norm_eq_cert_char_ordinal_payload() {
+        // Init #17844: (var 0 + -(2^32-1)) - 0  norms to  1·x0 + (-(2^32-1))
+        let k: BigInt = (BigInt::from(1u64) << 32) - 1;
+        let lhs = LinearExpr::Add(
+            Box::new(LinearExpr::Var(BigUint::from(0u32))),
+            Box::new(LinearExpr::Neg(Box::new(LinearExpr::Num(k.clone())))),
+        );
+        let rhs = LinearExpr::Num(BigInt::from(0));
+        let want = LinearPoly::Add(
+            BigInt::from(1),
+            BigUint::from(0u32),
+            Box::new(LinearPoly::Num(-k)),
+        );
+        let got = LinearExpr::Sub(Box::new(lhs), Box::new(rhs)).norm();
+        assert!(want.beq(&got), "{want:?} vs {got:?}");
     }
 }
 
@@ -567,49 +1297,6 @@ impl<'e> Checker<'e> {
             if !self.is_prop(ctx, &dom)? {
                 return reject("cannot project a Type field from a Prop structure");
             }
-            // Collect constructor field telescope (un-instantiated) to find the
-            // first *dependent* data field — a Type field mentioned by a later
-            // field. Projections at later indices are forbidden.
-            let mut teles = {
-                let subst2 = level::subst_map(&ctor_lp, &us);
-                let mut t = expr::instantiate_level_params(&ctor_typ, &subst2);
-                for p in args.iter().take(num_params as usize) {
-                    let (_, _, body) = self.ensure_pi(ctx, &t)?;
-                    t = expr::instantiate1(&body, p);
-                }
-                t
-            };
-            let mut ftypes: Vec<Expr> = Vec::new();
-            let mut fctx = ctx.clone();
-            for _ in 0..num_fields {
-                let (_, d, body) = self.ensure_pi(&fctx, &teles)?;
-                ftypes.push(d.clone());
-                fctx.push(d.clone());
-                teles = body;
-            }
-            let mut first_dep: Option<u32> = None;
-            for i in 0..num_fields as usize {
-                if self.is_prop(&ctx, &ftypes[i]).unwrap_or(false) {
-                    continue;
-                }
-                let mut used = false;
-                for j in (i + 1)..ftypes.len() {
-                    let bv = (j - 1 - i) as u32;
-                    if Self::occurs_bvar(&ftypes[j], bv) {
-                        used = true;
-                        break;
-                    }
-                }
-                if used {
-                    first_dep = Some(i as u32);
-                    break;
-                }
-            }
-            if let Some(d) = first_dep {
-                if idx > d {
-                    return reject("projection after a dependent data field of a Prop structure");
-                }
-            }
         }
         Ok(dom)
     }
@@ -751,6 +1438,24 @@ impl<'e> Checker<'e> {
     // ---------------- Reduction ----------------
 
     pub fn whnf(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        let depth = WHNF_DEPTH.with(|d| {
+            let n = d.get() + 1;
+            d.set(n);
+            n
+        });
+        if depth > 2048 {
+            WHNF_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            if depth == 2049 && std::env::var_os("KIOTA_DEBUG").is_some() {
+                eprintln!("WHNF_DEPTH {}", self.pp_budget(e, 50));
+            }
+            return Ok(e.clone());
+        }
+        let r = self.whnf_inner(ctx, e);
+        WHNF_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        r
+    }
+
+    fn whnf_inner(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         crate::stats::whnf_call();
         let cache = Self::cacheable(ctx, e);
         if cache {
@@ -766,7 +1471,11 @@ impl<'e> Checker<'e> {
             if let ExprData::Const(n, us) = &**head {
                 if let Some(unfolded) = self.unfold_def(*n, us)? {
                     let (_, args) = expr::unfold_apps(&core);
-                    cur = expr::apps(unfolded, &args);
+                    let next = expr::apps(unfolded, &args);
+                    if Rc::ptr_eq(&next, &cur) {
+                        break core;
+                    }
+                    cur = next;
                     continue;
                 }
             }
@@ -786,23 +1495,64 @@ impl<'e> Checker<'e> {
         self.whnf(ctx, e)
     }
 
-    /// Congruence on unreduced applications of the same constant.
+    /// Congruence on unreduced matching Proj / same-const apps.
     /// Full WHNF of `f 1 a` vs `f 1 (Acc.intro …)` unfolds `f` and iotas
-    /// Acc.rec on only the constructor side.
+    /// Acc.rec on only the constructor side. Same WHNF-first path also
+    /// iota-peels intern-distinct `s.i` / `Nat.rec` spines (`#3495`, `#4000`).
+    /// `false` means "not proved this way", never "not defeq".
     fn try_unreduced_const_congruence(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        match (&***a, &***b) {
+            (ExprData::Proj(s1, i1, v1), ExprData::Proj(s2, i2, v2)) if s1 == s2 && i1 == i2 => {
+                if self.is_def_eq(ctx, v1, v2)? {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
         let (h1, a1) = expr::unfold_apps(a);
         let (h2, a2) = expr::unfold_apps(b);
         let (ExprData::Const(n1, u1), ExprData::Const(n2, u2)) = (&**h1, &**h2) else {
             return Ok(false);
         };
+        if std::env::var_os("KIOTA_TRACE_LINEAR").is_some() {
+            let s1 = self.name_str(*n1);
+            let s2 = self.name_str(*n2);
+            if (s1 == "Eq" || s1.ends_with(".Eq") || s2 == "Eq" || s2.ends_with(".Eq"))
+                && a1.iter().chain(a2.iter()).any(|e| {
+                    let p = self.pp_budget(e, 40);
+                    p.contains("norm_eq_cert")
+                })
+            {
+                eprintln!(
+                    "EQCONG n1={s1}#{n1} n2={s2}#{n2} na={} nb={} us={} vs={} same={}",
+                    a1.len(),
+                    a2.len(),
+                    u1.len(),
+                    u2.len(),
+                    n1 == n2
+                );
+            }
+        }
         if n1 != n2 || a1.len() != a2.len() || u1.len() != u2.len() {
             return Ok(false);
         }
         if !u1.iter().zip(u2.iter()).all(|(x, y)| level::is_def_eq(x, y)) {
             return Ok(false);
         }
-        for (x, y) in a1.iter().zip(a2.iter()) {
-            if !self.is_def_eq(ctx, x, y)? {
+        let eq_trace = std::env::var_os("KIOTA_TRACE_LINEAR").is_some()
+            && a1.iter().chain(a2.iter()).any(|e| {
+                self.pp_budget(e, 40).contains("norm_eq_cert")
+            });
+        for (i, (x, y)) in a1.iter().zip(a2.iter()).enumerate() {
+            let r = self.is_def_eq(ctx, x, y)?;
+            if eq_trace {
+                eprintln!(
+                    "EQARG {i} r={r} x={} y={}",
+                    self.pp_budget(x, 28),
+                    self.pp_budget(y, 28)
+                );
+            }
+            if !r {
                 return Ok(false);
             }
         }
@@ -963,6 +1713,18 @@ impl<'e> Checker<'e> {
                                 cur = r;
                                 continue;
                             }
+                            if let Some(r) = self.try_int_linear(ctx, &head, &args)? {
+                                cur = r;
+                                continue;
+                            }
+                            if let Some(r) = self.try_comm_ring(ctx, &head, &args)? {
+                                cur = r;
+                                continue;
+                            }
+                            if let Some(r) = self.try_rat(ctx, &head, &args)? {
+                                cur = r;
+                                continue;
+                            }
                             if let Some(r) = self.try_dite(ctx, &head, &args)? {
                                 cur = r;
                                 continue;
@@ -1096,6 +1858,28 @@ impl<'e> Checker<'e> {
     // ---------------- Definitional equality ----------------
 
     pub fn is_def_eq(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        let depth = DEFEQ_DEPTH.with(|d| {
+            let n = d.get() + 1;
+            d.set(n);
+            n
+        });
+        if depth > 2048 {
+            DEFEQ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            if depth == 2049 && std::env::var_os("KIOTA_DEBUG").is_some() {
+                eprintln!(
+                    "DEFEQ_DEPTH a={} b={}",
+                    self.pp_budget(a, 50),
+                    self.pp_budget(b, 50)
+                );
+            }
+            return Ok(false);
+        }
+        let r = self.is_def_eq_inner(ctx, a, b);
+        DEFEQ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        r
+    }
+
+    fn is_def_eq_inner(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         crate::stats::defeq_call();
         if crate::stats::enabled() {
             let n = crate::stats::defeq_calls();
@@ -1125,6 +1909,24 @@ impl<'e> Checker<'e> {
         }
         let aw = self.whnf_for_defeq(ctx, a)?;
         let bw = self.whnf_for_defeq(ctx, b)?;
+        if std::env::var_os("KIOTA_TRACE_LINEAR").is_some() {
+            let pa = self.pp_budget(a, 24);
+            let pb = self.pp_budget(b, 24);
+            if pa.contains("norm_eq_cert") || pb.contains("norm_eq_cert") {
+                eprintln!(
+                    "DEFEQ_WHNF a={} b={} aw={} bw={}",
+                    pa,
+                    pb,
+                    self.pp_budget(&aw, 24),
+                    self.pp_budget(&bw, 24)
+                );
+            }
+        }
+        if let (Ok(Some(x)), Ok(Some(y))) = (self.closed_int_value(ctx, &aw), self.closed_int_value(ctx, &bw)) {
+            let r = x == y;
+            self.defeq_cache.borrow_mut().insert(key, r);
+            return Ok(r);
+        }
         let r = self.is_def_eq_core(ctx, &aw, &bw)?;
         self.defeq_cache.borrow_mut().insert(key, r);
         Ok(r)
@@ -1975,7 +2777,7 @@ impl<'e> Checker<'e> {
         Ok(Some(rec_app))
     }
 
-    fn try_quot(&self, _ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
+    fn try_quot(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
         let n = match &***head {
             ExprData::Const(n, _) => *n,
             _ => return Ok(None),
@@ -2009,8 +2811,8 @@ impl<'e> Checker<'e> {
         if args.len() <= q_idx {
             return Ok(None);
         }
-        let q = &args[q_idx];
-        let (qhead, qargs) = expr::unfold_apps(q);
+        let q = self.whnf(ctx, &args[q_idx])?;
+        let (qhead, qargs) = expr::unfold_apps(&q);
         let is_mk = matches!(&**qhead, ExprData::Const(cn,_) if matches!(self.env.get(*cn), Some(ConstantInfo::Quot{kind: QuotKind::Ctor,..})));
         if !is_mk || qargs.len() < 3 {
             return Ok(None);
@@ -2081,6 +2883,15 @@ impl<'e> Checker<'e> {
                         let r = nat::mk_succ(succ, a);
                         return Ok(Some(expr::apps(r, &args[2..])));
                     }
+                    // Do not succ-peel a large `Lit::Nat`: `Nat.add x 2147483395`
+                    // would recurse ~2e9 times and overflow the stack
+                    // (`Int32.instRxcHasSize_eq`).
+                    let large_lit = |e: &Expr| {
+                        nat::as_lit(e).is_some_and(|n| n.bits() >= 16)
+                    };
+                    if large_lit(&a) || large_lit(&b) {
+                        return Ok(None);
+                    }
                     if let Some(p) = nat::pred(&b, zero, succ) {
                         let add = expr::apps(expr::const_(n, vec![]), &[a, p]);
                         let r = nat::mk_succ(succ, add);
@@ -2113,6 +2924,11 @@ impl<'e> Checker<'e> {
                 }
                 if nat::is_zero(&a, zero) || nat::is_zero(&b, zero) {
                     return Ok(Some(expr::apps(nat::mk_lit(0u32.into()), &args[2..])));
+                }
+                if nat::as_lit(&a).is_some_and(|n| n.bits() >= 16)
+                    || nat::as_lit(&b).is_some_and(|n| n.bits() >= 16)
+                {
+                    return Ok(None);
                 }
                 if let Some(p) = nat::pred(&b, zero, succ) {
                     let mul = expr::apps(expr::const_(n, vec![]), &[a.clone(), p]);
@@ -2362,28 +3178,103 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
-            "Int.sub" if args.len() >= 2 => {
-                let a = self.whnf(ctx, &args[0])?;
-                let b = self.whnf(ctx, &args[1])?;
-                // Only closed numerals — `Int.zero_sub` needs `0 - n` to stay
-                // a `sub` so its recursor motive matches.
-                if self.is_int_of_nat_zero(&a) && self.is_closed_int_numeral(&b) {
-                    if let Some(ineg) = self.find_name_ending("Int.neg") {
-                        let r = expr::app(expr::const_(ineg, vec![]), b);
+            "Int.add" | "Int.sub" | "Int.mul" if args.len() >= 2 => {
+                if let (Some(a), Some(b)) = (
+                    self.closed_int_value(ctx, &args[0])?,
+                    self.closed_int_value(ctx, &args[1])?,
+                ) {
+                    let v = match name {
+                        "Int.add" => a + b,
+                        "Int.sub" => a - b,
+                        _ => a * b,
+                    };
+                    if let Some(r) = self.mk_closed_int(&v) {
                         return Ok(Some(expr::apps(r, &args[2..])));
                     }
                 }
                 Ok(None)
             }
-            "Int.neg" if !args.is_empty() => {
-                // Only when the argument is ≤ 0, so the result is a
-                // non-negative `OfNat`. Negating a positive OfNat would
-                // rebuild `Int.neg (OfNat n)` and loop in WHNF.
-                if let Some(v) = self.closed_int_value(ctx, &args[0])? {
-                    if v.sign() != Sign::Plus {
-                        if let Some(r) = self.mk_closed_int(&-v) {
-                            return Ok(Some(expr::apps(r, &args[1..])));
+            "Int.pow" if args.len() >= 2 => {
+                if let (Some(a), Some(e)) = (
+                    self.closed_int_value(ctx, &args[0])?,
+                    self.closed_nat_value(ctx, &args[1])?,
+                ) {
+                    if let Some(v) = int_pow(&a, &e) {
+                        if let Some(r) = self.mk_closed_int(&v) {
+                            return Ok(Some(expr::apps(r, &args[2..])));
                         }
+                    }
+                }
+                Ok(None)
+            }
+            "Int.bmod" if args.len() >= 2 => {
+                if let (Some(x), Some(m)) = (
+                    self.closed_int_value(ctx, &args[0])?,
+                    self.closed_nat_value(ctx, &args[1])?,
+                ) {
+                    if let Some(r) = self.mk_int_canonical(&int_bmod(&x, &m)) {
+                        return Ok(Some(expr::apps(r, &args[2..])));
+                    }
+                }
+                Ok(None)
+            }
+            "Int.emod" if args.len() >= 2 => {
+                if let Some(a) = self.closed_int_value(ctx, &args[0])? {
+                    if let Some(m) = self.closed_nat_value(ctx, &args[1])? {
+                        if let Some(r) = self.mk_int_canonical(&int_emod_nat(&a, &m)) {
+                            return Ok(Some(expr::apps(r, &args[2..])));
+                        }
+                    } else if let Some(b) = self.closed_int_value(ctx, &args[1])? {
+                        if b.sign() != Sign::Minus {
+                            let m = b.magnitude().clone();
+                            if let Some(r) = self.mk_int_canonical(&int_emod_nat(&a, &m)) {
+                                return Ok(Some(expr::apps(r, &args[2..])));
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            "Int.decLe" | "Int.decLt" if args.len() >= 2 => {
+                let aw = self.whnf(ctx, &args[0])?;
+                let bw = self.whnf(ctx, &args[1])?;
+                let va = self.closed_int_value(ctx, &aw)?;
+                let vb = self.closed_int_value(ctx, &bw)?;
+                if let (Some(a), Some(b)) = (va, vb) {
+                    let yes = if name == "Int.decLt" { a < b } else { a <= b };
+                    if let Some(r) = self.mk_decidable_bool(yes) {
+                        return Ok(Some(expr::apps(r, &args[2..])));
+                    }
+                }
+                Ok(None)
+            }
+            "Decidable.decide" | "decide" if args.len() >= 2 => {
+                let inst = self.whnf(ctx, &args[1])?;
+                let (ih, _) = expr::unfold_apps(&inst);
+                let iname = match &**ih {
+                    ExprData::Const(n, _) => self.name_str(*n),
+                    _ => return Ok(None),
+                };
+                let tname = if matches!(iname, "Decidable.isTrue" | "isTrue") {
+                    "Bool.true"
+                } else if matches!(iname, "Decidable.isFalse" | "isFalse") {
+                    "Bool.false"
+                } else {
+                    return Ok(None);
+                };
+                if let Some(bn) = self.find_name(tname) {
+                    return Ok(Some(expr::apps(expr::const_(bn, vec![]), &args[2..])));
+                }
+                Ok(None)
+            }
+            "Int.neg" if !args.is_empty() => {
+                // Canonical constructors, not `Int.neg (OfNat n)`: WHNF of
+                // that form unfolds `Int.neg` into a `Nat.rec` of size `n`
+                // (`Int32.toInt minValue` is `-(2^31)` and hits the hugeFuel
+                // peel cap). `negSucc (n-1)` is already WHNF.
+                if let Some(v) = self.closed_int_value(ctx, &args[0])? {
+                    if let Some(r) = self.mk_int_canonical(&-v) {
+                        return Ok(Some(expr::apps(r, &args[1..])));
                     }
                 }
                 // Peel the *raw* argument. Full WHNF would unfold the inner
@@ -2502,16 +3393,70 @@ impl<'e> Checker<'e> {
                 };
                 let ty = self.whnf(ctx, &args[0])?;
                 let mut stripped = args.to_vec();
-                stripped[0] = ty;
+                stripped[0] = ty.clone();
                 if let Some(v) = nat::of_nat_value(&stripped, nat_ty) {
                     return Ok(Some(expr::apps(v, &args[3..])));
                 }
                 if let Some(v) = nat::of_nat_value(args, nat_ty) {
                     return Ok(Some(expr::apps(v, &args[3..])));
                 }
+                let ty_name = match &**ty {
+                    ExprData::Const(t, _) => self.name_str(*t),
+                    _ => return Ok(None),
+                };
+                if ty_name == "Int" || ty_name.ends_with(".Int") {
+                    if let Some(n) = self.closed_nat_value(ctx, &args[1])? {
+                        if let Some(ofn) = self.find_name_ending("Int.ofNat") {
+                            let r = expr::app(expr::const_(ofn, vec![]), nat::mk_lit(n));
+                            return Ok(Some(expr::apps(r, &args[3..])));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            n if (n == "Int.beq'" || n.ends_with(".Int.beq'")) && args.len() >= 2 => {
+                if let (Some(a), Some(b)) = (
+                    self.closed_int_value(ctx, &args[0])?,
+                    self.closed_int_value(ctx, &args[1])?,
+                ) {
+                    let tname = if a == b { "Bool.true" } else { "Bool.false" };
+                    if let Some(bn) = self.find_name(tname) {
+                        return Ok(Some(expr::apps(expr::const_(bn, vec![]), &args[2..])));
+                    }
+                }
+                Ok(None)
+            }
+            n if (n == "Bool.and'" || n.ends_with(".Bool.and'")) && args.len() >= 2 => {
+                let a = self.whnf(ctx, &args[0])?;
+                let b = self.whnf(ctx, &args[1])?;
+                let ab = self.bool_const_val(&a);
+                let bb = self.bool_const_val(&b);
+                if let (Some(x), Some(y)) = (ab, bb) {
+                    let tname = if x && y { "Bool.true" } else { "Bool.false" };
+                    if let Some(bn) = self.find_name(tname) {
+                        return Ok(Some(expr::apps(expr::const_(bn, vec![]), &args[2..])));
+                    }
+                }
                 Ok(None)
             }
             _ => Ok(None),
+        }
+    }
+
+    fn bool_const_val(&self, e: &Expr) -> Option<bool> {
+        let (h, _) = expr::unfold_apps(e);
+        match &**h {
+            ExprData::Const(n, _) => {
+                let s = self.name_str(*n);
+                if s == "Bool.true" || s.ends_with(".Bool.true") {
+                    Some(true)
+                } else if s == "Bool.false" || s.ends_with(".Bool.false") {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
@@ -2565,6 +3510,7 @@ impl<'e> Checker<'e> {
                 "HAdd.hAdd" | "Add.add" => "Int.add",
                 "HSub.hSub" | "Sub.sub" => "Int.sub",
                 "HMul.hMul" | "Mul.mul" => "Int.mul",
+                "HPow.hPow" | "Pow.pow" => "Int.pow",
                 _ => return Ok(None),
             }
         } else {
@@ -2592,6 +3538,111 @@ impl<'e> Checker<'e> {
     /// `dite α c (isTrue p h) t e → t h` and `isFalse` → `e h`.
     /// `ite` drops the proof. Fires in `whnf_core` so height-based delta
     /// cannot unfold `modCore.go` before the instance constructor is seen.
+    /// Closed `Rat` projections / `inv`. `Rat.zpow_neg`'s `with_unfolding_all
+    /// rfl` needs `1⁻¹ = 1`; `Rat.inv` is a `dite` on `a.num < 0` whose
+    /// `Decidable` stays stuck unless `.num`/`.den` of `OfNat Rat n` reduce.
+    fn try_rat(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
+        let n = match &***head {
+            ExprData::Const(n, _) => *n,
+            _ => return Ok(None),
+        };
+        let name = self.name_str(n);
+        let ident = name.rsplit('.').next().unwrap_or(name);
+        let is_inv = ident == "inv" && (name.contains("Rat") || name.contains("Inv"));
+        let is_num = ident == "num" && name.contains("Rat");
+        let is_den = ident == "den" && name.contains("Rat");
+        if !is_inv && !is_num && !is_den {
+            return Ok(None);
+        }
+        if args.is_empty() {
+            return Ok(None);
+        }
+        let a = args.last().unwrap();
+        let Some((num, den, a_w)) = self.rat_closed_parts(ctx, a)? else {
+            return Ok(None);
+        };
+        if is_num {
+            let Some(e) = self.mk_closed_int(&num) else {
+                return Ok(None);
+            };
+            return Ok(Some(expr::apps(e, &args[args.len()..])));
+        }
+        if is_den {
+            return Ok(Some(expr::apps(expr::lit_nat(den), &args[args.len()..])));
+        }
+        // inv
+        let (inv_num, inv_den) = if num.sign() == Sign::Minus {
+            (-BigInt::from(den.clone()), num.magnitude().clone())
+        } else if num.sign() == Sign::Plus {
+            (BigInt::from(den.clone()), num.magnitude().clone())
+        } else {
+            (num.clone(), den.clone())
+        };
+        if inv_num == num && inv_den == den {
+            return Ok(Some(expr::apps(a_w, &args[args.len()..])));
+        }
+        Ok(None)
+    }
+
+    fn is_rat_const(&self, e: &Expr) -> bool {
+        let (h, _) = expr::unfold_apps(e);
+        match &**h {
+            ExprData::Const(n, _) => {
+                let s = self.name_str(*n);
+                s == "Rat" || s.ends_with(".Rat")
+            }
+            _ => false,
+        }
+    }
+
+    fn rat_closed_parts(
+        &self,
+        ctx: &Ctx,
+        e: &Expr,
+    ) -> R<Option<(BigInt, BigUint, Expr)>> {
+        let e = self.whnf(ctx, e)?;
+        let (h, args) = expr::unfold_apps(&e);
+        let name = match &**h {
+            ExprData::Const(n, _) => self.name_str(*n),
+            _ => return Ok(None),
+        };
+        let ident = name.rsplit('.').next().unwrap_or(name);
+        if ident == "mk'" && name.contains("Rat") && args.len() >= 4 {
+            let Some(num) = self.closed_int_value(ctx, &args[args.len() - 4])? else {
+                return Ok(None);
+            };
+            let Some(den) = self.closed_nat_value(ctx, &args[args.len() - 3])? else {
+                return Ok(None);
+            };
+            return Ok(Some((num, den, e)));
+        }
+        if ident == "ofInt" && name.contains("Rat") && !args.is_empty() {
+            let Some(num) = self.closed_int_value(ctx, args.last().unwrap())? else {
+                return Ok(None);
+            };
+            return Ok(Some((num, BigUint::from(1u32), e)));
+        }
+        if name == "OfNat.ofNat" && args.len() >= 2 && self.is_rat_const(&args[0]) {
+            let Some(n) = self.closed_nat_value(ctx, &args[1])? else {
+                return Ok(None);
+            };
+            return Ok(Some((BigInt::from(n), BigUint::from(1u32), e)));
+        }
+        if ident == "natCast" && args.len() >= 2 && self.is_rat_const(&args[0]) {
+            let Some(n) = self.closed_nat_value(ctx, args.last().unwrap())? else {
+                return Ok(None);
+            };
+            return Ok(Some((BigInt::from(n), BigUint::from(1u32), e)));
+        }
+        if ident == "intCast" && args.len() >= 2 && self.is_rat_const(&args[0]) {
+            let Some(n) = self.closed_int_value(ctx, args.last().unwrap())? else {
+                return Ok(None);
+            };
+            return Ok(Some((n, BigUint::from(1u32), e)));
+        }
+        Ok(None)
+    }
+
     fn try_dite(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
         let n = match &***head {
             ExprData::Const(n, _) => *n,
@@ -2692,6 +3743,1107 @@ impl<'e> Checker<'e> {
     }
 
     /// `IntList`/`Coeffs` list algebra used by omega reflection.
+    /// Closed `Int.Linear` poly merge / certificates. `combine_mul_k` is
+    /// `Nat.rec hugeFuel` (1e8); peeling it hits the rec cap and Init
+    /// `#17742` (`diseq_eq_subst_cert`) cannot reduce to `true`.
+    fn try_int_linear(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
+        let n = match &***head {
+            ExprData::Const(n, _) => *n,
+            _ => return Ok(None),
+        };
+        let name = self.name_str(n);
+        let ident = name.rsplit('.').next().unwrap_or(name);
+        if !name.contains("Int.Linear")
+            && !name.contains("RArray")
+            && ident != "getElem"
+            && !is_int_linear_ident(name, "diseq_eq_subst_cert")
+            && !is_int_linear_ident(name, "combine_mul_k")
+        {
+            return Ok(None);
+        }
+        let trace = std::env::var_os("KIOTA_TRACE_LINEAR").is_some()
+            && (ident == "diseq_eq_subst_cert"
+                || ident == "combine_mul_k"
+                || ident == "norm_eq_cert"
+                || ident == "denote"
+                || ident == "denote'"
+                || ident == "go"
+                || ident == "get");
+        if trace {
+            eprintln!("LINEAR ident={ident} nargs={} name={name}", args.len());
+        }
+
+        if ident == "get" && name.contains("RArray") && args.len() >= 2 {
+            let arr = &args[args.len() - 2];
+            let idx = &args[args.len() - 1];
+            if let Some(r) = self.rarray_get(ctx, arr, idx)? {
+                return Ok(Some(expr::apps(r, &args[args.len()..])));
+            }
+            return Ok(None);
+        }
+        if ident == "getElem" && args.len() >= 3 {
+            let arr = &args[args.len() - 3];
+            let idx = &args[args.len() - 2];
+            if let Some(r) = self.rarray_get(ctx, arr, idx)? {
+                return Ok(Some(expr::apps(r, &args[args.len()..])));
+            }
+        }
+        if ident == "denote" && name.contains("Int.Linear.Var") && args.len() >= 2 {
+            let arr = &args[args.len() - 2];
+            let idx = args.last().unwrap();
+            let got = self.rarray_get(ctx, arr, idx)?;
+            if trace {
+                let arr_w = self.whnf(ctx, arr)?;
+                let (h, as_) = expr::unfold_apps(&arr_w);
+                let hn = match &**h {
+                    ExprData::Const(cn, _) => self.name_str(*cn),
+                    _ => "?",
+                };
+                eprintln!(
+                    "VAR_DENOTE nargs={} got={} arr_head={hn} arr_nargs={} idx={}",
+                    args.len(),
+                    got.is_some(),
+                    as_.len(),
+                    self.pp_budget(idx, 12)
+                );
+            }
+            if let Some(r) = got {
+                return Ok(Some(r));
+            }
+            return Ok(None);
+        }
+        // `Expr.denote` / `Poly.denote'` are semireducible abbrevs whose
+        // `+`/`*` become `HAdd`/`HMul`. Unfolding those to `Int.add` and
+        // then `Nat.rec` hits the peel cap (`#17844`). Rebuild the same
+        // notation spine Lean stores: left-fold `denote'`, original
+        // OfNat/Neg numerals, never `Int.add`. `#17809` is `Eq.refl` of
+        // that HAdd tree (`eq_def`).
+        if ident == "denote" && name.contains("Int.Linear.Expr") && args.len() >= 2 {
+            let rctx = &args[args.len() - 2];
+            let e = args.last().unwrap();
+            if let Some(r) = self.linear_expr_denote(ctx, rctx, e)? {
+                return Ok(Some(expr::apps(r, &args[args.len()..])));
+            }
+        }
+        if ident == "denote'" && name.contains("Poly") && args.len() >= 2 {
+            let rctx = &args[args.len() - 2];
+            let p = args.last().unwrap();
+            if let Some(r) = self.linear_poly_denote_prime(ctx, rctx, p)? {
+                return Ok(Some(expr::apps(r, &args[args.len()..])));
+            }
+        }
+        if ident == "go" && name.contains("denote'") && args.len() >= 3 {
+            let rctx = &args[args.len() - 3];
+            let p = &args[args.len() - 2];
+            let acc = args.last().unwrap().clone();
+            if let Some(r) = self.linear_poly_denote_go(ctx, rctx, p, acc)? {
+                return Ok(Some(expr::apps(r, &args[args.len()..])));
+            }
+        }
+        if ident == "combine_mul_k" && args.len() >= 4 {
+            let Some(a) = self.closed_int_value(ctx, &self.whnf(ctx, &args[0])?)? else {
+                return Ok(None);
+            };
+            let Some(b) = self.closed_int_value(ctx, &self.whnf(ctx, &args[1])?)? else {
+                return Ok(None);
+            };
+            let Some(p1) = self.parse_linear_poly(ctx, &args[2])? else {
+                return Ok(None);
+            };
+            let Some(p2) = self.parse_linear_poly(ctx, &args[3])? else {
+                return Ok(None);
+            };
+            let r = LinearPoly::combine_mul_k(&a, &b, &p1, &p2);
+            if let Some(e) = self.mk_linear_poly(&r) {
+                return Ok(Some(expr::apps(e, &args[4..])));
+            }
+            return Ok(None);
+        }
+        if ident == "combine" && args.len() >= 2 && name.contains("Poly") {
+            let Some(p1) = self.parse_linear_poly(ctx, &args[0])? else {
+                return Ok(None);
+            };
+            let Some(p2) = self.parse_linear_poly(ctx, &args[1])? else {
+                return Ok(None);
+            };
+            let r = LinearPoly::combine_mul_k(
+                &BigInt::from(1),
+                &BigInt::from(1),
+                &p1,
+                &p2,
+            );
+            if let Some(e) = self.mk_linear_poly(&r) {
+                return Ok(Some(expr::apps(e, &args[2..])));
+            }
+            return Ok(None);
+        }
+
+        let bool_r = match ident {
+            "diseq_eq_subst_cert" if args.len() >= 4 => {
+                let xw = self.whnf(ctx, &args[0])?;
+                let Some(x) = self.closed_nat_value(ctx, &xw)? else {
+                    if trace {
+                        eprintln!("LINEAR diseq: x not closed {}", self.pp_budget(&xw, 40));
+                    }
+                    return Ok(None);
+                };
+                let Some(p1) = self.parse_linear_poly(ctx, &args[1])? else {
+                    if trace {
+                        eprintln!("LINEAR diseq: p1 parse fail {}", self.pp_budget(&args[1], 40));
+                    }
+                    return Ok(None);
+                };
+                let Some(p2) = self.parse_linear_poly(ctx, &args[2])? else {
+                    if trace {
+                        eprintln!("LINEAR diseq: p2 parse fail");
+                    }
+                    return Ok(None);
+                };
+                let Some(p3) = self.parse_linear_poly(ctx, &args[3])? else {
+                    if trace {
+                        eprintln!("LINEAR diseq: p3 parse fail {}", self.pp_budget(&args[3], 40));
+                    }
+                    return Ok(None);
+                };
+                let a = p1.coeff(&x);
+                let b = p2.coeff(&x);
+                let r = a.sign() != Sign::NoSign
+                    && p3.beq(&LinearPoly::combine_mul_k(&b, &(-&a), &p1, &p2));
+                if trace {
+                    eprintln!("LINEAR diseq: x={x} a={a} b={b} r={r}");
+                }
+                Some(r)
+            }
+            "eq_eq_subst_cert" if args.len() >= 4 => {
+                let Some(x) = self.closed_nat_value(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(p1) = self.parse_linear_poly(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(p2) = self.parse_linear_poly(ctx, &args[2])? else {
+                    return Ok(None);
+                };
+                let Some(p3) = self.parse_linear_poly(ctx, &args[3])? else {
+                    return Ok(None);
+                };
+                let a = p1.coeff(&x);
+                let b = p2.coeff(&x);
+                Some(p3.beq(&LinearPoly::combine_mul_k(&b, &(-&a), &p1, &p2)))
+            }
+            "eq_eq_subst'_cert" if args.len() >= 5 => {
+                let Some(a) = self.closed_int_value(ctx, &self.whnf(ctx, &args[0])?)? else {
+                    return Ok(None);
+                };
+                let Some(b) = self.closed_int_value(ctx, &self.whnf(ctx, &args[1])?)? else {
+                    return Ok(None);
+                };
+                let Some(p1) = self.parse_linear_poly(ctx, &args[2])? else {
+                    return Ok(None);
+                };
+                let Some(p2) = self.parse_linear_poly(ctx, &args[3])? else {
+                    return Ok(None);
+                };
+                let Some(p3) = self.parse_linear_poly(ctx, &args[4])? else {
+                    return Ok(None);
+                };
+                Some(p3.beq(&LinearPoly::combine_mul_k(&b, &(-&a), &p1, &p2)))
+            }
+            "eq_of_le_ge_cert" if args.len() >= 2 => {
+                let Some(p1) = self.parse_linear_poly(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(p2) = self.parse_linear_poly(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                Some(p2.beq(&p1.mul(&BigInt::from(-1))))
+            }
+            "eq_of_core_cert" if args.len() >= 3 => {
+                let Some(p1) = self.parse_linear_poly(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(p2) = self.parse_linear_poly(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(p3) = self.parse_linear_poly(ctx, &args[2])? else {
+                    return Ok(None);
+                };
+                Some(p3.beq(&LinearPoly::combine_mul_k(
+                    &BigInt::from(1),
+                    &BigInt::from(-1),
+                    &p1,
+                    &p2,
+                )))
+            }
+            "le_of_le_diseq_cert" if args.len() >= 3 => {
+                let Some(p1) = self.parse_linear_poly(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(p2) = self.parse_linear_poly(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(p3) = self.parse_linear_poly(ctx, &args[2])? else {
+                    return Ok(None);
+                };
+                let neg = p1.mul(&BigInt::from(-1));
+                Some((p2.beq(&p1) || p2.beq(&neg)) && p3.beq(&p1.add_const(&BigInt::from(1))))
+            }
+            "diseq_split_cert" if args.len() >= 3 => {
+                let Some(p1) = self.parse_linear_poly(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(p2) = self.parse_linear_poly(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(p3) = self.parse_linear_poly(ctx, &args[2])? else {
+                    return Ok(None);
+                };
+                let one = BigInt::from(1);
+                Some(
+                    p2.beq(&p1.add_const(&one))
+                        && p3.beq(&p1.mul(&BigInt::from(-1)).add_const(&one)),
+                )
+            }
+            "le_coeff_cert" if args.len() >= 3 => {
+                let Some(p1) = self.parse_linear_poly(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(p2) = self.parse_linear_poly(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[2])?)? else {
+                    return Ok(None);
+                };
+                Some(k.sign() == Sign::Plus && p1.div_coeffs(&k) && p2.beq(&p1.div(&k)))
+            }
+            "le_neg_cert" if args.len() >= 2 => {
+                let Some(p1) = self.parse_linear_poly(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(p2) = self.parse_linear_poly(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                Some(p2.beq(&p1.mul(&BigInt::from(-1)).add_const(&BigInt::from(1))))
+            }
+            "le_combine_cert" if args.len() >= 3 => {
+                let Some(p1) = self.parse_linear_poly(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(p2) = self.parse_linear_poly(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(p3) = self.parse_linear_poly(ctx, &args[2])? else {
+                    return Ok(None);
+                };
+                let a1 = LinearPoly::nat_abs(&p1.lead_coeff());
+                let a2 = LinearPoly::nat_abs(&p2.lead_coeff());
+                Some(p3.beq(&LinearPoly::combine_mul_k(&a2, &a1, &p1, &p2)))
+            }
+            "le_combine_coeff_cert" if args.len() >= 4 => {
+                let Some(p1) = self.parse_linear_poly(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(p2) = self.parse_linear_poly(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(p3) = self.parse_linear_poly(ctx, &args[2])? else {
+                    return Ok(None);
+                };
+                let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[3])?)? else {
+                    return Ok(None);
+                };
+                let a1 = LinearPoly::nat_abs(&p1.lead_coeff());
+                let a2 = LinearPoly::nat_abs(&p2.lead_coeff());
+                let p = LinearPoly::combine_mul_k(&a2, &a1, &p1, &p2);
+                Some(k.sign() == Sign::Plus && p.div_coeffs(&k) && p3.beq(&p.div(&k)))
+            }
+            "eq_coeff_cert" if args.len() >= 3 => {
+                let Some(p) = self.parse_linear_poly(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(p2) = self.parse_linear_poly(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[2])?)? else {
+                    return Ok(None);
+                };
+                Some(p.beq(&p2.mul(&k)) && k.sign() == Sign::Plus)
+            }
+            "eq_unsat_coeff_cert" if args.len() >= 2 => {
+                let Some(p) = self.parse_linear_poly(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[1])?)? else {
+                    return Ok(None);
+                };
+                Some(
+                    p.div_coeffs(&k)
+                        && k.sign() == Sign::Plus
+                        && int_cmod(&p.get_const(), &k).sign() == Sign::Minus,
+                )
+            }
+            "dvd_of_eq_cert" if args.len() >= 4 => {
+                let Some(x) = self.closed_nat_value(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(p1) = self.parse_linear_poly(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(d2) = self.closed_int_value(ctx, &self.whnf(ctx, &args[2])?)? else {
+                    return Ok(None);
+                };
+                let Some(p2) = self.parse_linear_poly(ctx, &args[3])? else {
+                    return Ok(None);
+                };
+                let a = p1.coeff(&x);
+                Some(d2 == LinearPoly::nat_abs(&a) && p2.beq(&p1.insert(&(-&a), &x)))
+            }
+            "eq_dvd_subst_cert" if args.len() >= 6 => {
+                let Some(x) = self.closed_nat_value(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(p1) = self.parse_linear_poly(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(d2) = self.closed_int_value(ctx, &self.whnf(ctx, &args[2])?)? else {
+                    return Ok(None);
+                };
+                let Some(p2) = self.parse_linear_poly(ctx, &args[3])? else {
+                    return Ok(None);
+                };
+                let Some(d3) = self.closed_int_value(ctx, &self.whnf(ctx, &args[4])?)? else {
+                    return Ok(None);
+                };
+                let Some(p3) = self.parse_linear_poly(ctx, &args[5])? else {
+                    return Ok(None);
+                };
+                let a = p1.coeff(&x);
+                let b = p2.coeff(&x);
+                let p = p1.insert(&(-&a), &x);
+                let q = p2.insert(&(-&b), &x);
+                Some(
+                    d3 == LinearPoly::nat_abs(&(&a * &d2))
+                        && p3.beq(&LinearPoly::combine_mul_k(&a, &(-&b), &q, &p)),
+                )
+            }
+            "var_eq_cert" if args.len() >= 3 => {
+                let Some(x) = self.closed_nat_value(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[1])?)? else {
+                    return Ok(None);
+                };
+                let Some(p) = self.parse_linear_poly(ctx, &args[2])? else {
+                    return Ok(None);
+                };
+                Some(match p {
+                    LinearPoly::Add(k1, x2, rest) => match *rest {
+                        LinearPoly::Num(k2) => {
+                            k1.sign() != Sign::NoSign && x == x2 && k == -int_ediv(&k2, &k1)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                })
+            }
+            "of_var_eq_mul_cert" if args.len() >= 4 => {
+                let Some(x) = self.closed_nat_value(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[1])?)? else {
+                    return Ok(None);
+                };
+                let Some(y) = self.closed_nat_value(ctx, &args[2])? else {
+                    return Ok(None);
+                };
+                let Some(p) = self.parse_linear_poly(ctx, &args[3])? else {
+                    return Ok(None);
+                };
+                let want = LinearPoly::Add(
+                    BigInt::from(1),
+                    x,
+                    Box::new(LinearPoly::Add(
+                        -k,
+                        y,
+                        Box::new(LinearPoly::Num(BigInt::from(0))),
+                    )),
+                );
+                Some(p.beq(&want))
+            }
+            "of_var_eq_var_cert" if args.len() >= 3 => {
+                let Some(x) = self.closed_nat_value(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(y) = self.closed_nat_value(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(p) = self.parse_linear_poly(ctx, &args[2])? else {
+                    return Ok(None);
+                };
+                let want = LinearPoly::Add(
+                    BigInt::from(1),
+                    x,
+                    Box::new(LinearPoly::Add(
+                        BigInt::from(-1),
+                        y,
+                        Box::new(LinearPoly::Num(BigInt::from(0))),
+                    )),
+                );
+                Some(p.beq(&want))
+            }
+            "norm_eq_cert" if args.len() >= 3 => {
+                let trace = std::env::var_os("KIOTA_TRACE_LINEAR").is_some();
+                let lhs = self.parse_linear_expr(ctx, &args[0])?;
+                let rhs = self.parse_linear_expr(ctx, &args[1])?;
+                let p = self.parse_linear_poly(ctx, &args[2])?;
+                if trace {
+                    eprintln!(
+                        "LINEAR norm_eq_cert lhs={} rhs={} p={} a0={}",
+                        lhs.is_some(),
+                        rhs.is_some(),
+                        p.is_some(),
+                        self.pp_budget(&args[0], 30)
+                    );
+                }
+                let (Some(lhs), Some(rhs), Some(p)) = (lhs, rhs, p) else {
+                    return Ok(None);
+                };
+                let n = LinearExpr::Sub(Box::new(lhs), Box::new(rhs)).norm();
+                let r = p.beq(&n);
+                if trace {
+                    eprintln!("LINEAR norm_eq_cert beq={r}");
+                }
+                Some(r)
+            }
+            "norm_eq_var_cert" if args.len() >= 4 => {
+                let Some(lhs) = self.parse_linear_expr(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(rhs) = self.parse_linear_expr(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(x) = self.closed_nat_value(ctx, &self.whnf(ctx, &args[2])?)? else {
+                    return Ok(None);
+                };
+                let Some(y) = self.closed_nat_value(ctx, &self.whnf(ctx, &args[3])?)? else {
+                    return Ok(None);
+                };
+                let want = LinearPoly::Add(
+                    BigInt::from(1),
+                    x,
+                    Box::new(LinearPoly::Add(
+                        BigInt::from(-1),
+                        y,
+                        Box::new(LinearPoly::Num(BigInt::from(0))),
+                    )),
+                );
+                Some(LinearExpr::Sub(Box::new(lhs), Box::new(rhs)).norm().beq(&want))
+            }
+            "norm_eq_var_const_cert" if args.len() >= 4 => {
+                let Some(lhs) = self.parse_linear_expr(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(rhs) = self.parse_linear_expr(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(x) = self.closed_nat_value(ctx, &self.whnf(ctx, &args[2])?)? else {
+                    return Ok(None);
+                };
+                let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[3])?)? else {
+                    return Ok(None);
+                };
+                let want = LinearPoly::Add(
+                    BigInt::from(1),
+                    x,
+                    Box::new(LinearPoly::Num(-k)),
+                );
+                Some(LinearExpr::Sub(Box::new(lhs), Box::new(rhs)).norm().beq(&want))
+            }
+            "norm_eq_coeff_cert" if args.len() >= 4 => {
+                let Some(lhs) = self.parse_linear_expr(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(rhs) = self.parse_linear_expr(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(p) = self.parse_linear_poly(ctx, &args[2])? else {
+                    return Ok(None);
+                };
+                let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[3])?)? else {
+                    return Ok(None);
+                };
+                let n = LinearExpr::Sub(Box::new(lhs), Box::new(rhs)).norm();
+                Some(n.beq(&p.mul(&k)) && k.sign() == Sign::Plus)
+            }
+            "of_var_eq_cert" if args.len() >= 3 => {
+                let Some(x) = self.closed_nat_value(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[1])?)? else {
+                    return Ok(None);
+                };
+                let Some(p) = self.parse_linear_poly(ctx, &args[2])? else {
+                    return Ok(None);
+                };
+                let want = LinearPoly::Add(
+                    BigInt::from(1),
+                    x,
+                    Box::new(LinearPoly::Num(-k)),
+                );
+                Some(p.beq(&want))
+            }
+            _ => None,
+        };
+        if let Some(v) = bool_r {
+            if let Some(e) = self.mk_bool_const(v) {
+                let skip = match ident {
+                    "eq_eq_subst'_cert" => 5,
+                    "eq_dvd_subst_cert" => 6,
+                    "dvd_of_eq_cert"
+                    | "of_var_eq_mul_cert"
+                    | "le_combine_coeff_cert"
+                    | "norm_eq_var_cert"
+                    | "norm_eq_var_const_cert"
+                    | "norm_eq_coeff_cert" => 4,
+                    "diseq_eq_subst_cert" | "eq_eq_subst_cert" => 4,
+                    "eq_of_core_cert"
+                    | "le_of_le_diseq_cert"
+                    | "diseq_split_cert"
+                    | "le_coeff_cert"
+                    | "le_combine_cert"
+                    | "eq_coeff_cert"
+                    | "var_eq_cert"
+                    | "of_var_eq_var_cert"
+                    | "of_var_eq_cert"
+                    | "norm_eq_cert" => 3,
+                    "eq_unsat_coeff_cert" | "eq_of_le_ge_cert" | "le_neg_cert" => 2,
+                    _ => args.len(),
+                };
+                let r = expr::apps(e, &args[skip.min(args.len())..]);
+                if trace {
+                    eprintln!(
+                        "LINEAR return ident={ident} skip={skip} nargs={} r={}",
+                        args.len(),
+                        self.pp_budget(&r, 16)
+                    );
+                }
+                return Ok(Some(r));
+            } else if trace {
+                eprintln!("LINEAR mk_bool FAIL ident={ident}");
+            }
+        }
+        Ok(None)
+    }
+
+    fn mk_int_bin(&self, op: &str, a: Expr, b: Expr) -> Option<Expr> {
+        let n = self.find_name_ending(op)?;
+        Some(expr::apps(expr::const_(n, vec![]), &[a, b]))
+    }
+
+    fn mk_int_un(&self, op: &str, a: Expr) -> Option<Expr> {
+        let n = self.find_name_ending(op)?;
+        Some(expr::app(expr::const_(n, vec![]), a))
+    }
+
+    fn mk_hbinop(
+        &self,
+        method: &str,
+        inst_h: &str,
+        inst_int: &str,
+        a: Expr,
+        b: Expr,
+    ) -> Option<Expr> {
+        let method_n = self.find_name(method)?;
+        let int = self.find_name_ending("Int")?;
+        let inst_h_n = self.find_name(inst_h)?;
+        let inst_int_n = self.find_name(inst_int)?;
+        let z = level::zero();
+        let ity = expr::const_(int, vec![]);
+        let inst = expr::apps(
+            expr::const_(inst_h_n, vec![z.clone()]),
+            &[ity.clone(), expr::const_(inst_int_n, vec![])],
+        );
+        Some(expr::apps(
+            expr::const_(method_n, vec![z.clone(), z.clone(), z]),
+            &[ity.clone(), ity.clone(), ity, inst, a, b],
+        ))
+    }
+
+    fn mk_hadd(&self, a: Expr, b: Expr) -> Option<Expr> {
+        self.mk_hbinop("HAdd.hAdd", "instHAdd", "Int.instAdd", a, b)
+    }
+
+    fn mk_hsub(&self, a: Expr, b: Expr) -> Option<Expr> {
+        self.mk_hbinop("HSub.hSub", "instHSub", "Int.instSub", a, b)
+    }
+
+    fn mk_hmul(&self, a: Expr, b: Expr) -> Option<Expr> {
+        self.mk_hbinop("HMul.hMul", "instHMul", "Int.instMul", a, b)
+    }
+
+    fn mk_hneg(&self, a: Expr) -> Option<Expr> {
+        let neg = self.find_name("Neg.neg")?;
+        let int = self.find_name_ending("Int")?;
+        let inst = self
+            .find_name("Int.instNegInt")
+            .or_else(|| self.find_name_ending("instNegInt"))?;
+        let z = level::zero();
+        Some(expr::apps(
+            expr::const_(neg, vec![z]),
+            &[expr::const_(int, vec![]), expr::const_(inst, vec![]), a],
+        ))
+    }
+
+    fn rarray_get(&self, ctx: &Ctx, arr: &Expr, idx: &Expr) -> R<Option<Expr>> {
+        let Some(n) = self.closed_nat_value(ctx, idx)? else {
+            return Ok(None);
+        };
+        let mut cur = self.whnf(ctx, arr)?;
+        loop {
+            let (h, args) = expr::unfold_apps(&cur);
+            let name = match &**h {
+                ExprData::Const(cn, _) => self.name_str(*cn),
+                _ => return Ok(None),
+            };
+            let ident = name.rsplit('.').next().unwrap_or(name);
+            if ident == "leaf" && !args.is_empty() {
+                return Ok(Some(args.last().unwrap().clone()));
+            }
+            if ident == "branch" && args.len() >= 3 {
+                let p = &args[args.len() - 3];
+                let l = &args[args.len() - 2];
+                let rgt = &args[args.len() - 1];
+                let Some(pv) = self.closed_nat_value(ctx, p)? else {
+                    return Ok(None);
+                };
+                cur = self.whnf(ctx, if n < pv { l } else { rgt })?;
+                continue;
+            }
+            return Ok(None);
+        }
+    }
+
+    fn linear_expr_denote(&self, ctx: &Ctx, rctx: &Expr, e: &Expr) -> R<Option<Expr>> {
+        let e = self.whnf(ctx, e)?;
+        let (h, args) = expr::unfold_apps(&e);
+        let name = match &**h {
+            ExprData::Const(n, _) => self.name_str(*n),
+            _ => return Ok(None),
+        };
+        if is_int_linear_ident(name, "Expr.num") && !args.is_empty() {
+            return Ok(Some(args.last().unwrap().clone()));
+        }
+        if is_int_linear_ident(name, "Expr.var") && !args.is_empty() {
+            return self.rarray_get(ctx, rctx, args.last().unwrap());
+        }
+        if is_int_linear_ident(name, "Expr.neg") && !args.is_empty() {
+            let Some(a) = self.linear_expr_denote(ctx, rctx, args.last().unwrap())? else {
+                return Ok(None);
+            };
+            return Ok(self.mk_hneg(a));
+        }
+        if is_int_linear_ident(name, "Expr.add") && args.len() >= 2 {
+            let Some(a) = self.linear_expr_denote(ctx, rctx, &args[args.len() - 2])? else {
+                return Ok(None);
+            };
+            let Some(b) = self.linear_expr_denote(ctx, rctx, &args[args.len() - 1])? else {
+                return Ok(None);
+            };
+            return Ok(self.mk_hadd(a, b));
+        }
+        if is_int_linear_ident(name, "Expr.sub") && args.len() >= 2 {
+            let Some(a) = self.linear_expr_denote(ctx, rctx, &args[args.len() - 2])? else {
+                return Ok(None);
+            };
+            let Some(b) = self.linear_expr_denote(ctx, rctx, &args[args.len() - 1])? else {
+                return Ok(None);
+            };
+            return Ok(self.mk_hsub(a, b));
+        }
+        if is_int_linear_ident(name, "Expr.mulL") && args.len() >= 2 {
+            let k = args[args.len() - 2].clone();
+            let Some(a) = self.linear_expr_denote(ctx, rctx, &args[args.len() - 1])? else {
+                return Ok(None);
+            };
+            return Ok(self.mk_hmul(k, a));
+        }
+        if is_int_linear_ident(name, "Expr.mulR") && args.len() >= 2 {
+            let Some(a) = self.linear_expr_denote(ctx, rctx, &args[args.len() - 2])? else {
+                return Ok(None);
+            };
+            let k = args[args.len() - 1].clone();
+            return Ok(self.mk_hmul(a, k));
+        }
+        Ok(None)
+    }
+
+    /// `Poly.denote'`: left-fold, skip `k==1` mul and `num 0` add, keep
+    /// the original numeral terms (`Neg.neg`/`OfNat`, not `negSucc`).
+    fn linear_poly_denote_prime(&self, ctx: &Ctx, rctx: &Expr, p: &Expr) -> R<Option<Expr>> {
+        let p = self.whnf(ctx, p)?;
+        let (h, args) = expr::unfold_apps(&p);
+        let name = match &**h {
+            ExprData::Const(n, _) => self.name_str(*n),
+            _ => return Ok(None),
+        };
+        if is_int_linear_ident(name, "Poly.num") && !args.is_empty() {
+            return Ok(Some(args.last().unwrap().clone()));
+        }
+        if is_int_linear_ident(name, "Poly.add") && args.len() >= 3 {
+            let k_term = args[args.len() - 3].clone();
+            let v_term = &args[args.len() - 2];
+            let rest = &args[args.len() - 1];
+            let Some(kv) = self.closed_int_value(ctx, &self.whnf(ctx, &k_term)?)? else {
+                return Ok(None);
+            };
+            let Some(var_e) = self.rarray_get(ctx, rctx, v_term)? else {
+                return Ok(None);
+            };
+            let acc = if kv == BigInt::from(1) {
+                var_e
+            } else {
+                let Some(m) = self.mk_hmul(k_term, var_e) else {
+                    return Ok(None);
+                };
+                m
+            };
+            return self.linear_poly_denote_go(ctx, rctx, rest, acc);
+        }
+        Ok(None)
+    }
+
+    fn linear_poly_denote_go(
+        &self,
+        ctx: &Ctx,
+        rctx: &Expr,
+        p: &Expr,
+        acc: Expr,
+    ) -> R<Option<Expr>> {
+        let p = self.whnf(ctx, p)?;
+        let (h, args) = expr::unfold_apps(&p);
+        let name = match &**h {
+            ExprData::Const(n, _) => self.name_str(*n),
+            _ => return Ok(None),
+        };
+        if is_int_linear_ident(name, "Poly.num") && !args.is_empty() {
+            let k_term = args.last().unwrap().clone();
+            let Some(kv) = self.closed_int_value(ctx, &self.whnf(ctx, &k_term)?)? else {
+                return Ok(None);
+            };
+            if kv.sign() == Sign::NoSign {
+                return Ok(Some(acc));
+            }
+            return Ok(self.mk_hadd(acc, k_term));
+        }
+        if is_int_linear_ident(name, "Poly.add") && args.len() >= 3 {
+            let k_term = args[args.len() - 3].clone();
+            let v_term = &args[args.len() - 2];
+            let rest = &args[args.len() - 1];
+            let Some(kv) = self.closed_int_value(ctx, &self.whnf(ctx, &k_term)?)? else {
+                return Ok(None);
+            };
+            let Some(var_e) = self.rarray_get(ctx, rctx, v_term)? else {
+                return Ok(None);
+            };
+            let step = if kv == BigInt::from(1) {
+                var_e
+            } else {
+                let Some(m) = self.mk_hmul(k_term, var_e) else {
+                    return Ok(None);
+                };
+                m
+            };
+            let Some(acc2) = self.mk_hadd(acc, step) else {
+                return Ok(None);
+            };
+            return self.linear_poly_denote_go(ctx, rctx, rest, acc2);
+        }
+        Ok(None)
+    }
+
+    fn parse_linear_expr(&self, ctx: &Ctx, e: &Expr) -> R<Option<LinearExpr>> {
+        let e = self.whnf(ctx, e)?;
+        let (h, args) = expr::unfold_apps(&e);
+        let name = match &**h {
+            ExprData::Const(n, _) => self.name_str(*n),
+            _ => return Ok(None),
+        };
+        if is_int_linear_ident(name, "Expr.num") && !args.is_empty() {
+            let last = self.whnf(ctx, args.last().unwrap())?;
+            let Some(k) = self.closed_int_value(ctx, &last)? else {
+                return Ok(None);
+            };
+            return Ok(Some(LinearExpr::Num(k)));
+        }
+        if is_int_linear_ident(name, "Expr.var") && !args.is_empty() {
+            let last = self.whnf(ctx, args.last().unwrap())?;
+            let Some(x) = self.closed_nat_value(ctx, &last)? else {
+                return Ok(None);
+            };
+            return Ok(Some(LinearExpr::Var(x)));
+        }
+        if is_int_linear_ident(name, "Expr.neg") && !args.is_empty() {
+            let Some(a) = self.parse_linear_expr(ctx, args.last().unwrap())? else {
+                return Ok(None);
+            };
+            return Ok(Some(LinearExpr::Neg(Box::new(a))));
+        }
+        if is_int_linear_ident(name, "Expr.add") && args.len() >= 2 {
+            let Some(a) = self.parse_linear_expr(ctx, &args[args.len() - 2])? else {
+                return Ok(None);
+            };
+            let Some(b) = self.parse_linear_expr(ctx, &args[args.len() - 1])? else {
+                return Ok(None);
+            };
+            return Ok(Some(LinearExpr::Add(Box::new(a), Box::new(b))));
+        }
+        if is_int_linear_ident(name, "Expr.sub") && args.len() >= 2 {
+            let Some(a) = self.parse_linear_expr(ctx, &args[args.len() - 2])? else {
+                return Ok(None);
+            };
+            let Some(b) = self.parse_linear_expr(ctx, &args[args.len() - 1])? else {
+                return Ok(None);
+            };
+            return Ok(Some(LinearExpr::Sub(Box::new(a), Box::new(b))));
+        }
+        if is_int_linear_ident(name, "Expr.mulL") && args.len() >= 2 {
+            let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[args.len() - 2])?)? else {
+                return Ok(None);
+            };
+            let Some(a) = self.parse_linear_expr(ctx, &args[args.len() - 1])? else {
+                return Ok(None);
+            };
+            return Ok(Some(LinearExpr::MulL(k, Box::new(a))));
+        }
+        if is_int_linear_ident(name, "Expr.mulR") && args.len() >= 2 {
+            let Some(a) = self.parse_linear_expr(ctx, &args[args.len() - 2])? else {
+                return Ok(None);
+            };
+            let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[args.len() - 1])?)? else {
+                return Ok(None);
+            };
+            return Ok(Some(LinearExpr::MulR(Box::new(a), k)));
+        }
+        Ok(None)
+    }
+
+    fn parse_linear_poly(&self, ctx: &Ctx, e: &Expr) -> R<Option<LinearPoly>> {
+        let e = self.whnf(ctx, e)?;
+        let (h, args) = expr::unfold_apps(&e);
+        let name = match &**h {
+            ExprData::Const(n, _) => self.name_str(*n),
+            _ => return Ok(None),
+        };
+        if std::env::var_os("KIOTA_TRACE_LINEAR").is_some()
+            && !is_int_linear_ident(name, "Poly.num")
+            && !is_int_linear_ident(name, "Poly.add")
+        {
+            eprintln!("LINEAR parse miss head={name} nargs={}", args.len());
+        }
+        if is_int_linear_ident(name, "Poly.num") && !args.is_empty() {
+            let last = self.whnf(ctx, args.last().unwrap())?;
+            let Some(k) = self.closed_int_value(ctx, &last)? else {
+                return Ok(None);
+            };
+            return Ok(Some(LinearPoly::Num(k)));
+        }
+        if is_int_linear_ident(name, "Poly.add") && args.len() >= 3 {
+            let k = self.whnf(ctx, &args[args.len() - 3])?;
+            let v = self.whnf(ctx, &args[args.len() - 2])?;
+            let p = &args[args.len() - 1];
+            let Some(kv) = self.closed_int_value(ctx, &k)? else {
+                return Ok(None);
+            };
+            let Some(vv) = self.closed_nat_value(ctx, &v)? else {
+                return Ok(None);
+            };
+            let Some(pv) = self.parse_linear_poly(ctx, p)? else {
+                return Ok(None);
+            };
+            return Ok(Some(LinearPoly::Add(kv, vv, Box::new(pv))));
+        }
+        Ok(None)
+    }
+
+    fn mk_linear_poly(&self, p: &LinearPoly) -> Option<Expr> {
+        match p {
+            LinearPoly::Num(k) => {
+                let ctor = self.find_int_linear_ident("Poly.num")?;
+                Some(expr::app(
+                    expr::const_(ctor, vec![]),
+                    self.mk_int_canonical(k)?,
+                ))
+            }
+            LinearPoly::Add(k, v, rest) => {
+                let ctor = self.find_int_linear_ident("Poly.add")?;
+                let ke = self.mk_int_canonical(k)?;
+                let ve = expr::lit_nat(v.clone());
+                let pe = self.mk_linear_poly(rest)?;
+                Some(expr::apps(expr::const_(ctor, vec![]), &[ke, ve, pe]))
+            }
+        }
+    }
+
+    fn find_int_linear_ident(&self, ident: &str) -> Option<u32> {
+        self.names
+            .iter()
+            .position(|n| is_int_linear_ident(n.as_str(), ident))
+            .map(|i| i as u32)
+    }
+
+    fn mk_bool_const(&self, v: bool) -> Option<Expr> {
+        let tname = if v { "Bool.true" } else { "Bool.false" };
+        let bn = self.find_name(tname)?;
+        Some(expr::const_(bn, vec![]))
+    }
+
+    /// Closed `Lean.Grind.CommRing` certificates. `toPoly_k` / `combine_k`
+    /// are `Expr.rec` / `Nat.rec hugeFuel`; peeling them dies at Init
+    /// `#17755` (`norm_cnstr_cert`). Do not intercept `Poly.beq'`.
+    fn try_comm_ring(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
+        let n = match &***head {
+            ExprData::Const(n, _) => *n,
+            _ => return Ok(None),
+        };
+        let name = self.name_str(n);
+        if !name.contains("CommRing") {
+            return Ok(None);
+        }
+        let ident = name.rsplit('.').next().unwrap_or(name);
+        let bool_r = match ident {
+            "norm_cnstr_cert" if args.len() >= 4 => {
+                let Some(lhs) = self.parse_commring_expr(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(rhs) = self.parse_commring_expr(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(lhs2) = self.parse_commring_expr(ctx, &args[2])? else {
+                    return Ok(None);
+                };
+                let Some(rhs2) = self.parse_commring_expr(ctx, &args[3])? else {
+                    return Ok(None);
+                };
+                let Some(p) = CrExpr::Sub(Box::new(rhs), Box::new(lhs)).to_poly() else {
+                    return Ok(None);
+                };
+                let Some(q) = CrExpr::Sub(Box::new(rhs2), Box::new(lhs2)).to_poly() else {
+                    return Ok(None);
+                };
+                Some(p.beq(&q))
+            }
+            "norm_eq_cert" if args.len() >= 4 && name.contains("CommRing") => {
+                let Some(lhs) = self.parse_commring_expr(ctx, &args[0])? else {
+                    return Ok(None);
+                };
+                let Some(rhs) = self.parse_commring_expr(ctx, &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(lhs2) = self.parse_commring_expr(ctx, &args[2])? else {
+                    return Ok(None);
+                };
+                let Some(rhs2) = self.parse_commring_expr(ctx, &args[3])? else {
+                    return Ok(None);
+                };
+                let Some(p) = CrExpr::Sub(Box::new(lhs), Box::new(rhs)).to_poly() else {
+                    return Ok(None);
+                };
+                let Some(q) = CrExpr::Sub(Box::new(lhs2), Box::new(rhs2)).to_poly() else {
+                    return Ok(None);
+                };
+                Some(p.beq(&q))
+            }
+            _ => None,
+        };
+        if let Some(v) = bool_r {
+            if let Some(e) = self.mk_bool_const(v) {
+                return Ok(Some(expr::apps(e, &args[4.min(args.len())..])));
+            }
+        }
+        Ok(None)
+    }
+
+    fn parse_commring_expr(&self, ctx: &Ctx, e: &Expr) -> R<Option<CrExpr>> {
+        let e = self.whnf(ctx, e)?;
+        let (h, args) = expr::unfold_apps(&e);
+        let name = match &**h {
+            ExprData::Const(n, _) => self.name_str(*n),
+            _ => return Ok(None),
+        };
+        if is_commring_ident(name, "Expr.num") && !args.is_empty() {
+            let last = self.whnf(ctx, args.last().unwrap())?;
+            let Some(k) = self.closed_int_value(ctx, &last)? else {
+                return Ok(None);
+            };
+            return Ok(Some(CrExpr::Num(k)));
+        }
+        if is_commring_ident(name, "Expr.natCast") && !args.is_empty() {
+            let last = self.whnf(ctx, args.last().unwrap())?;
+            let Some(k) = self.closed_nat_value(ctx, &last)? else {
+                return Ok(None);
+            };
+            return Ok(Some(CrExpr::NatCast(k)));
+        }
+        if is_commring_ident(name, "Expr.intCast") && !args.is_empty() {
+            let last = self.whnf(ctx, args.last().unwrap())?;
+            let Some(k) = self.closed_int_value(ctx, &last)? else {
+                return Ok(None);
+            };
+            return Ok(Some(CrExpr::IntCast(k)));
+        }
+        if is_commring_ident(name, "Expr.var") && !args.is_empty() {
+            let last = self.whnf(ctx, args.last().unwrap())?;
+            let Some(x) = self.closed_nat_value(ctx, &last)? else {
+                return Ok(None);
+            };
+            return Ok(Some(CrExpr::Var(x)));
+        }
+        if is_commring_ident(name, "Expr.neg") && !args.is_empty() {
+            let Some(a) = self.parse_commring_expr(ctx, args.last().unwrap())? else {
+                return Ok(None);
+            };
+            return Ok(Some(CrExpr::Neg(Box::new(a))));
+        }
+        if is_commring_ident(name, "Expr.add") && args.len() >= 2 {
+            let Some(a) = self.parse_commring_expr(ctx, &args[args.len() - 2])? else {
+                return Ok(None);
+            };
+            let Some(b) = self.parse_commring_expr(ctx, &args[args.len() - 1])? else {
+                return Ok(None);
+            };
+            return Ok(Some(CrExpr::Add(Box::new(a), Box::new(b))));
+        }
+        if is_commring_ident(name, "Expr.sub") && args.len() >= 2 {
+            let Some(a) = self.parse_commring_expr(ctx, &args[args.len() - 2])? else {
+                return Ok(None);
+            };
+            let Some(b) = self.parse_commring_expr(ctx, &args[args.len() - 1])? else {
+                return Ok(None);
+            };
+            return Ok(Some(CrExpr::Sub(Box::new(a), Box::new(b))));
+        }
+        if is_commring_ident(name, "Expr.mul") && args.len() >= 2 {
+            let Some(a) = self.parse_commring_expr(ctx, &args[args.len() - 2])? else {
+                return Ok(None);
+            };
+            let Some(b) = self.parse_commring_expr(ctx, &args[args.len() - 1])? else {
+                return Ok(None);
+            };
+            return Ok(Some(CrExpr::Mul(Box::new(a), Box::new(b))));
+        }
+        if is_commring_ident(name, "Expr.pow") && args.len() >= 2 {
+            let Some(a) = self.parse_commring_expr(ctx, &args[args.len() - 2])? else {
+                return Ok(None);
+            };
+            let kw = self.whnf(ctx, &args[args.len() - 1])?;
+            let Some(k) = self.closed_nat_value(ctx, &kw)? else {
+                return Ok(None);
+            };
+            return Ok(Some(CrExpr::Pow(Box::new(a), k)));
+        }
+        Ok(None)
+    }
+
     fn try_intlist(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
         let n = match &***head {
             ExprData::Const(n, _) => *n,
@@ -2819,6 +4971,16 @@ impl<'e> Checker<'e> {
             _ => return Ok(None),
         };
         let name = self.name_str(n);
+        let ident = name.rsplit('.').next().unwrap_or(name);
+        if ident == "tidyConstraint" || ident == "tidyCoeffs" {
+            if args.len() >= 2 {
+                if let Some((c, xs)) = self.omega_tidy(ctx, &args[0], &args[1])? {
+                    let r = if ident == "tidyConstraint" { c } else { xs };
+                    return Ok(Some(expr::apps(r, &args[2..])));
+                }
+            }
+            return Ok(None);
+        }
         if !name.contains("Constraint") {
             return Ok(None);
         }
@@ -2852,6 +5014,84 @@ impl<'e> Checker<'e> {
             }
         }
         Ok(None)
+    }
+
+    /// `Lean.Omega.tidy`: positivize (flip+neg if leading coeff < 0) then
+    /// normalize (divide by gcd). Init `#20467` (`ToInt.Add Int64`) is
+    /// `Eq.refl true` after `tidyConstraint`/`tidyCoeffs` of
+    /// `mk (some -(2^63-1)) (some 2^64-1)` with coeffs `[0,0,-2^64,2^64]`.
+    fn omega_tidy(
+        &self,
+        ctx: &Ctx,
+        s: &Expr,
+        x: &Expr,
+    ) -> R<Option<(Expr, Expr)>> {
+        let s = self.whnf(ctx, s)?;
+        let Some((lo_e, hi_e)) = self.constraint_mk_fields(&s) else {
+            return Ok(None);
+        };
+        let Some(mut lo) = self.closed_option_int(ctx, &lo_e)? else {
+            return Ok(None);
+        };
+        let Some(mut hi) = self.closed_option_int(ctx, &hi_e)? else {
+            return Ok(None);
+        };
+        let Some(mut coeffs) = self.closed_int_list_values(ctx, x)? else {
+            return Ok(None);
+        };
+        let leading = coeffs
+            .iter()
+            .find(|c| c.sign() != Sign::NoSign)
+            .cloned()
+            .unwrap_or_else(|| BigInt::from(0));
+        if leading.sign() == Sign::Minus {
+            let new_lo = hi.as_ref().map(|h| -h);
+            let new_hi = lo.as_ref().map(|l| -l);
+            lo = new_lo;
+            hi = new_hi;
+            for c in &mut coeffs {
+                *c = -&*c;
+            }
+        }
+        let mut g = BigUint::from(0u32);
+        for c in &coeffs {
+            let abs = c.magnitude().clone();
+            g = if g == BigUint::from(0u32) {
+                abs
+            } else {
+                num_bigint_gcd(&g, &abs)
+            };
+        }
+        if g == BigUint::from(0u32) {
+            let sat0 = lo.as_ref().map(|l| l <= &BigInt::from(0)).unwrap_or(true)
+                && hi.as_ref().map(|h| &BigInt::from(0) <= h).unwrap_or(true);
+            if sat0 {
+                lo = None;
+                hi = None;
+            } else {
+                lo = Some(BigInt::from(1));
+                hi = Some(BigInt::from(0));
+            }
+        } else if g != BigUint::from(1u32) {
+            let gk = BigInt::from(g.clone());
+            lo = lo.map(|x| -int_ediv(&(-&x), &gk));
+            hi = hi.map(|y| int_ediv(&y, &gk));
+            coeffs = coeffs.iter().map(|x| int_ediv(x, &gk)).collect();
+        }
+        let Some(mk) = self.find_name_ending("Constraint.mk") else {
+            return Ok(None);
+        };
+        let Some(lo_e) = self.mk_option_int(lo) else {
+            return Ok(None);
+        };
+        let Some(hi_e) = self.mk_option_int(hi) else {
+            return Ok(None);
+        };
+        let c = expr::apps(expr::const_(mk, vec![]), &[lo_e, hi_e]);
+        let Some(xs) = self.mk_closed_int_list(&coeffs) else {
+            return Ok(None);
+        };
+        Ok(Some((c, xs)))
     }
 
     fn closed_option_int(
@@ -3100,7 +5340,74 @@ impl<'e> Checker<'e> {
             }
             return Ok(None);
         }
+        if (name == "Int.pow" || name.ends_with(".Int.pow")) && args.len() >= 2 {
+            if let (Some(a), Some(e)) = (
+                self.closed_int_value(ctx, &args[0])?,
+                self.closed_nat_value(ctx, &args[1])?,
+            ) {
+                return Ok(int_pow(&a, &e));
+            }
+            return Ok(None);
+        }
+        if name == "HPow.hPow" && args.len() >= 6 {
+            if let (Some(a), Some(e)) = (
+                self.closed_int_value(ctx, &args[4])?,
+                self.closed_nat_value(ctx, &args[5])?,
+            ) {
+                return Ok(int_pow(&a, &e));
+            }
+            return Ok(None);
+        }
+        if (name == "Int.bmod" || name.ends_with(".Int.bmod")) && args.len() >= 2 {
+            if let (Some(x), Some(m)) = (
+                self.closed_int_value(ctx, &args[0])?,
+                self.closed_nat_value(ctx, &args[1])?,
+            ) {
+                return Ok(Some(int_bmod(&x, &m)));
+            }
+            return Ok(None);
+        }
         Ok(None)
+    }
+
+    /// `Int.ofNat n` / `Int.negSucc (n-1)` — already WHNF, so `Int.neg`
+    /// of a closed numeral cannot unfold into a `Nat.rec` of size `n`.
+    fn mk_int_canonical(&self, v: &BigInt) -> Option<Expr> {
+        if v.sign() != Sign::Minus {
+            let ofn = self.find_name_ending("Int.ofNat")?;
+            return Some(expr::app(
+                expr::const_(ofn, vec![]),
+                nat::mk_lit(v.magnitude().clone()),
+            ));
+        }
+        let ns = self.find_name_ending("Int.negSucc")?;
+        let mag = v.magnitude();
+        if *mag == BigUint::from(0u32) {
+            return None;
+        }
+        Some(expr::app(
+            expr::const_(ns, vec![]),
+            nat::mk_lit(mag - 1u32),
+        ))
+    }
+
+    /// Kernel-native `Int.decLe`/`Int.decLt` result. The proof payload is
+    /// `True.intro`; `ite`/`decide` only inspect the constructor.
+    fn mk_decidable_bool(&self, yes: bool) -> Option<Expr> {
+        let ctor = if yes {
+            "Decidable.isTrue"
+        } else {
+            "Decidable.isFalse"
+        };
+        let c = self
+            .find_name(ctor)
+            .or_else(|| self.find_name_ending(if yes { "isTrue" } else { "isFalse" }))?;
+        let true_ty = self.find_name("True")?;
+        let intro = self.find_name("True.intro")?;
+        Some(expr::apps(
+            expr::const_(c, vec![level::zero()]),
+            &[expr::const_(true_ty, vec![]), expr::const_(intro, vec![])],
+        ))
     }
 
     fn mk_closed_int(&self, v: &BigInt) -> Option<Expr> {
@@ -3321,6 +5628,10 @@ impl<'e> Checker<'e> {
                         expr::proj(combo, 1, lc),
                     )
                 };
+            let coeffs_w = self.whnf(ctx, &coeffs)?;
+            if self.is_list_nil(&coeffs_w) {
+                return Ok(Some(expr::apps(cnst, &args[2..])));
+            }
             let dot = self.find_name_ending("Coeffs.dot");
             let iadd = self.find_name_ending("Int.add");
             if std::env::var_os("KIOTA_TRACE_OMEGA").is_some() {

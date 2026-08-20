@@ -35,7 +35,16 @@ fn finish(result: Result<(), tc::TcError>) -> ! {
     };
     let _ = std::io::stderr().flush();
     let _ = std::io::stdout().flush();
-    std::process::exit(code);
+    // `std::process::exit` still runs Apple TLS dtors, which walk the
+    // interned `Rc` term DAG (`Interner` in thread-local). Full Init is
+    // ~13 GB of nodes; that drop took longer than checking. The OS
+    // reclaims the address space on `_exit`.
+    unsafe {
+        extern "C" {
+            fn _exit(status: i32) -> !;
+        }
+        _exit(code);
+    }
 }
 
 fn main() {

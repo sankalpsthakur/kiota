@@ -74,3 +74,8 @@ fn bad_def_rejects() {
 fn non_prop_thm_rejects() {
     assert_reject("012_nonPropThm.reject.ndjson");
 }
+
+#[test]
+fn extra_rec_rejects() {
+    assert_reject("extra-rec.reject.ndjson");
+}
