@@ -841,8 +841,9 @@ pub struct Checker<'e> {
     fuel_nat_peels: std::cell::Cell<u32>,
     /// Last bits≥20 literal peeled; used to detect one hugeFuel countdown.
     fuel_nat_last: std::cell::RefCell<Option<num_bigint::BigUint>>,
-    /// Lean `infer_only`: skip app-arg checks. Used from PI so we do not
-    /// Check a 100k-node proof just to read its type.
+    /// Lean `infer_only`: skip app-arg checks. Used from proof irrelevance
+    /// (Lean `infer`, not `check`) so we read a proof's type without
+    /// re-checking it. Declaration values always `check`.
     infer_only: std::cell::Cell<bool>,
     /// Tree size of the decl value currently being checked (0 = none).
     /// Eager Regular unfold is budgeted against this, not a library name.
@@ -858,9 +859,6 @@ pub struct Checker<'e> {
     /// class shape. Those instances need a higher Regular cap than huge
     /// proof bodies of similar size.
     checking_simple_prop_inductive: std::cell::Cell<bool>,
-    /// Theorem (not def) whose value is ≥10k nodes. Eager Regular cap stays
-    /// below circuit size; defs of similar size still unfold helpers.
-    checking_large_theorem: std::cell::Cell<bool>,
     /// Defs on an equality-shaped type (and nested Defs mentioned in
     /// those bodies). Unfolded regardless of the size cap so small eq
     /// lemmas of a large aux def still reduce.
@@ -989,7 +987,6 @@ impl<'e> Checker<'e> {
             checking_prop_structure: std::cell::Cell::new(false),
             eq_side_def_size: std::cell::Cell::new(0),
             checking_simple_prop_inductive: std::cell::Cell::new(false),
-            checking_large_theorem: std::cell::Cell::new(false),
             eq_related_defs: RefCell::new(Vec::new()),
         }
     }
@@ -1113,8 +1110,6 @@ impl<'e> Checker<'e> {
                 .map(|v| expr_size_capped(v, 200_000))
                 .unwrap_or(0),
         );
-        self.checking_large_theorem
-            .set(kind == "theorem" && self.decl_value_size.get() >= 10_000);
         let multi = kind == "theorem" && self.type_is_multiarg_prop_structure(ci.typ());
         self.checking_prop_structure.set(multi);
         self.checking_simple_prop_inductive
@@ -1190,14 +1185,11 @@ impl<'e> Checker<'e> {
             }
         }
         if let Some(value) = ci.value() {
-            // Large theorem bodies: infer with Lean infer_only (skip app-arg
-            // Check). Small equation lemmas still full-Check. Size, not a
-            // library name.
-            let vt = if kind == "theorem" && self.decl_value_size.get() >= 10_000 {
-                self.with_infer_only(|| self.infer_type(&ctx, value))?
-            } else {
-                self.infer_type(&ctx, value)?
-            };
+            // Lean `add_theorem` calls `checker.check(val)` (`infer_only =
+            // false`). Skipping app-arg checks on large theorem values would
+            // accept `False.elim junk` whenever the inferred type still
+            // matches the declaration.
+            let vt = self.infer_type(&ctx, value)?;
             if !self.is_def_eq(&ctx, &vt, typ)? {
                 if std::env::var_os("KIOTA_DEBUG").is_some() {
                     return reject(format!(
@@ -1292,9 +1284,9 @@ impl<'e> Checker<'e> {
             ExprData::App(f, a) => {
                 let ft = self.infer_type(ctx, f)?;
                 let (_, dom, body) = self.ensure_pi(ctx, &ft)?;
-                // Lean `infer_only` / mathgraph InferOnly: PI only needs the
-                // type, not a full Check of every argument. Nested Check of a
-                // 100k-node proof intern-OOMs.
+                // Lean `infer` (not `check`): proof irrelevance only needs
+                // the type of an already-checked proof. Declaration Check
+                // still verifies every argument.
                 if !self.infer_only.get() {
                     let at = self.infer_type(ctx, a)?;
                     if !self.is_def_eq(ctx, &at, &dom)? {
@@ -2393,11 +2385,6 @@ impl<'e> Checker<'e> {
                 return self.def_body_under(n, CIRCUIT);
             }
         }
-        let cur = self.decl_value_size.get();
-        // Hard ceiling below circuit Regulars (~3k–7k). A huge current proof
-        // must not raise the cap and instantiate those; equation lemmas of
-        // them unfold via `eq_related_defs` instead.
-        const CEILING: u32 = 3_000;
         let cap = if self.checking_prop_structure.get() {
             // Class-like theorems: stay below circuit Regulars (~3k–7k).
             // 512 rejected FullAdder carry; 3000 intern-exploded the out instance.
@@ -2407,10 +2394,6 @@ impl<'e> Checker<'e> {
             // need iterator-sized Regulars in the 1k–8k band, still below
             // the larger circuit Regulars.
             8_000
-        } else if self.checking_large_theorem.get() {
-            // Huge theorem: stay below circuit Regulars (~3k–7k). Large
-            // *defs* (matchers) still use CIRCUIT so helpers unfold.
-            CEILING
         } else {
             CIRCUIT
         };
@@ -6980,14 +6963,12 @@ mod tests {
             "small decl still unfolds a circuit-sized Regular"
         );
         tc.decl_value_size.set(20_000);
-        tc.checking_large_theorem.set(true);
         tc.whnf_cache.borrow_mut().clear();
         let w = tc.whnf(&ctx, &expr::const_(4, vec![])).unwrap();
         assert!(
-            matches!(&**w, ExprData::Const(4, _)),
-            "huge theorem does not instantiate a circuit Regular"
+            !matches!(&**w, ExprData::Const(4, _)),
+            "non-class huge theorem still unfolds a circuit Regular"
         );
-        tc.checking_large_theorem.set(false);
         tc.eq_related_defs.borrow_mut().push(4);
         tc.whnf_cache.borrow_mut().clear();
         let w = tc.whnf(&ctx, &expr::const_(4, vec![])).unwrap();
@@ -7033,6 +7014,96 @@ mod tests {
             got.is_ok(),
             "ensure_pi one-step unfolds a large Regular wrapping a Pi: {got:?}"
         );
+    }
+
+    /// `exfalso junk` with a ≥10k-node junk term of type True. Lean
+    /// `check`s the theorem value; infer_only would accept it.
+    #[test]
+    fn large_theorem_still_checks_app_args() {
+        use crate::env::{ConstantInfo, Environment};
+        let sort0 = expr::sort(level::zero());
+        let mut env = Environment::default();
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort0.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            1,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort0.clone(),
+                is_unsafe: false,
+            },
+        );
+        let false_ty = expr::const_(0, vec![]);
+        let true_ty = expr::const_(1, vec![]);
+        env.insert(
+            2,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::pi(expr::BinderInfo::Default, false_ty, true_ty.clone()),
+                is_unsafe: false,
+            },
+        );
+        // `andT : True → True → True`, `intro : True`. Shared spine so the
+        // junk term is ≥10k nodes at infer depth 16.
+        env.insert(
+            3,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::pi(
+                    expr::BinderInfo::Default,
+                    true_ty.clone(),
+                    expr::pi(expr::BinderInfo::Default, true_ty.clone(), true_ty.clone()),
+                ),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            4,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: true_ty.clone(),
+                is_unsafe: false,
+            },
+        );
+        let and_t = expr::const_(3, vec![]);
+        let mut junk = expr::const_(4, vec![]);
+        for _ in 0..16 {
+            junk = expr::app(expr::app(and_t.clone(), junk.clone()), junk);
+        }
+        assert!(
+            expr_size_capped(&junk, 20_000) >= 10_000,
+            "junk must trip the old ≥10k infer_only gate"
+        );
+        env.insert(
+            5,
+            ConstantInfo::Theorem {
+                level_params: vec![],
+                typ: true_ty,
+                value: expr::app(expr::const_(2, vec![]), junk),
+            },
+        );
+        let names = [
+            std::rc::Rc::new("False".into()),
+            std::rc::Rc::new("True".into()),
+            std::rc::Rc::new("exfalso".into()),
+            std::rc::Rc::new("andT".into()),
+            std::rc::Rc::new("intro".into()),
+            std::rc::Rc::new("bad".into()),
+        ];
+        let tc = Checker::new(&env, &names, None, None);
+        match tc.check_decl(5, "theorem") {
+            Err(TcError::Reject(msg)) => assert!(
+                msg.contains("application argument type mismatch"),
+                "expected app-arg reject, got {msg}"
+            ),
+            other => panic!("large ill-typed theorem must reject, got {other:?}"),
+        }
     }
 
     fn regulars_for_name_test() -> crate::env::Environment {
