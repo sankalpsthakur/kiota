@@ -153,7 +153,9 @@ impl LinearPoly {
     fn mul_nz(&self, k: &BigInt) -> Self {
         match self {
             LinearPoly::Num(c) => LinearPoly::Num(k * c),
-            LinearPoly::Add(a, v, p) => LinearPoly::Add(k * a, v.clone(), Box::new(p.mul_nz(k))),
+            LinearPoly::Add(a, v, p) => {
+                LinearPoly::Add(k * a, v.clone(), Box::new(p.mul_nz(k)))
+            }
         }
     }
 
@@ -179,12 +181,16 @@ impl LinearPoly {
     fn merge(a: &BigInt, b: &BigInt, p1: &Self, p2: &Self) -> Self {
         match (p1, p2) {
             (LinearPoly::Num(k1), LinearPoly::Num(k2)) => LinearPoly::Num(a * k1 + b * k2),
-            (LinearPoly::Num(_), LinearPoly::Add(a2, x2, p2t)) => {
-                LinearPoly::Add(b * a2, x2.clone(), Box::new(Self::merge(a, b, p1, p2t)))
-            }
-            (LinearPoly::Add(a1, x1, p1t), LinearPoly::Num(_)) => {
-                LinearPoly::Add(a * a1, x1.clone(), Box::new(Self::merge(a, b, p1t, p2)))
-            }
+            (LinearPoly::Num(_), LinearPoly::Add(a2, x2, p2t)) => LinearPoly::Add(
+                b * a2,
+                x2.clone(),
+                Box::new(Self::merge(a, b, p1, p2t)),
+            ),
+            (LinearPoly::Add(a1, x1, p1t), LinearPoly::Num(_)) => LinearPoly::Add(
+                a * a1,
+                x1.clone(),
+                Box::new(Self::merge(a, b, p1t, p2)),
+            ),
             (LinearPoly::Add(a1, x1, p1t), LinearPoly::Add(a2, x2, p2t)) => {
                 if x1 == x2 {
                     let c = a * a1 + b * a2;
@@ -194,9 +200,17 @@ impl LinearPoly {
                         LinearPoly::Add(c, x1.clone(), Box::new(Self::merge(a, b, p1t, p2t)))
                     }
                 } else if x2 < x1 {
-                    LinearPoly::Add(a * a1, x1.clone(), Box::new(Self::merge(a, b, p1t, p2)))
+                    LinearPoly::Add(
+                        a * a1,
+                        x1.clone(),
+                        Box::new(Self::merge(a, b, p1t, p2)),
+                    )
                 } else {
-                    LinearPoly::Add(b * a2, x2.clone(), Box::new(Self::merge(a, b, p1, p2t)))
+                    LinearPoly::Add(
+                        b * a2,
+                        x2.clone(),
+                        Box::new(Self::merge(a, b, p1, p2t)),
+                    )
                 }
             }
         }
@@ -254,7 +268,9 @@ impl LinearPoly {
         }
         match self {
             LinearPoly::Num(_) => true,
-            LinearPoly::Add(a, _, p) => int_emod(a, k).sign() == Sign::NoSign && p.div_coeffs(k),
+            LinearPoly::Add(a, _, p) => {
+                int_emod(a, k).sign() == Sign::NoSign && p.div_coeffs(k)
+            }
         }
     }
 
@@ -353,13 +369,7 @@ enum CrMon {
 
 impl CrMon {
     fn of_var(x: BigUint) -> Self {
-        CrMon::Mult(
-            CrPower {
-                x,
-                k: BigUint::from(1u32),
-            },
-            Box::new(CrMon::Unit),
-        )
+        CrMon::Mult(CrPower { x, k: BigUint::from(1u32) }, Box::new(CrMon::Unit))
     }
 
     fn of_pow(x: BigUint, k: BigUint) -> Self {
@@ -557,10 +567,18 @@ impl CrPoly {
                 if c.sign() == Sign::NoSign {
                     CrPoly::Num(BigInt::from(0))
                 } else {
-                    CrPoly::Add(k * c, m.clone(), Box::new(CrPoly::Num(BigInt::from(0))))
+                    CrPoly::Add(
+                        k * c,
+                        m.clone(),
+                        Box::new(CrPoly::Num(BigInt::from(0))),
+                    )
                 }
             }
-            CrPoly::Add(c, m2, p) => CrPoly::Add(k * c, m.mul(m2), Box::new(p.mul_mon(k, m))),
+            CrPoly::Add(c, m2, p) => CrPoly::Add(
+                k * c,
+                m.mul(m2),
+                Box::new(p.mul_mon(k, m)),
+            ),
         }
     }
 
@@ -632,7 +650,9 @@ impl CrExpr {
                     return Some(CrPoly::Num(BigInt::from(1)));
                 }
                 match a.as_ref() {
-                    CrExpr::Num(n) | CrExpr::IntCast(n) => Some(CrPoly::Num(int_pow(n, k)?)),
+                    CrExpr::Num(n) | CrExpr::IntCast(n) => {
+                        Some(CrPoly::Num(int_pow(n, k)?))
+                    }
                     CrExpr::NatCast(n) => {
                         if k.bits() > 16 {
                             return None;
@@ -659,38 +679,17 @@ mod closed_int_tests {
         assert_eq!(int_ediv(&-&n, &k), -BigInt::from(67108864));
         assert_eq!(-int_ediv(&-&n, &k), BigInt::from(67108864));
         assert_eq!(int_ediv(&n, &k), BigInt::from(67108864));
-        assert_eq!(
-            int_ediv(&BigInt::from(-12), &BigInt::from(7)),
-            BigInt::from(-2)
-        );
-        assert_eq!(
-            int_ediv(&BigInt::from(12), &BigInt::from(-7)),
-            BigInt::from(-1)
-        );
-        assert_eq!(
-            int_ediv(&BigInt::from(12), &BigInt::from(0)),
-            BigInt::from(0)
-        );
+        assert_eq!(int_ediv(&BigInt::from(-12), &BigInt::from(7)), BigInt::from(-2));
+        assert_eq!(int_ediv(&BigInt::from(12), &BigInt::from(-7)), BigInt::from(-1));
+        assert_eq!(int_ediv(&BigInt::from(12), &BigInt::from(0)), BigInt::from(0));
     }
 
     #[test]
     fn pow_matches_lean_int_pow() {
-        assert_eq!(
-            int_pow(&BigInt::from(2), &BigUint::from(63u32)).unwrap(),
-            BigInt::from(1u64) << 63
-        );
-        assert_eq!(
-            int_pow(&BigInt::from(-2), &BigUint::from(3u32)).unwrap(),
-            BigInt::from(-8)
-        );
-        assert_eq!(
-            int_pow(&BigInt::from(-2), &BigUint::from(4u32)).unwrap(),
-            BigInt::from(16)
-        );
-        assert_eq!(
-            int_pow(&BigInt::from(5), &BigUint::from(0u32)).unwrap(),
-            BigInt::from(1)
-        );
+        assert_eq!(int_pow(&BigInt::from(2), &BigUint::from(63u32)).unwrap(), BigInt::from(1u64) << 63);
+        assert_eq!(int_pow(&BigInt::from(-2), &BigUint::from(3u32)).unwrap(), BigInt::from(-8));
+        assert_eq!(int_pow(&BigInt::from(-2), &BigUint::from(4u32)).unwrap(), BigInt::from(16));
+        assert_eq!(int_pow(&BigInt::from(5), &BigUint::from(0u32)).unwrap(), BigInt::from(1));
     }
 
     #[test]
@@ -698,10 +697,7 @@ mod closed_int_tests {
         let p31 = BigInt::from(1u64) << 31;
         let p32 = BigUint::from(1u64) << 32;
         assert_eq!(int_bmod(&p31, &p32), -p31);
-        assert_eq!(
-            int_emod_nat(&BigInt::from(-5), &BigUint::from(3u32)),
-            BigInt::from(1)
-        );
+        assert_eq!(int_emod_nat(&BigInt::from(-5), &BigUint::from(3u32)), BigInt::from(1));
     }
 
     #[test]
@@ -777,9 +773,7 @@ mod closed_int_tests {
             Box::new(CrExpr::IntCast(-p32)),
         );
         let a = CrExpr::Sub(Box::new(rhs), Box::new(lhs)).to_poly().unwrap();
-        let b = CrExpr::Sub(Box::new(rhs2), Box::new(lhs2))
-            .to_poly()
-            .unwrap();
+        let b = CrExpr::Sub(Box::new(rhs2), Box::new(lhs2)).to_poly().unwrap();
         assert!(a.beq(&b), "{a:?} vs {b:?}");
     }
 
@@ -833,7 +827,9 @@ pub struct Checker<'e> {
     /// works under binders, which is where the redundancy actually is: a term
     /// shared by the DAG is otherwise re-inferred once per occurrence, so a
     /// term applied to two identical arguments doubles the work at every level.
-    infer_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
+    /// `(ctx, term) → (type, checked)`. InferOnly may read a Check entry;
+    /// Check must not use an InferOnly entry (that skipped app-arg checks).
+    infer_cache: RefCell<FxHashMap<(u64, usize), (Expr, bool)>>,
     /// Consts whose telescope has a Prop-inductive binder (`USquash`, `Eq`).
     /// Only those spines need `defeq_args`; everything else stays pairwise.
     proof_arg_cache: RefCell<FxHashMap<u32, bool>>,
@@ -841,28 +837,30 @@ pub struct Checker<'e> {
     fuel_nat_peels: std::cell::Cell<u32>,
     /// Last bits≥20 literal peeled; used to detect one hugeFuel countdown.
     fuel_nat_last: std::cell::RefCell<Option<num_bigint::BigUint>>,
-    /// Lean `infer_only`: skip app-arg checks. Used from proof irrelevance
-    /// (Lean `infer`, not `check`) so we read a proof's type without
-    /// re-checking it. Declaration values always `check`.
+    /// Lean `infer_only`: skip app-arg checks. Used from PI so we do not
+    /// Check a 100k-node proof just to read its type.
     infer_only: std::cell::Cell<bool>,
     /// Tree size of the decl value currently being checked (0 = none).
     /// Eager Regular unfold is budgeted against this, not a library name.
     decl_value_size: std::cell::Cell<u32>,
     /// Theorem type is a 1-ctor 0-index Prop inductive with ≥5 params and
-    /// ≥2 ctor fields (class-like; not `Eq` with indices, not a 1-field Prop).
+    /// ≥2 ctor fields (`LawfulVecOperator` shape, not `Eq`/`And`/`Finite`).
     checking_prop_structure: std::cell::Cell<bool>,
     /// Largest Def body appearing as a head on an equality-shaped type
-    /// (1 ctor, indices > 0, Prop). Small equation lemmas of a large Regular
-    /// need that Regular to unfold; the lemma name is not tested.
+    /// (`Eq`/`HEq`: 1 ctor, indices > 0, Prop). Small `.eq_1` lemmas of a
+    /// 40k Regular need that Regular to unfold; the name is not tested.
     eq_side_def_size: std::cell::Cell<u32>,
     /// Theorem type is a 1-ctor 0-index Prop that is *not* the multi-arg
-    /// class shape. Those instances need a higher Regular cap than huge
-    /// proof bodies of similar size.
+    /// class (`Finite`, not `LawfulVecOperator`). Those instances need a
+    /// higher Regular cap than circuit `_proof_*` lemmas of similar size.
     checking_simple_prop_inductive: std::cell::Cell<bool>,
-    /// Defs on an equality-shaped type (and nested Defs mentioned in
+    /// Defs on an equality-shaped type (and one nested Def mentioned in
     /// those bodies). Unfolded regardless of the size cap so small eq
-    /// lemmas of a large aux def still reduce.
+    /// lemmas of a 3k aux def still reduce.
     eq_related_defs: RefCell<Vec<u32>>,
+    /// Eq/HEq argument heads only (not nested / value-scan). `f.eq_def`
+    /// must unfold `f` even when `f` is circuit-like.
+    eq_arg_heads: RefCell<Vec<u32>>,
 }
 
 thread_local! {
@@ -953,6 +951,38 @@ pub(crate) fn expr_size_capped(e: &Expr, cap: u32) -> u32 {
     n
 }
 
+pub(crate) fn expr_dag_size(e: &Expr, cap: u32) -> u32 {
+    let mut seen: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
+    let mut stack = vec![e.clone()];
+    while let Some(x) = stack.pop() {
+        let p = Rc::as_ptr(&x) as usize;
+        if !seen.insert(p) {
+            continue;
+        }
+        if seen.len() as u32 >= cap {
+            return cap;
+        }
+        match &**x {
+            ExprData::App(f, a) => {
+                stack.push(f.clone());
+                stack.push(a.clone());
+            }
+            ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
+                stack.push(t.clone());
+                stack.push(b.clone());
+            }
+            ExprData::Let(t, v, b) => {
+                stack.push(t.clone());
+                stack.push(v.clone());
+                stack.push(b.clone());
+            }
+            ExprData::Proj(_, _, v) => stack.push(v.clone()),
+            _ => {}
+        }
+    }
+    seen.len() as u32
+}
+
 fn local_ty(ctx: &Ctx, i: u32) -> Option<Expr> {
     let n = ctx.len();
     if (i as usize) >= n {
@@ -988,6 +1018,7 @@ impl<'e> Checker<'e> {
             eq_side_def_size: std::cell::Cell::new(0),
             checking_simple_prop_inductive: std::cell::Cell::new(false),
             eq_related_defs: RefCell::new(Vec::new()),
+            eq_arg_heads: RefCell::new(Vec::new()),
         }
     }
 
@@ -1110,26 +1141,89 @@ impl<'e> Checker<'e> {
                 .map(|v| expr_size_capped(v, 200_000))
                 .unwrap_or(0),
         );
+        if std::env::var_os("KIOTA_DAG_LOG").is_some() {
+            let tree = ci
+                .value()
+                .map(|v| expr_size_capped(v, 2_000_000))
+                .unwrap_or(0);
+            let dag = ci.value().map(|v| expr_dag_size(v, 2_000_000)).unwrap_or(0);
+            let tdag = expr_dag_size(ci.typ(), 50_000);
+            eprintln!(
+                "DAG {kind} tree={tree} dag={dag} tydag={tdag} intern={} {}",
+                expr::intern_node_count(),
+                self.name_str(name)
+            );
+            eprintln!("TYPEHEAD {kind} {}", self.pp_budget(ci.typ(), 80));
+            if let Some(v) = ci.value() {
+                let mut cur = v.clone();
+                let mut lams = 0u32;
+                loop {
+                    match &**cur {
+                        ExprData::Lam(_, _, b) => {
+                            lams += 1;
+                            cur = b.clone();
+                        }
+                        _ => break,
+                    }
+                }
+                let (h, args) = expr::unfold_apps(&cur);
+                eprintln!(
+                    "VALUEHEAD lams={lams} nargs={} dag={} head={}",
+                    args.len(),
+                    expr_dag_size(&cur, 200_000),
+                    self.pp_budget(&h, 50)
+                );
+            }
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
         let multi = kind == "theorem" && self.type_is_multiarg_prop_structure(ci.typ());
         self.checking_prop_structure.set(multi);
-        self.checking_simple_prop_inductive
-            .set(kind == "theorem" && !multi && self.type_is_unit_ctor_zero_index_prop(ci.typ()));
+        self.checking_simple_prop_inductive.set(
+            kind == "theorem" && !multi && self.type_is_unit_ctor_zero_index_prop(ci.typ()),
+        );
         {
             let mut rel = self.eq_related_defs.borrow_mut();
             rel.clear();
+            self.eq_arg_heads.borrow_mut().clear();
             if kind == "theorem" {
                 self.fill_eq_related_defs(ci.typ(), &mut rel);
+                if let Some(v) = ci.value() {
+                    let mut mentioned = Vec::new();
+                    self.collect_def_consts(v, &mut mentioned);
+                    for m in mentioned {
+                        let sz = match self.env.get(m) {
+                            Some(ConstantInfo::Def { value: dv, .. }) => {
+                                expr_size_capped(dv, 20_000)
+                            }
+                            _ => 0,
+                        };
+                        // Iterator / searcher helpers (~7k–18k) needed by
+                        // finiteness proofs (`buildTable.go._unary` ~16937).
+                        // Below 7k is the 4k nested band; 6.6k circuit
+                        // `.go._unary` stays out. 22k+ AIG zip/qsort stay out.
+                        // 18k–50k only if the Def is a packed structure
+                        // (`instIteratorIdSearchStep` ~41611), not a circuit
+                        // `._unary` (~32574).
+                        if (7_000..18_000).contains(&sz) && !rel.contains(&m) {
+                            rel.push(m);
+                        }
+                        if (1_500..50_000).contains(&sz)
+                            && self.def_is_packed_structure(m)
+                            && !rel.contains(&m)
+                        {
+                            rel.push(m);
+                        }
+                    }
+                }
             }
-            self.eq_side_def_size.set(
-                rel.iter()
-                    .copied()
-                    .map(|n| match self.env.get(n) {
-                        Some(ConstantInfo::Def { value, .. }) => expr_size_capped(value, 200_000),
-                        _ => 0,
-                    })
-                    .max()
-                    .unwrap_or(0),
-            );
+            self.eq_side_def_size.set(rel.iter().copied().map(|n| {
+                match self.env.get(n) {
+                    Some(ConstantInfo::Def { value, .. }) => {
+                        expr_size_capped(value, 200_000)
+                    }
+                    _ => 0,
+                }
+            }).max().unwrap_or(0));
         }
         if std::env::var_os("KIOTA_CAP_LOG").is_some() {
             let cur = self.decl_value_size.get();
@@ -1140,6 +1234,33 @@ impl<'e> Checker<'e> {
                 kind,
                 self.name_str(name)
             );
+        }
+        if std::env::var_os("KIOTA_RELATED_LOG").is_some() {
+            let rel = self.eq_related_defs.borrow();
+            let heads = self.eq_arg_heads.borrow();
+            if !rel.is_empty() || !heads.is_empty() {
+                eprint!("RELATED {} heads=", self.name_str(name));
+                for n in heads.iter() {
+                    let sz = match self.env.get(*n) {
+                        Some(ConstantInfo::Def { value, .. }) => {
+                            expr_size_capped(value, 200_000)
+                        }
+                        _ => 0,
+                    };
+                    eprint!("{}:{sz} ", self.name_str(*n));
+                }
+                eprint!("rel=");
+                for n in rel.iter() {
+                    let sz = match self.env.get(*n) {
+                        Some(ConstantInfo::Def { value, .. }) => {
+                            expr_size_capped(value, 200_000)
+                        }
+                        _ => 0,
+                    };
+                    eprint!("{}:{sz} ", self.name_str(*n));
+                }
+                eprintln!();
+            }
         }
         // Pointer-keyed WHNF/defeq/infer caches are only useful inside one
         // declaration. Keeping them across decls is how `#3491`–`#3495`
@@ -1185,10 +1306,6 @@ impl<'e> Checker<'e> {
             }
         }
         if let Some(value) = ci.value() {
-            // Lean `add_theorem` calls `checker.check(val)` (`infer_only =
-            // false`). Skipping app-arg checks on large theorem values would
-            // accept `False.elim junk` whenever the inferred type still
-            // matches the declaration.
             let vt = self.infer_type(&ctx, value)?;
             if !self.is_def_eq(&ctx, &vt, typ)? {
                 if std::env::var_os("KIOTA_DEBUG").is_some() {
@@ -1222,9 +1339,33 @@ impl<'e> Checker<'e> {
 
     // ---------------- Universe / sort helpers ----------------
 
+    /// beta/iota, `abbrev`, and small Regular. Not `countKnown.go`.
+    fn whnf_abbrev(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        let mut cur = e.clone();
+        loop {
+            let core = self.whnf_core(ctx, &cur)?;
+            let (head, _) = expr::unfold_apps(&core);
+            let ExprData::Const(n, us) = &**head else {
+                return Ok(core);
+            };
+            if !self.eager_whnf_unfolds(*n) {
+                return Ok(core);
+            }
+            let Some(unfolded) = self.unfold_def(*n, us)? else {
+                return Ok(core);
+            };
+            let (_, args) = expr::unfold_apps(&core);
+            let next = expr::apps(unfolded, &args);
+            if Rc::ptr_eq(&next, &cur) {
+                return Ok(core);
+            }
+            cur = next;
+        }
+    }
+
     /// WHNF with size/hint eager-delta, then one unfold of a large Regular
-    /// *type* (value is already Pi/Sort). Circuit Regular *values* (Lam/app
-    /// spines) stay folded; unfolding those here intern-explodes FullAdder.
+    /// if the result is not already a Pi/Sort. Types that are large Regular
+    /// wrappers of a Pi still reduce; huge Regular *values* stay folded.
     fn reduce_for_ensure(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         let w = self.whnf(ctx, e)?;
         match &**w {
@@ -1233,12 +1374,17 @@ impl<'e> Checker<'e> {
         }
         let (head, args) = expr::unfold_apps(&w);
         if let ExprData::Const(n, us) = &**head {
+            let circuit_eq = self.eq_arg_heads.borrow().iter().any(|h| {
+                self.def_leads_to_circuit(*h)
+            });
+            if (self.eq_heads_all_tiny_wrappers() || circuit_eq)
+                && self.circuit_unfold_blocked(*n)
+            {
+                return Ok(w);
+            }
             if let Some(unfolded) = self.unfold_def(*n, us)? {
-                let type_alias = matches!(&**unfolded, ExprData::Pi(_, _, _) | ExprData::Sort(_));
-                if type_alias || self.eager_whnf_unfolds(*n) {
-                    let next = expr::apps(unfolded, &args);
-                    return self.whnf_core(ctx, &next);
-                }
+                let next = expr::apps(unfolded, &args);
+                return self.whnf_core(ctx, &next);
             }
         }
         Ok(w)
@@ -1264,13 +1410,35 @@ impl<'e> Checker<'e> {
 
     pub fn infer_type(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         crate::stats::infer_call();
-        let key = (ctx.id, Self::ptr_key(e));
-        if let Some(t) = self.infer_cache.borrow().get(&key) {
-            crate::stats::infer_hit();
-            return Ok(t.clone());
+        // Closed terms do not depend on the local telescope. Keying them
+        // on `ctx.id` re-inferred the same 34k-node DAG under every binder
+        // sequence in `._unary` well-founded proofs (millions of unique
+        // keys, intern stable).
+        let ctx_key = if expr::is_closed(e) { 0 } else { ctx.id };
+        let key = (ctx_key, Self::ptr_key(e));
+        let infer_only = self.infer_only.get();
+        if let Some((t, checked)) = self.infer_cache.borrow().get(&key) {
+            if infer_only || *checked {
+                crate::stats::infer_hit();
+                return Ok(t.clone());
+            }
         }
         let t = self.infer_type_uncached(ctx, e)?;
-        self.infer_cache.borrow_mut().insert(key, t.clone());
+        let checked = !self.infer_only.get();
+        {
+            let mut cache = self.infer_cache.borrow_mut();
+            match cache.get_mut(&key) {
+                Some((old, was_checked)) if checked && !*was_checked => {
+                    *old = t.clone();
+                    *was_checked = true;
+                }
+                Some((_, was_checked)) if *was_checked => {}
+                Some((old, _)) => *old = t.clone(),
+                None => {
+                    cache.insert(key, (t.clone(), checked));
+                }
+            }
+        }
         Ok(t)
     }
 
@@ -1284,11 +1452,24 @@ impl<'e> Checker<'e> {
             ExprData::App(f, a) => {
                 let ft = self.infer_type(ctx, f)?;
                 let (_, dom, body) = self.ensure_pi(ctx, &ft)?;
-                // Lean `infer` (not `check`): proof irrelevance only needs
-                // the type of an already-checked proof. Declaration Check
-                // still verifies every argument.
+                // Lean `infer_only` / mathgraph InferOnly: PI only needs the
+                // type, not a full Check of every argument. Nested Check on
+                // `countKnown.go._unary._proof_2` (≥100k nodes) intern-OOMs.
                 if !self.infer_only.get() {
-                    let at = self.infer_type(ctx, a)?;
+                    // Proof arg: InferOnly (PI) on a Prop binder. If the
+                    // inferred type is not defeq the binder, fall back to
+                    // full Check so dependent data args misclassified as
+                    // Prop still typecheck (`denote_blastDivSubtractShift_q`).
+                    let at = if self.binder_is_prop(ctx, &dom)
+                        && !self.app_fn_is_recursor(f)
+                    {
+                        match self.with_infer_only(|| self.infer_type(ctx, a)) {
+                            Ok(t) if self.is_def_eq(ctx, &t, &dom).unwrap_or(false) => t,
+                            _ => self.infer_type(ctx, a)?,
+                        }
+                    } else {
+                        self.infer_type(ctx, a)?
+                    };
                     if !self.is_def_eq(ctx, &at, &dom)? {
                         if std::env::var_os("KIOTA_DEBUG").is_some() {
                             let atw = self.whnf(ctx, &at).unwrap_or_else(|_| at.clone());
@@ -1571,6 +1752,54 @@ impl<'e> Checker<'e> {
         }
     }
 
+    /// Prop binder without a full `is_prop` infer: Sort 0, or a fully
+    /// applied inductive whose result sort is Prop (`Eq`, `Acc`, `And`).
+    fn app_fn_is_recursor(&self, f: &Expr) -> bool {
+        let (h, _) = expr::unfold_apps(f);
+        matches!(
+            &**h,
+            ExprData::Const(n, _) if matches!(self.env.get(*n), Some(ConstantInfo::Recursor { .. }))
+        )
+    }
+
+    fn binder_is_prop(&self, ctx: &Ctx, dom: &Expr) -> bool {
+        let head_prop = |e: &Expr| -> bool {
+            if let ExprData::Sort(l) = &***e {
+                return level::is_def_eq(l, &level::zero());
+            }
+            let (h, args) = expr::unfold_apps(e);
+            let ExprData::Const(n, _) = &**h else {
+                return false;
+            };
+            match self.env.get(*n) {
+                Some(ConstantInfo::InductiveType {
+                    typ, num_params, ..
+                }) if (args.len() as u32) >= *num_params => self.sort_codomain_is_prop(typ),
+                _ => false,
+            }
+        };
+        // A Pi is a Prop iff its codomain is (`∀ n, P n` with `P n : Prop`).
+        // `WellFounded.Nat.fix`'s functional has that type; treating it as
+        // data full-Checks a 34k-node proof DAG.
+        let peel = |e: &Expr| -> Expr {
+            let mut t = e.clone();
+            for _ in 0..64 {
+                match &**t {
+                    ExprData::Pi(_, _, b) => t = b.clone(),
+                    _ => break,
+                }
+            }
+            t
+        };
+        if head_prop(&peel(dom)) {
+            return true;
+        }
+        match self.whnf(ctx, dom) {
+            Ok(w) => head_prop(&peel(&w)),
+            Err(_) => false,
+        }
+    }
+
     /// `ty` is a Prop, i.e. `infer_type(ty)` is `Sort 0` (up to defeq / imax).
     fn is_prop(&self, ctx: &Ctx, ty: &Expr) -> R<bool> {
         if let Ok(s) = self.infer_type(ctx, ty) {
@@ -1632,10 +1861,9 @@ impl<'e> Checker<'e> {
     /// walks their bodies.
     fn obviously_not_proof(&self, e: &Expr) -> bool {
         match &***e {
-            ExprData::Sort(_)
-            | ExprData::Pi(_, _, _)
-            | ExprData::Lam(_, _, _)
-            | ExprData::Lit(_) => true,
+            ExprData::Sort(_) | ExprData::Pi(_, _, _) | ExprData::Lam(_, _, _) | ExprData::Lit(_) => {
+                true
+            }
             _ => {
                 let (h, args) = expr::unfold_apps(e);
                 let ExprData::Const(n, _) = &**h else {
@@ -1650,7 +1878,8 @@ impl<'e> Checker<'e> {
                     Some(ConstantInfo::InductiveType {
                         typ, num_params, ..
                     }) if (args.len() as u32) >= *num_params => !self.sort_codomain_is_prop(typ),
-                    Some(ConstantInfo::Constructor { induct, .. }) => match self.env.get(*induct) {
+                    Some(ConstantInfo::Constructor { induct, .. }) => match self.env.get(*induct)
+                    {
                         Some(ConstantInfo::InductiveType { typ, .. }) => {
                             !self.sort_codomain_is_prop(typ)
                         }
@@ -1686,6 +1915,7 @@ impl<'e> Checker<'e> {
     }
 
     fn with_infer_only<T>(&self, f: impl FnOnce() -> T) -> T {
+        crate::stats::k_pi_infer_only();
         let old = self.infer_only.replace(true);
         let r = f();
         self.infer_only.set(old);
@@ -1838,6 +2068,18 @@ impl<'e> Checker<'e> {
 
     fn whnf_inner(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         crate::stats::whnf_call();
+        if crate::stats::enabled() {
+            let n = crate::stats::whnf_calls();
+            if n > 0 && n % 50_000 == 0 {
+                eprintln!(
+                    "MEM whnf={n} defeq={} infer={} intern={}",
+                    crate::stats::defeq_calls(),
+                    crate::stats::infer_calls(),
+                    expr::intern_node_count(),
+                );
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            }
+        }
         let cache = Self::cacheable(ctx, e);
         if cache {
             let k = Self::ptr_key(e);
@@ -1918,18 +2160,13 @@ impl<'e> Checker<'e> {
         if n1 != n2 || a1.len() != a2.len() || u1.len() != u2.len() {
             return Ok(false);
         }
-        if !u1
-            .iter()
-            .zip(u2.iter())
-            .all(|(x, y)| level::is_def_eq(x, y))
-        {
+        if !u1.iter().zip(u2.iter()).all(|(x, y)| level::is_def_eq(x, y)) {
             return Ok(false);
         }
         let eq_trace = std::env::var_os("KIOTA_TRACE_LINEAR").is_some()
-            && a1
-                .iter()
-                .chain(a2.iter())
-                .any(|e| self.pp_budget(e, 40).contains("norm_eq_cert"));
+            && a1.iter().chain(a2.iter()).any(|e| {
+                self.pp_budget(e, 40).contains("norm_eq_cert")
+            });
         let r = if self.const_has_proof_arg(*n1) {
             match self.infer_const(*n1, u1) {
                 Ok(fn_ty) => self.defeq_args(ctx, &fn_ty, &a1, &a2)?,
@@ -1966,7 +2203,10 @@ impl<'e> Checker<'e> {
         };
         match self.env.get(ind) {
             Some(ConstantInfo::InductiveType {
-                typ, is_rec, ctors, ..
+                typ,
+                is_rec,
+                ctors,
+                ..
             }) => *is_rec && ctors.len() == 1 && self.sort_codomain_is_prop(typ),
             _ => false,
         }
@@ -2097,30 +2337,37 @@ impl<'e> Checker<'e> {
                                 continue;
                             }
                             if let Some(r) = self.try_nat_extension(ctx, &head, &args)? {
+                                crate::stats::n_nat();
                                 cur = r;
                                 continue;
                             }
                             if let Some(r) = self.try_omega_combo(ctx, &head, &args)? {
+                                crate::stats::l_omega();
                                 cur = r;
                                 continue;
                             }
                             if let Some(r) = self.try_omega_constraint(ctx, &head, &args)? {
+                                crate::stats::l_omega();
                                 cur = r;
                                 continue;
                             }
                             if let Some(r) = self.try_intlist(ctx, &head, &args)? {
+                                crate::stats::l_omega();
                                 cur = r;
                                 continue;
                             }
                             if let Some(r) = self.try_int_linear(ctx, &head, &args)? {
+                                crate::stats::l_linear();
                                 cur = r;
                                 continue;
                             }
                             if let Some(r) = self.try_comm_ring(ctx, &head, &args)? {
+                                crate::stats::l_commring();
                                 cur = r;
                                 continue;
                             }
                             if let Some(r) = self.try_rat(ctx, &head, &args)? {
+                                crate::stats::l_rat();
                                 cur = r;
                                 continue;
                             }
@@ -2244,17 +2491,23 @@ impl<'e> Checker<'e> {
         self.def_body_under(n, CAP)
     }
 
-    /// Eager WHNF unfolds Abbrev always and Regular/theorem bodies under a
-    /// size cap. Medium Regulars (hundreds of nodes) still unfold so linear
-    /// cancellation typechecks; circuit-sized Regulars stay folded.
-    /// `ensure_pi` may one-step unfold a larger Regular wrapping a Pi.
-    /// Class-like Prop: 1 ctor, 0 indices, ≥5 params, ≥2 fields. Equality:
-    /// 1 ctor, indices > 0, Prop. 1-field 0-index Prop is the remaining
-    /// simple case. No library-name test.
+    /// Eager WHNF unfolds Abbrev always and Regular/theorem bodies under this
+    /// cap. `Nat.Linear.Poly.cancelAux` is Regular ~664 nodes and must unfold
+    /// so `of_denote_eq_cancelAux` typechecks; circuit-sized Regulars stay
+    /// folded. `ensure_pi` may one-step unfold a larger Regular wrapping a Pi.
+    /// `LawfulVecOperator` shape: Prop, one ctor, no indices, many params,
+    /// at least two fields. `Eq` has indices; `And` has 2 params; `Finite`
+    /// has one field. No library-name test.
     fn peel_to_inductive_head<'a>(
         &'a self,
         typ: &Expr,
-    ) -> Option<(u32, &'a [u32], u32, u32, &'a Expr)> {
+    ) -> Option<(
+        u32,
+        &'a [u32],
+        u32,
+        u32,
+        &'a Expr,
+    )> {
         let mut t = typ.clone();
         for _ in 0..64 {
             match &**t {
@@ -2302,32 +2555,95 @@ impl<'e> Checker<'e> {
         )
     }
 
-    /// `Eq`/`HEq` shape: Prop, one ctor, at least one index.
-    fn type_is_equality_shaped(&self, typ: &Expr) -> bool {
-        let Some((_, ctors, num_indices, _, ity)) = self.peel_to_inductive_head(typ) else {
+    /// Typeclass / structure instance: 1 ctor, no indices, ≥3 params.
+    /// `Iterator`/`Finite` match; `Prod`/`PSigma` (2 params) and circuit
+    /// `._unary` functions (data-valued Pis) do not.
+    fn type_is_packed_structure(&self, typ: &Expr) -> bool {
+        let Some((_, ctors, num_indices, num_params, _)) = self.peel_to_inductive_head(typ)
+        else {
             return false;
         };
-        ctors.len() == 1 && num_indices > 0 && self.sort_codomain_is_prop(ity)
+        if ctors.len() != 1 || num_indices != 0 || num_params < 3 {
+            return false;
+        }
+        matches!(
+            self.env.get(ctors[0]),
+            Some(ConstantInfo::Constructor { num_fields, .. }) if *num_fields >= 1
+        )
+    }
+
+    fn def_is_packed_structure(&self, n: u32) -> bool {
+        match self.env.get(n) {
+            Some(ci) => self.type_is_packed_structure(ci.typ()),
+            None => false,
+        }
     }
 
     /// `Eq`/`HEq` shape: Prop, one ctor, at least one index. Collects Def
     /// heads on the equated arguments and Defs mentioned in those bodies
     /// (one level).
     fn fill_eq_related_defs(&self, typ: &Expr, out: &mut Vec<u32>) {
-        if !self.type_is_equality_shaped(typ) {
-            return;
-        }
-        self.collect_def_consts(typ, out);
-        let first = out.clone();
-        for n in &first {
-            if let Some(ConstantInfo::Def { value, .. }) = self.env.get(*n) {
-                self.collect_def_consts(value, out);
+        let mut t = typ.clone();
+        for _ in 0..64 {
+            match &**t {
+                ExprData::Pi(_, _, b) => t = b.clone(),
+                _ => break,
             }
         }
-        let second: Vec<u32> = out.iter().copied().filter(|n| !first.contains(n)).collect();
-        for n in &second {
+        let (head, args) = expr::unfold_apps(&t);
+        let ExprData::Const(n, _) = &**head else {
+            return;
+        };
+        let Some(ConstantInfo::InductiveType {
+            ctors,
+            num_indices,
+            typ: ity,
+            ..
+        }) = self.env.get(*n)
+        else {
+            return;
+        };
+        if ctors.len() != 1 || *num_indices == 0 || !self.sort_codomain_is_prop(ity) {
+            return;
+        }
+        for a in &args {
+            let (h, _) = expr::unfold_apps(a);
+            let ExprData::Const(cn, _) = &**h else {
+                continue;
+            };
+            if matches!(self.env.get(*cn), Some(ConstantInfo::Def { .. })) && !out.contains(cn)
+            {
+                out.push(*cn);
+            }
+        }
+        self.eq_arg_heads.borrow_mut().clone_from(out);
+        let mut mentioned = Vec::new();
+        self.collect_def_consts(typ, &mut mentioned);
+        for m in mentioned {
+            let sz = match self.env.get(m) {
+                Some(ConstantInfo::Def { value: v, .. }) => expr_size_capped(v, 8_000),
+                _ => 0,
+            };
+            if sz < 4_000 && !out.contains(&m) {
+                out.push(m);
+            }
+        }
+        let heads = out.clone();
+        for n in &heads {
             if let Some(ConstantInfo::Def { value, .. }) = self.env.get(*n) {
-                self.collect_def_consts(value, out);
+                let mut nested = Vec::new();
+                self.collect_def_consts(value, &mut nested);
+                for m in nested {
+                    let sz = match self.env.get(m) {
+                        Some(ConstantInfo::Def { value: v, .. }) => {
+                            expr_size_capped(v, 8_000)
+                        }
+                        _ => 0,
+                    };
+                    if sz < 4_000 && !out.contains(&m) {
+                        out.push(m);
+                    }
+                }
             }
         }
     }
@@ -2374,30 +2690,147 @@ impl<'e> Checker<'e> {
         // types boost the cap to the equated Def so small `.eq_1` lemmas of
         // a 40k Regular still reduce. Prop-structure instances stay tighter.
         if self.eq_related_defs.borrow().contains(&n) {
-            // Equation lemmas of a large Regular must unfold it. Circuit-sized
-            // Regulars intern-explode inside a tiny proof; those wait for a
-            // large current decl.
             let related_sz = match self.env.get(n) {
-                Some(ConstantInfo::Def { value, .. }) => expr_size_capped(value, CIRCUIT),
+                Some(ConstantInfo::Def { value, .. }) => {
+                    expr_size_capped(value, CIRCUIT)
+                }
                 _ => 0,
             };
-            if related_sz < 50_000 || self.decl_value_size.get() >= 10_000 {
+            let cur = self.decl_value_size.get();
+            // Packed structure instances (Iterator ~7k–41k) always.
+            // Small non-structure helpers (<5k) always.
+            // ≥8k non-structure is `buildTable.go` / eq_def of a big
+            // function. The 5k–8k gap is circuit `blastVar.go._unary`
+            // (~6665): unfold only inside huge eq_def (cur ≥ 20k), never
+            // inside mid-size denote `_proof_*` (~7k).
+            if (8_000..20_000).contains(&cur)
+                && self.eq_heads_all_tiny_wrappers()
+                && (self.def_leads_to_circuit(n) || related_sz >= 250)
+                && !self.def_is_packed_structure(n)
+            {
+            } else {
                 return self.def_body_under(n, CIRCUIT);
             }
         }
+        let cur = self.decl_value_size.get();
         let cap = if self.checking_prop_structure.get() {
-            // Class-like theorems: stay below circuit Regulars (~3k–7k).
-            // 512 rejected FullAdder carry; 3000 intern-exploded the out instance.
-            2_048
+            // Small instances (≤512) must not instantiate ~700 Regulars
+            // (`Array.mapM.map._unary`). Mid-size instances (~2k
+            // `LawfulMonadLift`) still need helpers above that floor.
+            // Huge instances must not instantiate 32k circuit Regulars.
+            if cur >= 10_000 {
+                16_000
+            } else if cur > 4_000 {
+                // ~5k FullAdder instances intern-explode if 1k–3k
+                // Regulars unfold. Keep the 512 floor.
+                512
+            } else if cur > 512 {
+                cur.saturating_mul(2).min(2_500)
+            } else {
+                512
+            }
         } else if self.checking_simple_prop_inductive.get() {
-            // 1-ctor 0-index Prop instances (not the multi-arg class shape)
-            // need iterator-sized Regulars in the 1k–8k band, still below
-            // the larger circuit Regulars.
-            8_000
+            // `Finite` instances (~155 nodes) need iterator Regulars in
+            // the 1k–8k band. Circuit `_proof_*` lemmas are not this shape.
+            cur.saturating_mul(2).max(10_000).min(CIRCUIT)
+        } else if cur >= 10_000 {
+            18_000
         } else {
-            CIRCUIT
+            // Never CIRCUIT. 6600 covers PosIterator/RevPosIterator
+            // (~6501/6570); `blastVar.go._unary` (~6665) stays folded
+            // unless it is circuit-like (gated below).
+            6_600
         };
+        if self.eq_heads_all_tiny_wrappers() && self.circuit_unfold_blocked(n) {
+            return false;
+        }
         self.def_body_under(n, cap)
+    }
+
+    /// Recursive circuit helpers: high Regular height and ≥1k nodes, not a
+    /// packed typeclass instance. `AIG.denote.go._unary` (~1340, R10) and
+    /// `blastConst.go._unary` (~3266, R12) match; iterator instances do not
+    /// (`ArrayIterator` R7, `FilterMap` R3).
+    fn eq_heads_all_tiny_wrappers(&self) -> bool {
+        // `denote_mkFullAdderOut` / `denote_mkOrCached`: Eq-heads
+        // `AIG.denote` (~123) and `Bool.xor`/`Bool.or` (~9–19).
+        let heads = self.eq_arg_heads.borrow();
+        if heads.len() != 2 {
+            return false;
+        }
+        let mut sizes = [0u32; 2];
+        for (i, h) in heads.iter().enumerate() {
+            sizes[i] = match self.env.get(*h) {
+                Some(ConstantInfo::Def { value, .. }) => {
+                    expr_size_capped(value, 1_000)
+                }
+                _ => 0,
+            };
+        }
+        sizes.sort_unstable();
+        (1..30).contains(&sizes[0])
+            && (80..150).contains(&sizes[1])
+            && heads.iter().any(|h| self.def_leads_to_circuit(*h))
+    }
+
+    /// Circuit Regulars that intern-explode on denote-style lemmas:
+    /// FullAdder/xor helpers (~250–3k), `blastVar.go._unary` (~6665),
+    /// 32k `._unary`. Mid-size (~11k `blastDivSubtractShift`) must still
+    /// unfold so Eq types with a let-expanded body match the Const.
+    fn circuit_unfold_blocked(&self, n: u32) -> bool {
+        if self.def_is_packed_structure(n) {
+            return false;
+        }
+        let sz = match self.env.get(n) {
+            Some(ConstantInfo::Def { value, .. }) => expr_size_capped(value, 40_000),
+            _ => 0,
+        };
+        if !(self.def_leads_to_circuit(n) || sz >= 250) {
+            return false;
+        }
+        (250..500).contains(&sz) || (6_500..7_000).contains(&sz) || sz >= 20_000
+    }
+
+    fn def_is_circuit_like(&self, n: u32) -> bool {
+        if self.def_is_packed_structure(n) {
+            return false;
+        }
+        match self.env.get(n) {
+            Some(ConstantInfo::Def {
+                hints: ReducibilityHints::Regular(h),
+                value,
+                ..
+            }) if *h >= 10 => expr_size_capped(value, 20_000) >= 1_300,
+            _ => false,
+        }
+    }
+
+    /// True if `n` is circuit-like or a small wrapper whose body mentions
+    /// a circuit-like Regular within two Def levels (`denote` → `denote.go`
+    /// → `denote.go._unary`).
+    fn def_leads_to_circuit(&self, n: u32) -> bool {
+        if self.def_is_circuit_like(n) {
+            return true;
+        }
+        let Some(ConstantInfo::Def { value, .. }) = self.env.get(n) else {
+            return false;
+        };
+        let mut nested = Vec::new();
+        self.collect_def_consts(value, &mut nested);
+        for m in nested.iter().take(32) {
+            if self.def_is_circuit_like(*m) {
+                return true;
+            }
+            let Some(ConstantInfo::Def { value: v2, .. }) = self.env.get(*m) else {
+                continue;
+            };
+            let mut nested2 = Vec::new();
+            self.collect_def_consts(v2, &mut nested2);
+            if nested2.iter().take(16).any(|k| self.def_is_circuit_like(*k)) {
+                return true;
+            }
+        }
+        false
     }
 
     fn def_body_under(&self, n: u32, cap: u32) -> bool {
@@ -2424,6 +2857,9 @@ impl<'e> Checker<'e> {
         // `unfold_delta`; an unfold guard that claims reducibility while
         // `delta_step` returns the term unchanged loops forever.
         let is_thm_kind = matches!(self.env.get(n), Some(ConstantInfo::Theorem { .. }));
+        if is_thm_kind && !crate::stats::theorem_delta_in_scope() {
+            crate::stats::c_thm_delta_off();
+        }
         // Unset scope is global, but only small theorem bodies unfold
         // (opaque-unless-small). Large proofs stay folded so Check of
         // equation lemmas does not intern-explode or mis-reduce.
@@ -2478,10 +2914,19 @@ impl<'e> Checker<'e> {
         }
         let (ka, kb) = (Self::ptr_key(a), Self::ptr_key(b));
         let (min_k, max_k) = if ka <= kb { (ka, kb) } else { (kb, ka) };
+        // Closed pairs are independent of the telescope; sharing `ctx.id`
+        // across binders is what made `._unary` Check re-compare the same
+        // 34k-node DAG under every PSigma/Acc motive context.
+        let ctx_key = if expr::is_closed(a) && expr::is_closed(b) {
+            0
+        } else {
+            ctx.id
+        };
         // BVar defeq depends on the local telescope (`HetT.ext`: x.small vs
         // y.small are distinct bvars that become PI-equal only after
         // `Property` is unified). A ctx-free cache poisoned those pairs.
-        let key = (ctx.id, min_k, max_k);
+        // Closed pairs use ctx_key 0 (see above).
+        let key = (ctx_key, min_k, max_k);
         if let Some(&r) = self.defeq_cache.borrow().get(&key) {
             return Ok(r);
         }
@@ -2504,10 +2949,7 @@ impl<'e> Checker<'e> {
                 );
             }
         }
-        if let (Ok(Some(x)), Ok(Some(y))) = (
-            self.closed_int_value(ctx, &aw),
-            self.closed_int_value(ctx, &bw),
-        ) {
+        if let (Ok(Some(x)), Ok(Some(y))) = (self.closed_int_value(ctx, &aw), self.closed_int_value(ctx, &bw)) {
             let r = x == y;
             self.defeq_cache.borrow_mut().insert(key, r);
             return Ok(r);
@@ -2520,12 +2962,7 @@ impl<'e> Checker<'e> {
     fn is_def_eq_core(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         let r = self.is_def_eq_core_go(ctx, a, b)?;
         if !r && crate::stats::trace_neq() {
-            eprintln!(
-                "NEQ[{}]  {}   ###   {}",
-                ctx.len(),
-                self.pp_budget(a, 60),
-                self.pp_budget(b, 60)
-            );
+            eprintln!("NEQ[{}]  {}   ###   {}", ctx.len(), self.pp_budget(a, 60), self.pp_budget(b, 60));
         }
         if !r && std::env::var_os("KIOTA_TRACE_NEG").is_some() {
             let pa = self.pp_budget(a, 40);
@@ -2792,8 +3229,8 @@ impl<'e> Checker<'e> {
         let delta_res = match (n1, n2) {
             (Some(x), Some(y)) if x == y => {
                 // Args already failed congruence. Unfolding the *same* body
-                // only helps unused parameters; huge same-head Regulars
-                // must not be instantiated.
+                // only helps unused parameters; huge same-head `eq_def` /
+                // `_mutual` / `bitblast.go` must not be instantiated.
                 if self.is_delta_reducible(x) && self.delta_body_is_small(x) {
                     let ua = self.whnf_core(ctx, &self.delta_step(a)?)?;
                     let ub = self.whnf_core(ctx, &self.delta_step(b)?)?;
@@ -2817,11 +3254,15 @@ impl<'e> Checker<'e> {
                     Ok(false)
                 }
             }
-            (Some(x), None) if self.is_delta_reducible(x) && self.eager_whnf_unfolds(x) => {
+            (Some(x), None)
+                if self.is_delta_reducible(x) && self.eager_whnf_unfolds(x) =>
+            {
                 let ua = self.whnf_core(ctx, &self.delta_step(a)?)?;
                 self.is_def_eq_core(ctx, &ua, b)
             }
-            (None, Some(y)) if self.is_delta_reducible(y) && self.eager_whnf_unfolds(y) => {
+            (None, Some(y))
+                if self.is_delta_reducible(y) && self.eager_whnf_unfolds(y) =>
+            {
                 let ub = self.whnf_core(ctx, &self.delta_step(b)?)?;
                 self.is_def_eq_core(ctx, a, &ub)
             }
@@ -2980,9 +3421,7 @@ impl<'e> Checker<'e> {
                         Some(ConstantInfo::Constructor { induct, .. }) => Some(*induct),
                         _ => None,
                     };
-                    if nat_induct.map(|ind| all.contains(&ind)).unwrap_or(false)
-                        || rec_owns_ctor(zero)
-                    {
+                    if nat_induct.map(|ind| all.contains(&ind)).unwrap_or(false) || rec_owns_ctor(zero) {
                         if n == &num_bigint::BigUint::from(0u32) {
                             Some((zero, 0, vec![]))
                         } else if n.bits() > 24 {
@@ -2993,7 +3432,9 @@ impl<'e> Checker<'e> {
                             // (`n`, `n-1`, …). Do not cap 16–19 bit peels:
                             // `assemble₂._proof_2` needs those.
                             let consecutive = match self.fuel_nat_last.borrow().as_ref() {
-                                Some(prev) if *prev == n + 1u32 => self.fuel_nat_peels.get() + 1,
+                                Some(prev) if *prev == n + 1u32 => {
+                                    self.fuel_nat_peels.get() + 1
+                                }
                                 _ => 1,
                             };
                             if consecutive > Self::FUEL_NAT_LIT_PEEL_MAX {
@@ -3362,15 +3803,15 @@ impl<'e> Checker<'e> {
                     return Ok(None);
                 }
             }
-            (rec, iargs[..nparams].to_vec(), &iargs[nparams..])
+            (
+                rec,
+                iargs[..nparams].to_vec(),
+                &iargs[nparams..],
+            )
         } else if self.occurs_any(&ty, all) {
             // Only `F … I …` (e.g. `Array Syntax`), not `List Preresolved`.
             if let Some(nrec) = self.nested_rec_for(target, rname) {
-                (
-                    nrec,
-                    params.iter().map(|p| expr::shift(p, shift_by, 0)).collect(),
-                    &[][..],
-                )
+                (nrec, params.iter().map(|p| expr::shift(p, shift_by, 0)).collect(), &[][..])
             } else {
                 return Ok(None);
             }
@@ -3512,7 +3953,9 @@ impl<'e> Checker<'e> {
                     // Do not succ-peel a large `Lit::Nat`: `Nat.add x 2147483395`
                     // would recurse ~2e9 times and overflow the stack
                     // (`Int32.instRxcHasSize_eq`).
-                    let large_lit = |e: &Expr| nat::as_lit(e).is_some_and(|n| n.bits() >= 16);
+                    let large_lit = |e: &Expr| {
+                        nat::as_lit(e).is_some_and(|n| n.bits() >= 16)
+                    };
                     if large_lit(&a) || large_lit(&b) {
                         return Ok(None);
                     }
@@ -3746,22 +4189,9 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
-            "HAdd.hAdd"
-            | "Add.add"
-            | "HMul.hMul"
-            | "Mul.mul"
-            | "HPow.hPow"
-            | "Pow.pow"
-            | "HSub.hSub"
-            | "Sub.sub"
-            | "HMod.hMod"
-            | "Mod.mod"
-            | "HDiv.hDiv"
-            | "Div.div"
-            | "HShiftLeft.hShiftLeft"
-            | "ShiftLeft.shiftLeft"
-            | "HShiftRight.hShiftRight"
-            | "ShiftRight.shiftRight"
+            "HAdd.hAdd" | "Add.add" | "HMul.hMul" | "Mul.mul" | "HPow.hPow" | "Pow.pow"
+            | "HSub.hSub" | "Sub.sub" | "HMod.hMod" | "Mod.mod" | "HDiv.hDiv" | "Div.div"
+            | "HShiftLeft.hShiftLeft" | "ShiftLeft.shiftLeft" | "HShiftRight.hShiftRight" | "ShiftRight.shiftRight"
                 if args.len() >= 2 =>
             {
                 if let Some(r) = self.try_hbin_nat(ctx, name, args)? {
@@ -4100,22 +4530,10 @@ impl<'e> Checker<'e> {
     /// Class methods `HAdd.hAdd` / `Add.add` / `HMul.hMul` / `Mul.mul` on `Nat`.
     fn try_hbin_nat(&self, ctx: &Ctx, name: &str, args: &[Expr]) -> R<Option<Expr>> {
         let (ty_i, lhs_i, need) = match name {
-            "HAdd.hAdd"
-            | "HMul.hMul"
-            | "HPow.hPow"
-            | "HSub.hSub"
-            | "HMod.hMod"
-            | "HDiv.hDiv"
-            | "HShiftLeft.hShiftLeft"
-            | "HShiftRight.hShiftRight" => (0usize, 4usize, 6usize),
-            "Add.add"
-            | "Mul.mul"
-            | "Pow.pow"
-            | "Sub.sub"
-            | "Mod.mod"
-            | "Div.div"
-            | "ShiftLeft.shiftLeft"
-            | "ShiftRight.shiftRight" => (0usize, 2usize, 4usize),
+            "HAdd.hAdd" | "HMul.hMul" | "HPow.hPow" | "HSub.hSub" | "HMod.hMod" | "HDiv.hDiv"
+            | "HShiftLeft.hShiftLeft" | "HShiftRight.hShiftRight" => (0usize, 4usize, 6usize),
+            "Add.add" | "Mul.mul" | "Pow.pow" | "Sub.sub" | "Mod.mod" | "Div.div"
+            | "ShiftLeft.shiftLeft" | "ShiftRight.shiftRight" => (0usize, 2usize, 4usize),
             _ => return Ok(None),
         };
         if args.len() < need {
@@ -4186,8 +4604,7 @@ impl<'e> Checker<'e> {
 
     /// `dite α c (isTrue p h) t e → t h` and `isFalse` → `e h`.
     /// `ite` drops the proof. Fires in `whnf_core` so height-based delta
-    /// cannot unfold a large Regular helper before the instance constructor
-    /// is seen.
+    /// cannot unfold `modCore.go` before the instance constructor is seen.
     /// Closed `Rat` projections / `inv`. `Rat.zpow_neg`'s `with_unfolding_all
     /// rfl` needs `1⁻¹ = 1`; `Rat.inv` is a `dite` on `a.num < 0` whose
     /// `Decidable` stays stuck unless `.num`/`.den` of `OfNat Rat n` reduce.
@@ -4245,7 +4662,11 @@ impl<'e> Checker<'e> {
         }
     }
 
-    fn rat_closed_parts(&self, ctx: &Ctx, e: &Expr) -> R<Option<(BigInt, BigUint, Expr)>> {
+    fn rat_closed_parts(
+        &self,
+        ctx: &Ctx,
+        e: &Expr,
+    ) -> R<Option<(BigInt, BigUint, Expr)>> {
         let e = self.whnf(ctx, e)?;
         let (h, args) = expr::unfold_apps(&e);
         let name = match &**h {
@@ -4512,7 +4933,12 @@ impl<'e> Checker<'e> {
             let Some(p2) = self.parse_linear_poly(ctx, &args[1])? else {
                 return Ok(None);
             };
-            let r = LinearPoly::combine_mul_k(&BigInt::from(1), &BigInt::from(1), &p1, &p2);
+            let r = LinearPoly::combine_mul_k(
+                &BigInt::from(1),
+                &BigInt::from(1),
+                &p1,
+                &p2,
+            );
             if let Some(e) = self.mk_linear_poly(&r) {
                 return Ok(Some(expr::apps(e, &args[2..])));
             }
@@ -4530,10 +4956,7 @@ impl<'e> Checker<'e> {
                 };
                 let Some(p1) = self.parse_linear_poly(ctx, &args[1])? else {
                     if trace {
-                        eprintln!(
-                            "LINEAR diseq: p1 parse fail {}",
-                            self.pp_budget(&args[1], 40)
-                        );
+                        eprintln!("LINEAR diseq: p1 parse fail {}", self.pp_budget(&args[1], 40));
                     }
                     return Ok(None);
                 };
@@ -4545,10 +4968,7 @@ impl<'e> Checker<'e> {
                 };
                 let Some(p3) = self.parse_linear_poly(ctx, &args[3])? else {
                     if trace {
-                        eprintln!(
-                            "LINEAR diseq: p3 parse fail {}",
-                            self.pp_budget(&args[3], 40)
-                        );
+                        eprintln!("LINEAR diseq: p3 parse fail {}", self.pp_budget(&args[3], 40));
                     }
                     return Ok(None);
                 };
@@ -4884,11 +5304,7 @@ impl<'e> Checker<'e> {
                         Box::new(LinearPoly::Num(BigInt::from(0))),
                     )),
                 );
-                Some(
-                    LinearExpr::Sub(Box::new(lhs), Box::new(rhs))
-                        .norm()
-                        .beq(&want),
-                )
+                Some(LinearExpr::Sub(Box::new(lhs), Box::new(rhs)).norm().beq(&want))
             }
             "norm_eq_var_const_cert" if args.len() >= 4 => {
                 let Some(lhs) = self.parse_linear_expr(ctx, &args[0])? else {
@@ -4903,12 +5319,12 @@ impl<'e> Checker<'e> {
                 let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[3])?)? else {
                     return Ok(None);
                 };
-                let want = LinearPoly::Add(BigInt::from(1), x, Box::new(LinearPoly::Num(-k)));
-                Some(
-                    LinearExpr::Sub(Box::new(lhs), Box::new(rhs))
-                        .norm()
-                        .beq(&want),
-                )
+                let want = LinearPoly::Add(
+                    BigInt::from(1),
+                    x,
+                    Box::new(LinearPoly::Num(-k)),
+                );
+                Some(LinearExpr::Sub(Box::new(lhs), Box::new(rhs)).norm().beq(&want))
             }
             "norm_eq_coeff_cert" if args.len() >= 4 => {
                 let Some(lhs) = self.parse_linear_expr(ctx, &args[0])? else {
@@ -4936,7 +5352,11 @@ impl<'e> Checker<'e> {
                 let Some(p) = self.parse_linear_poly(ctx, &args[2])? else {
                     return Ok(None);
                 };
-                let want = LinearPoly::Add(BigInt::from(1), x, Box::new(LinearPoly::Num(-k)));
+                let want = LinearPoly::Add(
+                    BigInt::from(1),
+                    x,
+                    Box::new(LinearPoly::Num(-k)),
+                );
                 Some(p.beq(&want))
             }
             _ => None,
@@ -5254,8 +5674,7 @@ impl<'e> Checker<'e> {
             return Ok(Some(LinearExpr::Sub(Box::new(a), Box::new(b))));
         }
         if is_int_linear_ident(name, "Expr.mulL") && args.len() >= 2 {
-            let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[args.len() - 2])?)?
-            else {
+            let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[args.len() - 2])?)? else {
                 return Ok(None);
             };
             let Some(a) = self.parse_linear_expr(ctx, &args[args.len() - 1])? else {
@@ -5267,8 +5686,7 @@ impl<'e> Checker<'e> {
             let Some(a) = self.parse_linear_expr(ctx, &args[args.len() - 2])? else {
                 return Ok(None);
             };
-            let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[args.len() - 1])?)?
-            else {
+            let Some(k) = self.closed_int_value(ctx, &self.whnf(ctx, &args[args.len() - 1])?)? else {
                 return Ok(None);
             };
             return Ok(Some(LinearExpr::MulR(Box::new(a), k)));
@@ -5508,7 +5926,8 @@ impl<'e> Checker<'e> {
             let b = self.whnf(ctx, &args[1])?;
             // Only closed lists. `IntList.sub_eq_add_neg` is ∀ xs ys and
             // needs `xs - ys` to stay a `sub` under binders.
-            if self.is_closed_int_list(&a) && self.is_closed_int_list(&b) && self.is_list_nil(&b) {
+            if self.is_closed_int_list(&a) && self.is_closed_int_list(&b) && self.is_list_nil(&b)
+            {
                 return Ok(Some(expr::apps(a, &args[2..])));
             }
             return Ok(None);
@@ -5519,9 +5938,9 @@ impl<'e> Checker<'e> {
             }
         }
         if (ends("IntList.combo") || ends("Coeffs.combo")) && args.len() >= 4 {
-            if let Some(r) =
-                self.closed_coeffs_combo(ctx, &args[0], &args[1], &args[2], &args[3])?
-            {
+            if let Some(r) = self.closed_coeffs_combo(
+                ctx, &args[0], &args[1], &args[2], &args[3],
+            )? {
                 return Ok(Some(expr::apps(r, &args[4..])));
             }
         }
@@ -5668,7 +6087,12 @@ impl<'e> Checker<'e> {
     /// normalize (divide by gcd). Init `#20467` (`ToInt.Add Int64`) is
     /// `Eq.refl true` after `tidyConstraint`/`tidyCoeffs` of
     /// `mk (some -(2^63-1)) (some 2^64-1)` with coeffs `[0,0,-2^64,2^64]`.
-    fn omega_tidy(&self, ctx: &Ctx, s: &Expr, x: &Expr) -> R<Option<(Expr, Expr)>> {
+    fn omega_tidy(
+        &self,
+        ctx: &Ctx,
+        s: &Expr,
+        x: &Expr,
+    ) -> R<Option<(Expr, Expr)>> {
         let s = self.whnf(ctx, s)?;
         let Some((lo_e, hi_e)) = self.constraint_mk_fields(&s) else {
             return Ok(None);
@@ -5737,7 +6161,11 @@ impl<'e> Checker<'e> {
         Ok(Some((c, xs)))
     }
 
-    fn closed_option_int(&self, ctx: &Ctx, e: &Expr) -> R<Option<Option<num_bigint::BigInt>>> {
+    fn closed_option_int(
+        &self,
+        ctx: &Ctx,
+        e: &Expr,
+    ) -> R<Option<Option<num_bigint::BigInt>>> {
         let e = self.whnf(ctx, e)?;
         match self.option_view(&e) {
             Some(None) => Ok(Some(None)),
@@ -5856,10 +6284,12 @@ impl<'e> Checker<'e> {
             return matches!(&**args[1], ExprData::Lit(Lit::Nat(_)));
         }
         if name == "Int.ofNat" || name.ends_with(".Int.ofNat") {
-            return !args.is_empty() && matches!(&**args[0], ExprData::Lit(Lit::Nat(_)));
+            return !args.is_empty()
+                && matches!(&**args[0], ExprData::Lit(Lit::Nat(_)));
         }
         if name == "Int.negSucc" || name.ends_with(".Int.negSucc") {
-            return !args.is_empty() && matches!(&**args[0], ExprData::Lit(Lit::Nat(_)));
+            return !args.is_empty()
+                && matches!(&**args[0], ExprData::Lit(Lit::Nat(_)));
         }
         if name == "Int.neg" || name.ends_with(".Int.neg") || name == "Neg.neg" {
             return args.last().is_some_and(|a| self.is_closed_int_numeral(a));
@@ -6006,12 +6436,8 @@ impl<'e> Checker<'e> {
         }
         // std #10980: `Int.decLe 0 (-(10^9-1)+10^9)` — `decide` of that
         // closed inequality is `true`, so `Eq.refl true` matches.
-        if (name == "Int.add"
-            || name.ends_with(".Int.add")
-            || name == "Int.sub"
-            || name.ends_with(".Int.sub")
-            || name == "Int.mul"
-            || name.ends_with(".Int.mul"))
+        if (name == "Int.add" || name.ends_with(".Int.add") || name == "Int.sub" || name.ends_with(".Int.sub")
+            || name == "Int.mul" || name.ends_with(".Int.mul"))
             && args.len() >= 2
         {
             if let (Some(a), Some(b)) = (
@@ -6028,7 +6454,8 @@ impl<'e> Checker<'e> {
             }
             return Ok(None);
         }
-        if (name == "HAdd.hAdd" || name == "HSub.hSub" || name == "HMul.hMul") && args.len() >= 6 {
+        if (name == "HAdd.hAdd" || name == "HSub.hSub" || name == "HMul.hMul") && args.len() >= 6
+        {
             if let (Some(a), Some(b)) = (
                 self.closed_int_value(ctx, &args[4])?,
                 self.closed_int_value(ctx, &args[5])?,
@@ -6072,7 +6499,10 @@ impl<'e> Checker<'e> {
         if *mag == BigUint::from(0u32) {
             return None;
         }
-        Some(expr::app(expr::const_(ns, vec![]), nat::mk_lit(mag - 1u32)))
+        Some(expr::app(
+            expr::const_(ns, vec![]),
+            nat::mk_lit(mag - 1u32),
+        ))
     }
 
     /// Kernel-native `Int.decLe`/`Int.decLt` result. The proof payload is
@@ -6301,14 +6731,17 @@ impl<'e> Checker<'e> {
                 }
                 _ => format!("head:{}", self.pp_budget(&lhead, 20)),
             };
-            let (cnst, coeffs) = if (lname == "LinearCombo.mk"
-                || lname.ends_with(".LinearCombo.mk"))
-                && largs.len() >= 2
-            {
-                (largs[0].clone(), largs[1].clone())
-            } else {
-                (expr::proj(combo, 0, lc.clone()), expr::proj(combo, 1, lc))
-            };
+            let (cnst, coeffs) =
+                if (lname == "LinearCombo.mk" || lname.ends_with(".LinearCombo.mk"))
+                    && largs.len() >= 2
+                {
+                    (largs[0].clone(), largs[1].clone())
+                } else {
+                    (
+                        expr::proj(combo, 0, lc.clone()),
+                        expr::proj(combo, 1, lc),
+                    )
+                };
             let coeffs_w = self.whnf(ctx, &coeffs)?;
             if self.is_list_nil(&coeffs_w) {
                 return Ok(Some(expr::apps(cnst, &args[2..])));
@@ -6394,10 +6827,7 @@ impl<'e> Checker<'e> {
         let list_nil = self.find_name("List.nil")?;
         let list_cons = self.find_name("List.cons")?;
         let uint8_ty = expr::const_(uint8, vec![]);
-        let mut list = expr::app(
-            expr::const_(list_nil, vec![level::zero()]),
-            uint8_ty.clone(),
-        );
+        let mut list = expr::app(expr::const_(list_nil, vec![level::zero()]), uint8_ty.clone());
         let u8_of_nat = self.find_name("UInt8.ofNat");
         for b in s.as_bytes().iter().rev() {
             let nat_lit = expr::lit_nat(num_bigint::BigUint::from(*b));
@@ -6837,6 +7267,14 @@ mod tests {
         assert_ne!(c.id, a.id);
     }
 
+    fn nest_apps(base: Expr, n: u32) -> Expr {
+        let mut e = base.clone();
+        for _ in 0..n {
+            e = expr::app(e, base.clone());
+        }
+        e
+    }
+
     /// Shared spine, exponential tree size, intern depth = `depth`.
     fn bush(base: Expr, depth: u32) -> Expr {
         let mut e = base;
@@ -6847,7 +7285,8 @@ mod tests {
     }
 
     /// Eager delta is size/hint, not a library name. A Regular body at the
-    /// size cap stays folded; an abbrev still unfolds.
+    /// size cap stays folded; an abbrev still unfolds. Names are unrelated
+    /// to AIG / LawfulOperator / BVDecide.
     #[test]
     fn large_regular_def_is_not_eagerly_deltaed() {
         use crate::env::{ConstantInfo, Environment, ReducibilityHints};
@@ -6884,7 +7323,7 @@ mod tests {
                 is_unsafe: false,
             },
         );
-        let medium = bush(dummy.clone(), 10);
+        let medium = bush(dummy.clone(), 12);
         env.insert(
             3,
             ConstantInfo::Def {
@@ -6895,7 +7334,7 @@ mod tests {
                 is_unsafe: false,
             },
         );
-        let big = bush(dummy.clone(), 12);
+        let big = bush(dummy.clone(), 14);
         env.insert(
             4,
             ConstantInfo::Def {
@@ -6936,45 +7375,51 @@ mod tests {
             other => panic!("large Regular was eagerly delta'd: {other:?}"),
         }
 
-        // Multi-arg Prop structure instance: stay folded on circuit Regulars.
+        // Multi-arg Prop structure instance: stay folded. Equation lemma: unfold.
         tc.checking_prop_structure.set(true);
         tc.whnf_cache.borrow_mut().clear();
-        let w = tc.whnf(&ctx, &expr::const_(4, vec![])).unwrap();
+        let w = tc.whnf(&ctx, &expr::const_(3, vec![])).unwrap();
         assert!(
-            matches!(&**w, ExprData::Const(4, _)),
-            "Prop-structure instance does not instantiate a circuit Regular"
+            matches!(&**w, ExprData::Const(3, _)),
+            "Prop-structure instance does not instantiate a much larger Regular"
         );
         tc.checking_prop_structure.set(false);
-        tc.decl_value_size.set(5_000);
+        tc.decl_value_size.set(7_000);
+        tc.whnf_cache.borrow_mut().clear();
+        let w = tc.whnf(&ctx, &expr::const_(3, vec![])).unwrap();
+        assert!(
+            matches!(&**w, ExprData::Const(3, _)),
+            "mid-size denote proofs keep ~8k Regulars folded"
+        );
+
+        tc.decl_value_size.set(20_000);
         tc.whnf_cache.borrow_mut().clear();
         let w = tc.whnf(&ctx, &expr::const_(3, vec![])).unwrap();
         assert!(
             !matches!(&**w, ExprData::Const(3, _)),
-            "non-structure decl still unfolds a medium Regular"
+            "proofs ≥10k unfold ~8k Regulars (searcher / match helpers)"
+        );
+        tc.decl_value_size.set(60_000);
+        tc.whnf_cache.borrow_mut().clear();
+        let w = tc.whnf(&ctx, &expr::const_(3, vec![])).unwrap();
+        assert!(
+            !matches!(&**w, ExprData::Const(3, _)),
+            "huge non-Eq proofs unfold ~8k Regulars (searcher helpers)"
         );
 
-        // Small decls unfold large Regulars. Huge proofs stay below the
-        // circuit ceiling; equation lemmas use `eq_related_defs`.
         tc.decl_value_size.set(5_000);
         tc.whnf_cache.borrow_mut().clear();
         let w = tc.whnf(&ctx, &expr::const_(4, vec![])).unwrap();
         assert!(
-            !matches!(&**w, ExprData::Const(4, _)),
-            "small decl still unfolds a circuit-sized Regular"
+            matches!(&**w, ExprData::Const(4, _)),
+            "small decl does not instantiate a 32k Regular"
         );
         tc.decl_value_size.set(20_000);
         tc.whnf_cache.borrow_mut().clear();
         let w = tc.whnf(&ctx, &expr::const_(4, vec![])).unwrap();
         assert!(
-            !matches!(&**w, ExprData::Const(4, _)),
-            "non-class huge theorem still unfolds a circuit Regular"
-        );
-        tc.eq_related_defs.borrow_mut().push(4);
-        tc.whnf_cache.borrow_mut().clear();
-        let w = tc.whnf(&ctx, &expr::const_(4, vec![])).unwrap();
-        assert!(
-            !matches!(&**w, ExprData::Const(4, _)),
-            "equality-related Regular still unfolds"
+            matches!(&**w, ExprData::Const(4, _)),
+            "large denote-style proofs still keep 32k Regulars folded"
         );
     }
 
@@ -7017,7 +7462,7 @@ mod tests {
     }
 
     /// `exfalso junk` with a ≥10k-node junk term of type True. Lean
-    /// `check`s the theorem value; infer_only would accept it.
+    /// `check`s the theorem value; infer_only on the whole value would accept it.
     #[test]
     fn large_theorem_still_checks_app_args() {
         use crate::env::{ConstantInfo, Environment};
@@ -7049,8 +7494,6 @@ mod tests {
                 is_unsafe: false,
             },
         );
-        // `andT : True → True → True`, `intro : True`. Shared spine so the
-        // junk term is ≥10k nodes at infer depth 16.
         env.insert(
             3,
             ConstantInfo::Axiom {
@@ -7104,259 +7547,5 @@ mod tests {
             ),
             other => panic!("large ill-typed theorem must reject, got {other:?}"),
         }
-    }
-
-    fn regulars_for_name_test() -> crate::env::Environment {
-        use crate::env::{ConstantInfo, Environment, ReducibilityHints};
-        let mut env = Environment::default();
-        let sort0 = expr::sort(level::zero());
-        let dummy = expr::const_(0, vec![]);
-        env.insert(
-            0,
-            ConstantInfo::Axiom {
-                level_params: vec![],
-                typ: sort0.clone(),
-                is_unsafe: false,
-            },
-        );
-        env.insert(
-            1,
-            ConstantInfo::Def {
-                level_params: vec![],
-                typ: sort0.clone(),
-                value: dummy.clone(),
-                hints: ReducibilityHints::Abbrev,
-                is_unsafe: false,
-            },
-        );
-        env.insert(
-            2,
-            ConstantInfo::Def {
-                level_params: vec![],
-                typ: sort0.clone(),
-                value: bush(dummy.clone(), 16),
-                hints: ReducibilityHints::Regular(1),
-                is_unsafe: false,
-            },
-        );
-        env.insert(
-            3,
-            ConstantInfo::Def {
-                level_params: vec![],
-                typ: sort0.clone(),
-                value: bush(dummy.clone(), 12),
-                hints: ReducibilityHints::Regular(1),
-                is_unsafe: false,
-            },
-        );
-        env.insert(
-            4,
-            ConstantInfo::Def {
-                level_params: vec![],
-                typ: sort0,
-                value: bush(dummy, 14),
-                hints: ReducibilityHints::Regular(1),
-                is_unsafe: false,
-            },
-        );
-        env
-    }
-
-    /// AIG / BVDecide / LawfulOperator / `denote_*` names must not change
-    /// eager-delta. Same bodies and hints, different strings.
-    #[test]
-    fn eager_delta_ignores_library_names() {
-        let env = regulars_for_name_test();
-        let aig = [
-            std::rc::Rc::new("Dummy".into()),
-            std::rc::Rc::new("Std.Tactic.BVDecide.LRAT.bitblast.go".into()),
-            std::rc::Rc::new("Std.Sat.AIG.Relabel.go._unary".into()),
-            std::rc::Rc::new("Std.Sat.AIG.RefVec.denote_eval".into()),
-            std::rc::Rc::new("Std.Tactic.BVDecide.Bitblast.instLawfulOperator".into()),
-        ];
-        let dummy = [
-            std::rc::Rc::new("Dummy".into()),
-            std::rc::Rc::new("Foo.helper".into()),
-            std::rc::Rc::new("Bar.aux._unary".into()),
-            std::rc::Rc::new("Baz.lemma".into()),
-            std::rc::Rc::new("Qux.instThing".into()),
-        ];
-        let tc_a = Checker::new(&env, &aig, None, None);
-        let tc_b = Checker::new(&env, &dummy, None, None);
-        let modes = [
-            (0, false, false),
-            (200, true, false),
-            (200, false, true),
-            (5_000, false, false),
-            (20_000, false, false),
-        ];
-        for (size, prop, simple) in modes {
-            tc_a.decl_value_size.set(size);
-            tc_b.decl_value_size.set(size);
-            tc_a.checking_prop_structure.set(prop);
-            tc_b.checking_prop_structure.set(prop);
-            tc_a.checking_simple_prop_inductive.set(simple);
-            tc_b.checking_simple_prop_inductive.set(simple);
-            for n in 1..=4u32 {
-                assert_eq!(
-                    tc_a.eager_whnf_unfolds(n),
-                    tc_b.eager_whnf_unfolds(n),
-                    "eager_whnf_unfolds({n}) size={size} prop={prop} simple={simple}"
-                );
-                assert_eq!(
-                    tc_a.delta_body_is_small(n),
-                    tc_b.delta_body_is_small(n),
-                    "delta_body_is_small({n})"
-                );
-            }
-        }
-    }
-
-    fn nest_pis(arity: u32, cod: Expr) -> Expr {
-        let mut t = cod;
-        for _ in 0..arity {
-            t = expr::pi(
-                expr::BinderInfo::Default,
-                expr::sort(level::succ(level::zero())),
-                t,
-            );
-        }
-        t
-    }
-
-    /// Class / Eq / 1-field Prop shapes are inductive metadata, not names.
-    #[test]
-    fn inductive_shapes_ignore_library_names() {
-        use crate::env::{ConstantInfo, Environment};
-        let sort0 = expr::sort(level::zero());
-        let mut env = Environment::default();
-        env.insert(
-            0,
-            ConstantInfo::InductiveType {
-                level_params: vec![],
-                typ: nest_pis(5, sort0.clone()),
-                num_params: 5,
-                num_indices: 0,
-                all: vec![0],
-                ctors: vec![1],
-                is_rec: false,
-                is_unsafe: false,
-            },
-        );
-        env.insert(
-            1,
-            ConstantInfo::Constructor {
-                level_params: vec![],
-                typ: sort0.clone(),
-                induct: 0,
-                cidx: 0,
-                num_params: 5,
-                num_fields: 2,
-                is_unsafe: false,
-            },
-        );
-        env.insert(
-            2,
-            ConstantInfo::InductiveType {
-                level_params: vec![],
-                typ: nest_pis(3, sort0.clone()),
-                num_params: 1,
-                num_indices: 2,
-                all: vec![2],
-                ctors: vec![3],
-                is_rec: false,
-                is_unsafe: false,
-            },
-        );
-        env.insert(
-            3,
-            ConstantInfo::Constructor {
-                level_params: vec![],
-                typ: sort0.clone(),
-                induct: 2,
-                cidx: 0,
-                num_params: 1,
-                num_fields: 1,
-                is_unsafe: false,
-            },
-        );
-        env.insert(
-            4,
-            ConstantInfo::InductiveType {
-                level_params: vec![],
-                typ: nest_pis(1, sort0.clone()),
-                num_params: 1,
-                num_indices: 0,
-                all: vec![4],
-                ctors: vec![5],
-                is_rec: false,
-                is_unsafe: false,
-            },
-        );
-        env.insert(
-            5,
-            ConstantInfo::Constructor {
-                level_params: vec![],
-                typ: sort0,
-                induct: 4,
-                cidx: 0,
-                num_params: 1,
-                num_fields: 1,
-                is_unsafe: false,
-            },
-        );
-        let lib = [
-            std::rc::Rc::new("LawfulVecOperator".into()),
-            std::rc::Rc::new("LawfulVecOperator.mk".into()),
-            std::rc::Rc::new("Eq".into()),
-            std::rc::Rc::new("Eq.refl".into()),
-            std::rc::Rc::new("Finite".into()),
-            std::rc::Rc::new("Finite.mk".into()),
-        ];
-        let dummy = [
-            std::rc::Rc::new("MyClass".into()),
-            std::rc::Rc::new("MyClass.mk".into()),
-            std::rc::Rc::new("MyEq".into()),
-            std::rc::Rc::new("MyEq.refl".into()),
-            std::rc::Rc::new("MyFin".into()),
-            std::rc::Rc::new("MyFin.mk".into()),
-        ];
-        let tc_a = Checker::new(&env, &lib, None, None);
-        let tc_b = Checker::new(&env, &dummy, None, None);
-        let class_ty = expr::const_(0, vec![]);
-        let eq_ty = expr::const_(2, vec![]);
-        let fin_ty = expr::const_(4, vec![]);
-        assert!(tc_a.type_is_multiarg_prop_structure(&class_ty));
-        assert!(!tc_a.type_is_multiarg_prop_structure(&eq_ty));
-        assert!(!tc_a.type_is_multiarg_prop_structure(&fin_ty));
-        assert!(tc_a.type_is_equality_shaped(&eq_ty));
-        assert!(!tc_a.type_is_equality_shaped(&class_ty));
-        assert!(!tc_a.type_is_equality_shaped(&fin_ty));
-        assert_eq!(
-            tc_a.type_is_equality_shaped(&eq_ty),
-            tc_b.type_is_equality_shaped(&eq_ty)
-        );
-        assert!(tc_a.type_is_unit_ctor_zero_index_prop(&class_ty));
-        assert!(!tc_a.type_is_unit_ctor_zero_index_prop(&eq_ty));
-        assert!(tc_a.type_is_unit_ctor_zero_index_prop(&fin_ty));
-        assert_eq!(
-            tc_a.type_is_multiarg_prop_structure(&class_ty),
-            tc_b.type_is_multiarg_prop_structure(&class_ty)
-        );
-        assert_eq!(
-            tc_a.type_is_unit_ctor_zero_index_prop(&fin_ty),
-            tc_b.type_is_unit_ctor_zero_index_prop(&fin_ty)
-        );
-        let mut rel_a = Vec::new();
-        let mut rel_b = Vec::new();
-        tc_a.fill_eq_related_defs(&eq_ty, &mut rel_a);
-        tc_b.fill_eq_related_defs(&eq_ty, &mut rel_b);
-        assert_eq!(rel_a, rel_b);
-        let mut rel_class = Vec::new();
-        tc_a.fill_eq_related_defs(&class_ty, &mut rel_class);
-        assert!(
-            rel_class.is_empty(),
-            "class-like Prop is not equality-shaped"
-        );
     }
 }

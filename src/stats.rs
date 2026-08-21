@@ -52,6 +52,10 @@ pub fn defeq_calls() -> u64 {
     DEFEQ_CALLS.with(|c| c.get())
 }
 
+pub fn infer_calls() -> u64 {
+    INFER_CALLS.with(|c| c.get())
+}
+
 pub fn report() {
     if !enabled() {
         return;
@@ -119,6 +123,65 @@ pub fn set_theorem_delta_scope(name: &str) {
 
 pub fn theorem_delta_in_scope() -> bool {
     THEOREM_DELTA_SCOPE.with(|c| c.get())
+}
+
+/// Decision histogram: fundamentals vs name-gates vs library interpreters.
+/// On when `KIOTA_SHORTCUT_JSON` or `KIOTA_STATS` is set.
+pub fn shortcut_enabled() -> bool {
+    thread_local! {
+        static ON: bool = std::env::var_os("KIOTA_SHORTCUT_JSON").is_some()
+            || std::env::var_os("KIOTA_STATS").is_some();
+    }
+    ON.with(|b| *b)
+}
+
+macro_rules! sc_bump {
+    ($name:ident, $cell:ident) => {
+        #[inline(always)]
+        pub fn $name() {
+            if shortcut_enabled() {
+                $cell.with(|c| c.set(c.get() + 1));
+            }
+        }
+    };
+}
+
+thread_local! {
+    static C_THM_DELTA_OFF: Cell<u64> = const { Cell::new(0) };
+    static K_PI_INFER_ONLY: Cell<u64> = const { Cell::new(0) };
+    static N_NAT: Cell<u64> = const { Cell::new(0) };
+    static N_INT: Cell<u64> = const { Cell::new(0) };
+    static L_LINEAR: Cell<u64> = const { Cell::new(0) };
+    static L_COMMRING: Cell<u64> = const { Cell::new(0) };
+    static L_RAT: Cell<u64> = const { Cell::new(0) };
+    static L_OMEGA: Cell<u64> = const { Cell::new(0) };
+}
+
+sc_bump!(c_thm_delta_off, C_THM_DELTA_OFF);
+sc_bump!(k_pi_infer_only, K_PI_INFER_ONLY);
+sc_bump!(n_nat, N_NAT);
+sc_bump!(n_int, N_INT);
+sc_bump!(l_linear, L_LINEAR);
+sc_bump!(l_commring, L_COMMRING);
+sc_bump!(l_rat, L_RAT);
+sc_bump!(l_omega, L_OMEGA);
+
+pub fn report_shortcuts() {
+    if !shortcut_enabled() {
+        return;
+    }
+    let g = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|x| x.get());
+    eprintln!(
+        "{{\"kiota_shortcuts\":{{\"C_thm_delta_off\":{},\"K_pi_infer_only\":{},\"N_nat\":{},\"N_int\":{},\"L_linear\":{},\"L_commring\":{},\"L_rat\":{},\"L_omega\":{}}}}}",
+        g(&C_THM_DELTA_OFF),
+        g(&K_PI_INFER_ONLY),
+        g(&N_NAT),
+        g(&N_INT),
+        g(&L_LINEAR),
+        g(&L_COMMRING),
+        g(&L_RAT),
+        g(&L_OMEGA),
+    );
 }
 
 #[cfg(test)]

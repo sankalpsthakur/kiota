@@ -213,6 +213,10 @@ pub fn intern(d: ExprData) -> Expr {
     INTERN.with(|t| t.borrow_mut().intern(d))
 }
 
+pub fn intern_node_count() -> usize {
+    INTERN.with(|t| t.borrow().buckets.values().map(|v| v.len()).sum())
+}
+
 pub fn bvar(i: u32) -> Expr {
     intern(ExprData::BVar(i))
 }

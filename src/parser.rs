@@ -595,12 +595,47 @@ impl Parser {
             eprintln!("[decl #{}] {kind} {nm}", self.decl_count);
             let _ = std::io::stderr().flush();
         }
+        if std::env::var_os("KIOTA_SIZE_LOG").is_some() {
+            let sz = self
+                .env
+                .get(name)
+                .and_then(|c| c.value())
+                .map(|v| crate::tc::expr_size_capped(v, 200_000))
+                .unwrap_or(0);
+            let hint = match self.env.get(name) {
+                Some(ConstantInfo::Def {
+                    hints: ReducibilityHints::Regular(h),
+                    ..
+                }) => format!("R{h}"),
+                Some(ConstantInfo::Def {
+                    hints: ReducibilityHints::Abbrev,
+                    ..
+                }) => "A".into(),
+                Some(ConstantInfo::Def {
+                    hints: ReducibilityHints::Opaque,
+                    ..
+                }) => "O".into(),
+                Some(ConstantInfo::Theorem { .. }) => "T".into(),
+                _ => "-".into(),
+            };
+            eprintln!("SIZE #{} {kind} {hint} {sz} {nm}", self.decl_count);
+        }
+        if std::env::var_os("KIOTA_SIZE_ONLY").is_some() {
+            return Ok(());
+        }
         if let Ok(max) = std::env::var("KIOTA_MAX_DECL") {
             if let Ok(max_n) = max.parse::<usize>() {
                 if self.decl_count > max_n {
                     return Err(TcError::Decline(format!(
                         "KIOTA_MAX_DECL={max_n}"
                     )));
+                }
+            }
+        }
+        if let Ok(min) = std::env::var("KIOTA_MIN_DECL") {
+            if let Ok(min_n) = min.parse::<usize>() {
+                if self.decl_count < min_n {
+                    return Ok(());
                 }
             }
         }
