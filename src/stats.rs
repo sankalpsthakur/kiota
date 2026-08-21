@@ -108,14 +108,31 @@ thread_local! {
 /// theorem can be unfolded without letting the delta path tear through every
 /// large proof body in the environment. With `KIOTA_THEOREM_DELTA_TARGET` set,
 /// theorem delta applies only while checking a decl whose name contains the
-/// substring; unset means the scope is global (current behavior).
+/// substring; unset means the scope is global.
 pub fn set_theorem_delta_scope(name: &str) {
-    let on = std::env::var("KIOTA_THEOREM_DELTA_TARGET")
-        .map(|t| name.contains(&t))
-        .unwrap_or_else(|_| name.contains("fixF_eq"));
+    let on = match std::env::var("KIOTA_THEOREM_DELTA_TARGET") {
+        Ok(t) if !t.is_empty() => name.contains(&t),
+        _ => true,
+    };
     THEOREM_DELTA_SCOPE.with(|c| c.set(on));
 }
 
 pub fn theorem_delta_in_scope() -> bool {
     THEOREM_DELTA_SCOPE.with(|c| c.get())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unset_theorem_delta_is_global() {
+        // Unset `KIOTA_THEOREM_DELTA_TARGET` must not key on `fixF_eq`.
+        std::env::remove_var("KIOTA_THEOREM_DELTA_TARGET");
+        super::set_theorem_delta_scope("Nat.add_comm");
+        assert!(
+            super::theorem_delta_in_scope(),
+            "unset theorem-delta scope is global"
+        );
+        super::set_theorem_delta_scope("WellFounded.fixF_eq");
+        assert!(super::theorem_delta_in_scope());
+    }
 }
