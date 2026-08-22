@@ -86,3 +86,23 @@ fn extra_rec_rejects() {
 fn extra_rec_all_field_not_pretty_name_accepts() {
     assert_accept("extra-rec-alt-name.accept.ndjson");
 }
+
+#[test]
+fn extra_rec_sole_false_type_rejects() {
+    assert_reject("extra-rec-sole-false-typ.reject.ndjson");
+}
+
+#[test]
+fn unsafe_axiom_rejects() {
+    assert_reject("unsafe-axiom.reject.ndjson");
+}
+
+#[test]
+fn partial_def_rejects() {
+    assert_reject("partial-def.reject.ndjson");
+}
+
+#[test]
+fn quot_false_rejects() {
+    assert_reject("quot-false.reject.ndjson");
+}

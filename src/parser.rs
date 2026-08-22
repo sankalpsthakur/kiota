@@ -217,6 +217,9 @@ impl Parser {
         match kind {
             "axiomDecl" | "axiom" => {
                 let is_unsafe = Self::get_bool(v, "isUnsafe");
+                if is_unsafe {
+                    return Err(TcError::Reject("unsafe axiom".into()));
+                }
                 self.env.insert(
                     name,
                     ConstantInfo::Axiom {
@@ -240,7 +243,11 @@ impl Parser {
                     }
                     _ => ReducibilityHints::Regular(0),
                 };
-                let is_unsafe = Self::get_str(v, "safety") == "unsafe";
+                let safety = Self::get_str(v, "safety");
+                if safety == "unsafe" || safety == "partial" {
+                    return Err(TcError::Reject(format!("{safety} definition")));
+                }
+                let is_unsafe = false;
                 self.env.insert(
                     name,
                     ConstantInfo::Def {
@@ -265,7 +272,11 @@ impl Parser {
             }
             "opaqueDecl" | "opaque" => {
                 let value = self.expr_at(Self::get_u32(v, "value"));
-                let is_unsafe = Self::get_str(v, "safety") == "unsafe";
+                let safety = Self::get_str(v, "safety");
+                if safety == "unsafe" || safety == "partial" {
+                    return Err(TcError::Reject(format!("{safety} opaque")));
+                }
+                let is_unsafe = false;
                 self.env.insert(
                     name,
                     ConstantInfo::Opaque {
@@ -293,6 +304,14 @@ impl Parser {
         let level_params = Self::get_vec_u32(v, "levelParams");
         let typ = self.expr_at(Self::get_u32(v, "type"));
         self.reject_if_dup(name)?;
+        match &**typ {
+            crate::expr::ExprData::Pi(_, _, _) | crate::expr::ExprData::Sort(_) => {}
+            _ => {
+                return Err(TcError::Reject(
+                    "quot type must be a function or a sort".into(),
+                ));
+            }
+        }
         self.env.insert(
             name,
             ConstantInfo::Quot {
@@ -332,6 +351,15 @@ impl Parser {
             let ctor_names = Self::get_vec_u32(t, "ctors");
             let is_rec = Self::get_bool(t, "isRec");
             let is_unsafe = Self::get_bool(t, "isUnsafe");
+            if is_unsafe {
+                return Err(TcError::Reject(format!(
+                    "unsafe inductive `{}`",
+                    self.names
+                        .get(name as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or("?")
+                )));
+            }
             self.env.insert(
                 name,
                 ConstantInfo::InductiveType {
@@ -356,6 +384,15 @@ impl Parser {
             let num_params = Self::get_u32(c, "numParams");
             let num_fields = Self::get_u32(c, "numFields");
             let is_unsafe = Self::get_bool(c, "isUnsafe");
+            if is_unsafe {
+                return Err(TcError::Reject(format!(
+                    "unsafe constructor `{}`",
+                    self.names
+                        .get(name as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or("?")
+                )));
+            }
             self.env.insert(
                 name,
                 ConstantInfo::Constructor {
@@ -381,6 +418,24 @@ impl Parser {
             let num_minors = Self::get_u32(r, "numMinors");
             let k = Self::get_bool(r, "k");
             let is_unsafe = Self::get_bool(r, "isUnsafe");
+            if is_unsafe {
+                return Err(TcError::Reject(format!(
+                    "unsafe recursor `{}`",
+                    self.names
+                        .get(name as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or("?")
+                )));
+            }
+            if !matches!(&**typ, crate::expr::ExprData::Pi(_, _, _)) {
+                return Err(TcError::Reject(format!(
+                    "recursor `{}` type is not a function",
+                    self.names
+                        .get(name as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or("?")
+                )));
+            }
             let rules = r
                 .get("rules")
                 .and_then(|x| x.as_array())

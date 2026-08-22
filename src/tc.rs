@@ -2664,13 +2664,18 @@ impl<'e> Checker<'e> {
                             }
                             let (phead, pargs) = expr::unfold_apps(&vw);
                             if let ExprData::Const(cname, _us) = &**phead {
-                                if let Some(ConstantInfo::Constructor { num_params, .. }) =
-                                    self.env.get(*cname)
+                                if let Some(ConstantInfo::Constructor {
+                                    num_params,
+                                    induct,
+                                    ..
+                                }) = self.env.get(*cname)
                                 {
-                                    let fi = (*num_params + *idx) as usize;
-                                    if fi < pargs.len() {
-                                        cur = expr::apps(pargs[fi].clone(), &args);
-                                        continue;
+                                    if *induct == *sname {
+                                        let fi = (*num_params + *idx) as usize;
+                                        if fi < pargs.len() {
+                                            cur = expr::apps(pargs[fi].clone(), &args);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
@@ -2750,13 +2755,18 @@ impl<'e> Checker<'e> {
                     }
                     let (head, args) = expr::unfold_apps(&vw);
                     if let ExprData::Const(cname, _us) = &**head {
-                        if let Some(ConstantInfo::Constructor { num_params, .. }) =
-                            self.env.get(*cname)
+                        if let Some(ConstantInfo::Constructor {
+                            num_params,
+                            induct,
+                            ..
+                        }) = self.env.get(*cname)
                         {
-                            let fi = (*num_params + *idx) as usize;
-                            if fi < args.len() {
-                                cur = args[fi].clone();
-                                continue;
+                            if *induct == *sname {
+                                let fi = (*num_params + *idx) as usize;
+                                if fi < args.len() {
+                                    cur = args[fi].clone();
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -3279,30 +3289,6 @@ impl<'e> Checker<'e> {
                 nat::numeral_value(b, zero, succ),
             ) {
                 return Ok(x == y);
-            }
-        }
-        {
-            let (h1, _) = expr::unfold_apps(a);
-            if let ExprData::Const(n, _) = &**h1 {
-                if matches!(self.env.get(*n), Some(ConstantInfo::Theorem { .. })) {
-                    let same = self.with_infer_only(|| -> R<bool> {
-                        let ta = match self.infer_type(ctx, a) {
-                            Ok(t) => t,
-                            Err(_) => return Ok(false),
-                        };
-                        if !self.is_prop(ctx, &ta)? {
-                            return Ok(false);
-                        }
-                        let tb = match self.infer_type(ctx, b) {
-                            Ok(t) => t,
-                            Err(_) => return Ok(false),
-                        };
-                        self.is_def_eq(ctx, &ta, &tb)
-                    })?;
-                    if same {
-                        return Ok(true);
-                    }
-                }
             }
         }
         // Structural match without delta.
@@ -6597,6 +6583,9 @@ impl<'e> Checker<'e> {
             return Ok(None);
         }
         if name == "Neg.neg" && args.len() >= 3 {
+            if !self.type_head_is_int(&args[0]) {
+                return Ok(None);
+            }
             if let Some(v) = self.closed_int_value(ctx, &args[2])? {
                 return Ok(Some(-v));
             }
@@ -6614,6 +6603,9 @@ impl<'e> Checker<'e> {
             return Ok(None);
         }
         if name == "HDiv.hDiv" && args.len() >= 6 {
+            if !self.type_head_is_int(&args[0]) {
+                return Ok(None);
+            }
             if let (Some(a), Some(b)) = (
                 self.closed_int_value(ctx, &args[4])?,
                 self.closed_int_value(ctx, &args[5])?,
@@ -6623,12 +6615,18 @@ impl<'e> Checker<'e> {
             return Ok(None);
         }
         if (name == "Nat.cast" || name == "NatCast.natCast") && args.len() >= 3 {
+            if !self.type_head_is_int(&args[0]) {
+                return Ok(None);
+            }
             if let Some(n) = self.closed_nat_value(ctx, &args[2])? {
                 return Ok(Some(BigInt::from(n)));
             }
             return Ok(None);
         }
         if name == "NatCast.natCast" && args.len() >= 2 {
+            if !self.type_head_is_int(&args[0]) {
+                return Ok(None);
+            }
             if let Some(n) = self.closed_nat_value(ctx, &args[1])? {
                 return Ok(Some(BigInt::from(n)));
             }
@@ -6644,6 +6642,9 @@ impl<'e> Checker<'e> {
             return Ok(None);
         }
         if name == "HPow.hPow" && args.len() >= 6 {
+            if !self.type_head_is_int(&args[0]) {
+                return Ok(None);
+            }
             if let (Some(a), Some(e)) = (
                 self.closed_int_value(ctx, &args[4])?,
                 self.closed_nat_value(ctx, &args[5])?,
@@ -6683,6 +6684,9 @@ impl<'e> Checker<'e> {
         }
         if (name == "HAdd.hAdd" || name == "HSub.hSub" || name == "HMul.hMul") && args.len() >= 6
         {
+            if !self.type_head_is_int(&args[0]) {
+                return Ok(None);
+            }
             if let (Some(a), Some(b)) = (
                 self.closed_int_value(ctx, &args[4])?,
                 self.closed_int_value(ctx, &args[5])?,
@@ -6696,6 +6700,9 @@ impl<'e> Checker<'e> {
             return Ok(None);
         }
         if (name == "Add.add" || name == "Sub.sub" || name == "Mul.mul") && args.len() >= 4 {
+            if !self.type_head_is_int(&args[0]) {
+                return Ok(None);
+            }
             if let (Some(a), Some(b)) = (
                 self.closed_int_value(ctx, &args[2])?,
                 self.closed_int_value(ctx, &args[3])?,
@@ -8369,6 +8376,161 @@ mod tests {
         assert!(
             !eq,
             "Nat literal 3 must not defeq OfNat.ofNat Int 3 inst"
+        );
+    }
+
+    /// `Nat.cast` must not identify numerals at unrelated types.
+    #[test]
+    fn nat_cast_nat_vs_int_not_defeq() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            1,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            2,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::pi(
+                    expr::BinderInfo::Default,
+                    sort1.clone(),
+                    expr::pi(
+                        expr::BinderInfo::Default,
+                        expr::sort(level::zero()),
+                        expr::pi(
+                            expr::BinderInfo::Default,
+                            expr::const_(0, vec![]),
+                            expr::bvar(2),
+                        ),
+                    ),
+                ),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            3,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::sort(level::zero()),
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["Nat", "Int", "Nat.cast", "inst"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let n3 = expr::lit_nat(3u32.into());
+        let cast = |ty: u32| {
+            expr::apps(
+                expr::const_(2, vec![]),
+                &[
+                    expr::const_(ty, vec![]),
+                    expr::const_(3, vec![]),
+                    n3.clone(),
+                ],
+            )
+        };
+        let eq = tc
+            .is_def_eq(&Ctx::new(), &cast(0), &cast(1))
+            .unwrap();
+        assert!(!eq, "Nat.cast Nat 3 must not defeq Nat.cast Int 3");
+    }
+
+    /// Proj ι only if the constructor belongs to the projected inductive.
+    #[test]
+    fn proj_wrong_inductive_does_not_iota() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            1,
+            ConstantInfo::InductiveType {
+                level_params: vec![],
+                typ: sort1.clone(),
+                num_params: 0,
+                num_indices: 0,
+                all: vec![1],
+                ctors: vec![2],
+                is_rec: false,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            2,
+            ConstantInfo::Constructor {
+                level_params: vec![],
+                typ: expr::pi(
+                    expr::BinderInfo::Default,
+                    expr::const_(0, vec![]),
+                    expr::const_(1, vec![]),
+                ),
+                induct: 1,
+                cidx: 0,
+                num_params: 0,
+                num_fields: 1,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            3,
+            ConstantInfo::InductiveType {
+                level_params: vec![],
+                typ: sort1,
+                num_params: 0,
+                num_indices: 0,
+                all: vec![3],
+                ctors: vec![4],
+                is_rec: false,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            4,
+            ConstantInfo::Constructor {
+                level_params: vec![],
+                typ: expr::pi(
+                    expr::BinderInfo::Default,
+                    expr::const_(0, vec![]),
+                    expr::const_(3, vec![]),
+                ),
+                induct: 3,
+                cidx: 0,
+                num_params: 0,
+                num_fields: 1,
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["Nat", "A", "A.mk", "B", "B.mk"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let n3 = expr::lit_nat(3u32.into());
+        let amk = expr::app(expr::const_(2, vec![]), n3.clone());
+        let w = tc
+            .whnf(&Ctx::new(), &expr::proj(3, 0, amk))
+            .expect("WHNF");
+        assert!(
+            !Rc::ptr_eq(&w, &n3) && !matches!(&**w, ExprData::Lit(_)),
+            "proj B 0 (A.mk 3) must not ι to 3, got {}",
+            tc.pp(&w)
         );
     }
 
