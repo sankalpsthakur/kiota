@@ -1759,14 +1759,6 @@ impl<'e> Checker<'e> {
         }
     }
 
-    fn is_closed_numeral(l: &Level) -> bool {
-        match &**l {
-            crate::level::LevelData::Zero => true,
-            crate::level::LevelData::Succ(a) => Self::is_closed_numeral(a),
-            _ => false,
-        }
-    }
-
     fn is_non_rec_structure(&self, name: u32) -> bool {
         matches!(
             self.env.get(name),
@@ -7208,18 +7200,14 @@ impl<'e> Checker<'e> {
                         ExprData::Pi(_, dom, body) => {
                             self.check_arg_positive(&c2, dom, &all, num_params)?;
                             let ds = self.infer_type(&c2, dom)?;
-                            if let Ok(field_lvl) = self.ensure_sort(&c2, &ds) {
-                                // Only reject when both universes are closed numerals;
-                                // parametric comparisons are left to `leq`, but a failed
-                                // `leq` on open levels is treated as "not sure" to avoid
-                                // rejecting valid polymorphic structures such as `HAdd`.
-                                if Self::is_closed_numeral(&field_lvl)
-                                    && Self::is_closed_numeral(&t_sort)
-                                    && !level::leq(&field_lvl, &t_sort, 0)
-                                    && !level::is_def_eq(&t_sort, &level::zero())
-                                {
-                                    return reject("constructor field universe is too big for the inductive type");
-                                }
+                            let field_lvl = self.ensure_sort(&c2, &ds)?;
+                            // Lean: field level ≤ inductive level, or the inductive is Prop.
+                            if !level::leq(&field_lvl, &t_sort, 0)
+                                && !level::is_def_eq(&t_sort, &level::zero())
+                            {
+                                return reject(
+                                    "constructor field universe is too big for the inductive type",
+                                );
                             }
                             c2.push(dom.clone());
                             cur2 = body.clone();
@@ -7272,7 +7260,7 @@ impl<'e> Checker<'e> {
     /// Walk a constructor's argument telescope; each argument type must be
     /// strictly positive in the names being defined (`bound`).
     fn check_positivity(&self, ctx: &Ctx, e: &Expr, bound: &[u32], _strict_pos_ok: bool) -> R<()> {
-        let w = self.whnf(ctx, e).unwrap_or_else(|_| e.clone());
+        let w = self.positivity_whnf(ctx, e)?;
         match &**w {
             ExprData::Pi(_, dom, body) => {
                 self.check_arg_positive(ctx, dom, bound, 0)?;
@@ -7287,9 +7275,18 @@ impl<'e> Checker<'e> {
         }
     }
 
+    fn positivity_whnf(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        match self.whnf(ctx, e) {
+            Ok(w) => Ok(w),
+            Err(TcError::Decline(m)) => Err(TcError::Decline(m)),
+            Err(_) => reject("cannot prove constructor argument is positive"),
+        }
+    }
+
     /// Strict positivity: `bound` may not occur in a Pi domain. Direct
-    /// `I params..` is allowed. Nested `F … (I params) …` is allowed when `F`
-    /// is a previously defined inductive and `I`'s parameters are uniform.
+    /// `I params..` is allowed. Nested `F … I …` is allowed when `F` is a
+    /// previously defined inductive whose constructors are strictly positive
+    /// in `I`.
     fn check_arg_positive(
         &self,
         ctx: &Ctx,
@@ -7297,7 +7294,18 @@ impl<'e> Checker<'e> {
         bound: &[u32],
         num_params: u32,
     ) -> R<()> {
-        let mut cur = self.whnf(ctx, arg_ty).unwrap_or_else(|_| arg_ty.clone());
+        self.check_arg_positive_in(ctx, arg_ty, bound, num_params, &[])
+    }
+
+    fn check_arg_positive_in(
+        &self,
+        ctx: &Ctx,
+        arg_ty: &Expr,
+        bound: &[u32],
+        num_params: u32,
+        visiting: &[(u32, Vec<Expr>)],
+    ) -> R<()> {
+        let mut cur = self.positivity_whnf(ctx, arg_ty)?;
         let mut ctx2 = {
             crate::stats::ctx_clone();
             ctx.clone()
@@ -7311,12 +7319,12 @@ impl<'e> Checker<'e> {
                         );
                     }
                     ctx2.push(dom.clone());
-                    cur = self.whnf(&ctx2, body).unwrap_or_else(|_| body.clone());
+                    cur = self.positivity_whnf(&ctx2, body)?;
                 }
                 _ => break,
             }
         }
-        self.check_positive_spine(&ctx2, &cur, bound, num_params)
+        self.check_positive_spine(&ctx2, &cur, bound, num_params, visiting)
     }
 
     fn expected_param_args(&self, ctx: &Ctx, num_params: u32) -> Vec<Expr> {
@@ -7336,14 +7344,33 @@ impl<'e> Checker<'e> {
         }
         let expected = self.expected_param_args(ctx, num_params);
         for (a, e) in args.iter().zip(expected.iter()) {
-            if !self.is_def_eq(ctx, a, e).unwrap_or(false) {
+            if !self.is_def_eq(ctx, a, e)? {
                 return reject("non-uniform nested inductive parameter");
             }
         }
         Ok(())
     }
 
-    fn check_positive_spine(&self, ctx: &Ctx, e: &Expr, bound: &[u32], num_params: u32) -> R<()> {
+    fn params_defeq(&self, ctx: &Ctx, a: &[Expr], b: &[Expr]) -> R<bool> {
+        if a.len() != b.len() {
+            return Ok(false);
+        }
+        for (x, y) in a.iter().zip(b.iter()) {
+            if !self.is_def_eq(ctx, x, y)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn check_positive_spine(
+        &self,
+        ctx: &Ctx,
+        e: &Expr,
+        bound: &[u32],
+        num_params: u32,
+        visiting: &[(u32, Vec<Expr>)],
+    ) -> R<()> {
         if !self.occurs_any(e, bound) {
             return Ok(());
         }
@@ -7352,17 +7379,162 @@ impl<'e> Checker<'e> {
             ExprData::Const(n, _) if bound.contains(n) => {
                 self.check_uniform_i(ctx, &args, bound, num_params)
             }
-            ExprData::Const(n, _) => match self.env.get(*n) {
+            ExprData::Const(n, us) => match self.env.get(*n) {
                 Some(ConstantInfo::InductiveType { .. }) => {
-                    for a in &args {
-                        self.check_positive_spine(ctx, a, bound, num_params)?;
-                    }
-                    Ok(())
+                    self.check_nested_functor(ctx, *n, us, &args, bound, num_params, visiting)
                 }
                 _ => reject("occurrence of inductive type in unsupported position"),
             },
             _ => reject("occurrence of inductive type in unsupported position"),
         }
+    }
+
+    /// Lean eliminates `F Ds` to an auxiliary mutual type, then positivity
+    /// is checked on the specialized constructors. Export form still has
+    /// `F Ds`, so instantiate F's constructors at `Ds` and require those
+    /// fields to be strictly positive in `bound`.
+    fn check_nested_functor(
+        &self,
+        ctx: &Ctx,
+        f_name: u32,
+        f_us: &[Level],
+        args: &[Expr],
+        bound: &[u32],
+        i_num_params: u32,
+        visiting: &[(u32, Vec<Expr>)],
+    ) -> R<()> {
+        let (f_np, f_all, f_lp) = match self.env.get(f_name) {
+            Some(ConstantInfo::InductiveType {
+                num_params,
+                all,
+                level_params,
+                ..
+            }) => (*num_params, all.clone(), level_params.clone()),
+            _ => return reject("occurrence of inductive type in unsupported position"),
+        };
+        if args.len() < f_np as usize {
+            return reject("nested inductive applied to too few parameters");
+        }
+        if f_lp.len() != f_us.len() {
+            return reject("nested inductive universe mismatch");
+        }
+        let param_args = &args[..f_np as usize];
+        let index_args = &args[f_np as usize..];
+        for (n, ps) in visiting {
+            if *n == f_name && self.params_defeq(ctx, ps, param_args)? {
+                for ix in index_args {
+                    if self.occurs_any(ix, bound) {
+                        return reject("nested inductive occurrence in an index");
+                    }
+                }
+                return Ok(());
+            }
+        }
+        if !param_args.iter().any(|a| self.occurs_any(a, bound)) {
+            return reject("occurrence of inductive type in unsupported position");
+        }
+        for ix in index_args {
+            if self.occurs_any(ix, bound) {
+                return reject("nested inductive occurrence in an index");
+            }
+        }
+        let group: Vec<u32> = if f_all.is_empty() {
+            vec![f_name]
+        } else {
+            f_all
+        };
+        let mut visiting2 = visiting.to_vec();
+        for tname in &group {
+            visiting2.push((*tname, param_args.to_vec()));
+        }
+        for tname in &group {
+            let ctors = match self.env.get(*tname) {
+                Some(ConstantInfo::InductiveType { ctors, .. }) => ctors.clone(),
+                _ => continue,
+            };
+            for cname in &ctors {
+                self.check_specialized_ctor_positive(
+                    ctx,
+                    *cname,
+                    f_us,
+                    param_args,
+                    bound,
+                    i_num_params,
+                    &visiting2,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_specialized_ctor_positive(
+        &self,
+        ctx: &Ctx,
+        cname: u32,
+        f_us: &[Level],
+        param_args: &[Expr],
+        bound: &[u32],
+        i_num_params: u32,
+        visiting: &[(u32, Vec<Expr>)],
+    ) -> R<()> {
+        let (lp, typ, c_np) = match self.env.get(cname) {
+            Some(ConstantInfo::Constructor {
+                level_params,
+                typ,
+                num_params,
+                ..
+            }) => (level_params.clone(), typ.clone(), *num_params),
+            _ => return reject("nested inductive constructor is missing"),
+        };
+        if c_np as usize != param_args.len() {
+            return reject("nested inductive constructor numParams mismatch");
+        }
+        if lp.len() != f_us.len() {
+            return reject("nested inductive constructor universe mismatch");
+        }
+        let subst = level::subst_map(&lp, f_us);
+        let mut cur = expr::instantiate_level_params(&typ, &subst);
+        for a in param_args {
+            match &**cur {
+                ExprData::Pi(_, _, body) => {
+                    cur = expr::instantiate1(body, a);
+                }
+                _ => {
+                    return reject(
+                        "nested inductive constructor is not a function of its parameters",
+                    )
+                }
+            }
+        }
+        let mut ctx2 = {
+            crate::stats::ctx_clone();
+            ctx.clone()
+        };
+        loop {
+            match &**cur {
+                ExprData::Pi(_, dom, body) => {
+                    self.check_arg_positive_in(&ctx2, dom, bound, i_num_params, visiting)?;
+                    ctx2.push(dom.clone());
+                    cur = body.clone();
+                }
+                _ => break,
+            }
+        }
+        let (h, cargs) = expr::unfold_apps(&cur);
+        if let ExprData::Const(n, _) = &**h {
+            if let Some(ConstantInfo::InductiveType { num_params: np, .. }) = self.env.get(*n) {
+                for ix in cargs.get(*np as usize..).unwrap_or(&[]) {
+                    if self.occurs_any(ix, bound) {
+                        return reject("nested inductive occurrence in an index");
+                    }
+                }
+                return Ok(());
+            }
+        }
+        if self.occurs_any(&cur, bound) {
+            return reject("occurrence of inductive type in unsupported position");
+        }
+        Ok(())
     }
 
     fn occurs_any(&self, e: &Expr, names: &[u32]) -> bool {

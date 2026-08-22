@@ -177,3 +177,24 @@ fn missing_rec_rule_rhs_rejects() {
 fn unknown_expr_kind_rejects() {
     assert_reject("unknown-expr-kind.reject.ndjson");
 }
+
+/// `inductive Bad.{u} : Sort u | mk : Sort (u+1) → Bad`. Open `leq` used
+/// to skip the field-universe check (closed numerals only).
+#[test]
+fn ctor_field_univ_open_rejects() {
+    assert_reject("ctor-field-univ-open.reject.ndjson");
+}
+
+/// `Neg α` has a negative field; `Bad` nested as `Neg Bad` must not pass
+/// just because `Neg` is a previously defined inductive.
+#[test]
+fn nested_neg_functor_rejects() {
+    assert_reject("nested-neg-functor.reject.ndjson");
+}
+
+/// `List` is strictly positive; `Tree` with a `List Tree` field is a nested
+/// inductive Lean accepts (`Syntax` is the same shape).
+#[test]
+fn nested_list_tree_accepts() {
+    assert_accept("nested-list-tree.accept.ndjson");
+}
