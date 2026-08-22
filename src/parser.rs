@@ -1,5 +1,5 @@
 use crate::env::{ConstantInfo, Environment, QuotKind, RecRule, ReducibilityHints};
-use crate::expr::{self, BinderInfo, Expr, ExprData};
+use crate::expr::{self, BinderInfo, Expr};
 use crate::level::{self, Level};
 use crate::tc::{Checker, TcError};
 use num_bigint::BigUint;
@@ -506,40 +506,25 @@ impl Parser {
             }
         }
         {
-            // Minor concatenation: main recursor first, then nested recs in
-            // the order their *container* inductives first appear applied to
-            // a group type (`Array Syntax` before `List Syntax`). That is
-            // Lean's specialization order; pretty `I.rec_N` is only a
-            // fallback if the ctor type walk misses a container.
-            let nested_order = self.nested_container_order(&type_names);
+            // Minor concatenation is Lean's rec_k order (main, then nested
+            // types in specialization order). Main = recs in `rec_of` (rule
+            // constructors), not the pretty suffix `.rec`. Nested recs with
+            // the same container (`Value.rec_3` / `rec_4`, both `List`) share
+            // `ctor.induct`; `I.rec_N` is the specialization index — order
+            // only, not a reject gate. Unique-container first-occurrence
+            // put `List` before `Map` and rejected `Value._sizeOf_5_eq`.
             let mut group: Vec<u32> = recs.iter().map(|r| Self::get_u32(r, "name")).collect();
             group.sort_by_key(|n| {
+                let (tag, rec_k) = rec_sort_key(
+                    self.names
+                        .get(*n as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                );
                 if self.env.rec_of.values().any(|r| r == n) {
-                    return (0u8, 0u32);
-                }
-                let idx = match self.env.get(*n) {
-                    Some(ConstantInfo::Recursor { rules, .. }) => rules.iter().find_map(|rule| {
-                        match self.env.get(rule.ctor) {
-                            Some(ConstantInfo::Constructor { induct, .. }) => nested_order
-                                .iter()
-                                .position(|t| t == induct)
-                                .map(|p| p as u32),
-                            _ => None,
-                        }
-                    }),
-                    _ => None,
-                };
-                match idx {
-                    Some(i) => (1u8, i),
-                    None => {
-                        let (tag, k) = rec_sort_key(
-                            self.names
-                                .get(*n as usize)
-                                .map(|s| s.as_str())
-                                .unwrap_or(""),
-                        );
-                        (tag.saturating_add(2), k)
-                    }
+                    (0u8, 0u32)
+                } else {
+                    (tag.saturating_add(1), rec_k)
                 }
             });
             for n in &group {
@@ -713,82 +698,10 @@ impl Parser {
     }
 }
 
-impl Parser {
-    /// Inductives `F` such that some constructor of the group mentions
-    /// `F … I …` (nested occurrence). Order is first appearance, which
-    /// matches Lean's `_nested.F_k` numbering.
-    fn nested_container_order(&self, type_names: &[u32]) -> Vec<u32> {
-        let mut out = Vec::new();
-        for tname in type_names {
-            let ctors = match self.env.get(*tname) {
-                Some(ConstantInfo::InductiveType { ctors, .. }) => ctors.clone(),
-                _ => continue,
-            };
-            for c in ctors {
-                if let Some(ConstantInfo::Constructor { typ, .. }) = self.env.get(c) {
-                    self.collect_nested_containers(typ, type_names, &mut out);
-                }
-            }
-        }
-        out
-    }
-
-    fn collect_nested_containers(&self, e: &Expr, type_names: &[u32], out: &mut Vec<u32>) {
-        match &***e {
-            ExprData::App(_, _) => {
-                let (head, args) = expr::unfold_apps(e);
-                if let ExprData::Const(n, _) = &**head {
-                    if matches!(self.env.get(*n), Some(ConstantInfo::InductiveType { .. }))
-                        && !type_names.contains(n)
-                        && args.iter().any(|a| self.expr_mentions_inducts(a, type_names))
-                        && !out.contains(n)
-                    {
-                        out.push(*n);
-                    }
-                }
-                self.collect_nested_containers(&head, type_names, out);
-                for a in &args {
-                    self.collect_nested_containers(a, type_names, out);
-                }
-            }
-            ExprData::Pi(_, ty, b) | ExprData::Lam(_, ty, b) => {
-                self.collect_nested_containers(ty, type_names, out);
-                self.collect_nested_containers(b, type_names, out);
-            }
-            ExprData::Let(ty, v, b) => {
-                self.collect_nested_containers(ty, type_names, out);
-                self.collect_nested_containers(v, type_names, out);
-                self.collect_nested_containers(b, type_names, out);
-            }
-            ExprData::Proj(_, _, v) => self.collect_nested_containers(v, type_names, out),
-            _ => {}
-        }
-    }
-
-    fn expr_mentions_inducts(&self, e: &Expr, type_names: &[u32]) -> bool {
-        match &***e {
-            ExprData::Const(n, _) => type_names.contains(n),
-            ExprData::App(f, a) => {
-                self.expr_mentions_inducts(f, type_names) || self.expr_mentions_inducts(a, type_names)
-            }
-            ExprData::Pi(_, ty, b) | ExprData::Lam(_, ty, b) => {
-                self.expr_mentions_inducts(ty, type_names) || self.expr_mentions_inducts(b, type_names)
-            }
-            ExprData::Let(ty, v, b) => {
-                self.expr_mentions_inducts(ty, type_names)
-                    || self.expr_mentions_inducts(v, type_names)
-                    || self.expr_mentions_inducts(b, type_names)
-            }
-            ExprData::Proj(_, _, v) => self.expr_mentions_inducts(v, type_names),
-            _ => false,
-        }
-    }
-}
-
 fn kind_or_direct(_v: &Value) {}
 
-/// Fallback only: `.rec` first, then `.rec_1`, `.rec_2`. Prefer
-/// `nested_container_order` (ctor-type walk) for rec_group sort.
+/// Lean nested recursor numbering: `.rec` first, then `.rec_1`, `.rec_2`, …
+/// Used for rec_group minor order only, not extra-rec reject.
 fn rec_sort_key(name: &str) -> (u8, u32) {
     if let Some((_, suf)) = name.rsplit_once(".rec_") {
         if let Ok(n) = suf.parse::<u32>() {

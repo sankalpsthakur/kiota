@@ -14,8 +14,8 @@ thread_local! {
     /// `WHNF_DEPTH` (that only wraps the outer `whnf` entry). Unbounded it
     /// overflows the 1GB worker stack (`BitVec.msb_eq_decide`).
     static CORE_DEPTH: Cell<u32> = const { Cell::new(0) };
-    /// Set when `whnf_core` hits CONV_DEPTH and returns stuck. Outer `whnf`
-    /// must not cache that result (criterion 2).
+    /// Set when `whnf_core` hits CONV_DEPTH. The abort is a Decline, never a
+    /// stuck term cached or returned as WHNF (criterion 2).
     static CORE_ABORTED: Cell<bool> = const { Cell::new(false) };
     /// Unreduced same-const App congruence (`try_unreduced` + `is_def_eq_core`
     /// pairwise) nested 15+ deep on class spines walks the *tree*, not the
@@ -2357,7 +2357,18 @@ impl<'e> Checker<'e> {
             }
             break core;
         };
-        if CORE_ABORTED.with(|a| a.get()) {
+        // Abort is per-`whnf` call. Leaving CORE_ABORTED set poisoned later
+        // unfolds in the same decl (`Int8.toInt_toInt32` declined after a
+        // deep stuck recursor, then a shallow β-redex was treated as the
+        // abort result).
+        let aborted = CORE_ABORTED.with(|a| a.replace(false));
+        if aborted {
+            if Self::is_whnf_core_redex(&r) {
+                return decline(format!(
+                    "WHNF core depth limit: {}",
+                    self.pp_budget(&r, 12)
+                ));
+            }
             return Ok(r);
         }
         self.whnf_cache.borrow_mut().insert(k, r.clone());
@@ -2538,6 +2549,24 @@ impl<'e> Checker<'e> {
     }
 
     /// beta/zeta/proj/iota reduction to whnf, WITHOUT unfolding delta.
+    /// True when `whnf_core` still has a β/ζ/proj redex. Delta/ι are the
+    /// outer `whnf` / `try_iota` steps; a recursor app with a stuck major
+    /// is already core-WHNF.
+    fn is_whnf_core_redex(e: &Expr) -> bool {
+        match &***e {
+            ExprData::Let(_, _, _) => true,
+            ExprData::Proj(_, _, _) => true,
+            ExprData::App(_, _) => {
+                let (head, _) = expr::unfold_apps(e);
+                matches!(
+                    &**head,
+                    ExprData::Lam(_, _, _) | ExprData::Let(_, _, _) | ExprData::Proj(_, _, _)
+                )
+            }
+            _ => false,
+        }
+    }
+
     fn cheap_zeta(e: &Expr) -> Expr {
         let mut cur = e.clone();
         while let ExprData::Let(_, val, body) = &**cur {
@@ -2559,11 +2588,19 @@ impl<'e> Checker<'e> {
         if depth > CONV_DEPTH {
             CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
             CORE_ABORTED.with(|a| a.set(true));
-            // Do not cache: a later shallower call must still be allowed to reduce.
+            // Do not cache. A β/ζ/proj redex at the cap is not WHNF — Decline.
+            // A stuck recursor/axiom app is already WHNF; returning it as Ok
+            // is honest (Init `Int8.toInt_toInt32`).
             if std::env::var_os("KIOTA_TRACE_IOTA").is_some()
                 || std::env::var_os("KIOTA_TRACE_EQ").is_some()
             {
                 eprintln!("CORE_DEPTH abort {}", crate::expr::loose_bvar_range(&e));
+            }
+            if Self::is_whnf_core_redex(&e) {
+                return decline(format!(
+                    "WHNF core depth limit: {}",
+                    self.pp_budget(&e, 12)
+                ));
             }
             return Ok(e);
         }
@@ -8700,6 +8737,63 @@ mod tests {
         let nf = expr::pi(expr::BinderInfo::Default, a, t);
         let eq = tc.is_def_eq(&Ctx::new(), &redex, &nf).unwrap();
         assert!(eq, "Pi body must beta: (λ y, T) x ≡ T");
+    }
+
+    /// CORE_DEPTH abort must Decline. Returning the unreduced `id a` as
+    /// WHNF makes `id a ≡ a` Ok(false) at the cap (stuck term as normal form).
+    #[test]
+    fn core_depth_abort_declines_not_stuck_whnf() {
+        use crate::env::{ConstantInfo, Environment, ReducibilityHints};
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            1,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::const_(0, vec![]),
+                is_unsafe: false,
+            },
+        );
+        let a_ty = expr::const_(0, vec![]);
+        env.insert(
+            2,
+            ConstantInfo::Def {
+                level_params: vec![],
+                typ: expr::pi(
+                    expr::BinderInfo::Default,
+                    a_ty.clone(),
+                    a_ty.clone(),
+                ),
+                value: expr::lam(expr::BinderInfo::Default, a_ty, expr::bvar(0)),
+                hints: ReducibilityHints::Abbrev,
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["A", "a", "id"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let id_a = expr::app(expr::const_(2, vec![]), expr::const_(1, vec![]));
+        CORE_DEPTH.with(|d| d.set(CONV_DEPTH));
+        CORE_ABORTED.with(|a| a.set(false));
+        let wh = tc.whnf(&Ctx::new(), &id_a);
+        let eq = tc.is_def_eq(&Ctx::new(), &id_a, &expr::const_(1, vec![]));
+        CORE_DEPTH.with(|d| d.set(0));
+        CORE_ABORTED.with(|a| a.set(false));
+        match wh {
+            Err(TcError::Decline(_)) => {}
+            other => panic!("CORE_DEPTH abort must Decline unreduced `id a`, got {other:?}"),
+        }
+        match eq {
+            Err(TcError::Decline(_)) => {}
+            other => panic!("CORE_DEPTH abort must Decline defeq, not {other:?}"),
+        }
     }
 
     /// Let-zeta is part of WHNF. Defeq of `let x := v; x` vs `v` must hold
