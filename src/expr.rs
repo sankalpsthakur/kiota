@@ -1,7 +1,9 @@
 use crate::level::Level;
+use num_bigint::BigUint;
 use rustc_hash::{FxHashMap, FxHasher};
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::rc::Rc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,14 +33,16 @@ pub enum ExprData {
     Lit(Lit),
 }
 
-/// An interned node: the term itself plus the one derived fact the hot paths
-/// need constantly. `loose` is the smallest `k` such that every loose bvar in
-/// the node has index `< k` (0 = closed). It is computed once at intern time
-/// from the children's own `loose` values, so reading it is a field load rather
-/// than a traversal or a hash lookup.
+/// An interned node plus the facts hot paths need constantly.
+///
+/// `loose` is the smallest `k` such that every loose bvar has index `< k`
+/// (0 = closed). `used_bvars` is the bitset of those indices (`bit i` = bvar
+/// `i` occurs); `u64::MAX` means some bvar is `≥ 64` and the defeq pair key
+/// must fall back to `suffix[loose]`.
 pub struct ExprNode {
     data: ExprData,
     loose: u32,
+    used_bvars: u64,
 }
 
 impl std::ops::Deref for ExprNode {
@@ -87,6 +91,53 @@ fn ptr(e: &Expr) -> usize {
 #[inline(always)]
 pub fn loose_bvar_range(e: &Expr) -> u32 {
     e.loose
+}
+
+/// Bitset of loose bvar indices, or `u64::MAX` if some index is `≥ 64`.
+#[inline(always)]
+pub fn used_bvars(e: &Expr) -> u64 {
+    e.used_bvars
+}
+
+const USED_OVERFLOW: u64 = u64::MAX;
+
+fn used_or(a: u64, b: u64) -> u64 {
+    if a == USED_OVERFLOW || b == USED_OVERFLOW {
+        USED_OVERFLOW
+    } else {
+        a | b
+    }
+}
+
+fn used_shift_binder(u: u64) -> u64 {
+    if u == USED_OVERFLOW {
+        USED_OVERFLOW
+    } else {
+        u >> 1
+    }
+}
+
+/// Computed once per node from children that already carry their own bits.
+fn used_of(d: &ExprData) -> u64 {
+    match d {
+        ExprData::BVar(i) => {
+            if *i >= 64 {
+                USED_OVERFLOW
+            } else {
+                1u64 << *i
+            }
+        }
+        ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => 0,
+        ExprData::App(f, a) => used_or(f.used_bvars, a.used_bvars),
+        ExprData::Lam(_, ty, body) | ExprData::Pi(_, ty, body) => {
+            used_or(ty.used_bvars, used_shift_binder(body.used_bvars))
+        }
+        ExprData::Let(ty, val, body) => used_or(
+            used_or(ty.used_bvars, val.used_bvars),
+            used_shift_binder(body.used_bvars),
+        ),
+        ExprData::Proj(_, _, v) => v.used_bvars,
+    }
 }
 
 /// Computed once per node, from children that already carry their own range.
@@ -183,38 +234,119 @@ fn node_eq(a: &ExprData, b: &ExprData) -> bool {
     }
 }
 
-#[derive(Default)]
+/// Hash-cons table. Almost every hash is unique (`bmax=1` at 30M nodes), so a
+/// `HashMap<u64, Vec<Expr>>` paid a heap `Vec` per node — HashMap → Vec → Rc
+/// on every lookup. Primary is a single `Expr` per hash; overflow is only for
+/// the rare collision. Check of std `#18000` at 30M intern was 15min vs <2s
+/// at parse-only 2.5M intern; the extra pointer chase was the difference.
 struct Interner {
-    buckets: FxHashMap<u64, Vec<Expr>>,
+    primary: FxHashMap<u64, Expr>,
+    overflow: FxHashMap<u64, Vec<Expr>>,
+}
+
+impl Default for Interner {
+    fn default() -> Self {
+        Interner {
+            primary: FxHashMap::default(),
+            overflow: FxHashMap::default(),
+        }
+    }
 }
 
 impl Interner {
     fn intern(&mut self, d: ExprData) -> Expr {
         let h = hash_node(&d);
-        if let Some(bucket) = self.buckets.get(&h) {
+        if let Some(e) = self.primary.get(&h) {
+            if node_eq(&d, e) {
+                return e.clone();
+            }
+            if let Some(bucket) = self.overflow.get(&h) {
+                for e in bucket {
+                    if node_eq(&d, e) {
+                        return e.clone();
+                    }
+                }
+            }
+            let e = alloc_node(d);
+            self.overflow.entry(h).or_default().push(e.clone());
+            return e;
+        }
+        if let Some(bucket) = self.overflow.get(&h) {
             for e in bucket {
                 if node_eq(&d, e) {
                     return e.clone();
                 }
             }
         }
-        let loose = loose_of(&d);
-        let e = Rc::new(ExprNode { data: d, loose });
-        self.buckets.entry(h).or_default().push(e.clone());
+        let e = alloc_node(d);
+        self.primary.insert(h, e.clone());
         e
     }
+
+    fn len(&self) -> usize {
+        self.primary.len() + self.overflow.values().map(|v| v.len()).sum::<usize>()
+    }
+}
+
+fn alloc_node(d: ExprData) -> Expr {
+    let loose = loose_of(&d);
+    let used_bvars = used_of(&d);
+    Rc::new(ExprNode {
+        data: d,
+        loose,
+        used_bvars,
+    })
 }
 
 thread_local! {
     static INTERN: RefCell<Interner> = RefCell::new(Interner::default());
+    static INTERN_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static LEVEL_INST_MEMO: RefCell<FxHashMap<(usize, u64), Expr>> =
+        RefCell::new(FxHashMap::default());
+    static SHIFT_MEMO: RefCell<FxHashMap<(usize, i32, u32), Expr>> =
+        RefCell::new(FxHashMap::default());
+    static INST1_MEMO: RefCell<FxHashMap<(usize, usize), Expr>> =
+        RefCell::new(FxHashMap::default());
 }
 
 pub fn intern(d: ExprData) -> Expr {
+    let n = INTERN_CALLS.with(|c| {
+        let n = c.get() + 1;
+        c.set(n);
+        n
+    });
+    if n % 100_000_000 == 0 {
+        eprintln!("INTERN_CALLS {n} nodes={}", intern_node_count());
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
     INTERN.with(|t| t.borrow_mut().intern(d))
 }
 
 pub fn intern_node_count() -> usize {
-    INTERN.with(|t| t.borrow().buckets.values().map(|v| v.len()).sum())
+    INTERN.with(|t| t.borrow().len())
+}
+
+pub fn intern_calls() -> u64 {
+    INTERN_CALLS.with(|c| c.get())
+}
+
+/// Allocate `n` unique interned apps so a later Check sees a large table
+/// without typechecking 18k decls. `KIOTA_WARM_INTERN`.
+pub fn warm_intern(n: u32) {
+    let mut e = bvar(0);
+    for i in 0..n {
+        e = app(e, lit_nat(BigUint::from(i)));
+    }
+    let _ = e;
+}
+
+/// Drop per-decl substitution memos. The intern table stays: env terms
+/// live there. These two maps grow with every `shift`/`instantiate_level_params`
+/// and were never cleared, so std `#18000` hung after 18k decls of residue.
+pub fn clear_subst_memos() {
+    LEVEL_INST_MEMO.with(|m| m.borrow_mut().clear());
+    SHIFT_MEMO.with(|m| m.borrow_mut().clear());
+    INST1_MEMO.with(|m| m.borrow_mut().clear());
 }
 
 pub fn bvar(i: u32) -> Expr {
@@ -272,8 +404,12 @@ pub fn shift(e: &Expr, by: i32, cutoff: u32) -> Expr {
     if loose_bvar_range(e) <= cutoff {
         return e.clone();
     }
+    let key = (ptr(e), by, cutoff);
+    if let Some(r) = SHIFT_MEMO.with(|m| m.borrow().get(&key).cloned()) {
+        return r;
+    }
     crate::stats::shift_node();
-    match &***e {
+    let r = match &***e {
         ExprData::BVar(i) => {
             if *i >= cutoff {
                 bvar((*i as i64 + by as i64) as u32)
@@ -291,7 +427,11 @@ pub fn shift(e: &Expr, by: i32, cutoff: u32) -> Expr {
             shift(body, by, cutoff + 1),
         ),
         ExprData::Proj(s, i, v) => proj(*s, *i, shift(v, by, cutoff)),
-    }
+    };
+    SHIFT_MEMO.with(|m| {
+        m.borrow_mut().insert(key, r.clone());
+    });
+    r
 }
 
 /// Substitute `args` (in reverse: args[0] replaces the innermost bound var 0)
@@ -364,10 +504,44 @@ fn instantiate_core(
 
 /// Single-substitution convenience (beta / zeta): replace bvar 0 with `arg`.
 pub fn instantiate1(e: &Expr, arg: &Expr) -> Expr {
-    instantiate(e, std::slice::from_ref(arg))
+    let key = (ptr(e), ptr(arg));
+    if let Some(r) = INST1_MEMO.with(|m| m.borrow().get(&key).cloned()) {
+        return r;
+    }
+    let r = instantiate(e, std::slice::from_ref(arg));
+    INST1_MEMO.with(|m| {
+        m.borrow_mut().insert(key, r.clone());
+    });
+    r
+}
+
+fn subst_hash(subst: &rustc_hash::FxHashMap<u32, Level>) -> u64 {
+    let mut keys: Vec<u32> = subst.keys().copied().collect();
+    keys.sort_unstable();
+    let mut h = FxHasher::default();
+    for k in keys {
+        k.hash(&mut h);
+        subst[&k].hash(&mut h);
+    }
+    h.finish()
 }
 
 pub fn instantiate_level_params(e: &Expr, subst: &rustc_hash::FxHashMap<u32, Level>) -> Expr {
+    if subst.is_empty() {
+        return e.clone();
+    }
+    let key = (ptr(e), subst_hash(subst));
+    if let Some(r) = LEVEL_INST_MEMO.with(|m| m.borrow().get(&key).cloned()) {
+        return r;
+    }
+    let r = instantiate_level_params_go(e, subst);
+    LEVEL_INST_MEMO.with(|m| {
+        m.borrow_mut().insert(key, r.clone());
+    });
+    r
+}
+
+fn instantiate_level_params_go(e: &Expr, subst: &rustc_hash::FxHashMap<u32, Level>) -> Expr {
     match &***e {
         ExprData::BVar(_) | ExprData::Lit(_) => e.clone(),
         ExprData::Sort(l) => sort(crate::level::instantiate(l, subst)),
@@ -435,6 +609,31 @@ mod tests {
         let n2 = lit_nat(7u32.into());
         assert!(Rc::ptr_eq(&n1, &n2));
         assert!(!Rc::ptr_eq(&n1, &lit_nat(8u32.into())));
+    }
+
+    #[test]
+    fn instantiate1_memo_returns_same_ptr() {
+        let body = app(bvar(0), bvar(1));
+        let arg = const_(3, vec![]);
+        let a = instantiate1(&body, &arg);
+        let b = instantiate1(&body, &arg);
+        assert!(Rc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn intern_primary_reuses_after_many_unique() {
+        let mut acc = bvar(0);
+        for i in 0..8_000u32 {
+            acc = app(acc, lit_nat(BigUint::from(i)));
+        }
+        let mut acc2 = bvar(0);
+        for i in 0..8_000u32 {
+            acc2 = app(acc2, lit_nat(BigUint::from(i)));
+        }
+        assert!(
+            Rc::ptr_eq(&acc, &acc2),
+            "primary intern map must still hash-cons after thousands of unique nodes"
+        );
     }
 
     #[test]

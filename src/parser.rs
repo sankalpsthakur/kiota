@@ -1,5 +1,5 @@
 use crate::env::{ConstantInfo, Environment, QuotKind, RecRule, ReducibilityHints};
-use crate::expr::{self, BinderInfo, Expr};
+use crate::expr::{self, BinderInfo, Expr, ExprData};
 use crate::level::{self, Level};
 use crate::tc::{Checker, TcError};
 use num_bigint::BigUint;
@@ -28,6 +28,12 @@ fn bi_of(s: &str) -> BinderInfo {
 
 impl Parser {
     pub fn new() -> Self {
+        if let Ok(n) = std::env::var("KIOTA_WARM_INTERN") {
+            if let Ok(n) = n.parse::<u32>() {
+                crate::expr::warm_intern(n);
+                eprintln!("WARM_INTERN {n} nodes={}", crate::expr::intern_node_count());
+            }
+        }
         Parser {
             names: vec![Rc::new(String::new())], // index 0 = anonymous
             name_by_str: FxHashMap::default(),
@@ -405,11 +411,30 @@ impl Parser {
             );
         }
 
-        // Recursor names: each inductive `I` needs `I.rec`. Nested auxiliaries
-        // are exported as `I.rec_1`, `I.rec_2`, … — accept those, do not treat
-        // them as a second `I.rec`. Exported `k` / rule payloads are not trusted.
+        // Recursor identity is the inductive of this recursor's *rule
+        // constructors*, not the pretty name `I.rec` and not `all[0]`.
+        // Nested `Syntax.rec`/`rec_1`/`rec_2` all export `all = [Syntax]`;
+        // `rec_2`'s rules are `List.nil`/`List.cons`. Mapping every rec to
+        // `all[0]` is a duplicate-recursor reject on type 8527; mapping by
+        // `I.rec` rejects a well-typed recursor named `elim`. Empty-rules
+        // recursors (`False.rec`) claim `all ∩ group`. Nested rec_k have
+        // rules for foreign constructors and must not steal `rec_of[I]`.
+        // Extra recursor: more recs than `types + numNested`, or two recs
+        // claiming the same group type. Exported `k` / rule RHS are not trusted.
         let type_names: Vec<u32> = types.iter().map(|t| Self::get_u32(t, "name")).collect();
-        let nested = types.iter().any(|t| Self::get_u32(t, "numNested") > 0);
+        let nested_n = types
+            .iter()
+            .map(|t| Self::get_u32(t, "numNested"))
+            .max()
+            .unwrap_or(0);
+        let nested = nested_n > 0;
+        let expected_recs = type_names.len() + nested_n as usize;
+        if recs.len() > expected_recs {
+            return Err(TcError::Reject(format!(
+                "extra recursor in inductive group ({} recs, expected {expected_recs})",
+                recs.len()
+            )));
+        }
         let mut seen_rec_for: FxHashSet<u32> = FxHashSet::default();
         for r in &recs {
             let rname = Self::get_u32(r, "name");
@@ -418,39 +443,40 @@ impl Parser {
                 .get(rname as usize)
                 .map(|s| s.as_str())
                 .unwrap_or("");
-            let mut matched = None;
-            let mut aux = false;
-            for t in &type_names {
-                let tstr = self
-                    .names
-                    .get(*t as usize)
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                if rstr == format!("{tstr}.rec") {
-                    matched = Some(*t);
-                    break;
-                }
-                let prefix = format!("{tstr}.rec_");
-                if rstr.starts_with(&prefix)
-                    && rstr[prefix.len()..].bytes().all(|b| b.is_ascii_digit())
-                {
-                    matched = Some(*t);
-                    aux = true;
-                    break;
-                }
-            }
-            let Some(t) = matched else {
-                return Err(TcError::Reject(format!(
-                    "recursor `{rstr}` is not named `I.rec` for an inductive in this group"
-                )));
-            };
-            if !aux {
-                if !seen_rec_for.insert(t) {
-                    return Err(TcError::Reject(format!("duplicate recursor for type {t}")));
-                }
-                self.env.rec_of.insert(t, rname);
-            }
             let all = Self::get_vec_u32(r, "all");
+            let rules_arr = r.get("rules").and_then(|x| x.as_array());
+            let n_rules = rules_arr.map(|a| a.len()).unwrap_or(0);
+            let mut claimed: Vec<u32> = Vec::new();
+            if let Some(arr) = rules_arr {
+                for rule in arr {
+                    let ctor = Self::get_u32(rule, "ctor");
+                    if let Some(ConstantInfo::Constructor { induct, .. }) = self.env.get(ctor) {
+                        if type_names.contains(induct) && !claimed.contains(induct) {
+                            claimed.push(*induct);
+                        }
+                    }
+                }
+            }
+            if claimed.is_empty() && n_rules == 0 {
+                for t in &all {
+                    if type_names.contains(t) && !claimed.contains(t) {
+                        claimed.push(*t);
+                    }
+                }
+                if claimed.is_empty() && !nested {
+                    return Err(TcError::Reject(format!(
+                        "recursor `{rstr}` does not recursor any type in this inductive group"
+                    )));
+                }
+            }
+            for owner in &claimed {
+                if !seen_rec_for.insert(*owner) {
+                    return Err(TcError::Reject(format!(
+                        "duplicate recursor for type {owner}"
+                    )));
+                }
+                self.env.rec_of.insert(*owner, rname);
+            }
             let num_motives = Self::get_u32(r, "numMotives");
             let motives_ok = num_motives as usize == all.len()
                 || num_motives as usize == type_names.len()
@@ -480,14 +506,41 @@ impl Parser {
             }
         }
         {
+            // Minor concatenation: main recursor first, then nested recs in
+            // the order their *container* inductives first appear applied to
+            // a group type (`Array Syntax` before `List Syntax`). That is
+            // Lean's specialization order; pretty `I.rec_N` is only a
+            // fallback if the ctor type walk misses a container.
+            let nested_order = self.nested_container_order(&type_names);
             let mut group: Vec<u32> = recs.iter().map(|r| Self::get_u32(r, "name")).collect();
             group.sort_by_key(|n| {
-                rec_sort_key(
-                    self.names
-                        .get(*n as usize)
-                        .map(|s| s.as_str())
-                        .unwrap_or(""),
-                )
+                if self.env.rec_of.values().any(|r| r == n) {
+                    return (0u8, 0u32);
+                }
+                let idx = match self.env.get(*n) {
+                    Some(ConstantInfo::Recursor { rules, .. }) => rules.iter().find_map(|rule| {
+                        match self.env.get(rule.ctor) {
+                            Some(ConstantInfo::Constructor { induct, .. }) => nested_order
+                                .iter()
+                                .position(|t| t == induct)
+                                .map(|p| p as u32),
+                            _ => None,
+                        }
+                    }),
+                    _ => None,
+                };
+                match idx {
+                    Some(i) => (1u8, i),
+                    None => {
+                        let (tag, k) = rec_sort_key(
+                            self.names
+                                .get(*n as usize)
+                                .map(|s| s.as_str())
+                                .unwrap_or(""),
+                        );
+                        (tag.saturating_add(2), k)
+                    }
+                }
             });
             for n in &group {
                 self.env.rec_group.insert(*n, group.clone());
@@ -501,7 +554,7 @@ impl Parser {
                     .map(|s| s.as_str())
                     .unwrap_or("?");
                 return Err(TcError::Reject(format!(
-                    "inductive `{tstr}` is missing a recursor named `{tstr}.rec`"
+                    "inductive `{tstr}` is missing a recursor"
                 )));
             }
         }
@@ -660,10 +713,82 @@ impl Parser {
     }
 }
 
+impl Parser {
+    /// Inductives `F` such that some constructor of the group mentions
+    /// `F … I …` (nested occurrence). Order is first appearance, which
+    /// matches Lean's `_nested.F_k` numbering.
+    fn nested_container_order(&self, type_names: &[u32]) -> Vec<u32> {
+        let mut out = Vec::new();
+        for tname in type_names {
+            let ctors = match self.env.get(*tname) {
+                Some(ConstantInfo::InductiveType { ctors, .. }) => ctors.clone(),
+                _ => continue,
+            };
+            for c in ctors {
+                if let Some(ConstantInfo::Constructor { typ, .. }) = self.env.get(c) {
+                    self.collect_nested_containers(typ, type_names, &mut out);
+                }
+            }
+        }
+        out
+    }
+
+    fn collect_nested_containers(&self, e: &Expr, type_names: &[u32], out: &mut Vec<u32>) {
+        match &***e {
+            ExprData::App(_, _) => {
+                let (head, args) = expr::unfold_apps(e);
+                if let ExprData::Const(n, _) = &**head {
+                    if matches!(self.env.get(*n), Some(ConstantInfo::InductiveType { .. }))
+                        && !type_names.contains(n)
+                        && args.iter().any(|a| self.expr_mentions_inducts(a, type_names))
+                        && !out.contains(n)
+                    {
+                        out.push(*n);
+                    }
+                }
+                self.collect_nested_containers(&head, type_names, out);
+                for a in &args {
+                    self.collect_nested_containers(a, type_names, out);
+                }
+            }
+            ExprData::Pi(_, ty, b) | ExprData::Lam(_, ty, b) => {
+                self.collect_nested_containers(ty, type_names, out);
+                self.collect_nested_containers(b, type_names, out);
+            }
+            ExprData::Let(ty, v, b) => {
+                self.collect_nested_containers(ty, type_names, out);
+                self.collect_nested_containers(v, type_names, out);
+                self.collect_nested_containers(b, type_names, out);
+            }
+            ExprData::Proj(_, _, v) => self.collect_nested_containers(v, type_names, out),
+            _ => {}
+        }
+    }
+
+    fn expr_mentions_inducts(&self, e: &Expr, type_names: &[u32]) -> bool {
+        match &***e {
+            ExprData::Const(n, _) => type_names.contains(n),
+            ExprData::App(f, a) => {
+                self.expr_mentions_inducts(f, type_names) || self.expr_mentions_inducts(a, type_names)
+            }
+            ExprData::Pi(_, ty, b) | ExprData::Lam(_, ty, b) => {
+                self.expr_mentions_inducts(ty, type_names) || self.expr_mentions_inducts(b, type_names)
+            }
+            ExprData::Let(ty, v, b) => {
+                self.expr_mentions_inducts(ty, type_names)
+                    || self.expr_mentions_inducts(v, type_names)
+                    || self.expr_mentions_inducts(b, type_names)
+            }
+            ExprData::Proj(_, _, v) => self.expr_mentions_inducts(v, type_names),
+            _ => false,
+        }
+    }
+}
+
 fn kind_or_direct(_v: &Value) {}
 
-/// `.rec` first, then `.rec_1`, `.rec_2`, … so nested minors concatenate
-/// as main ctors then nested types in declaration order.
+/// Fallback only: `.rec` first, then `.rec_1`, `.rec_2`. Prefer
+/// `nested_container_order` (ctor-type walk) for rec_group sort.
 fn rec_sort_key(name: &str) -> (u8, u32) {
     if let Some((_, suf)) = name.rsplit_once(".rec_") {
         if let Ok(n) = suf.parse::<u32>() {

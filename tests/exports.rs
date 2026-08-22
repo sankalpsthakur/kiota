@@ -79,3 +79,10 @@ fn non_prop_thm_rejects() {
 fn extra_rec_rejects() {
     assert_reject("extra-rec.reject.ndjson");
 }
+
+/// Recursor identity is rule constructors / `all ∩ group`, not `I.rec`.
+/// `elim` is a well-typed recursor for `False`; a pretty-name gate used to reject it.
+#[test]
+fn extra_rec_all_field_not_pretty_name_accepts() {
+    assert_accept("extra-rec-alt-name.accept.ndjson");
+}

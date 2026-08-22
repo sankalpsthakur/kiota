@@ -10,7 +10,25 @@ use std::rc::Rc;
 thread_local! {
     static DEFEQ_DEPTH: Cell<u32> = const { Cell::new(0) };
     static WHNF_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// `whnf_core` → iota → `whnf_major` → `whnf_core` is not counted by
+    /// `WHNF_DEPTH` (that only wraps the outer `whnf` entry). Unbounded it
+    /// overflows the 1GB worker stack (`BitVec.msb_eq_decide`).
+    static CORE_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// Set when `whnf_core` hits CONV_DEPTH and returns stuck. Outer `whnf`
+    /// must not cache that result (criterion 2).
+    static CORE_ABORTED: Cell<bool> = const { Cell::new(false) };
+    /// Unreduced same-const App congruence (`try_unreduced` + `is_def_eq_core`
+    /// pairwise) nested 15+ deep on class spines walks the *tree*, not the
+    /// intern DAG — 7^15 at std `#18000` (`LawfulVecOperator.mk`). One level
+    /// keeps Acc.rec unreduced majors; nested Apps WHNF then delta.
+    static APP_CONG_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
+
+/// Recursion guard for `whnf` / `is_def_eq`, not a completeness fingerprint.
+/// Lean has no 2048 cap; `WellFounded.Nat.fix` / UTF-8 decode proofs nest
+/// `Nat.rec` conversion past that (Init `utf8DecodeChar?.assemble₃._proof_3`).
+/// Kept well under typical C-stack (~8MB) so this is a decline, not a segfault.
+const CONV_DEPTH: u32 = 8_192;
 
 #[derive(Debug)]
 pub enum TcError {
@@ -815,8 +833,9 @@ pub struct Checker<'e> {
     pub names: &'e [std::rc::Rc<String>],
     pub nat_ref: Option<u32>,
     pub string_ref: Option<u32>,
-    whnf_cache: RefCell<FxHashMap<usize, Expr>>,
-    whnf_core_cache: RefCell<FxHashMap<usize, Expr>>,
+    /// `(ctx_key, ptr) → WHNF`. `ctx_key` is 0 for closed terms, `ctx.id` for open.
+    whnf_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
+    whnf_core_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
     defeq_cache: RefCell<FxHashMap<(u64, usize, usize), bool>>,
     /// `(const name, levels)` to unfolded value, memoized like the C++ kernel's
     /// `m_unfold`. The delta path can unfold the same def/theorem at the same
@@ -837,8 +856,8 @@ pub struct Checker<'e> {
     fuel_nat_peels: std::cell::Cell<u32>,
     /// Last bits≥20 literal peeled; used to detect one hugeFuel countdown.
     fuel_nat_last: std::cell::RefCell<Option<num_bigint::BigUint>>,
-    /// Lean `infer_only`: skip app-arg checks. Used from PI so we do not
-    /// Check a 100k-node proof just to read its type.
+    /// Lean `infer_only`: skip app-arg checks. Only for PI
+    /// (`proofs_of_same_prop`) on already-checked terms.
     infer_only: std::cell::Cell<bool>,
     /// Tree size of the decl value currently being checked (0 = none).
     /// Eager Regular unfold is budgeted against this, not a library name.
@@ -870,6 +889,20 @@ thread_local! {
     static CTX_NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
 }
 
+/// Intern `(parent_id, type ptr)` to a context id. Shared by full `ctx.id`
+/// and by suffix keys (the k innermost binders of an open term).
+fn intern_ctx_id(parent: u64, ty_ptr: usize) -> u64 {
+    CTX_IDS.with(|m| {
+        *m.borrow_mut().entry((parent, ty_ptr)).or_insert_with(|| {
+            CTX_NEXT.with(|c| {
+                let v = c.get();
+                c.set(v + 1);
+                v
+            })
+        })
+    })
+}
+
 /// `ctx[len-1-i]` is the raw (unshifted) type recorded for bvar `i`.
 ///
 /// The `id` is what makes a type-inference cache possible. Keying on depth
@@ -877,7 +910,11 @@ thread_local! {
 /// — so each context carries an identity interned from the sequence of types
 /// that built it. Equal ids therefore imply equal contexts; distinct ids for
 /// equal contexts would only cost a cache miss, and interning rules that out.
-#[derive(Clone, Default)]
+///
+/// `suffix[k]` is the interned id of the **k innermost** binder types
+/// (`suffix[0] = 0`). A term with `loose = k` only reads those k binders,
+/// so infer/defeq can key on `suffix[k]` instead of the full telescope.
+#[derive(Clone)]
 struct Ctx {
     /// Invariant: only ever extended through `push`, which keeps `id` in step.
     /// Mutating this directly would leave `id` describing a different context
@@ -885,6 +922,17 @@ struct Ctx {
     /// inferred under other bindings — a false accept, silently.
     tys: Vec<Expr>,
     id: u64,
+    suffix: Vec<u64>,
+}
+
+impl Default for Ctx {
+    fn default() -> Self {
+        Ctx {
+            tys: Vec::new(),
+            id: 0,
+            suffix: vec![0],
+        }
+    }
 }
 
 impl Ctx {
@@ -893,17 +941,67 @@ impl Ctx {
     }
 
     fn push(&mut self, ty: Expr) {
-        let key = (self.id, Rc::as_ptr(&ty) as usize);
-        self.id = CTX_IDS.with(|m| {
-            *m.borrow_mut().entry(key).or_insert_with(|| {
-                CTX_NEXT.with(|c| {
-                    let v = c.get();
-                    c.set(v + 1);
-                    v
-                })
-            })
-        });
+        let ty_ptr = Rc::as_ptr(&ty) as usize;
+        let new_id = intern_ctx_id(self.id, ty_ptr);
+        let mut suffix = vec![0];
+        suffix.push(intern_ctx_id(0, ty_ptr));
+        for k in 1..self.tys.len() {
+            suffix.push(intern_ctx_id(self.suffix[k], ty_ptr));
+        }
+        if !self.tys.is_empty() {
+            suffix.push(new_id);
+        }
+        self.id = new_id;
+        self.suffix = suffix;
         self.tys.push(ty);
+    }
+
+    /// Infer/defeq cache key: closed → 0; otherwise the intern of the types
+    /// of **bvars the term actually uses**, not a contiguous suffix of length
+    /// `loose`. Extra innermost binders (`Decidable.rec` in `#18041`) must not
+    /// split AIG `BinaryInput.mk` pair cache. `used_bvars == u64::MAX` (some
+    /// index `≥ 64`) falls back to `suffix[loose]`. Types are stored
+    /// unshifted; `local_ty` shifts on read.
+    fn term_ctx_key(&self, e: &Expr) -> u64 {
+        self.used_bvar_key(expr::used_bvars(e), expr::loose_bvar_range(e))
+    }
+
+    fn pair_ctx_key(&self, a: &Expr, b: &Expr) -> u64 {
+        let used = expr::used_bvars(a) | expr::used_bvars(b);
+        let overflow = expr::used_bvars(a) == u64::MAX || expr::used_bvars(b) == u64::MAX;
+        let used = if overflow { u64::MAX } else { used };
+        let loose = expr::loose_bvar_range(a).max(expr::loose_bvar_range(b));
+        self.used_bvar_key(used, loose)
+    }
+
+    fn used_bvar_key(&self, used: u64, loose: u32) -> u64 {
+        if loose == 0 {
+            return 0;
+        }
+        if used == 0 || used == u64::MAX {
+            return self.suffix_key(loose as usize);
+        }
+        // Same fold as `suffix[k]` when `used` is bits `0..k`: outer-of-the
+        // used set first, innermost last (`intern_ctx_id` extends with the
+        // new innermost).
+        let n = self.tys.len();
+        let mut id = 0u64;
+        for i in (0..64u32).rev() {
+            if used & (1u64 << i) == 0 {
+                continue;
+            }
+            if (i as usize) >= n {
+                return self.suffix_key(loose as usize);
+            }
+            let ty_ptr = Rc::as_ptr(&self.tys[n - 1 - i as usize]) as usize;
+            id = intern_ctx_id(id, ty_ptr);
+        }
+        id
+    }
+
+    fn suffix_key(&self, k: usize) -> u64 {
+        let k = k.min(self.tys.len());
+        self.suffix.get(k).copied().unwrap_or(self.id)
     }
 
     fn len(&self) -> usize {
@@ -1026,18 +1124,11 @@ impl<'e> Checker<'e> {
         Rc::as_ptr(e) as usize
     }
 
-    fn cacheable(_ctx: &Ctx, _e: &Expr) -> bool {
-        // The whnf stack is context-pure: whnf/whnf_core/whnf_major never
-        // infer types (try_iota/try_quot/try_nat_extension/try_dite and
-        // reduce_nat_arg are all pure reduction over the expression and the
-        // environment), so a de Bruijn term's whnf is the same term in every
-        // context. Pointer identity is structural identity through the
-        // interner, so a ptr-keyed cache is sound under binders as well.
-        // (is_def_eq is NOT context-pure — proof irrelevance infers types —
-        // and keeps its own stricter gate.) Requiring closed terms in an
-        // empty context meant the caches were dead inside declaration
-        // bodies, which is where reduction actually happens.
-        true
+    fn whnf_cache_key(ctx: &Ctx, e: &Expr) -> (u64, usize) {
+        // Closed terms are context-free. Open terms (K-like `Eq.rec`/`True.rec`
+        // of a bvar major) infer the major's type, so the key includes `ctx.id`.
+        let ctx_key = if expr::is_closed(e) { 0 } else { ctx.id };
+        (ctx_key, Self::ptr_key(e))
     }
 
     fn name_str(&self, n: u32) -> &str {
@@ -1129,10 +1220,70 @@ impl<'e> Checker<'e> {
             .env
             .get(name)
             .ok_or_else(|| TcError::Other(format!("missing const {name}")))?;
+        // Drop the previous decl's subst/ctx intern before any WHNF/shape
+        // probe. Those maps otherwise hold one extra decl of residue while
+        // `type_is_multiarg_prop_structure` runs.
+        expr::clear_subst_memos();
+        CTX_IDS.with(|m| m.borrow_mut().clear());
+        CTX_NEXT.with(|c| c.set(1));
+        CORE_ABORTED.with(|a| a.set(false));
         crate::stats::set_theorem_delta_scope(self.name_str(name));
         if std::env::var_os("KIOTA_DEBUG").is_some() && self.name_str(name).contains("_mutual") {
             eprintln!("CHECKING {}", self.name_str(name));
             let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
+        if std::env::var_os("KIOTA_DUMP_PSIGMA").is_some()
+            && self.name_str(name).contains("toGraphviz.go._unary.eq_def")
+        {
+            for (i, nm) in self.names.iter().enumerate() {
+                let s = nm.as_str();
+                if s == "PSigma" {
+                    match self.env.get(i as u32) {
+                        Some(ConstantInfo::InductiveType {
+                            is_rec,
+                            num_indices,
+                            ctors,
+                            ..
+                        }) => eprintln!(
+                            "DUMP PSigma is_rec={is_rec} nidx={num_indices} nctors={} non_rec={}",
+                            ctors.len(),
+                            self.is_non_rec_structure(i as u32)
+                        ),
+                        other => eprintln!("DUMP PSigma not inductive {other:?}"),
+                    }
+                }
+                if s == "PSigma.casesOn" {
+                    match self.env.get(i as u32) {
+                        Some(ConstantInfo::Def { hints, value, .. }) => {
+                            eprintln!(
+                                "DUMP casesOn hints={hints:?} val={}",
+                                self.pp_budget(value, 10)
+                            );
+                        }
+                        other => eprintln!("DUMP casesOn {other:?}"),
+                    }
+                }
+                if s.ends_with("StateT.bind.match_1") || s == "StateT.bind.match_1"
+                    || s == "Bind.bind"
+                    || s == "Monad.toBind"
+                    || s == "StateT.bind"
+                    || s == "StateT.instMonad"
+                    || s.ends_with(".Bind.bind")
+                    || s.ends_with(".StateT.bind")
+                    || s.ends_with(".StateT.instMonad")
+                {
+                    match self.env.get(i as u32) {
+                        Some(ConstantInfo::Def { hints, value, .. }) => {
+                            eprintln!(
+                                "DUMP {s} Def hints={hints:?} sz={} val={}",
+                                expr_size_capped(value, 20_000),
+                                self.pp_budget(value, 12)
+                            );
+                        }
+                        other => eprintln!("DUMP {s} {other:?}"),
+                    }
+                }
+            }
         }
         self.fuel_nat_peels.set(0);
         *self.fuel_nat_last.borrow_mut() = None;
@@ -1181,49 +1332,12 @@ impl<'e> Checker<'e> {
         self.checking_simple_prop_inductive.set(
             kind == "theorem" && !multi && self.type_is_unit_ctor_zero_index_prop(ci.typ()),
         );
-        {
+        self.eq_related_defs.borrow_mut().clear();
+        self.eq_arg_heads.borrow_mut().clear();
+        self.eq_side_def_size.set(0);
+        if std::env::var_os("KIOTA_RELATED_LOG").is_some() && kind == "theorem" {
             let mut rel = self.eq_related_defs.borrow_mut();
-            rel.clear();
-            self.eq_arg_heads.borrow_mut().clear();
-            if kind == "theorem" {
-                self.fill_eq_related_defs(ci.typ(), &mut rel);
-                if let Some(v) = ci.value() {
-                    let mut mentioned = Vec::new();
-                    self.collect_def_consts(v, &mut mentioned);
-                    for m in mentioned {
-                        let sz = match self.env.get(m) {
-                            Some(ConstantInfo::Def { value: dv, .. }) => {
-                                expr_size_capped(dv, 20_000)
-                            }
-                            _ => 0,
-                        };
-                        // Iterator / searcher helpers (~7k–18k) needed by
-                        // finiteness proofs (`buildTable.go._unary` ~16937).
-                        // Below 7k is the 4k nested band; 6.6k circuit
-                        // `.go._unary` stays out. 22k+ AIG zip/qsort stay out.
-                        // 18k–50k only if the Def is a packed structure
-                        // (`instIteratorIdSearchStep` ~41611), not a circuit
-                        // `._unary` (~32574).
-                        if (7_000..18_000).contains(&sz) && !rel.contains(&m) {
-                            rel.push(m);
-                        }
-                        if (1_500..50_000).contains(&sz)
-                            && self.def_is_packed_structure(m)
-                            && !rel.contains(&m)
-                        {
-                            rel.push(m);
-                        }
-                    }
-                }
-            }
-            self.eq_side_def_size.set(rel.iter().copied().map(|n| {
-                match self.env.get(n) {
-                    Some(ConstantInfo::Def { value, .. }) => {
-                        expr_size_capped(value, 200_000)
-                    }
-                    _ => 0,
-                }
-            }).max().unwrap_or(0));
+            self.fill_eq_related_defs(ci.typ(), &mut rel);
         }
         if std::env::var_os("KIOTA_CAP_LOG").is_some() {
             let cur = self.decl_value_size.get();
@@ -1266,6 +1380,9 @@ impl<'e> Checker<'e> {
         // declaration. Keeping them across decls is how `#3491`–`#3495`
         // grew from ~0.9 GB to multi-GB before the next omega proof.
         // `unfold_cache` is keyed by (const, levels) and is reused.
+        expr::clear_subst_memos();
+        CTX_IDS.with(|m| m.borrow_mut().clear());
+        CTX_NEXT.with(|c| c.set(1));
         self.whnf_cache.borrow_mut().clear();
         self.whnf_core_cache.borrow_mut().clear();
         self.defeq_cache.borrow_mut().clear();
@@ -1275,6 +1392,7 @@ impl<'e> Checker<'e> {
         }
         let decl_inst0 = crate::stats::inst_nodes();
         let decl_whnf0 = crate::stats::whnf_calls();
+        let decl_intern0 = expr::intern_calls();
         // Native quot/inductive/ctor/rec kinds are validated elsewhere.
         let level_params = ci.level_params();
         {
@@ -1325,12 +1443,15 @@ impl<'e> Checker<'e> {
         if std::env::var_os("KIOTA_DECL_STATS").is_some() {
             let di = crate::stats::inst_nodes() - decl_inst0;
             let dw = crate::stats::whnf_calls() - decl_whnf0;
-            if di > 100_000 || dw > 1_000_000 {
+            let dic = expr::intern_calls() - decl_intern0;
+            if di > 100_000 || dw > 1_000_000 || dic > 100_000 {
                 eprintln!(
-                    "DECLSTATS {} inst=+{} whnf=+{}",
+                    "DECLSTATS {} inst=+{} whnf=+{} intern_calls=+{} nodes={}",
                     self.name_str(name),
                     di,
-                    dw
+                    dw,
+                    dic,
+                    expr::intern_node_count()
                 );
             }
         }
@@ -1363,31 +1484,30 @@ impl<'e> Checker<'e> {
         }
     }
 
-    /// WHNF with size/hint eager-delta, then one unfold of a large Regular
-    /// if the result is not already a Pi/Sort. Types that are large Regular
-    /// wrappers of a Pi still reduce; huge Regular *values* stay folded.
+    /// Lean `ensure_pi`/`ensure_sort`: WHNF-core, then delta until Pi/Sort.
+    /// Regular values stay folded in `whnf`; types that wrap a Pi still reduce.
     fn reduce_for_ensure(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
-        let w = self.whnf(ctx, e)?;
-        match &**w {
-            ExprData::Pi(_, _, _) | ExprData::Sort(_) => return Ok(w),
-            _ => {}
-        }
-        let (head, args) = expr::unfold_apps(&w);
-        if let ExprData::Const(n, us) = &**head {
-            let circuit_eq = self.eq_arg_heads.borrow().iter().any(|h| {
-                self.def_leads_to_circuit(*h)
-            });
-            if (self.eq_heads_all_tiny_wrappers() || circuit_eq)
-                && self.circuit_unfold_blocked(*n)
-            {
+        let mut w = self.whnf(ctx, e)?;
+        for _ in 0..2048 {
+            match &**w {
+                ExprData::Pi(_, _, _) | ExprData::Sort(_) => return Ok(w),
+                _ => {}
+            }
+            let (head, args) = expr::unfold_apps(&w);
+            let ExprData::Const(n, us) = &**head else {
+                return Ok(w);
+            };
+            let Some(unfolded) = self.unfold_def(*n, us)? else {
+                return Ok(w);
+            };
+            let next = expr::apps(unfolded, &args);
+            let core = self.whnf_core(ctx, &next)?;
+            if Rc::ptr_eq(&core, &w) {
                 return Ok(w);
             }
-            if let Some(unfolded) = self.unfold_def(*n, us)? {
-                let next = expr::apps(unfolded, &args);
-                return self.whnf_core(ctx, &next);
-            }
+            w = core;
         }
-        Ok(w)
+        decline("ensure reduction depth limit")
     }
 
     fn ensure_sort(&self, ctx: &Ctx, e: &Expr) -> R<Level> {
@@ -1410,11 +1530,10 @@ impl<'e> Checker<'e> {
 
     pub fn infer_type(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         crate::stats::infer_call();
-        // Closed terms do not depend on the local telescope. Keying them
-        // on `ctx.id` re-inferred the same 34k-node DAG under every binder
-        // sequence in `._unary` well-founded proofs (millions of unique
-        // keys, intern stable).
-        let ctx_key = if expr::is_closed(e) { 0 } else { ctx.id };
+        // Closed → 0. Open `loose = k` → k innermost binders, not the full
+        // telescope: a 34k DAG with one loose bvar must not re-Check under
+        // every extra PSigma/Acc motive (`._unary` well-founded proofs).
+        let ctx_key = ctx.term_ctx_key(e);
         let key = (ctx_key, Self::ptr_key(e));
         let infer_only = self.infer_only.get();
         if let Some((t, checked)) = self.infer_cache.borrow().get(&key) {
@@ -1452,24 +1571,10 @@ impl<'e> Checker<'e> {
             ExprData::App(f, a) => {
                 let ft = self.infer_type(ctx, f)?;
                 let (_, dom, body) = self.ensure_pi(ctx, &ft)?;
-                // Lean `infer_only` / mathgraph InferOnly: PI only needs the
-                // type, not a full Check of every argument. Nested Check on
-                // `countKnown.go._unary._proof_2` (≥100k nodes) intern-OOMs.
+                // Lean `check` infers every App argument. InferOnly is only
+                // for PI (`proofs_of_same_prop`) on already-checked terms.
                 if !self.infer_only.get() {
-                    // Proof arg: InferOnly (PI) on a Prop binder. If the
-                    // inferred type is not defeq the binder, fall back to
-                    // full Check so dependent data args misclassified as
-                    // Prop still typecheck (`denote_blastDivSubtractShift_q`).
-                    let at = if self.binder_is_prop(ctx, &dom)
-                        && !self.app_fn_is_recursor(f)
-                    {
-                        match self.with_infer_only(|| self.infer_type(ctx, a)) {
-                            Ok(t) if self.is_def_eq(ctx, &t, &dom).unwrap_or(false) => t,
-                            _ => self.infer_type(ctx, a)?,
-                        }
-                    } else {
-                        self.infer_type(ctx, a)?
-                    };
+                    let at = self.infer_type(ctx, a)?;
                     if !self.is_def_eq(ctx, &at, &dom)? {
                         if std::env::var_os("KIOTA_DEBUG").is_some() {
                             let atw = self.whnf(ctx, &at).unwrap_or_else(|_| at.clone());
@@ -1733,12 +1838,42 @@ impl<'e> Checker<'e> {
             Some(ConstantInfo::Constructor { num_fields, .. }) => *num_fields,
             _ => return Ok(None),
         };
-        let mt = self.infer_type(ctx, major)?;
+        let mt = match self.infer_type(ctx, major) {
+            Ok(t) => t,
+            Err(e) => {
+                if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
+                    eprintln!(
+                        "IOTA to_ctor infer fail major={} err={e:?}",
+                        self.pp_budget(major, 8)
+                    );
+                }
+                return Err(e);
+            }
+        };
         let mtw = self.whnf(ctx, &mt)?;
+        // Lean skips Prop structures (`is_prop` of the type). PSigma is Type.
+        if self.is_prop(ctx, &mtw)? {
+            if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
+                eprintln!(
+                    "IOTA to_ctor skip Prop structure {} ty={}",
+                    self.name_str(tname),
+                    self.pp_budget(&mtw, 10)
+                );
+            }
+            return Ok(None);
+        }
         let (thead, targs) = expr::unfold_apps(&mtw);
         match &**thead {
             ExprData::Const(n, _) if *n == tname => {
                 if targs.len() < num_params as usize {
+                    if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
+                        eprintln!(
+                            "IOTA to_ctor underapplied {} targs={} nparams={}",
+                            self.name_str(tname),
+                            targs.len(),
+                            num_params
+                        );
+                    }
                     return Ok(None);
                 }
                 let mut ctor_args: Vec<Expr> = targs[..num_params as usize].to_vec();
@@ -1748,88 +1883,101 @@ impl<'e> Checker<'e> {
                 let _ = params;
                 Ok(Some((cname, num_params, ctor_args)))
             }
-            _ => Ok(None),
-        }
-    }
-
-    /// Prop binder without a full `is_prop` infer: Sort 0, or a fully
-    /// applied inductive whose result sort is Prop (`Eq`, `Acc`, `And`).
-    fn app_fn_is_recursor(&self, f: &Expr) -> bool {
-        let (h, _) = expr::unfold_apps(f);
-        matches!(
-            &**h,
-            ExprData::Const(n, _) if matches!(self.env.get(*n), Some(ConstantInfo::Recursor { .. }))
-        )
-    }
-
-    fn binder_is_prop(&self, ctx: &Ctx, dom: &Expr) -> bool {
-        let head_prop = |e: &Expr| -> bool {
-            if let ExprData::Sort(l) = &***e {
-                return level::is_def_eq(l, &level::zero());
-            }
-            let (h, args) = expr::unfold_apps(e);
-            let ExprData::Const(n, _) = &**h else {
-                return false;
-            };
-            match self.env.get(*n) {
-                Some(ConstantInfo::InductiveType {
-                    typ, num_params, ..
-                }) if (args.len() as u32) >= *num_params => self.sort_codomain_is_prop(typ),
-                _ => false,
-            }
-        };
-        // A Pi is a Prop iff its codomain is (`∀ n, P n` with `P n : Prop`).
-        // `WellFounded.Nat.fix`'s functional has that type; treating it as
-        // data full-Checks a 34k-node proof DAG.
-        let peel = |e: &Expr| -> Expr {
-            let mut t = e.clone();
-            for _ in 0..64 {
-                match &**t {
-                    ExprData::Pi(_, _, b) => t = b.clone(),
-                    _ => break,
+            other => {
+                if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
+                    eprintln!(
+                        "IOTA to_ctor head mismatch want={} got={} ty={}",
+                        self.name_str(tname),
+                        match other {
+                            ExprData::Const(n, _) => self.name_str(*n).to_string(),
+                            ExprData::BVar(i) => format!("#{i}"),
+                            _ => format!("{other:?}"),
+                        },
+                        self.pp_budget(&mtw, 12)
+                    );
                 }
+                Ok(None)
             }
-            t
-        };
-        if head_prop(&peel(dom)) {
-            return true;
-        }
-        match self.whnf(ctx, dom) {
-            Ok(w) => head_prop(&peel(&w)),
-            Err(_) => false,
         }
     }
 
-    /// `ty` is a Prop, i.e. `infer_type(ty)` is `Sort 0` (up to defeq / imax).
+    /// Whether `ty` is a proposition (`ty : Prop`), not whether `ty` *is* Prop.
+    /// `whnf(Prop) = Sort 0` so a Sort is a universe (`Prop : Type`); PI must
+    /// not identify `True` with `False`. Prop inductives, axioms `P : Prop`,
+    /// and Pis into those count. Reads the constant's telescope, not `infer_type`
+    /// of `ty` (that re-entered Check of huge type spines from PI).
     fn is_prop(&self, ctx: &Ctx, ty: &Expr) -> R<bool> {
-        if let Ok(s) = self.infer_type(ctx, ty) {
-            if let Ok(l) = self.ensure_sort(ctx, &s) {
-                if level::is_def_eq(&l, &level::zero()) {
-                    return Ok(true);
-                }
-            }
-        }
-        // Prop-class apps (`Small α`) sometimes infer as a non-zero sort
-        // (imax / unused universe param). A *fully applied* inductive whose
-        // result sort is `Sort 0` is still a Prop.
         let w = match self.whnf(ctx, ty) {
             Ok(w) => w,
             Err(_) => return Ok(false),
         };
-        let (h, args) = expr::unfold_apps(&w);
-        let ExprData::Const(n, _) = &**h else {
-            return Ok(false);
-        };
-        let Some(ConstantInfo::InductiveType {
-            typ, num_params, ..
-        }) = self.env.get(*n)
-        else {
-            return Ok(false);
-        };
-        if (args.len() as u32) < *num_params {
-            return Ok(false);
+        match &**w {
+            ExprData::Sort(_) => Ok(false),
+            ExprData::BVar(i) => {
+                let Some(t) = local_ty(ctx, *i) else {
+                    return Ok(false);
+                };
+                let tw = match self.whnf(ctx, &t) {
+                    Ok(x) => x,
+                    Err(_) => return Ok(false),
+                };
+                Ok(matches!(&**tw, ExprData::Sort(l) if level::is_def_eq(l, &level::zero())))
+            }
+            ExprData::Pi(_, dom, body) => {
+                let mut ctx2 = {
+                    crate::stats::ctx_clone();
+                    ctx.clone()
+                };
+                ctx2.push(dom.clone());
+                self.is_prop(&ctx2, body)
+            }
+            _ => {
+                let (h, args) = expr::unfold_apps(&w);
+                let ExprData::Const(n, _) = &**h else {
+                    return self.is_prop_by_infer(ctx, &w);
+                };
+                if let Some(ConstantInfo::InductiveType {
+                    typ, num_params, ..
+                }) = self.env.get(*n)
+                {
+                    if (args.len() as u32) >= *num_params {
+                        return Ok(self.sort_codomain_is_prop(typ));
+                    }
+                }
+                let Some(cty) = self.const_typ(*n) else {
+                    return self.is_prop_by_infer(ctx, &w);
+                };
+                if self.telescope_codomain_is_prop(cty, args.len()) {
+                    return Ok(true);
+                }
+                self.is_prop_by_infer(ctx, &w)
+            }
         }
-        Ok(self.sort_codomain_is_prop(typ))
+    }
+
+    /// InferOnly typeof. Check-mode infer here re-entered PI on huge type
+    /// spines (`blastAdd`). Lean `is_prop` uses `infer`, not `check`.
+    fn is_prop_by_infer(&self, ctx: &Ctx, ty: &Expr) -> R<bool> {
+        self.with_infer_only(|| {
+            match self.infer_type(ctx, ty) {
+                Ok(s) => match self.ensure_sort(ctx, &s) {
+                    Ok(l) => Ok(level::is_def_eq(&l, &level::zero())),
+                    Err(_) => Ok(false),
+                },
+                Err(_) => Ok(false),
+            }
+        })
+    }
+
+    fn telescope_codomain_is_prop(&self, typ: &Expr, args: usize) -> bool {
+        let mut t = typ.clone();
+        for _ in 0..args {
+            match &**t {
+                ExprData::Pi(_, _, b) => t = b.clone(),
+                _ => return false,
+            }
+        }
+        matches!(&**t, ExprData::Sort(l) if level::is_def_eq(l, &level::zero()))
     }
 
     fn sort_codomain_is_prop(&self, ty: &Expr) -> bool {
@@ -1857,23 +2005,21 @@ impl<'e> Checker<'e> {
     }
 
     /// True when `e` cannot be a proof, so PI must not `infer_type` it.
-    /// Large Regular heads are data (not theorems); inferring them as proofs
-    /// walks their bodies.
+    /// Size is not a proof test: class instances are large Regular *proofs*
+    /// of a Prop (`#18000` `LawfulVecOperator`). `infer_type` of a const uses
+    /// the declared type, not the body — skipping those forced pairwise of
+    /// nested `mk` fields.
     fn obviously_not_proof(&self, e: &Expr) -> bool {
         match &***e {
-            ExprData::Sort(_) | ExprData::Pi(_, _, _) | ExprData::Lam(_, _, _) | ExprData::Lit(_) => {
-                true
-            }
+            // Lams can be proofs (`True → True`, `fun α => Mk …` class
+            // instances). Skipping PI on them forced lam-congruence of
+            // `#18041` nested `LawfulOperator` bodies.
+            ExprData::Sort(_) | ExprData::Pi(_, _, _) | ExprData::Lit(_) => true,
             _ => {
                 let (h, args) = expr::unfold_apps(e);
                 let ExprData::Const(n, _) = &**h else {
                     return false;
                 };
-                if matches!(self.env.get(*n), Some(ConstantInfo::Def { .. }))
-                    && !self.eager_whnf_unfolds(*n)
-                {
-                    return true;
-                }
                 match self.env.get(*n) {
                     Some(ConstantInfo::InductiveType {
                         typ, num_params, ..
@@ -1971,6 +2117,29 @@ impl<'e> Checker<'e> {
         let Some(ci) = self.env.get(n) else {
             return false;
         };
+        // Prop-ctor spines and class-instance defs (`LawfulOperator.mk`,
+        // `instLawful*`) must use `defeq_args` so proof fields/args are
+        // skipped. Pairwise of those is 7^depth (`#18000`, `#18041`).
+        if let ConstantInfo::Constructor { induct, .. } = ci {
+            if let Some(ConstantInfo::InductiveType { typ, .. }) = self.env.get(*induct) {
+                if self.sort_codomain_is_prop(typ) {
+                    return true;
+                }
+            }
+        }
+        if let ConstantInfo::InductiveType { typ, .. } = ci {
+            if self.sort_codomain_is_prop(typ) {
+                return true;
+            }
+        }
+        if self.type_is_unit_ctor_zero_index_prop(ci.typ())
+            || self.type_is_multiarg_prop_structure(ci.typ())
+            || self.peel_to_inductive_head(ci.typ()).is_some_and(|(_, _, _, _, ity)| {
+                self.sort_codomain_is_prop(ity)
+            })
+        {
+            return true;
+        }
         let mut t = ci.typ().clone();
         let empty = Ctx::new();
         for _ in 0..64 {
@@ -1990,12 +2159,96 @@ impl<'e> Checker<'e> {
         false
     }
 
+    fn trace_pair(kind: &str, name: &str, na: usize, has_pr: bool) {
+        thread_local! {
+            static N: Cell<u32> = const { Cell::new(0) };
+        }
+        N.with(|c| {
+            let n = c.get();
+            if n < 40 {
+                c.set(n + 1);
+                eprintln!("PAIR {kind} {name} na={na} proof_arg={has_pr}");
+            }
+        });
+    }
+
+    fn with_fresh_app_cong<T>(&self, f: impl FnOnce() -> T) -> T {
+        let old = APP_CONG_DEPTH.with(|d| d.replace(0));
+        let r = f();
+        APP_CONG_DEPTH.with(|d| d.set(old));
+        r
+    }
+
+    fn app_spines_congruent(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        let (h1, a1) = expr::unfold_apps(a);
+        let (h2, a2) = expr::unfold_apps(b);
+        if let (ExprData::Const(n1, u1), ExprData::Const(n2, u2)) = (&**h1, &**h2) {
+            if n1 == n2
+                && a1.len() == a2.len()
+                && u1.len() == u2.len()
+                && u1
+                    .iter()
+                    .zip(u2.iter())
+                    .all(|(x, y)| level::is_def_eq(x, y))
+            {
+                let has_pr = self.const_has_proof_arg(*n1);
+                if std::env::var_os("KIOTA_TRACE_PAIR").is_some() && a1.len() >= 3 {
+                    Self::trace_pair("core", self.name_str(*n1), a1.len(), has_pr);
+                }
+                let r = if has_pr {
+                    match self.infer_const(*n1, u1) {
+                        Ok(fn_ty) => self.defeq_args(ctx, &fn_ty, &a1, &a2)?,
+                        Err(_) => self.pairwise_args(ctx, &a1, &a2)?,
+                    }
+                } else {
+                    self.pairwise_args(ctx, &a1, &a2)?
+                };
+                if !r && std::env::var_os("KIOTA_TRACE_EQ").is_some() && a1.len() >= 4 {
+                    eprintln!(
+                        "EQCORE fail {} na={}",
+                        self.name_str(*n1),
+                        a1.len()
+                    );
+                }
+                return Ok(r);
+            }
+            return Ok(false);
+        }
+        if a1.len() != a2.len() {
+            return Ok(false);
+        }
+        let head_eq = Rc::ptr_eq(&h1, &h2)
+            || (!matches!(&**h1, ExprData::Const(..))
+                && !matches!(&**h2, ExprData::Const(..))
+                && self.is_def_eq(ctx, &h1, &h2)?);
+        if !head_eq {
+            return Ok(false);
+        }
+        if let ExprData::Const(n, us) = &**h1 {
+            if self.const_has_proof_arg(*n) {
+                return match self.infer_const(*n, us) {
+                    Ok(fn_ty) => self.defeq_args(ctx, &fn_ty, &a1, &a2),
+                    Err(_) => self.pairwise_args(ctx, &a1, &a2),
+                };
+            }
+        }
+        self.pairwise_args(ctx, &a1, &a2)
+    }
+
     fn pairwise_args(&self, ctx: &Ctx, a1: &[Expr], a2: &[Expr]) -> R<bool> {
         if a1.len() != a2.len() {
             return Ok(false);
         }
-        for (x, y) in a1.iter().zip(a2.iter()) {
+        for (i, (x, y)) in a1.iter().zip(a2.iter()).enumerate() {
             if !self.is_def_eq(ctx, x, y)? {
+                if std::env::var_os("KIOTA_TRACE_EQ").is_some() {
+                    eprintln!(
+                        "EQPAIR fail i={i}/{} a={} b={}",
+                        a1.len(),
+                        self.pp_budget(x, 16),
+                        self.pp_budget(y, 16)
+                    );
+                }
                 return Ok(false);
             }
         }
@@ -2032,7 +2285,8 @@ impl<'e> Checker<'e> {
                     return Ok(true);
                 }
             };
-            if self.domain_is_prop_inductive(ctx, &dom)? {
+            if self.domain_is_prop_inductive(ctx, &dom)? || self.is_prop(ctx, &dom).unwrap_or(false)
+            {
                 ty = expr::instantiate1(&body, &a1[i]);
                 i += 1;
                 continue;
@@ -2054,12 +2308,12 @@ impl<'e> Checker<'e> {
             d.set(n);
             n
         });
-        if depth > 2048 {
+        if depth > CONV_DEPTH {
             WHNF_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-            if depth == 2049 && std::env::var_os("KIOTA_DEBUG").is_some() {
+            if depth == CONV_DEPTH + 1 && std::env::var_os("KIOTA_DEBUG").is_some() {
                 eprintln!("WHNF_DEPTH {}", self.pp_budget(e, 50));
             }
-            return Ok(e.clone());
+            return decline("WHNF depth limit");
         }
         let r = self.whnf_inner(ctx, e);
         WHNF_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
@@ -2080,12 +2334,9 @@ impl<'e> Checker<'e> {
                 let _ = std::io::Write::flush(&mut std::io::stderr());
             }
         }
-        let cache = Self::cacheable(ctx, e);
-        if cache {
-            let k = Self::ptr_key(e);
-            if let Some(r) = self.whnf_cache.borrow().get(&k) {
-                return Ok(r.clone());
-            }
+        let k = Self::whnf_cache_key(ctx, e);
+        if let Some(r) = self.whnf_cache.borrow().get(&k) {
+            return Ok(r.clone());
         }
         let mut cur = e.clone();
         let r = loop {
@@ -2106,11 +2357,10 @@ impl<'e> Checker<'e> {
             }
             break core;
         };
-        if cache {
-            self.whnf_cache
-                .borrow_mut()
-                .insert(Self::ptr_key(e), r.clone());
+        if CORE_ABORTED.with(|a| a.get()) {
+            return Ok(r);
         }
+        self.whnf_cache.borrow_mut().insert(k, r.clone());
         Ok(r)
     }
 
@@ -2160,6 +2410,29 @@ impl<'e> Checker<'e> {
         if n1 != n2 || a1.len() != a2.len() || u1.len() != u2.len() {
             return Ok(false);
         }
+        // Recursor spines and *large* Regulars must WHNF/δ/ι first.
+        // Unreduced pairwise of `mkGateCached` walks AIG `BinaryInput.mk`
+        // as a tree (`#18041`). Abbrev Acc wrappers still congruence.
+        if matches!(self.env.get(*n1), Some(ConstantInfo::Recursor { .. })) {
+            return Ok(false);
+        }
+        // Type-structure ctors (`BinaryInput.mk`): unreduced field-pairwise
+        // is a tree walk of AIG DAGs. WHNF+δ first intern-shares the spine.
+        if let Some(ConstantInfo::Constructor { induct, .. }) = self.env.get(*n1) {
+            if let Some(ConstantInfo::InductiveType {
+                typ,
+                ctors,
+                num_indices,
+                is_rec,
+                ..
+            }) = self.env.get(*induct)
+            {
+                if ctors.len() == 1 && *num_indices == 0 && !*is_rec && !self.sort_codomain_is_prop(typ)
+                {
+                    return Ok(false);
+                }
+            }
+        }
         if !u1.iter().zip(u2.iter()).all(|(x, y)| level::is_def_eq(x, y)) {
             return Ok(false);
         }
@@ -2167,7 +2440,11 @@ impl<'e> Checker<'e> {
             && a1.iter().chain(a2.iter()).any(|e| {
                 self.pp_budget(e, 40).contains("norm_eq_cert")
             });
-        let r = if self.const_has_proof_arg(*n1) {
+        let has_pr = self.const_has_proof_arg(*n1);
+        if std::env::var_os("KIOTA_TRACE_PAIR").is_some() && a1.len() >= 3 {
+            Self::trace_pair("unreduced", self.name_str(*n1), a1.len(), has_pr);
+        }
+        let r = if has_pr {
             match self.infer_const(*n1, u1) {
                 Ok(fn_ty) => self.defeq_args(ctx, &fn_ty, &a1, &a2)?,
                 Err(_) => self.pairwise_args(ctx, &a1, &a2)?,
@@ -2177,6 +2454,15 @@ impl<'e> Checker<'e> {
         };
         if eq_trace {
             eprintln!("EQARGS r={r} n={} na={}", self.name_str(*n1), a1.len());
+        }
+        if !r && std::env::var_os("KIOTA_TRACE_EQ").is_some() && a1.len() >= 4 {
+            eprintln!(
+                "EQSPINE fail {} na={} a4={} b4={}",
+                self.name_str(*n1),
+                a1.len(),
+                self.pp_budget(&a1[a1.len() - 1], 10),
+                self.pp_budget(&a2[a2.len() - 1], 10)
+            );
         }
         Ok(r)
     }
@@ -2252,20 +2538,44 @@ impl<'e> Checker<'e> {
     }
 
     /// beta/zeta/proj/iota reduction to whnf, WITHOUT unfolding delta.
+    fn cheap_zeta(e: &Expr) -> Expr {
+        let mut cur = e.clone();
+        while let ExprData::Let(_, val, body) = &**cur {
+            cur = expr::instantiate1(body, val);
+        }
+        cur
+    }
+
     fn whnf_core(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
-        let cache = Self::cacheable(ctx, e);
-        if cache {
-            let k = Self::ptr_key(e);
-            if let Some(r) = self.whnf_core_cache.borrow().get(&k) {
-                return Ok(r.clone());
+        // ζ before the depth cap: a `let` produced by structure ι
+        // (`StateT.bind.match_1`) must not freeze as WHNF just because
+        // `CORE_DEPTH` is already at CONV_DEPTH.
+        let e = Self::cheap_zeta(e);
+        let depth = CORE_DEPTH.with(|d| {
+            let n = d.get() + 1;
+            d.set(n);
+            n
+        });
+        if depth > CONV_DEPTH {
+            CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            CORE_ABORTED.with(|a| a.set(true));
+            // Do not cache: a later shallower call must still be allowed to reduce.
+            if std::env::var_os("KIOTA_TRACE_IOTA").is_some()
+                || std::env::var_os("KIOTA_TRACE_EQ").is_some()
+            {
+                eprintln!("CORE_DEPTH abort {}", crate::expr::loose_bvar_range(&e));
             }
+            return Ok(e);
         }
-        let r = self.whnf_core_go(ctx, e)?;
-        if cache {
-            self.whnf_core_cache
-                .borrow_mut()
-                .insert(Self::ptr_key(e), r.clone());
+        let k = Self::whnf_cache_key(ctx, &e);
+        if let Some(r) = self.whnf_core_cache.borrow().get(&k) {
+            CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            return Ok(r.clone());
         }
+        let r = self.whnf_core_go(ctx, &e);
+        CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        let r = r?;
+        self.whnf_core_cache.borrow_mut().insert(k, r.clone());
         Ok(r)
     }
 
@@ -2276,6 +2586,16 @@ impl<'e> Checker<'e> {
                 ExprData::App(_, _) => {
                     let (head, args) = expr::unfold_apps(&cur);
                     match &**head {
+                        // Lean `whnf_core` on App first `whnf_core`s the function.
+                        // A Let head is ζ, then the args are reapplied:
+                        //   WHNF ((let x := v; f) a₁ … aₙ) = WHNF (f[v] a₁ … aₙ)
+                        // Without this, `StateT.bind.match_1` ι yields a `let`
+                        // that stuck as App(Let, minor), so Bind.bind minors
+                        // (`p.1` vs unpacked) never converted (#81930).
+                        ExprData::Let(_, _, _) => {
+                            cur = expr::apps(Self::cheap_zeta(&head), &args);
+                            continue;
+                        }
                         ExprData::Lam(_, _, _) => {
                             let mut body = head.clone();
                             let mut i = 0;
@@ -2301,7 +2621,10 @@ impl<'e> Checker<'e> {
                         // Class projections: `HAdd.hAdd` / `OfNat.ofNat` unfold to
                         // `s.i` applied to further args; reduce the proj head first.
                         ExprData::Proj(sname, idx, v) => {
-                            let vw = self.whnf(ctx, v)?;
+                            let mut vw = self.whnf(ctx, v)?;
+                            if let Some(u) = self.try_unfold_const_head(&vw)? {
+                                vw = self.whnf_core(ctx, &u)?;
+                            }
                             let (phead, pargs) = expr::unfold_apps(&vw);
                             if let ExprData::Const(cname, _us) = &**phead {
                                 if let Some(ConstantInfo::Constructor { num_params, .. }) =
@@ -2384,7 +2707,10 @@ impl<'e> Checker<'e> {
                     continue;
                 }
                 ExprData::Proj(sname, idx, v) => {
-                    let vw = self.whnf(ctx, v)?;
+                    let mut vw = self.whnf(ctx, v)?;
+                    if let Some(u) = self.try_unfold_const_head(&vw)? {
+                        vw = self.whnf_core(ctx, &u)?;
+                    }
                     let (head, args) = expr::unfold_apps(&vw);
                     if let ExprData::Const(cname, _us) = &**head {
                         if let Some(ConstantInfo::Constructor { num_params, .. }) =
@@ -2420,6 +2746,14 @@ impl<'e> Checker<'e> {
     /// terms are huge and instantiating them per call explodes (grind-ring-5
     /// went from 1s to >2min). The is_def_eq delta path below is the cold,
     /// targeted path; it may unfold theorems via `unfold_delta`.
+    fn try_unfold_const_head(&self, e: &Expr) -> R<Option<Expr>> {
+        let (h, args) = expr::unfold_apps(e);
+        let ExprData::Const(n, us) = &**h else {
+            return Ok(None);
+        };
+        Ok(self.unfold_def(*n, us)?.map(|u| expr::apps(u, &args)))
+    }
+
     fn unfold_def(&self, n: u32, us: &[Level]) -> R<Option<Expr>> {
         match self.env.get(n) {
             Some(ConstantInfo::Def {
@@ -2684,153 +3018,19 @@ impl<'e> Checker<'e> {
     }
 
     fn eager_whnf_unfolds(&self, n: u32) -> bool {
-        const CIRCUIT: u32 = 100_000;
-        // Cap Regular unfold by the decl being checked. Small proofs must
-        // not instantiate 20k+ Regulars (intern explosion). Equality-shaped
-        // types boost the cap to the equated Def so small `.eq_1` lemmas of
-        // a 40k Regular still reduce. Prop-structure instances stay tighter.
-        if self.eq_related_defs.borrow().contains(&n) {
-            let related_sz = match self.env.get(n) {
-                Some(ConstantInfo::Def { value, .. }) => {
-                    expr_size_capped(value, CIRCUIT)
-                }
-                _ => 0,
-            };
-            let cur = self.decl_value_size.get();
-            // Packed structure instances (Iterator ~7k–41k) always.
-            // Small non-structure helpers (<5k) always.
-            // ≥8k non-structure is `buildTable.go` / eq_def of a big
-            // function. The 5k–8k gap is circuit `blastVar.go._unary`
-            // (~6665): unfold only inside huge eq_def (cur ≥ 20k), never
-            // inside mid-size denote `_proof_*` (~7k).
-            if (8_000..20_000).contains(&cur)
-                && self.eq_heads_all_tiny_wrappers()
-                && (self.def_leads_to_circuit(n) || related_sz >= 250)
-                && !self.def_is_packed_structure(n)
-            {
-            } else {
-                return self.def_body_under(n, CIRCUIT);
-            }
-        }
-        let cur = self.decl_value_size.get();
-        let cap = if self.checking_prop_structure.get() {
-            // Small instances (≤512) must not instantiate ~700 Regulars
-            // (`Array.mapM.map._unary`). Mid-size instances (~2k
-            // `LawfulMonadLift`) still need helpers above that floor.
-            // Huge instances must not instantiate 32k circuit Regulars.
-            if cur >= 10_000 {
-                16_000
-            } else if cur > 4_000 {
-                // ~5k FullAdder instances intern-explode if 1k–3k
-                // Regulars unfold. Keep the 512 floor.
-                512
-            } else if cur > 512 {
-                cur.saturating_mul(2).min(2_500)
-            } else {
-                512
-            }
-        } else if self.checking_simple_prop_inductive.get() {
-            // `Finite` instances (~155 nodes) need iterator Regulars in
-            // the 1k–8k band. Circuit `_proof_*` lemmas are not this shape.
-            cur.saturating_mul(2).max(10_000).min(CIRCUIT)
-        } else if cur >= 10_000 {
-            18_000
-        } else {
-            // Never CIRCUIT. 6600 covers PosIterator/RevPosIterator
-            // (~6501/6570); `blastVar.go._unary` (~6665) stays folded
-            // unless it is circuit-like (gated below).
-            6_600
-        };
-        if self.eq_heads_all_tiny_wrappers() && self.circuit_unfold_blocked(n) {
-            return false;
-        }
-        self.def_body_under(n, cap)
-    }
-
-    /// Recursive circuit helpers: high Regular height and ≥1k nodes, not a
-    /// packed typeclass instance. `AIG.denote.go._unary` (~1340, R10) and
-    /// `blastConst.go._unary` (~3266, R12) match; iterator instances do not
-    /// (`ArrayIterator` R7, `FilterMap` R3).
-    fn eq_heads_all_tiny_wrappers(&self) -> bool {
-        // `denote_mkFullAdderOut` / `denote_mkOrCached`: Eq-heads
-        // `AIG.denote` (~123) and `Bool.xor`/`Bool.or` (~9–19).
-        let heads = self.eq_arg_heads.borrow();
-        if heads.len() != 2 {
-            return false;
-        }
-        let mut sizes = [0u32; 2];
-        for (i, h) in heads.iter().enumerate() {
-            sizes[i] = match self.env.get(*h) {
-                Some(ConstantInfo::Def { value, .. }) => {
-                    expr_size_capped(value, 1_000)
-                }
-                _ => 0,
-            };
-        }
-        sizes.sort_unstable();
-        (1..30).contains(&sizes[0])
-            && (80..150).contains(&sizes[1])
-            && heads.iter().any(|h| self.def_leads_to_circuit(*h))
-    }
-
-    /// Circuit Regulars that intern-explode on denote-style lemmas:
-    /// FullAdder/xor helpers (~250–3k), `blastVar.go._unary` (~6665),
-    /// 32k `._unary`. Mid-size (~11k `blastDivSubtractShift`) must still
-    /// unfold so Eq types with a let-expanded body match the Const.
-    fn circuit_unfold_blocked(&self, n: u32) -> bool {
-        if self.def_is_packed_structure(n) {
-            return false;
-        }
-        let sz = match self.env.get(n) {
-            Some(ConstantInfo::Def { value, .. }) => expr_size_capped(value, 40_000),
-            _ => 0,
-        };
-        if !(self.def_leads_to_circuit(n) || sz >= 250) {
-            return false;
-        }
-        (250..500).contains(&sz) || (6_500..7_000).contains(&sz) || sz >= 20_000
-    }
-
-    fn def_is_circuit_like(&self, n: u32) -> bool {
-        if self.def_is_packed_structure(n) {
-            return false;
-        }
+        // Lean `is_delta` = `has_value`. Abbrev and Regular both have a
+        // kernel value; Opaque does not unfold. Nested `Syntax.rec_k` ι is
+        // rule-ctor identity + specialization-order rec_group, not a size
+        // band. Lazy delta (`is_delta_reducible`) still unfolds theorems
+        // that pass the small-body cut.
         match self.env.get(n) {
             Some(ConstantInfo::Def {
-                hints: ReducibilityHints::Regular(h),
-                value,
+                hints: ReducibilityHints::Opaque,
                 ..
-            }) if *h >= 10 => expr_size_capped(value, 20_000) >= 1_300,
+            }) => false,
+            Some(ConstantInfo::Def { .. }) => true,
             _ => false,
         }
-    }
-
-    /// True if `n` is circuit-like or a small wrapper whose body mentions
-    /// a circuit-like Regular within two Def levels (`denote` → `denote.go`
-    /// → `denote.go._unary`).
-    fn def_leads_to_circuit(&self, n: u32) -> bool {
-        if self.def_is_circuit_like(n) {
-            return true;
-        }
-        let Some(ConstantInfo::Def { value, .. }) = self.env.get(n) else {
-            return false;
-        };
-        let mut nested = Vec::new();
-        self.collect_def_consts(value, &mut nested);
-        for m in nested.iter().take(32) {
-            if self.def_is_circuit_like(*m) {
-                return true;
-            }
-            let Some(ConstantInfo::Def { value: v2, .. }) = self.env.get(*m) else {
-                continue;
-            };
-            let mut nested2 = Vec::new();
-            self.collect_def_consts(v2, &mut nested2);
-            if nested2.iter().take(16).any(|k| self.def_is_circuit_like(*k)) {
-                return true;
-            }
-        }
-        false
     }
 
     fn def_body_under(&self, n: u32, cap: u32) -> bool {
@@ -2867,7 +3067,18 @@ impl<'e> Checker<'e> {
             && std::env::var_os("KIOTA_NO_THEOREM_DELTA").is_none()
             && crate::stats::theorem_delta_in_scope()
             && self.delta_body_is_small(n);
-        matches!(self.env.get(n), Some(ConstantInfo::Def { .. })) || is_thm
+        // Lean `is_delta` = `has_value`. WHNF unfolds Abbrev and Regular
+        // (`eager_whnf_unfolds`). Lazy delta still unfolds theorems that
+        // pass the small-body cut so `Bind.bind inst.1` can reach
+        // `StateT.bind` / `match_1`.
+        let is_def = matches!(
+            self.env.get(n),
+            Some(ConstantInfo::Def {
+                hints: ReducibilityHints::Abbrev | ReducibilityHints::Regular(_),
+                ..
+            })
+        );
+        is_def || is_thm
     }
 
     // ---------------- Definitional equality ----------------
@@ -2878,16 +3089,16 @@ impl<'e> Checker<'e> {
             d.set(n);
             n
         });
-        if depth > 2048 {
+        if depth > CONV_DEPTH {
             DEFEQ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-            if depth == 2049 && std::env::var_os("KIOTA_DEBUG").is_some() {
+            if depth == CONV_DEPTH + 1 && std::env::var_os("KIOTA_DEBUG").is_some() {
                 eprintln!(
                     "DEFEQ_DEPTH a={} b={}",
                     self.pp_budget(a, 50),
                     self.pp_budget(b, 50)
                 );
             }
-            return Ok(false);
+            return decline("defeq depth limit");
         }
         let r = self.is_def_eq_inner(ctx, a, b);
         DEFEQ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
@@ -2914,21 +3125,20 @@ impl<'e> Checker<'e> {
         }
         let (ka, kb) = (Self::ptr_key(a), Self::ptr_key(b));
         let (min_k, max_k) = if ka <= kb { (ka, kb) } else { (kb, ka) };
-        // Closed pairs are independent of the telescope; sharing `ctx.id`
-        // across binders is what made `._unary` Check re-compare the same
-        // 34k-node DAG under every PSigma/Acc motive context.
-        let ctx_key = if expr::is_closed(a) && expr::is_closed(b) {
-            0
-        } else {
-            ctx.id
-        };
-        // BVar defeq depends on the local telescope (`HetT.ext`: x.small vs
-        // y.small are distinct bvars that become PI-equal only after
-        // `Property` is unified). A ctx-free cache poisoned those pairs.
-        // Closed pairs use ctx_key 0 (see above).
+        // Closed pairs → 0. Open → k innermost binders (`pair_ctx_key`).
+        let ctx_key = ctx.pair_ctx_key(a, b);
         let key = (ctx_key, min_k, max_k);
         if let Some(&r) = self.defeq_cache.borrow().get(&key) {
             return Ok(r);
+        }
+        // Proof irrelevance before app congruence. Typeclass instances are
+        // proofs of a Prop (the class). Pairwise of `LawfulVecOperator.mk`
+        // (7 args, nested ~15 deep) is a tree walk; PI compares the inferred
+        // class types instead. Acc `f 1 a` vs `f 1 (Acc.intro …)` is Bool,
+        // so PI is false there and unreduced congruence still runs.
+        if self.proofs_of_same_prop(ctx, a, b)? {
+            self.defeq_cache.borrow_mut().insert(key, true);
+            return Ok(true);
         }
         if self.try_unreduced_const_congruence(ctx, a, b)? {
             self.defeq_cache.borrow_mut().insert(key, true);
@@ -2936,6 +3146,25 @@ impl<'e> Checker<'e> {
         }
         let aw = self.whnf_for_defeq(ctx, a)?;
         let bw = self.whnf_for_defeq(ctx, b)?;
+        if std::env::var_os("KIOTA_TRACE_EQ").is_some() {
+            let ha = expr::unfold_apps(a).0;
+            if let ExprData::Const(n, _) = &**ha {
+                let nm = self.name_str(*n);
+                if nm.contains("casesOn") || nm.ends_with(".rec") || nm.contains("match_1") {
+                    let hb = expr::unfold_apps(&aw).0;
+                    let hbn = match &**hb {
+                        ExprData::Const(m, _) => self.name_str(*m).to_string(),
+                        ExprData::Lam(_, _, _) => "lam".into(),
+                        ExprData::Let(_, _, _) => "let".into(),
+                        ExprData::BVar(i) => format!("#{i}"),
+                        ExprData::Proj(s, i, _) => format!("proj {}.{}", self.name_str(*s), i),
+                        ExprData::Pi(_, _, _) => "pi".into(),
+                        _ => format!("{hb:?}"),
+                    };
+                    eprintln!("WHNFHEAD {nm} -> {hbn}");
+                }
+            }
+        }
         if std::env::var_os("KIOTA_TRACE_LINEAR").is_some() {
             let pa = self.pp_budget(a, 24);
             let pb = self.pp_budget(b, 24);
@@ -2955,7 +3184,13 @@ impl<'e> Checker<'e> {
             return Ok(r);
         }
         let r = self.is_def_eq_core(ctx, &aw, &bw)?;
-        self.defeq_cache.borrow_mut().insert(key, r);
+        // CONV_DEPTH / CORE_DEPTH abort as Decline, not Ok(false), so a stored
+        // false is a completed answer. True-only left std `#18000` retrying the
+        // same failing pair — 1e9 intern hits, intern size unchanged.
+        // Do not cache a result produced under a CORE_DEPTH stuck WHNF.
+        if !CORE_ABORTED.with(|a| a.get()) {
+            self.defeq_cache.borrow_mut().insert(key, r);
+        }
         Ok(r)
     }
 
@@ -3035,6 +3270,12 @@ impl<'e> Checker<'e> {
         }
         // Structural match without delta.
         match (&***a, &***b) {
+            (ExprData::Let(_, v, body), _) => {
+                return self.is_def_eq(ctx, &expr::instantiate1(body, v), b);
+            }
+            (_, ExprData::Let(_, v, body)) => {
+                return self.is_def_eq(ctx, a, &expr::instantiate1(body, v));
+            }
             (ExprData::Sort(l1), ExprData::Sort(l2)) => return Ok(level::is_def_eq(l1, l2)),
             (ExprData::BVar(i), ExprData::BVar(j)) if i == j => return Ok(true),
             (ExprData::Lit(x), ExprData::Lit(y)) => return Ok(x == y),
@@ -3047,79 +3288,22 @@ impl<'e> Checker<'e> {
                     ctx.clone()
                 };
                 ctx2.push(t1.clone());
-                return self.is_def_eq(&ctx2, b1, b2);
+                return self.with_fresh_app_cong(|| self.is_def_eq(&ctx2, b1, b2));
             }
             (ExprData::Lam(_, t1, b1), ExprData::Lam(_, t2, b2)) => {
-                let _ = self.is_def_eq(ctx, t1, t2)?; // domains needn't match strictly if only used for eta-shape; keep permissive
+                if !self.is_def_eq(ctx, t1, t2)? {
+                    return Ok(false);
+                }
                 let mut ctx2 = {
                     crate::stats::ctx_clone();
                     ctx.clone()
                 };
                 ctx2.push(t1.clone());
-                return self.is_def_eq(&ctx2, b1, b2);
+                return self.with_fresh_app_cong(|| self.is_def_eq(&ctx2, b1, b2));
             }
             (ExprData::App(_, _), ExprData::App(_, _)) => {
-                let (h1, a1) = expr::unfold_apps(a);
-                let (h2, a2) = expr::unfold_apps(b);
-                if let (ExprData::Const(n1, u1), ExprData::Const(n2, u2)) = (&**h1, &**h2) {
-                    if n1 == n2
-                        && a1.len() == a2.len()
-                        && u1.len() == u2.len()
-                        && u1
-                            .iter()
-                            .zip(u2.iter())
-                            .all(|(x, y)| level::is_def_eq(x, y))
-                    {
-                        let ok = if self.const_has_proof_arg(*n1) {
-                            match self.infer_const(*n1, u1) {
-                                Ok(fn_ty) => self.defeq_args(ctx, &fn_ty, &a1, &a2)?,
-                                Err(_) => self.pairwise_args(ctx, &a1, &a2)?,
-                            }
-                        } else {
-                            self.pairwise_args(ctx, &a1, &a2)?
-                        };
-                        if ok {
-                            return Ok(true);
-                        }
-                    }
-                } else if a1.len() == a2.len() {
-                    // Congruence under any shared head, not just a bound
-                    // variable or a Const. Restricting this to BVar left
-                    // `f x` and `f y` uncomparable whenever `f` was, say, a
-                    // projection: the Const arm does not apply, and the delta
-                    // path below cannot fire because neither head is a Const.
-                    // Init hits this at Std.Iterator.step, where the shared
-                    // head is `Std.Internal.idOpaque ….0[Subtype]`.
-                    //
-                    // Pointer-equal heads are the common case; when they
-                    // differ but are *definitionally* equal we must still
-                    // compare, otherwise a pair like
-                    //   `(Nat.rec … #1).0[PProd] #2` vs
-                    //   `(Nat.rec … (#1+0)).0[PProd] #2`
-                    // dies at the delta path's `(None, None)` dead end
-                    // (neither spine head is a Const). Two Const heads are
-                    // left to the delta path, which handles unfolding.
-                    let head_eq = Rc::ptr_eq(&h1, &h2)
-                        || (!matches!(&**h1, ExprData::Const(..))
-                            && !matches!(&**h2, ExprData::Const(..))
-                            && self.is_def_eq(ctx, &h1, &h2)?);
-                    if head_eq {
-                        let ok = if let ExprData::Const(n, us) = &**h1 {
-                            if self.const_has_proof_arg(*n) {
-                                match self.infer_const(*n, us) {
-                                    Ok(fn_ty) => self.defeq_args(ctx, &fn_ty, &a1, &a2)?,
-                                    Err(_) => self.pairwise_args(ctx, &a1, &a2)?,
-                                }
-                            } else {
-                                self.pairwise_args(ctx, &a1, &a2)?
-                            }
-                        } else {
-                            self.pairwise_args(ctx, &a1, &a2)?
-                        };
-                        if ok {
-                            return Ok(true);
-                        }
-                    }
+                if self.app_spines_congruent(ctx, a, b)? {
+                    return Ok(true);
                 }
             }
             (ExprData::Proj(s1, i1, v1), ExprData::Proj(s2, i2, v2)) => {
@@ -3165,7 +3349,7 @@ impl<'e> Checker<'e> {
                 } else {
                     unreachable!()
                 };
-                return self.is_def_eq(&ctx2, &a_body, &b_app);
+                return self.with_fresh_app_cong(|| self.is_def_eq(&ctx2, &a_body, &b_app));
             }
         }
         if let (_, ExprData::Lam(_, t2, _)) = (&***a, &***b) {
@@ -3181,7 +3365,7 @@ impl<'e> Checker<'e> {
                 } else {
                     unreachable!()
                 };
-                return self.is_def_eq(&ctx2, &a_app, &b_body);
+                return self.with_fresh_app_cong(|| self.is_def_eq(&ctx2, &a_app, &b_body));
             }
         }
 
@@ -3228,10 +3412,7 @@ impl<'e> Checker<'e> {
         }
         let delta_res = match (n1, n2) {
             (Some(x), Some(y)) if x == y => {
-                // Args already failed congruence. Unfolding the *same* body
-                // only helps unused parameters; huge same-head `eq_def` /
-                // `_mutual` / `bitblast.go` must not be instantiated.
-                if self.is_delta_reducible(x) && self.delta_body_is_small(x) {
+                if self.is_delta_reducible(x) {
                     let ua = self.whnf_core(ctx, &self.delta_step(a)?)?;
                     let ub = self.whnf_core(ctx, &self.delta_step(b)?)?;
                     self.is_def_eq_core(ctx, &ua, &ub)
@@ -3242,8 +3423,8 @@ impl<'e> Checker<'e> {
             (Some(x), Some(y)) => {
                 let hx = self.def_height(x);
                 let hy = self.def_height(y);
-                let rx = self.is_delta_reducible(x) && self.eager_whnf_unfolds(x);
-                let ry = self.is_delta_reducible(y) && self.eager_whnf_unfolds(y);
+                let rx = self.is_delta_reducible(x);
+                let ry = self.is_delta_reducible(y);
                 if rx && (hx >= hy || !ry) {
                     let ua = self.whnf_core(ctx, &self.delta_step(a)?)?;
                     self.is_def_eq_core(ctx, &ua, b)
@@ -3254,15 +3435,11 @@ impl<'e> Checker<'e> {
                     Ok(false)
                 }
             }
-            (Some(x), None)
-                if self.is_delta_reducible(x) && self.eager_whnf_unfolds(x) =>
-            {
+            (Some(x), None) if self.is_delta_reducible(x) => {
                 let ua = self.whnf_core(ctx, &self.delta_step(a)?)?;
                 self.is_def_eq_core(ctx, &ua, b)
             }
-            (None, Some(y))
-                if self.is_delta_reducible(y) && self.eager_whnf_unfolds(y) =>
-            {
+            (None, Some(y)) if self.is_delta_reducible(y) => {
                 let ub = self.whnf_core(ctx, &self.delta_step(b)?)?;
                 self.is_def_eq_core(ctx, a, &ub)
             }
@@ -3347,13 +3524,6 @@ impl<'e> Checker<'e> {
         Ok(Some(true))
     }
 
-    /// Cap one consecutive `Nat.rec` countdown of a `bits() >= 20` literal.
-    /// `Poly.cancelAux hugeFuel` (`1e6`) as a million-step countdown is the
-    /// `#3256` hang. A global-per-decl budget of 2048 false-rejects grind
-    /// `_proof_1_1` (`simp_cert` stuck vs `eagerReduce` true): that proof
-    /// does ~26382 hugeFuel peels as many short O(|poly|) countdowns.
-    const FUEL_NAT_LIT_PEEL_MAX: u32 = 2048;
-
     fn try_iota(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
         let (rname, us) = match &***head {
             ExprData::Const(n, us) => (*n, us.clone()),
@@ -3404,6 +3574,14 @@ impl<'e> Checker<'e> {
         let major_w = self.whnf_major(ctx, major, rname)?;
         let (mhead, margs) = expr::unfold_apps(&major_w);
 
+        if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
+            eprintln!(
+                "IOTA rec={} major={} mhead={}",
+                self.name_str(rname),
+                self.pp_budget(major, 8),
+                self.pp_budget(&mhead, 6)
+            );
+        }
         let ctor = match &**mhead {
             ExprData::Const(cname, _) => match self.env.get(*cname) {
                 Some(ConstantInfo::Constructor {
@@ -3424,28 +3602,13 @@ impl<'e> Checker<'e> {
                     if nat_induct.map(|ind| all.contains(&ind)).unwrap_or(false) || rec_owns_ctor(zero) {
                         if n == &num_bigint::BigUint::from(0u32) {
                             Some((zero, 0, vec![]))
-                        } else if n.bits() > 24 {
-                            // `UInt32.toNat_shiftLeft` peels `2^32` (33 bits).
-                            None
-                        } else if n.bits() >= 20 {
-                            // Count consecutive peels of one literal
-                            // (`n`, `n-1`, …). Do not cap 16–19 bit peels:
-                            // `assemble₂._proof_2` needs those.
-                            let consecutive = match self.fuel_nat_last.borrow().as_ref() {
-                                Some(prev) if *prev == n + 1u32 => {
-                                    self.fuel_nat_peels.get() + 1
-                                }
-                                _ => 1,
-                            };
-                            if consecutive > Self::FUEL_NAT_LIT_PEEL_MAX {
-                                None
-                            } else {
-                                self.fuel_nat_peels.set(consecutive);
-                                *self.fuel_nat_last.borrow_mut() = Some(n.clone());
-                                let pred = n - 1u32;
-                                Some((succ, 0, vec![expr::lit_nat(pred)]))
-                            }
+                        } else if n.bits() > 256 {
+                            // Lean `LEAN_NAT_MAX_SIZE`-style byte cap, not a
+                            // bits∈[20,24] fingerprint of hugeFuel vs 2^32.
+                            return decline("Nat literal exceeds byte cap");
                         } else {
+                            // One succ peel per iota (C++ natLit). WHNF-core
+                            // may continue; uniform WHNF_DEPTH declines.
                             let pred = n - 1u32;
                             Some((succ, 0, vec![expr::lit_nat(pred)]))
                         }
@@ -3461,7 +3624,17 @@ impl<'e> Checker<'e> {
 
         let (cname, cnp, ctor_args) = if let Some(x) = ctor {
             x
-        } else if let Some(x) = self.to_ctor_when_structure(ctx, &all, params, major)? {
+        } else if let Some(x) = self.to_ctor_when_structure(ctx, &all, params, &major_w)? {
+            if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
+                eprintln!(
+                    "IOTA expand rec={} major={} → ctor {} nparams={} nfields={}",
+                    self.name_str(rname),
+                    self.pp_budget(&major_w, 8),
+                    self.name_str(x.0),
+                    x.1,
+                    x.2.len()
+                );
+            }
             x
         } else if k_like {
             match self.k_like_ctor(ctx, &all, params, major)? {
@@ -3837,9 +4010,15 @@ impl<'e> Checker<'e> {
             fapp = expr::app(fapp, expr::bvar(i as u32));
         }
         rec_app = expr::app(rec_app, fapp);
-        for (i, bty) in binders.iter().enumerate().rev() {
-            let shifted = expr::shift(bty, i as i32, 0);
-            rec_app = expr::lam(crate::expr::BinderInfo::Default, shifted, rec_app);
+        // Binder types were captured while walking the telescope: binders[0]
+        // at the original depth, binders[k] under the previous k binders
+        // (so the immediately-outer variable is already `#0`). Wrapping
+        // inside-out must not shift by `i` — that turned Acc.intro's
+        // `∀ y, r y x → Acc r y` into `λ y. λ h : r #1 x. …` (`y` as `#1`
+        // instead of `#0`), and `WellFounded.fixF_eq` then failed to convert
+        // the iota rec-call with `fun y p => fixF F y (Acc.inv … p)`.
+        for bty in binders.iter().rev() {
+            rec_app = expr::lam(crate::expr::BinderInfo::Default, bty.clone(), rec_app);
         }
         Ok(Some(rec_app))
     }
@@ -6330,16 +6509,27 @@ impl<'e> Checker<'e> {
 
     /// Closed `Int` numerals only. Open terms (e.g. `0 - n`) stay untouched
     /// so lemmas like `Int.zero_sub` still see a `sub`.
-    fn closed_int_value(&self, ctx: &Ctx, e: &Expr) -> R<Option<BigInt>> {
-        if let ExprData::Lit(Lit::Nat(n)) = &***e {
-            return Ok(Some(BigInt::from(n.clone())));
+    fn type_head_is_int(&self, e: &Expr) -> bool {
+        let (h, _) = expr::unfold_apps(e);
+        match &**h {
+            ExprData::Const(n, _) => {
+                let s = self.name_str(*n);
+                s == "Int" || s.ends_with(".Int")
+            }
+            _ => false,
         }
+    }
+
+    fn closed_int_value(&self, ctx: &Ctx, e: &Expr) -> R<Option<BigInt>> {
         let (h, args) = expr::unfold_apps(e);
         let name = match &**h {
             ExprData::Const(n, _) => self.name_str(*n),
             _ => return Ok(None),
         };
         if name == "OfNat.ofNat" && args.len() >= 2 {
+            if !self.type_head_is_int(&args[0]) {
+                return Ok(None);
+            }
             if let Some(n) = self.closed_nat_value(ctx, &args[1])? {
                 return Ok(Some(BigInt::from(n)));
             }
@@ -7226,6 +7416,81 @@ mod tests {
     }
 
     #[test]
+    fn suffix_ctx_key_uses_innermost_k_binders() {
+        let a = ctx_of(&[1, 2, 3]);
+        let b = ctx_of(&[9, 2, 3]);
+        assert_ne!(a.id, b.id, "full telescopes differ at the outer binder");
+        let e = expr::bvar(0);
+        assert_eq!(
+            a.term_ctx_key(&e),
+            b.term_ctx_key(&e),
+            "loose=1 keys on the innermost binder only"
+        );
+        let e1 = expr::app(expr::bvar(1), expr::bvar(0));
+        assert_eq!(
+            a.term_ctx_key(&e1),
+            b.term_ctx_key(&e1),
+            "loose=2 keys on the two innermost binders"
+        );
+        let e2 = expr::bvar(2);
+        assert_ne!(
+            a.term_ctx_key(&e2),
+            b.term_ctx_key(&e2),
+            "loose=3 sees the outer binder"
+        );
+        assert_eq!(a.term_ctx_key(&ty(0)), 0, "closed terms keep ctx_key 0");
+    }
+
+    /// `#18041` AIG `BinaryInput.mk` only mentions `aig`/`input` (high bvars).
+    /// Extra innermost binders from `Decidable.rec` must not split the defeq
+    /// pair cache — that walked intern-distinct copies as a tree.
+    #[test]
+    fn ctx_key_uses_actual_bvar_types_not_unused_inner() {
+        let a = ctx_of(&[1, 2, 3]);
+        let b = ctx_of(&[1, 9, 3]);
+        assert_ne!(a.id, b.id, "middle binder differs");
+        let e = expr::bvar(2);
+        assert_eq!(
+            a.term_ctx_key(&e),
+            b.term_ctx_key(&e),
+            "bvar 2 keys on that binder's type only, not unused inner binders"
+        );
+        let mk = expr::app(expr::app(ty(5), expr::bvar(2)), expr::bvar(2));
+        assert_eq!(
+            a.pair_ctx_key(&mk, &mk),
+            b.pair_ctx_key(&mk, &mk),
+            "structure-ctor apps that only mention bvar 2 share a pair key"
+        );
+        assert_ne!(
+            a.term_ctx_key(&expr::bvar(1)),
+            b.term_ctx_key(&expr::bvar(1)),
+            "a term that uses the middle binder still sees the difference"
+        );
+    }
+
+    /// Open binder types (`Vec #0`) still share a suffix key. Falling back to
+    /// the full `ctx.id` re-Checks a 34k-DAG well-founded proof once per extra
+    /// PSigma/Acc motive (`._unary` / `blastAdd.go_denote_eq`).
+    #[test]
+    fn suffix_ctx_key_shares_open_innermost_binder() {
+        let vec0 = expr::app(ty(99), expr::bvar(0));
+        assert!(expr::loose_bvar_range(&vec0) > 0);
+        let mut a = Ctx::new();
+        a.push(ty(1));
+        a.push(vec0.clone());
+        let mut b = Ctx::new();
+        b.push(ty(2));
+        b.push(vec0);
+        let e = expr::bvar(0);
+        assert_eq!(
+            a.term_ctx_key(&e),
+            b.term_ctx_key(&e),
+            "loose=1 keys on the raw innermost type, even when that type mentions the parent"
+        );
+        assert_ne!(a.id, b.id);
+    }
+
+    #[test]
     fn ctx_id_tracks_every_push() {
         let mut c = Ctx::new();
         let mut seen = vec![c.id];
@@ -7284,11 +7549,10 @@ mod tests {
         e
     }
 
-    /// Eager delta is size/hint, not a library name. A Regular body at the
-    /// size cap stays folded; an abbrev still unfolds. Names are unrelated
-    /// to AIG / LawfulOperator / BVDecide.
+    /// Eager WHNF unfolds every non-opaque Def (`has_value`). Size/name
+    /// are not skip gates. Names are unrelated to AIG / LawfulOperator.
     #[test]
-    fn large_regular_def_is_not_eagerly_deltaed() {
+    fn large_regular_def_unfolds_in_whnf() {
         use crate::env::{ConstantInfo, Environment, ReducibilityHints};
         let mut env = Environment::default();
         let sort0 = expr::sort(level::zero());
@@ -7318,7 +7582,7 @@ mod tests {
             ConstantInfo::Def {
                 level_params: vec![],
                 typ: sort0.clone(),
-                value: large_body,
+                value: large_body.clone(),
                 hints: ReducibilityHints::Regular(1),
                 is_unsafe: false,
             },
@@ -7365,62 +7629,64 @@ mod tests {
         let w_small = tc.whnf(&ctx, &expr::const_(1, vec![])).unwrap();
         assert!(
             Rc::ptr_eq(&w_small, &small_body),
-            "small/abbrev def still unfolds"
+            "abbrev still unfolds in WHNF"
         );
         let w_large = tc.whnf(&ctx, &expr::const_(2, vec![])).unwrap();
-        match &**w_large {
-            ExprData::Const(n, _) => {
-                assert_eq!(*n, 2, "circuit-sized Regular stays folded")
-            }
-            other => panic!("large Regular was eagerly delta'd: {other:?}"),
-        }
+        assert!(
+            Rc::ptr_eq(&w_large, &large_body),
+            "large Regular unfolds in WHNF (has_value); size is not a skip"
+        );
+    }
 
-        // Multi-arg Prop structure instance: stay folded. Equation lemma: unfold.
-        tc.checking_prop_structure.set(true);
-        tc.whnf_cache.borrow_mut().clear();
-        let w = tc.whnf(&ctx, &expr::const_(3, vec![])).unwrap();
-        assert!(
-            matches!(&**w, ExprData::Const(3, _)),
-            "Prop-structure instance does not instantiate a much larger Regular"
+    /// Related-def / Eq-head tables are not a WHNF gate. A Regular ≥ 4096
+    /// unfolds in WHNF (`is_delta` = has_value) with empty tables.
+    #[test]
+    fn large_regular_converts_without_eq_head_table() {
+        use crate::env::{ConstantInfo, Environment, ReducibilityHints};
+        let mut env = Environment::default();
+        let sort0 = expr::sort(level::zero());
+        let dummy = expr::const_(0, vec![]);
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort0.clone(),
+                is_unsafe: false,
+            },
         );
-        tc.checking_prop_structure.set(false);
-        tc.decl_value_size.set(7_000);
-        tc.whnf_cache.borrow_mut().clear();
-        let w = tc.whnf(&ctx, &expr::const_(3, vec![])).unwrap();
+        let body = bush(dummy.clone(), 13);
         assert!(
-            matches!(&**w, ExprData::Const(3, _)),
-            "mid-size denote proofs keep ~8k Regulars folded"
+            expr_size_capped(&body, 10_000) >= 4_096,
+            "body must exceed the WHNF Regular size band"
         );
-
-        tc.decl_value_size.set(20_000);
-        tc.whnf_cache.borrow_mut().clear();
-        let w = tc.whnf(&ctx, &expr::const_(3, vec![])).unwrap();
+        env.insert(
+            1,
+            ConstantInfo::Def {
+                level_params: vec![],
+                typ: sort0,
+                value: body.clone(),
+                hints: ReducibilityHints::Regular(1),
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["Dummy", "bigReg"]);
+        let tc = Checker::new(&env, &names, None, None);
         assert!(
-            !matches!(&**w, ExprData::Const(3, _)),
-            "proofs ≥10k unfold ~8k Regulars (searcher / match helpers)"
+            tc.eq_arg_heads.borrow().is_empty() && tc.eq_related_defs.borrow().is_empty(),
+            "no theorem Eq-head table on a fresh checker"
         );
-        tc.decl_value_size.set(60_000);
-        tc.whnf_cache.borrow_mut().clear();
-        let w = tc.whnf(&ctx, &expr::const_(3, vec![])).unwrap();
         assert!(
-            !matches!(&**w, ExprData::Const(3, _)),
-            "huge non-Eq proofs unfold ~8k Regulars (searcher helpers)"
+            tc.eager_whnf_unfolds(1),
+            "has_value Regular unfolds regardless of Eq-head tables"
         );
-
-        tc.decl_value_size.set(5_000);
-        tc.whnf_cache.borrow_mut().clear();
-        let w = tc.whnf(&ctx, &expr::const_(4, vec![])).unwrap();
         assert!(
-            matches!(&**w, ExprData::Const(4, _)),
-            "small decl does not instantiate a 32k Regular"
+            tc.is_delta_reducible(1),
+            "lazy delta still has_value for the large Regular"
         );
-        tc.decl_value_size.set(20_000);
-        tc.whnf_cache.borrow_mut().clear();
-        let w = tc.whnf(&ctx, &expr::const_(4, vec![])).unwrap();
-        assert!(
-            matches!(&**w, ExprData::Const(4, _)),
-            "large denote-style proofs still keep 32k Regulars folded"
-        );
+        let eq = tc
+            .is_def_eq(&Ctx::new(), &expr::const_(1, vec![]), &body)
+            .unwrap_or(false);
+        assert!(eq, "large Regular converts without related-def / Eq-heads");
     }
 
     #[test]
@@ -7547,5 +7813,1365 @@ mod tests {
             ),
             other => panic!("large ill-typed theorem must reject, got {other:?}"),
         }
+    }
+
+    fn test_names(ss: &[&str]) -> Vec<std::rc::Rc<String>> {
+        ss.iter().map(|s| std::rc::Rc::new((*s).into())).collect()
+    }
+
+    /// `False` / `True` as inductives (not axioms). `True.intro` is a ctor.
+    fn insert_false_true(env: &mut Environment) {
+        let sort0 = expr::sort(level::zero());
+        env.insert(
+            0,
+            ConstantInfo::InductiveType {
+                level_params: vec![],
+                typ: sort0.clone(),
+                num_params: 0,
+                num_indices: 0,
+                all: vec![0],
+                ctors: vec![],
+                is_rec: false,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            1,
+            ConstantInfo::InductiveType {
+                level_params: vec![],
+                typ: sort0.clone(),
+                num_params: 0,
+                num_indices: 0,
+                all: vec![1],
+                ctors: vec![2],
+                is_rec: false,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            2,
+            ConstantInfo::Constructor {
+                level_params: vec![],
+                typ: expr::const_(1, vec![]),
+                induct: 1,
+                cidx: 0,
+                num_params: 0,
+                num_fields: 0,
+                is_unsafe: false,
+            },
+        );
+    }
+
+    fn assert_app_mismatch(r: R<()>) {
+        match r {
+            Err(TcError::Reject(msg)) => assert!(
+                msg.contains("application argument type mismatch"),
+                "expected app-arg reject, got {msg}"
+            ),
+            other => panic!("ill-typed theorem must reject, got {other:?}"),
+        }
+    }
+
+    /// `idT (False.elim True.intro)` with True/False inductives. InferOnly on
+    /// the Prop binder of `idT` currently skips Check of the inner app.
+    #[test]
+    fn idt_false_elim_true_intro_rejects() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        insert_false_true(&mut env);
+        let false_ty = expr::const_(0, vec![]);
+        let true_ty = expr::const_(1, vec![]);
+        env.insert(
+            3,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::pi(expr::BinderInfo::Default, false_ty, true_ty.clone()),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            4,
+            ConstantInfo::Def {
+                level_params: vec![],
+                typ: expr::pi(
+                    expr::BinderInfo::Default,
+                    true_ty.clone(),
+                    true_ty.clone(),
+                ),
+                value: expr::lam(expr::BinderInfo::Default, true_ty.clone(), expr::bvar(0)),
+                hints: crate::env::ReducibilityHints::Abbrev,
+                is_unsafe: false,
+            },
+        );
+        let junk = expr::app(expr::const_(3, vec![]), expr::const_(2, vec![]));
+        env.insert(
+            5,
+            ConstantInfo::Theorem {
+                level_params: vec![],
+                typ: true_ty,
+                value: expr::app(expr::const_(4, vec![]), junk),
+            },
+        );
+        let names = test_names(&["False", "True", "True.intro", "elim", "idT", "bad"]);
+        let tc = Checker::new(&env, &names, None, None);
+        assert_app_mismatch(tc.check_decl(5, "theorem"));
+    }
+
+    /// `Prop` is a universe, not a proposition. PI must not make `True ≡ False`.
+    #[test]
+    fn true_and_false_are_not_proof_irrelevant() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_false_true(&mut env);
+        let names = test_names(&["False", "True", "True.intro"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let eq = tc
+            .is_def_eq(&Ctx::new(), &expr::const_(1, vec![]), &expr::const_(0, vec![]))
+            .expect("defeq");
+        assert!(!eq, "True and False must not convert by PI of Prop");
+    }
+
+    /// Two `Cl.mk` spines with PI-equal but not pointer-equal `True` fields
+    /// must convert by proof irrelevance, not by walking 7-ary fields as a
+    /// tree. This is the std `#18000` `LawfulVecOperator.mk` shape.
+    #[test]
+    fn prop_ctor_apps_convert_by_pi_not_field_tree() {
+        use crate::env::{ConstantInfo, Environment, ReducibilityHints};
+        let mut env = Environment::default();
+        insert_false_true(&mut env);
+        let true_ty = expr::const_(1, vec![]);
+        let intro = expr::const_(2, vec![]);
+        env.insert(
+            3,
+            ConstantInfo::Def {
+                level_params: vec![],
+                typ: expr::pi(
+                    expr::BinderInfo::Default,
+                    true_ty.clone(),
+                    true_ty.clone(),
+                ),
+                value: expr::lam(expr::BinderInfo::Default, true_ty.clone(), expr::bvar(0)),
+                hints: ReducibilityHints::Abbrev,
+                is_unsafe: false,
+            },
+        );
+        let sort0 = expr::sort(level::zero());
+        env.insert(
+            4,
+            ConstantInfo::InductiveType {
+                level_params: vec![],
+                typ: sort0.clone(),
+                num_params: 0,
+                num_indices: 0,
+                all: vec![4],
+                ctors: vec![5],
+                is_rec: false,
+                is_unsafe: false,
+            },
+        );
+        let mut mk_ty = expr::const_(4, vec![]);
+        for _ in 0..7 {
+            mk_ty = expr::pi(expr::BinderInfo::Default, true_ty.clone(), mk_ty);
+        }
+        env.insert(
+            5,
+            ConstantInfo::Constructor {
+                level_params: vec![],
+                typ: mk_ty,
+                induct: 4,
+                cidx: 0,
+                num_params: 0,
+                num_fields: 7,
+                is_unsafe: false,
+            },
+        );
+        let id_intro = expr::app(expr::const_(3, vec![]), intro.clone());
+        let mk = expr::const_(5, vec![]);
+        let mut left = mk.clone();
+        let mut right = mk.clone();
+        for _ in 0..7 {
+            left = expr::app(left, intro.clone());
+            right = expr::app(right, id_intro.clone());
+        }
+        let names = test_names(&["False", "True", "True.intro", "idTrue", "Cl", "Cl.mk"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let ctx = Ctx::new();
+        let intern0 = crate::expr::intern_calls();
+        let ok = tc.is_def_eq(&ctx, &left, &right).expect("defeq");
+        let intern_delta = crate::expr::intern_calls() - intern0;
+        assert!(ok, "distinct True proofs of the same Cl must convert by PI");
+        assert!(
+            intern_delta < 50_000,
+            "PI must not tree-walk 7-ary mk fields: intern_calls +{intern_delta}"
+        );
+        // Nested mk spines: `#18000` is ~15 deep. Pairwise of 7-ary fields
+        // without Prop-ctor skip is exponential; PI/defeq_args must stay DAG.
+        let mut nest_l = left.clone();
+        let mut nest_r = right.clone();
+        for _ in 0..4 {
+            let mut l = mk.clone();
+            let mut r = mk.clone();
+            for i in 0..7 {
+                l = expr::app(l, if i == 0 { nest_l.clone() } else { intro.clone() });
+                r = expr::app(r, if i == 0 { nest_r.clone() } else { id_intro.clone() });
+            }
+            nest_l = l;
+            nest_r = r;
+        }
+        let intern1 = crate::expr::intern_calls();
+        let ok = tc.is_def_eq(&ctx, &nest_l, &nest_r).expect("nested defeq");
+        let nested_delta = crate::expr::intern_calls() - intern1;
+        assert!(ok, "nested Cl.mk spines must convert by Prop-ctor skip / PI");
+        assert!(
+            nested_delta < 50_000,
+            "nested Prop-ctor spines must not tree-walk: intern_calls +{nested_delta}"
+        );
+    }
+
+    /// std `#18000` instances are *large Regular defs* of a class (Prop).
+    /// `obviously_not_proof` must not treat a size-capped Regular as data:
+    /// PI uses the declared type, and the WHNFs (`True.intro` vs opaque `idT`
+    /// of it) do not convert without PI.
+    #[test]
+    fn large_prop_regulars_convert_by_pi() {
+        use crate::env::{ConstantInfo, Environment, ReducibilityHints};
+        let mut env = Environment::default();
+        insert_false_true(&mut env);
+        let true_ty = expr::const_(1, vec![]);
+        let intro = expr::const_(2, vec![]);
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            3,
+            ConstantInfo::Def {
+                level_params: vec![],
+                typ: expr::pi(
+                    expr::BinderInfo::Default,
+                    true_ty.clone(),
+                    true_ty.clone(),
+                ),
+                value: expr::lam(expr::BinderInfo::Default, true_ty.clone(), expr::bvar(0)),
+                hints: ReducibilityHints::Opaque,
+                is_unsafe: false,
+            },
+        );
+        let pad = bush(true_ty.clone(), 13);
+        assert!(
+            expr_size_capped(&pad, 10_000) >= 4_096,
+            "pad must exceed the WHNF Regular cap"
+        );
+        env.insert(
+            4,
+            ConstantInfo::Def {
+                level_params: vec![],
+                typ: true_ty.clone(),
+                value: expr::let_(sort1.clone(), pad.clone(), intro.clone()),
+                hints: ReducibilityHints::Regular(2),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            5,
+            ConstantInfo::Def {
+                level_params: vec![],
+                typ: true_ty,
+                value: expr::let_(
+                    sort1,
+                    pad,
+                    expr::app(expr::const_(3, vec![]), intro),
+                ),
+                hints: ReducibilityHints::Regular(2),
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["False", "True", "True.intro", "idT", "pA", "pB"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let ctx = Ctx::new();
+        let intern0 = crate::expr::intern_calls();
+        let ok = tc
+            .is_def_eq(&ctx, &expr::const_(4, vec![]), &expr::const_(5, vec![]))
+            .expect("defeq");
+        let intern_delta = crate::expr::intern_calls() - intern0;
+        assert!(
+            ok,
+            "True.intro vs opaque idT True.intro, both large Regulars, must PI"
+        );
+        assert!(
+            intern_delta < 50_000,
+            "PI must not unfold the padded bodies: intern_calls +{intern_delta}"
+        );
+    }
+
+    /// `#18041` instances are *lambdas* (`fun α => Mk …`). `True → True` is a
+    /// Prop; Lean PI identifies `fun _ => intro` with `fun x => x`. Treating
+    /// every Lam as `obviously_not_proof` forced lam-congruence of nested
+    /// class-instance bodies (7^depth).
+    #[test]
+    fn lam_proofs_of_pi_prop_convert_by_pi() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_false_true(&mut env);
+        let true_ty = expr::const_(1, vec![]);
+        let intro = expr::const_(2, vec![]);
+        let names = test_names(&["False", "True", "True.intro"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let const_intro = expr::lam(expr::BinderInfo::Default, true_ty.clone(), intro);
+        let identity = expr::lam(expr::BinderInfo::Default, true_ty, expr::bvar(0));
+        let intern0 = crate::expr::intern_calls();
+        let ok = tc
+            .is_def_eq(&Ctx::new(), &const_intro, &identity)
+            .expect("defeq");
+        let intern_delta = crate::expr::intern_calls() - intern0;
+        assert!(
+            ok,
+            "fun _ => True.intro and fun x => x must PI as proofs of True → True"
+        );
+        assert!(
+            intern_delta < 50_000,
+            "PI must not lam-walk bodies: intern_calls +{intern_delta}"
+        );
+    }
+
+    /// `idP (elimP True.intro)`: binder is `Sort 0`, which `binder_is_prop`
+    /// treats as Prop. InferOnly never sees `True.intro` vs `False`.
+    #[test]
+    fn idp_elimp_true_intro_sort0_rejects() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        insert_false_true(&mut env);
+        let false_ty = expr::const_(0, vec![]);
+        let true_ty = expr::const_(1, vec![]);
+        let sort0 = expr::sort(level::zero());
+        env.insert(
+            3,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::pi(expr::BinderInfo::Default, false_ty, sort0.clone()),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            4,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::pi(expr::BinderInfo::Default, sort0, true_ty.clone()),
+                is_unsafe: false,
+            },
+        );
+        let junk = expr::app(expr::const_(3, vec![]), expr::const_(2, vec![]));
+        env.insert(
+            5,
+            ConstantInfo::Theorem {
+                level_params: vec![],
+                typ: true_ty,
+                value: expr::app(expr::const_(4, vec![]), junk),
+            },
+        );
+        let names = test_names(&["False", "True", "True.intro", "elimP", "idP", "bad"]);
+        let tc = Checker::new(&env, &names, None, None);
+        assert_app_mismatch(tc.check_decl(5, "theorem"));
+    }
+
+    /// `And.intro True.intro (False.elim True.intro)`. `And.intro` is a ctor,
+    /// not a recursor, so InferOnly applies to both proof fields.
+    #[test]
+    fn and_intro_false_elim_rejects() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        insert_false_true(&mut env);
+        let sort0 = expr::sort(level::zero());
+        // And : Prop → Prop → Prop
+        let and_ty = expr::pi(
+            expr::BinderInfo::Default,
+            sort0.clone(),
+            expr::pi(expr::BinderInfo::Default, sort0.clone(), sort0.clone()),
+        );
+        env.insert(
+            3,
+            ConstantInfo::InductiveType {
+                level_params: vec![],
+                typ: and_ty,
+                num_params: 2,
+                num_indices: 0,
+                all: vec![3],
+                ctors: vec![4],
+                is_rec: false,
+                is_unsafe: false,
+            },
+        );
+        // And.intro : Π a b : Prop. a → b → And a b
+        let and_a_b = expr::app(
+            expr::app(expr::const_(3, vec![]), expr::bvar(3)),
+            expr::bvar(2),
+        );
+        let intro_ty = expr::pi(
+            expr::BinderInfo::Default,
+            sort0.clone(),
+            expr::pi(
+                expr::BinderInfo::Default,
+                sort0.clone(),
+                expr::pi(
+                    expr::BinderInfo::Default,
+                    expr::bvar(1),
+                    expr::pi(expr::BinderInfo::Default, expr::bvar(1), and_a_b),
+                ),
+            ),
+        );
+        env.insert(
+            4,
+            ConstantInfo::Constructor {
+                level_params: vec![],
+                typ: intro_ty,
+                induct: 3,
+                cidx: 0,
+                num_params: 2,
+                num_fields: 2,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            5,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::pi(
+                    expr::BinderInfo::Default,
+                    expr::const_(0, vec![]),
+                    expr::const_(1, vec![]),
+                ),
+                is_unsafe: false,
+            },
+        );
+        let t = expr::const_(1, vec![]);
+        let intro = expr::const_(2, vec![]);
+        let junk = expr::app(expr::const_(5, vec![]), intro.clone());
+        let value = expr::apps(expr::const_(4, vec![]), &[t.clone(), t.clone(), intro, junk]);
+        env.insert(
+            6,
+            ConstantInfo::Theorem {
+                level_params: vec![],
+                typ: expr::app(expr::app(expr::const_(3, vec![]), t.clone()), t),
+                value,
+            },
+        );
+        let names = test_names(&[
+            "False",
+            "True",
+            "True.intro",
+            "And",
+            "And.intro",
+            "elim",
+            "bad",
+        ]);
+        let tc = Checker::new(&env, &names, None, None);
+        assert_app_mismatch(tc.check_decl(6, "theorem"));
+    }
+
+    /// `closed_int_value` currently treats `Lit Nat n` and `OfNat.ofNat Int n`
+    /// as the same integer, so the terms defeq. Lean conversion does not.
+    #[test]
+    fn heq_nat_vs_int_numeral_not_defeq() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            1,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        // OfNat.ofNat : {α} → Nat → {OfNat α} → α  (we only need the name + ≥2 args)
+        env.insert(
+            2,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::pi(
+                    expr::BinderInfo::Default,
+                    sort1.clone(),
+                    expr::pi(
+                        expr::BinderInfo::Default,
+                        expr::const_(0, vec![]),
+                        expr::pi(
+                            expr::BinderInfo::Default,
+                            expr::sort(level::zero()),
+                            expr::bvar(2),
+                        ),
+                    ),
+                ),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            3,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::sort(level::zero()),
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["Nat", "Int", "OfNat.ofNat", "inst"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let n3 = expr::lit_nat(3u32.into());
+        let int3 = expr::apps(
+            expr::const_(2, vec![]),
+            &[
+                expr::const_(1, vec![]),
+                n3.clone(),
+                expr::const_(3, vec![]),
+            ],
+        );
+        let eq = tc.is_def_eq(&Ctx::new(), &n3, &int3).unwrap();
+        assert!(
+            !eq,
+            "Nat literal 3 must not defeq OfNat.ofNat Int 3 inst"
+        );
+    }
+
+    /// Lam conversion must require domains, like Pi. `fun (x : Nat) => star`
+    /// is not `fun (x : Bool) => star`.
+    #[test]
+    fn lam_domains_must_defeq() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            1,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            2,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::const_(0, vec![]),
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["Nat", "Bool", "star"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let star = expr::const_(2, vec![]);
+        let f_nat = expr::lam(
+            expr::BinderInfo::Default,
+            expr::const_(0, vec![]),
+            star.clone(),
+        );
+        let f_bool = expr::lam(
+            expr::BinderInfo::Default,
+            expr::const_(1, vec![]),
+            star,
+        );
+        let eq = tc.is_def_eq(&Ctx::new(), &f_nat, &f_bool).unwrap();
+        assert!(!eq, "lambda domains must convert, like Pi");
+    }
+
+    /// `(let f := id; f) a` must ζ then β. `StateT.bind.match_1` ι can
+    /// produce a `let` under remaining args; WHNF of `App(Let, …)` is that case.
+    #[test]
+    fn app_of_let_zetas_then_beta() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            1,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::const_(0, vec![]),
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["A", "a"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let a_ty = expr::const_(0, vec![]);
+        let id = expr::lam(expr::BinderInfo::Default, a_ty.clone(), expr::bvar(0));
+        let arg = expr::const_(1, vec![]);
+        let e = expr::app(
+            expr::let_(
+                expr::pi(expr::BinderInfo::Default, a_ty.clone(), a_ty),
+                id,
+                expr::bvar(0),
+            ),
+            arg.clone(),
+        );
+        let w = tc.whnf(&Ctx::new(), &e).expect("WHNF App(Let, arg)");
+        assert!(
+            Rc::ptr_eq(&w, &arg),
+            "(let f := id; f) a must be a, got {}",
+            tc.pp(&w)
+        );
+    }
+
+    /// Same interned K-like rec app `True.rec motive minor #0` under
+    /// `#0 : True` vs `#0 : False`. WHNF keyed only by ptr K-reduces in
+    /// the True context then reuses that result for False (Eq.rec class).
+    #[test]
+    fn eq_rec_whnf_cache_is_context_sensitive() {
+        use crate::env::{ConstantInfo, Environment, RecRule};
+        let mut env = Environment::default();
+        insert_false_true(&mut env);
+        let true_ty = expr::const_(1, vec![]);
+        let sort0 = expr::sort(level::zero());
+        // motive : True → Prop
+        let mot_ty = expr::pi(expr::BinderInfo::Default, true_ty.clone(), sort0.clone());
+        // True.rec : (motive : True → Prop) → motive True.intro → (t : True) → motive t
+        let rec_ty = expr::pi(
+            expr::BinderInfo::Default,
+            mot_ty,
+            expr::pi(
+                expr::BinderInfo::Default,
+                expr::app(expr::bvar(0), expr::const_(2, vec![])),
+                expr::pi(
+                    expr::BinderInfo::Default,
+                    true_ty.clone(),
+                    expr::app(expr::bvar(2), expr::bvar(0)),
+                ),
+            ),
+        );
+        env.insert(
+            3,
+            ConstantInfo::Recursor {
+                level_params: vec![],
+                typ: rec_ty,
+                all: vec![1],
+                num_params: 0,
+                num_indices: 0,
+                num_motives: 1,
+                num_minors: 1,
+                rules: vec![RecRule {
+                    ctor: 2,
+                    nfields: 0,
+                    rhs: expr::bvar(0),
+                }],
+                k: true,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            4,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort0.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.rec_of.insert(1, 3);
+        let names = test_names(&["False", "True", "True.intro", "True.rec", "star"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let motive = expr::lam(expr::BinderInfo::Default, true_ty, sort0);
+        let star = expr::const_(4, vec![]);
+        let rec_app = expr::apps(expr::const_(3, vec![]), &[motive, star.clone(), expr::bvar(0)]);
+        let mut ctx_true = Ctx::new();
+        ctx_true.push(expr::const_(1, vec![]));
+        let mut ctx_false = Ctx::new();
+        ctx_false.push(expr::const_(0, vec![]));
+        let w_true = tc.whnf(&ctx_true, &rec_app).expect("WHNF True context");
+        assert!(
+            Rc::ptr_eq(&w_true, &star),
+            "K-like True.rec under #0 : True must reduce to the minor, got {}",
+            tc.pp(&w_true)
+        );
+        let w_false = tc.whnf(&ctx_false, &rec_app).expect("WHNF False context");
+        assert!(
+            !Rc::ptr_eq(&w_false, &star),
+            "WHNF of the same rec app under #0 : False must not reuse the True-context K-reduction"
+        );
+    }
+
+    /// Mini `PSigma` (2 params, 1 ctor, 0 indices, not rec). Lean
+    /// `to_ctor_when_structure` expands a bvar major to `mk e.1 e.2` so
+    /// `PSigma.rec motive minor x` iotas to `minor x.1 x.2`.
+    fn insert_mini_psigma(env: &mut Environment) {
+        let sort1 = expr::sort(level::succ(level::zero()));
+        let psigma = expr::const_(0, vec![]);
+        env.insert(
+            0,
+            ConstantInfo::InductiveType {
+                level_params: vec![],
+                typ: expr::pi(
+                    expr::BinderInfo::Default,
+                    sort1.clone(),
+                    expr::pi(expr::BinderInfo::Default, sort1.clone(), sort1.clone()),
+                ),
+                num_params: 2,
+                num_indices: 0,
+                all: vec![0],
+                ctors: vec![1],
+                is_rec: false,
+                is_unsafe: false,
+            },
+        );
+        // mk : (α β : Type) → α → β → PSigma α β
+        let mk_ty = expr::pi(
+            expr::BinderInfo::Default,
+            sort1.clone(),
+            expr::pi(
+                expr::BinderInfo::Default,
+                sort1.clone(),
+                expr::pi(
+                    expr::BinderInfo::Default,
+                    expr::bvar(1),
+                    expr::pi(
+                        expr::BinderInfo::Default,
+                        expr::bvar(1),
+                        expr::apps(psigma, &[expr::bvar(3), expr::bvar(2)]),
+                    ),
+                ),
+            ),
+        );
+        env.insert(
+            1,
+            ConstantInfo::Constructor {
+                level_params: vec![],
+                typ: mk_ty,
+                induct: 0,
+                cidx: 0,
+                num_params: 2,
+                num_fields: 2,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            2,
+            ConstantInfo::Recursor {
+                level_params: vec![],
+                typ: sort1.clone(),
+                all: vec![0],
+                num_params: 2,
+                num_indices: 0,
+                num_motives: 1,
+                num_minors: 1,
+                rules: vec![crate::env::RecRule {
+                    ctor: 1,
+                    nfields: 2,
+                    rhs: expr::bvar(0),
+                }],
+                k: false,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            3,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            4,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1,
+                is_unsafe: false,
+            },
+        );
+        env.rec_of.insert(0, 2);
+    }
+
+    /// `PSigma.rec α β motive minor (mk α β x y)` iotas to `minor x y`.
+    #[test]
+    fn psigma_rec_iotas_ctor_major() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_psigma(&mut env);
+        let names = test_names(&["PSigma", "PSigma.mk", "PSigma.rec", "A", "B"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let a = expr::const_(3, vec![]);
+        let b = expr::const_(4, vec![]);
+        let psigma_ab = expr::apps(expr::const_(0, vec![]), &[a.clone(), b.clone()]);
+        let sort1 = expr::sort(level::succ(level::zero()));
+        let motive = expr::lam(expr::BinderInfo::Default, psigma_ab, sort1);
+        let minor = expr::lam(
+            expr::BinderInfo::Default,
+            a.clone(),
+            expr::lam(expr::BinderInfo::Default, b.clone(), expr::bvar(1)),
+        );
+        let x = expr::const_(3, vec![]); // A : Type used as a dummy value of type A (ill-typed but WHNF-only)
+        let y = expr::const_(4, vec![]);
+        let mk = expr::apps(expr::const_(1, vec![]), &[a.clone(), b, x.clone(), y]);
+        let rec_app = expr::apps(
+            expr::const_(2, vec![]),
+            &[a, expr::const_(4, vec![]), motive, minor, mk],
+        );
+        let w = tc.whnf(&Ctx::new(), &rec_app).expect("WHNF ctor major");
+        assert!(
+            Rc::ptr_eq(&w, &x),
+            "PSigma.rec of mk x y must iota to minor x y = x, got {}",
+            tc.pp(&w)
+        );
+    }
+
+    /// `PSigma.rec α β motive minor #0` under `#0 : PSigma α β` must expand
+    /// the bvar to `mk #0.1 #0.2` and iota. std
+    /// `toGraphviz.go._unary.eq_def` is this case (`PSigma.casesOn` → rec).
+    #[test]
+    fn psigma_rec_iotas_bvar_major() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_psigma(&mut env);
+        let names = test_names(&["PSigma", "PSigma.mk", "PSigma.rec", "A", "B"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let a = expr::const_(3, vec![]);
+        let b = expr::const_(4, vec![]);
+        let psigma_ab = expr::apps(expr::const_(0, vec![]), &[a.clone(), b.clone()]);
+        let sort1 = expr::sort(level::succ(level::zero()));
+        let motive = expr::lam(expr::BinderInfo::Default, psigma_ab.clone(), sort1);
+        let minor = expr::lam(
+            expr::BinderInfo::Default,
+            a.clone(),
+            expr::lam(expr::BinderInfo::Default, b.clone(), expr::bvar(1)),
+        );
+        let rec_app = expr::apps(
+            expr::const_(2, vec![]),
+            &[a, b, motive, minor, expr::bvar(0)],
+        );
+        let mut ctx = Ctx::new();
+        ctx.push(psigma_ab);
+        let w = tc.whnf(&ctx, &rec_app).expect("WHNF bvar major");
+        let expected = expr::proj(0, 0, expr::bvar(0));
+        assert!(
+            tc.is_def_eq(&ctx, &w, &expected).unwrap_or(false),
+            "PSigma.rec of a PSigma bvar must iota to minor (proj 0) (proj 1) = proj 0, got {}",
+            tc.pp(&w)
+        );
+    }
+
+    /// `Π x : A, (λ y : A, T) x` converts to `Π x : A, T`.
+    /// `toGraphviz.go._unary.eq_def` Eq args include this Pi-beta.
+    #[test]
+    fn pi_body_beta_converts() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            1,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1,
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["A", "T"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let a = expr::const_(0, vec![]);
+        let t = expr::const_(1, vec![]);
+        let redex = expr::pi(
+            expr::BinderInfo::Default,
+            a.clone(),
+            expr::app(
+                expr::lam(expr::BinderInfo::Default, a.clone(), t.clone()),
+                expr::bvar(0),
+            ),
+        );
+        let nf = expr::pi(expr::BinderInfo::Default, a, t);
+        let eq = tc.is_def_eq(&Ctx::new(), &redex, &nf).unwrap();
+        assert!(eq, "Pi body must beta: (λ y, T) x ≡ T");
+    }
+
+    /// Let-zeta is part of WHNF. Defeq of `let x := v; x` vs `v` must hold
+    /// even if a CORE_DEPTH abort previously saw the unreduced let.
+    #[test]
+    fn let_zetas_in_defeq() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            1,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::const_(0, vec![]),
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["A", "v"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let a = expr::const_(0, vec![]);
+        let v = expr::const_(1, vec![]);
+        let let_e = expr::let_(a, v.clone(), expr::bvar(0));
+        let eq = tc.is_def_eq(&Ctx::new(), &let_e, &v).unwrap();
+        assert!(eq, "let x := v; x must convert to v");
+        let w = tc.whnf(&Ctx::new(), &let_e).unwrap();
+        assert!(
+            Rc::ptr_eq(&w, &v),
+            "WHNF of let x := v; x must be v, got {}",
+            tc.pp(&w)
+        );
+    }
+
+    /// `Π x : A, ((λ y : A, F #2) x) ≡ Π x : A, F #1`.
+    /// The `#2` lives outside the Pi; beta must decrement it. `eq_def`'s
+    /// `Π String. ((λ String. Π PSigma. StateM) #0)` has this shape with
+    /// HashSet/Array.size bvars.
+    #[test]
+    fn pi_body_beta_decrements_outer_bvars() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        // F : Type → Type
+        env.insert(
+            1,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::pi(expr::BinderInfo::Default, sort1.clone(), sort1),
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["A", "F"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let a = expr::const_(0, vec![]);
+        let f = expr::const_(1, vec![]);
+        let redex = expr::pi(
+            expr::BinderInfo::Default,
+            a.clone(),
+            expr::app(
+                expr::lam(
+                    expr::BinderInfo::Default,
+                    a.clone(),
+                    expr::app(f.clone(), expr::bvar(2)),
+                ),
+                expr::bvar(0),
+            ),
+        );
+        let nf = expr::pi(
+            expr::BinderInfo::Default,
+            a,
+            expr::app(f, expr::bvar(1)),
+        );
+        let eq = tc.is_def_eq(&Ctx::new(), &redex, &nf).unwrap();
+        assert!(
+            eq,
+            "Pi-body beta must decrement outer bvars: got {} vs {}",
+            tc.pp(&redex),
+            tc.pp(&nf)
+        );
+    }
+
+    /// Inner lambda domain is a beta redex: `λ x : A, λ y : ((λ _ : A, B) x), y`
+    /// vs `λ x : A, λ y : B, y`. congrArg on `toGraphviz.go._unary.eq_def`
+    /// has `λ ((λ String. PSigma …) #0). …` on one Eq side.
+    #[test]
+    fn lam_domain_beta_redex_converts() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            1,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1,
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["A", "B"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let a = expr::const_(0, vec![]);
+        let b = expr::const_(1, vec![]);
+        let redex = expr::lam(
+            expr::BinderInfo::Default,
+            a.clone(),
+            expr::lam(
+                expr::BinderInfo::Default,
+                expr::app(
+                    expr::lam(expr::BinderInfo::Default, a.clone(), b.clone()),
+                    expr::bvar(0),
+                ),
+                expr::bvar(0),
+            ),
+        );
+        let nf = expr::lam(
+            expr::BinderInfo::Default,
+            a,
+            expr::lam(expr::BinderInfo::Default, b, expr::bvar(0)),
+        );
+        let eq = tc.is_def_eq(&Ctx::new(), &redex, &nf).unwrap();
+        assert!(
+            eq,
+            "lambda domain beta must convert: got {} vs {}",
+            tc.pp(&redex),
+            tc.pp(&nf)
+        );
+    }
+
+    /// `PSigma.rec motive (λ a b, f a b) p ≡ f p.1 p.2`. After ι the rec
+    /// is the applied minor; Bind.bind minors in `eq_def` are this shape.
+    #[test]
+    fn psigma_rec_defeq_proj_applied_minor() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_psigma(&mut env);
+        let names = test_names(&["PSigma", "PSigma.mk", "PSigma.rec", "A", "B"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let a = expr::const_(3, vec![]);
+        let b = expr::const_(4, vec![]);
+        let psigma_ab = expr::apps(expr::const_(0, vec![]), &[a.clone(), b.clone()]);
+        let sort1 = expr::sort(level::succ(level::zero()));
+        let motive = expr::lam(expr::BinderInfo::Default, psigma_ab.clone(), sort1);
+        let minor = expr::lam(
+            expr::BinderInfo::Default,
+            a.clone(),
+            expr::lam(expr::BinderInfo::Default, b.clone(), expr::bvar(1)),
+        );
+        let rec_app = expr::apps(
+            expr::const_(2, vec![]),
+            &[a, b, motive, minor, expr::bvar(0)],
+        );
+        let mut ctx = Ctx::new();
+        ctx.push(psigma_ab);
+        let applied = expr::proj(0, 0, expr::bvar(0));
+        assert!(
+            tc.is_def_eq(&ctx, &rec_app, &applied).unwrap_or(false),
+            "rec on a PSigma bvar must convert to the minor of projections, got {} vs {}",
+            tc.pp(&tc.whnf(&ctx, &rec_app).unwrap_or_else(|_| rec_app.clone())),
+            tc.pp(&applied)
+        );
+    }
+
+    /// Abbrev `match_1 t minor := rec (λ a b, minor a b) t` (StateT.bind.match_1
+    /// shape). WHNF and defeq must ι through the Abbrev, not compare the
+    /// unreduced minors `λ a b, a` vs `λ a b, p.1`.
+    #[test]
+    fn bind_match_abbrev_iotas_then_defeq_unpacked_vs_proj() {
+        use crate::env::{ConstantInfo, Environment, ReducibilityHints};
+        let mut env = Environment::default();
+        insert_mini_psigma(&mut env);
+        let a_ty = expr::const_(3, vec![]);
+        let b_ty = expr::const_(4, vec![]);
+        let psigma_ab = expr::apps(expr::const_(0, vec![]), &[a_ty.clone(), b_ty.clone()]);
+        let sort1 = expr::sort(level::succ(level::zero()));
+        let motive = expr::lam(expr::BinderInfo::Default, psigma_ab.clone(), sort1);
+        // match_1 t minor := rec A B motive (λ a b, minor a b) t
+        let minor_ty = expr::pi(
+            expr::BinderInfo::Default,
+            a_ty.clone(),
+            expr::pi(expr::BinderInfo::Default, b_ty.clone(), a_ty.clone()),
+        );
+        let match_val = expr::lam(
+            expr::BinderInfo::Default,
+            psigma_ab.clone(),
+            expr::lam(
+                expr::BinderInfo::Default,
+                minor_ty.clone(),
+                expr::apps(
+                    expr::const_(2, vec![]),
+                    &[
+                        a_ty.clone(),
+                        b_ty.clone(),
+                        motive,
+                        expr::lam(
+                            expr::BinderInfo::Default,
+                            a_ty.clone(),
+                            expr::lam(
+                                expr::BinderInfo::Default,
+                                b_ty.clone(),
+                                expr::apps(expr::bvar(2), &[expr::bvar(1), expr::bvar(0)]),
+                            ),
+                        ),
+                        expr::bvar(1),
+                    ],
+                ),
+            ),
+        );
+        env.insert(
+            5,
+            ConstantInfo::Def {
+                level_params: vec![],
+                typ: expr::pi(
+                    expr::BinderInfo::Default,
+                    psigma_ab.clone(),
+                    expr::pi(expr::BinderInfo::Default, minor_ty, a_ty.clone()),
+                ),
+                value: match_val,
+                hints: ReducibilityHints::Abbrev,
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&[
+            "PSigma",
+            "PSigma.mk",
+            "PSigma.rec",
+            "A",
+            "B",
+            "match_1",
+        ]);
+        let tc = Checker::new(&env, &names, None, None);
+        let mut ctx = Ctx::new();
+        ctx.push(psigma_ab);
+        let unpacked = expr::lam(
+            expr::BinderInfo::Default,
+            a_ty.clone(),
+            expr::lam(expr::BinderInfo::Default, b_ty, expr::bvar(1)),
+        );
+        // Continuation that ignores a,b and reads the major via projections —
+        // the Bind.bind minor mismatch in eq_def.
+        let via_proj = expr::lam(
+            expr::BinderInfo::Default,
+            a_ty.clone(),
+            expr::lam(
+                expr::BinderInfo::Default,
+                expr::const_(4, vec![]),
+                expr::proj(0, 0, expr::bvar(2)),
+            ),
+        );
+        let m_unpacked = expr::apps(expr::const_(5, vec![]), &[expr::bvar(0), unpacked]);
+        let m_proj = expr::apps(expr::const_(5, vec![]), &[expr::bvar(0), via_proj]);
+        let w = tc.whnf(&ctx, &m_unpacked).expect("WHNF match_1 unpacked");
+        let expected = expr::proj(0, 0, expr::bvar(0));
+        assert!(
+            tc.is_def_eq(&ctx, &w, &expected).unwrap_or(false),
+            "match_1 Abbrev must ι to minor of projs, WHNF got {}",
+            tc.pp(&w)
+        );
+        assert!(
+            tc.is_def_eq(&ctx, &m_unpacked, &m_proj).unwrap_or(false),
+            "match_1 (λ a b, a) must convert to match_1 (λ a b, p.1) after ι, left={} right={}",
+            tc.pp(&tc.whnf(&ctx, &m_unpacked).unwrap_or_else(|_| m_unpacked.clone())),
+            tc.pp(&tc.whnf(&ctx, &m_proj).unwrap_or_else(|_| m_proj.clone()))
+        );
+        // StateT.bind.match_1 ι yields `let Fin := mk a b; …`. WHNF must ζ
+        // that let, not return it as a stuck value (`WHNFHEAD match_1 -> let`).
+        let via_let = expr::lam(
+            expr::BinderInfo::Default,
+            a_ty.clone(),
+            expr::lam(
+                expr::BinderInfo::Default,
+                expr::const_(4, vec![]),
+                expr::let_(a_ty.clone(), expr::bvar(1), expr::bvar(0)),
+            ),
+        );
+        let m_let = expr::apps(expr::const_(5, vec![]), &[expr::bvar(0), via_let]);
+        let wlet = tc.whnf(&ctx, &m_let).expect("WHNF match_1 let-minor");
+        assert!(
+            !matches!(&**wlet, ExprData::Let(_, _, _)),
+            "WHNF of match_1 with a let-minor must ζ, got {}",
+            tc.pp(&wlet)
+        );
+        assert!(
+            tc.is_def_eq(&ctx, &wlet, &expected).unwrap_or(false),
+            "let-minor match_1 must convert to p.1, got {}",
+            tc.pp(&wlet)
+        );
+    }
+
+    /// `λ p, PSigma.casesOn … p minor` ≡ `λ p, PSigma.rec … (λ a b, minor a b) p`.
+    /// This is the Eq-argument pair that std `#81930` fails to convert.
+    #[test]
+    fn cases_on_lambda_converts_to_rec_lambda() {
+        use crate::env::{ConstantInfo, Environment, ReducibilityHints};
+        let mut env = Environment::default();
+        insert_mini_psigma(&mut env);
+        let a_ty = expr::const_(3, vec![]);
+        let b_ty = expr::const_(4, vec![]);
+        let psigma_ab = expr::apps(expr::const_(0, vec![]), &[a_ty.clone(), b_ty.clone()]);
+        let sort1 = expr::sort(level::succ(level::zero()));
+        let motive = expr::lam(expr::BinderInfo::Default, psigma_ab.clone(), a_ty.clone());
+        let minor_ty = expr::pi(
+            expr::BinderInfo::Default,
+            a_ty.clone(),
+            expr::pi(expr::BinderInfo::Default, b_ty.clone(), a_ty.clone()),
+        );
+        // casesOn α β motive t minor := rec α β motive (λ a b, minor a b) t
+        let cases_val = expr::lam(
+            expr::BinderInfo::Default,
+            sort1.clone(),
+            expr::lam(
+                expr::BinderInfo::Default,
+                sort1.clone(),
+                expr::lam(
+                    expr::BinderInfo::Default,
+                    expr::pi(expr::BinderInfo::Default, psigma_ab.clone(), sort1.clone()),
+                    expr::lam(
+                        expr::BinderInfo::Default,
+                        psigma_ab.clone(),
+                        expr::lam(
+                            expr::BinderInfo::Default,
+                            minor_ty.clone(),
+                            expr::apps(
+                                expr::const_(2, vec![]),
+                                &[
+                                    expr::bvar(4),
+                                    expr::bvar(3),
+                                    expr::bvar(2),
+                                    expr::lam(
+                                        expr::BinderInfo::Default,
+                                        a_ty.clone(),
+                                        expr::lam(
+                                            expr::BinderInfo::Default,
+                                            b_ty.clone(),
+                                            expr::apps(
+                                                expr::bvar(2),
+                                                &[expr::bvar(1), expr::bvar(0)],
+                                            ),
+                                        ),
+                                    ),
+                                    expr::bvar(1),
+                                ],
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+        env.insert(
+            5,
+            ConstantInfo::Def {
+                level_params: vec![],
+                typ: sort1,
+                value: cases_val,
+                hints: ReducibilityHints::Abbrev,
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&[
+            "PSigma",
+            "PSigma.mk",
+            "PSigma.rec",
+            "A",
+            "B",
+            "PSigma.casesOn",
+        ]);
+        let tc = Checker::new(&env, &names, None, None);
+        let minor = expr::lam(
+            expr::BinderInfo::Default,
+            a_ty.clone(),
+            expr::lam(expr::BinderInfo::Default, b_ty.clone(), expr::bvar(1)),
+        );
+        let cases_app = expr::apps(
+            expr::const_(5, vec![]),
+            &[
+                a_ty.clone(),
+                b_ty.clone(),
+                motive.clone(),
+                expr::bvar(0),
+                minor.clone(),
+            ],
+        );
+        // Rec with the same minor; casesOn wraps it as (λ a b, minor a b).
+        let rec_app = expr::apps(
+            expr::const_(2, vec![]),
+            &[a_ty, b_ty, motive, minor, expr::bvar(0)],
+        );
+        let lam_cases = expr::lam(
+            expr::BinderInfo::Default,
+            psigma_ab.clone(),
+            cases_app,
+        );
+        let lam_rec = expr::lam(expr::BinderInfo::Default, psigma_ab, rec_app);
+        let eq = tc.is_def_eq(&Ctx::new(), &lam_cases, &lam_rec).unwrap_or(false);
+        assert!(
+            eq,
+            "λ p, casesOn p minor must convert to λ p, rec (λ a b, minor a b) p"
+        );
+    }
+
+    /// Lean `is_delta` is `has_value`. A Regular whose body is larger than the
+    /// WHNF eager cap must still unfold on the *lazy delta* path so
+    /// `Bind.bind inst.1` can reach `StateT.bind` / `match_1`.
+    #[test]
+    fn large_regular_defeq_via_lazy_delta() {
+        use crate::env::{ConstantInfo, Environment, ReducibilityHints};
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        let dummy = expr::const_(0, vec![]);
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        // (λ _ : pad, x) pad  ≡  x. Body ≥ 4096; Lean has_value still unfolds.
+        let pad = bush(dummy.clone(), 13);
+        assert!(
+            expr_size_capped(&pad, 10_000) >= 4_096,
+            "pad must exceed the WHNF Regular cap"
+        );
+        let value = expr::lam(
+            expr::BinderInfo::Default,
+            sort1.clone(),
+            expr::app(
+                expr::lam(expr::BinderInfo::Default, sort1.clone(), expr::bvar(1)),
+                pad,
+            ),
+        );
+        env.insert(
+            1,
+            ConstantInfo::Def {
+                level_params: vec![],
+                typ: expr::pi(expr::BinderInfo::Default, sort1.clone(), sort1.clone()),
+                value,
+                hints: ReducibilityHints::Regular(1),
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["A", "hugeId"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let arg = dummy;
+        let lhs = expr::app(expr::const_(1, vec![]), arg.clone());
+        let eq = tc.is_def_eq(&Ctx::new(), &lhs, &arg).unwrap_or(false);
+        assert!(
+            eq,
+            "lazy delta must unfold a large Regular: {} vs {}",
+            tc.pp(&lhs),
+            tc.pp(&arg)
+        );
     }
 }
