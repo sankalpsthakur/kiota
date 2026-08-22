@@ -47,6 +47,25 @@ impl Parser {
     fn get_u32(v: &Value, k: &str) -> u32 {
         v.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as u32
     }
+
+    fn require_u32(v: &Value, k: &str) -> Result<u32, TcError> {
+        match v.get(k) {
+            None => Err(TcError::Reject(format!("missing required field `{k}`"))),
+            Some(x) => match x.as_u64() {
+                Some(n) if n <= u32::MAX as u64 => Ok(n as u32),
+                _ => Err(TcError::Reject(format!("field `{k}` must be a u32"))),
+            },
+        }
+    }
+
+    fn require_expr(&self, v: &Value, k: &str) -> Result<Expr, TcError> {
+        let i = Self::require_u32(v, k)?;
+        self.exprs
+            .get(i as usize)
+            .cloned()
+            .ok_or_else(|| TcError::Reject(format!("expr index {i} for `{k}` is out of range")))
+    }
+
     fn get_str<'a>(v: &'a Value, k: &str) -> &'a str {
         v.get(k).and_then(|x| x.as_str()).unwrap_or("")
     }
@@ -210,10 +229,10 @@ impl Parser {
     }
 
     fn handle_def_like(&mut self, kind: &str, v: &Value) -> Result<(), TcError> {
-        let name = Self::get_u32(v, "name");
+        let name = Self::require_u32(v, "name")?;
         self.reject_if_dup(name)?;
         let level_params = Self::get_vec_u32(v, "levelParams");
-        let typ = self.expr_at(Self::get_u32(v, "type"));
+        let typ = self.require_expr(v, "type")?;
         match kind {
             "axiomDecl" | "axiom" => {
                 let is_unsafe = Self::get_bool(v, "isUnsafe");
@@ -230,7 +249,7 @@ impl Parser {
                 );
             }
             "defnDecl" | "def" => {
-                let value = self.expr_at(Self::get_u32(v, "value"));
+                let value = self.require_expr(v, "value")?;
                 let hints_v = v.get("hints");
                 let hints = match hints_v {
                     Some(Value::String(s)) => Self::hints_of(s, 0),
@@ -260,7 +279,7 @@ impl Parser {
                 );
             }
             "thmDecl" | "theorem" => {
-                let value = self.expr_at(Self::get_u32(v, "value"));
+                let value = self.require_expr(v, "value")?;
                 self.env.insert(
                     name,
                     ConstantInfo::Theorem {
@@ -271,7 +290,7 @@ impl Parser {
                 );
             }
             "opaqueDecl" | "opaque" => {
-                let value = self.expr_at(Self::get_u32(v, "value"));
+                let value = self.require_expr(v, "value")?;
                 let safety = Self::get_str(v, "safety");
                 if safety == "unsafe" || safety == "partial" {
                     return Err(TcError::Reject(format!("{safety} opaque")));
@@ -293,24 +312,29 @@ impl Parser {
     }
 
     fn handle_quot(&mut self, v: &Value) -> Result<(), TcError> {
-        let kind = match Self::get_str(v, "kind") {
+        let kind_s = v
+            .get("kind")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| TcError::Reject("quot missing kind".into()))?;
+        let kind = match kind_s {
             "type" => QuotKind::Type,
             "ctor" => QuotKind::Ctor,
             "lift" => QuotKind::Lift,
             "ind" => QuotKind::Ind,
-            _ => return Ok(()),
-        };
-        let name = Self::get_u32(v, "name");
-        let level_params = Self::get_vec_u32(v, "levelParams");
-        let typ = self.expr_at(Self::get_u32(v, "type"));
-        self.reject_if_dup(name)?;
-        match &**typ {
-            crate::expr::ExprData::Pi(_, _, _) | crate::expr::ExprData::Sort(_) => {}
-            _ => {
-                return Err(TcError::Reject(
-                    "quot type must be a function or a sort".into(),
-                ));
+            other => {
+                return Err(TcError::Reject(format!(
+                    "quot kind `{other}` is not type/ctor/lift/ind"
+                )))
             }
+        };
+        let name = Self::require_u32(v, "name")?;
+        let level_params = Self::get_vec_u32(v, "levelParams");
+        let typ = self.require_expr(v, "type")?;
+        self.reject_if_dup(name)?;
+        if !quot_type_matches_kind(&kind, &typ) {
+            return Err(TcError::Reject(
+                "quot type does not match kernel quotient shape".into(),
+            ));
         }
         self.env.insert(
             name,
@@ -341,12 +365,12 @@ impl Parser {
             .unwrap_or_default();
 
         for t in &types {
-            let name = Self::get_u32(t, "name");
+            let name = Self::require_u32(t, "name")?;
             self.reject_if_dup(name)?;
             let level_params = Self::get_vec_u32(t, "levelParams");
-            let typ = self.expr_at(Self::get_u32(t, "type"));
-            let num_params = Self::get_u32(t, "numParams");
-            let num_indices = Self::get_u32(t, "numIndices");
+            let typ = self.require_expr(t, "type")?;
+            let num_params = Self::require_u32(t, "numParams")?;
+            let num_indices = Self::require_u32(t, "numIndices")?;
             let all = Self::get_vec_u32(t, "all");
             let ctor_names = Self::get_vec_u32(t, "ctors");
             let is_rec = Self::get_bool(t, "isRec");
@@ -375,14 +399,14 @@ impl Parser {
             );
         }
         for c in &ctors {
-            let name = Self::get_u32(c, "name");
+            let name = Self::require_u32(c, "name")?;
             self.reject_if_dup(name)?;
             let level_params = Self::get_vec_u32(c, "levelParams");
-            let typ = self.expr_at(Self::get_u32(c, "type"));
-            let induct = Self::get_u32(c, "induct");
-            let cidx = Self::get_u32(c, "cidx");
-            let num_params = Self::get_u32(c, "numParams");
-            let num_fields = Self::get_u32(c, "numFields");
+            let typ = self.require_expr(c, "type")?;
+            let induct = Self::require_u32(c, "induct")?;
+            let cidx = Self::require_u32(c, "cidx")?;
+            let num_params = Self::require_u32(c, "numParams")?;
+            let num_fields = Self::require_u32(c, "numFields")?;
             let is_unsafe = Self::get_bool(c, "isUnsafe");
             if is_unsafe {
                 return Err(TcError::Reject(format!(
@@ -407,15 +431,15 @@ impl Parser {
             );
         }
         for r in &recs {
-            let name = Self::get_u32(r, "name");
+            let name = Self::require_u32(r, "name")?;
             self.reject_if_dup(name)?;
             let level_params = Self::get_vec_u32(r, "levelParams");
-            let typ = self.expr_at(Self::get_u32(r, "type"));
+            let typ = self.require_expr(r, "type")?;
             let all = Self::get_vec_u32(r, "all");
-            let num_params = Self::get_u32(r, "numParams");
-            let num_indices = Self::get_u32(r, "numIndices");
-            let num_motives = Self::get_u32(r, "numMotives");
-            let num_minors = Self::get_u32(r, "numMinors");
+            let num_params = Self::require_u32(r, "numParams")?;
+            let num_indices = Self::require_u32(r, "numIndices")?;
+            let num_motives = Self::require_u32(r, "numMotives")?;
+            let num_minors = Self::require_u32(r, "numMinors")?;
             let k = Self::get_bool(r, "k");
             let is_unsafe = Self::get_bool(r, "isUnsafe");
             if is_unsafe {
@@ -427,9 +451,12 @@ impl Parser {
                         .unwrap_or("?")
                 )));
             }
-            if !matches!(&**typ, crate::expr::ExprData::Pi(_, _, _)) {
+            let expected =
+                num_params as u64 + num_indices as u64 + num_motives as u64 + num_minors as u64 + 1;
+            let arity = pi_telescope_len(&typ);
+            if arity as u64 != expected {
                 return Err(TcError::Reject(format!(
-                    "recursor `{}` type is not a function",
+                    "recursor `{}` type telescope length {arity} != {expected}",
                     self.names
                         .get(name as usize)
                         .map(|s| s.as_str())
@@ -677,9 +704,13 @@ impl Parser {
     }
 
     fn check_last(&mut self, d: &Value, kind: &str) -> Result<(), TcError> {
-        let name = Self::get_u32(d, "name");
+        let name = Self::require_u32(d, "name")?;
         self.decl_count += 1;
-        let nm = self.names.get(name as usize).map(|s| s.as_str()).unwrap_or("?");
+        let nm = self
+            .names
+            .get(name as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("?");
         let debug = std::env::var_os("KIOTA_DEBUG").is_some();
         if self.decl_count % 100 == 0
             || std::env::var_os("KIOTA_PROGRESS").is_some()
@@ -719,9 +750,7 @@ impl Parser {
         if let Ok(max) = std::env::var("KIOTA_MAX_DECL") {
             if let Ok(max_n) = max.parse::<usize>() {
                 if self.decl_count > max_n {
-                    return Err(TcError::Decline(format!(
-                        "KIOTA_MAX_DECL={max_n}"
-                    )));
+                    return Err(TcError::Decline(format!("KIOTA_MAX_DECL={max_n}")));
                 }
             }
         }
@@ -754,6 +783,42 @@ impl Parser {
 }
 
 fn kind_or_direct(_v: &Value) {}
+
+fn pi_telescope_len(typ: &Expr) -> u32 {
+    let mut n = 0u32;
+    let mut cur = typ.clone();
+    loop {
+        match &**cur {
+            crate::expr::ExprData::Pi(_, _, body) => {
+                n += 1;
+                cur = body.clone();
+            }
+            _ => return n,
+        }
+    }
+}
+
+/// Kernel quot shapes: Type 2+Sort, Ctor 3+App, Lift 6, Ind 5.
+fn quot_type_matches_kind(kind: &QuotKind, typ: &Expr) -> bool {
+    let mut n = 0u32;
+    let mut cur = typ.clone();
+    loop {
+        match &**cur {
+            crate::expr::ExprData::Pi(_, _, body) => {
+                n += 1;
+                cur = body.clone();
+            }
+            rest => {
+                return match kind {
+                    QuotKind::Type => n == 2 && matches!(rest, crate::expr::ExprData::Sort(_)),
+                    QuotKind::Ctor => n == 3 && matches!(rest, crate::expr::ExprData::App(_, _)),
+                    QuotKind::Lift => n == 6,
+                    QuotKind::Ind => n == 5,
+                };
+            }
+        }
+    }
+}
 
 /// Lean nested recursor numbering: `.rec` first, then `.rec_1`, `.rec_2`, …
 /// Used for rec_group minor order only, not extra-rec reject.
