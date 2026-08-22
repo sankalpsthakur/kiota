@@ -1,5 +1,5 @@
 use crate::env::{ConstantInfo, Environment, QuotKind, RecRule, ReducibilityHints};
-use crate::expr::{self, BinderInfo, Expr};
+use crate::expr::{self, BinderInfo, Expr, ExprData};
 use crate::level::{self, Level};
 use crate::tc::{Checker, TcError};
 use num_bigint::BigUint;
@@ -71,6 +71,14 @@ impl Parser {
     }
     fn get_bool(v: &Value, k: &str) -> bool {
         v.get(k).and_then(|x| x.as_bool()).unwrap_or(false)
+    }
+    fn require_bool(v: &Value, k: &str) -> Result<bool, TcError> {
+        match v.get(k) {
+            None => Err(TcError::Reject(format!("missing required field `{k}`"))),
+            Some(x) => x
+                .as_bool()
+                .ok_or_else(|| TcError::Reject(format!("field `{k}` must be a bool"))),
+        }
     }
     fn get_vec_u32(v: &Value, k: &str) -> Vec<u32> {
         v.get(k)
@@ -206,11 +214,21 @@ impl Parser {
         Ok(())
     }
 
-    fn hints_of(s: &str, n: u64) -> ReducibilityHints {
-        match s {
-            "opaque" => ReducibilityHints::Opaque,
-            "abbrev" => ReducibilityHints::Abbrev,
-            _ => ReducibilityHints::Regular(n as u32),
+    fn require_hints(v: &Value) -> Result<ReducibilityHints, TcError> {
+        match v.get("hints") {
+            None => Err(TcError::Reject("missing required field `hints`".into())),
+            Some(Value::String(s)) => match s.as_str() {
+                "opaque" => Ok(ReducibilityHints::Opaque),
+                "abbrev" => Ok(ReducibilityHints::Abbrev),
+                other => Err(TcError::Reject(format!("unknown hints `{other}`"))),
+            },
+            Some(Value::Object(o)) => match o.get("regular").and_then(|x| x.as_u64()) {
+                Some(n) if n <= u32::MAX as u64 => Ok(ReducibilityHints::Regular(n as u32)),
+                _ => Err(TcError::Reject(
+                    "hints object must have a u32 `regular` field".into(),
+                )),
+            },
+            _ => Err(TcError::Reject("invalid hints".into())),
         }
     }
 
@@ -249,18 +267,7 @@ impl Parser {
             }
             "defnDecl" | "def" => {
                 let value = self.require_expr(v, "value")?;
-                let hints_v = v.get("hints");
-                let hints = match hints_v {
-                    Some(Value::String(s)) => Self::hints_of(s, 0),
-                    Some(Value::Object(o)) => {
-                        if let Some(n) = o.get("regular").and_then(|x| x.as_u64()) {
-                            ReducibilityHints::Regular(n as u32)
-                        } else {
-                            ReducibilityHints::Regular(0)
-                        }
-                    }
-                    _ => ReducibilityHints::Regular(0),
-                };
+                let hints = Self::require_hints(v)?;
                 let safety = Self::get_str(v, "safety");
                 if safety == "unsafe" || safety == "partial" {
                     return Err(TcError::Reject(format!("{safety} definition")));
@@ -372,7 +379,7 @@ impl Parser {
             let num_indices = Self::require_u32(t, "numIndices")?;
             let all = Self::get_vec_u32(t, "all");
             let ctor_names = Self::get_vec_u32(t, "ctors");
-            let is_rec = Self::get_bool(t, "isRec");
+            let is_rec = Self::require_bool(t, "isRec")?;
             let is_unsafe = Self::get_bool(t, "isUnsafe");
             if is_unsafe {
                 return Err(TcError::Reject(format!(
@@ -500,16 +507,13 @@ impl Parser {
         // `I.rec` rejects a well-typed recursor named `elim`. Empty-rules
         // recursors (`False.rec`) claim `all ∩ group`. Nested rec_k have
         // rules for foreign constructors and must not steal `rec_of[I]`.
-        // Extra recursor: more recs than `types + numNested`, or two recs
-        // claiming the same group type. Exported `k` / rule RHS are not trusted.
+        // Extra recursor: more recs than `types + nested specializations
+        // reconstructed from ctor fields`, or two recs claiming the same
+        // group type. Exported `numNested` / `k` / rule RHS are not trusted.
         let type_names: Vec<u32> = types.iter().map(|t| Self::get_u32(t, "name")).collect();
-        let nested_n = types
-            .iter()
-            .map(|t| Self::get_u32(t, "numNested"))
-            .max()
-            .unwrap_or(0);
+        let nested_n = self.counted_nested(&type_names);
         let nested = nested_n > 0;
-        let expected_recs = type_names.len() + nested_n as usize;
+        let expected_recs = type_names.len() + nested_n;
         if recs.len() > expected_recs {
             return Err(TcError::Reject(format!(
                 "extra recursor in inductive group ({} recs, expected {expected_recs})",
@@ -625,6 +629,120 @@ impl Parser {
             }
         }
         Ok(())
+    }
+
+    /// Nested specializations actually occurring in constructor fields of
+    /// `type_names`, including those found by instantiating a previous
+    /// inductive's constructors (Array T also yields List T).
+    fn counted_nested(&self, type_names: &[u32]) -> usize {
+        let mut seen: FxHashSet<usize> = FxHashSet::default();
+        let mut work: Vec<Expr> = Vec::new();
+        for &tname in type_names {
+            let (ctors, nparams) = match self.env.get(tname) {
+                Some(ConstantInfo::InductiveType {
+                    ctors, num_params, ..
+                }) => (ctors.clone(), *num_params),
+                _ => continue,
+            };
+            for cname in ctors {
+                if let Some(ConstantInfo::Constructor { typ, .. }) = self.env.get(cname) {
+                    work.extend(ctor_field_tys(typ, nparams, None));
+                }
+            }
+        }
+        let mut i = 0;
+        while i < work.len() {
+            let e = work[i].clone();
+            self.collect_nested_in(&e, type_names, &mut seen, &mut work);
+            i += 1;
+        }
+        seen.len()
+    }
+
+    fn collect_nested_in(
+        &self,
+        e: &Expr,
+        group: &[u32],
+        seen: &mut FxHashSet<usize>,
+        work: &mut Vec<Expr>,
+    ) {
+        match &***e {
+            ExprData::App(_, _) => {
+                let (h, args) = expr::unfold_apps(e);
+                if let ExprData::Const(n, us) = &**h {
+                    self.note_nested_app(*n, us.as_slice(), &args, group, seen, work);
+                }
+                self.collect_nested_in(&h, group, seen, work);
+                for a in &args {
+                    self.collect_nested_in(a, group, seen, work);
+                }
+            }
+            ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
+                self.collect_nested_in(t, group, seen, work);
+                self.collect_nested_in(b, group, seen, work);
+            }
+            ExprData::Let(t, v, b) => {
+                self.collect_nested_in(t, group, seen, work);
+                self.collect_nested_in(v, group, seen, work);
+                self.collect_nested_in(b, group, seen, work);
+            }
+            ExprData::Proj(_, _, v) => self.collect_nested_in(v, group, seen, work),
+            ExprData::Const(n, us) => {
+                self.note_nested_app(*n, us.as_slice(), &[], group, seen, work)
+            }
+            _ => {}
+        }
+    }
+
+    fn note_nested_app(
+        &self,
+        n: u32,
+        us: &[Level],
+        args: &[Expr],
+        group: &[u32],
+        seen: &mut FxHashSet<usize>,
+        work: &mut Vec<Expr>,
+    ) {
+        if group.contains(&n) {
+            return;
+        }
+        let Some(ConstantInfo::InductiveType {
+            num_params, all, ..
+        }) = self.env.get(n)
+        else {
+            return;
+        };
+        let num_params = *num_params;
+        if args.len() < num_params as usize {
+            return;
+        }
+        let params = &args[..num_params as usize];
+        if !params.iter().any(|a| expr_occurs_names(a, group)) {
+            return;
+        }
+        let all = all.clone();
+        for m in all {
+            let key_e = expr::apps(expr::const_(m, us.to_vec()), params);
+            let k = Rc::as_ptr(&key_e) as usize;
+            if !seen.insert(k) {
+                continue;
+            }
+            let (ctors, m_params, subst) = match self.env.get(m) {
+                Some(ConstantInfo::InductiveType {
+                    ctors,
+                    num_params: m_params,
+                    level_params,
+                    ..
+                }) => (ctors.clone(), *m_params, level::subst_map(level_params, us)),
+                _ => continue,
+            };
+            for c in ctors {
+                if let Some(ConstantInfo::Constructor { typ, .. }) = self.env.get(c) {
+                    let ty = expr::instantiate_level_params(typ, &subst);
+                    work.extend(ctor_field_tys(&ty, m_params, Some(params)));
+                }
+            }
+        }
     }
 
     /// Parse+check the file line by line, checking each declaration as it is
@@ -797,20 +915,87 @@ fn pi_telescope_len(typ: &Expr) -> u32 {
     }
 }
 
-/// Kernel quot shapes: Type 2+Sort, Ctor 3+App, Lift 6, Ind 5.
+fn ctor_field_tys(typ: &Expr, num_params: u32, inst: Option<&[Expr]>) -> Vec<Expr> {
+    let mut cur = typ.clone();
+    let mut peeled = 0u32;
+    while peeled < num_params {
+        match &**cur {
+            ExprData::Pi(_, _, body) => {
+                cur = body.clone();
+                peeled += 1;
+            }
+            _ => return Vec::new(),
+        }
+    }
+    if let Some(args) = inst {
+        let rev: Vec<Expr> = args.iter().rev().cloned().collect();
+        cur = expr::instantiate(&cur, &rev);
+    }
+    let mut fields = Vec::new();
+    loop {
+        match &**cur {
+            ExprData::Pi(_, dom, body) => {
+                fields.push(dom.clone());
+                cur = body.clone();
+            }
+            _ => break,
+        }
+    }
+    fields
+}
+
+fn expr_occurs_names(e: &Expr, names: &[u32]) -> bool {
+    match &***e {
+        ExprData::Const(n, _) => names.contains(n),
+        ExprData::App(f, a) => expr_occurs_names(f, names) || expr_occurs_names(a, names),
+        ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
+            expr_occurs_names(t, names) || expr_occurs_names(b, names)
+        }
+        ExprData::Let(t, v, b) => {
+            expr_occurs_names(t, names)
+                || expr_occurs_names(v, names)
+                || expr_occurs_names(b, names)
+        }
+        ExprData::Proj(_, _, v) => expr_occurs_names(v, names),
+        _ => false,
+    }
+}
+
+fn is_quot_rel(e: &Expr) -> bool {
+    match &***e {
+        ExprData::Pi(_, _, b1) => match &***b1 {
+            ExprData::Pi(_, _, b2) => matches!(&***b2, ExprData::Sort(l) if level::is_zero(l)),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Kernel quot shapes: Type 2-Pi Sort-dom + rel + Sort; Ctor 3-Pi Sort-dom + rel + App; Lift 6; Ind 5.
 fn quot_type_matches_kind(kind: &QuotKind, typ: &Expr) -> bool {
-    let mut n = 0u32;
+    let mut doms: Vec<Expr> = Vec::new();
     let mut cur = typ.clone();
     loop {
         match &**cur {
-            crate::expr::ExprData::Pi(_, _, body) => {
-                n += 1;
+            ExprData::Pi(_, dom, body) => {
+                doms.push(dom.clone());
                 cur = body.clone();
             }
             rest => {
+                let n = doms.len();
                 return match kind {
-                    QuotKind::Type => n == 2 && matches!(rest, crate::expr::ExprData::Sort(_)),
-                    QuotKind::Ctor => n == 3 && matches!(rest, crate::expr::ExprData::App(_, _)),
+                    QuotKind::Type => {
+                        n == 2
+                            && matches!(rest, ExprData::Sort(_))
+                            && matches!(&**doms[0], ExprData::Sort(_))
+                            && is_quot_rel(&doms[1])
+                    }
+                    QuotKind::Ctor => {
+                        n == 3
+                            && matches!(rest, ExprData::App(_, _))
+                            && matches!(&**doms[0], ExprData::Sort(_))
+                            && is_quot_rel(&doms[1])
+                    }
                     QuotKind::Lift => n == 6,
                     QuotKind::Ind => n == 5,
                 };

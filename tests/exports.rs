@@ -177,3 +177,26 @@ fn missing_rec_rule_rhs_rejects() {
 fn unknown_expr_kind_rejects() {
     assert_reject("unknown-expr-kind.reject.ndjson");
 }
+
+/// Missing `hints` used to become `Regular(0)` and unfold like a transparent def.
+#[test]
+fn missing_hints_unfolds_rejects() {
+    assert_reject("missing-hints-unfolds.reject.ndjson");
+}
+
+/// `numNested: 9` is not extra-rec allowance; nested types come from ctor fields.
+#[test]
+fn inflated_num_nested_rejects() {
+    assert_reject("inflated-numNested.reject.ndjson");
+}
+
+#[test]
+fn missing_is_rec_rejects() {
+    assert_reject("missing-isRec.reject.ndjson");
+}
+
+/// 2-Pi+Sort whose first domain is `False`, not `Sort`.
+#[test]
+fn quot_2pi_false_dom_rejects() {
+    assert_reject("quot-2pi-false-dom.reject.ndjson");
+}
