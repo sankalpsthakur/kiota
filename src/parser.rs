@@ -150,7 +150,7 @@ impl Parser {
         self.levels[idx as usize] = l;
     }
 
-    fn handle_expr(&mut self, idx: u32, v: &Value) {
+    fn handle_expr(&mut self, idx: u32, v: &Value) -> Result<(), TcError> {
         let e = if let Some(l) = v.get("sort") {
             expr::sort(self.level_at(l.as_u64().unwrap() as u32))
         } else if let Some(c) = v.get("const") {
@@ -197,14 +197,13 @@ impl Parser {
             // Metadata wraps an expr; ignore metadata, use inner expr.
             self.expr_at(Self::get_u32(m, "expr"))
         } else {
-            // Unknown expr kind - use a sort as inert placeholder; declarations
-            // referencing this will be handled defensively by the checker.
-            expr::sort(level::zero())
+            return Err(TcError::Reject("unknown expr kind".into()));
         };
         while self.exprs.len() <= idx as usize {
             self.exprs.push(expr::sort(level::zero()));
         }
         self.exprs[idx as usize] = e;
+        Ok(())
     }
 
     fn hints_of(s: &str, n: u64) -> ReducibilityHints {
@@ -463,19 +462,19 @@ impl Parser {
                         .unwrap_or("?")
                 )));
             }
-            let rules = r
-                .get("rules")
-                .and_then(|x| x.as_array())
-                .map(|a| {
-                    a.iter()
-                        .map(|rule| RecRule {
-                            ctor: Self::get_u32(rule, "ctor"),
-                            nfields: Self::get_u32(rule, "nfields"),
-                            rhs: self.expr_at(Self::get_u32(rule, "rhs")),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let rules = if let Some(arr) = r.get("rules").and_then(|x| x.as_array()) {
+                let mut out = Vec::with_capacity(arr.len());
+                for rule in arr {
+                    out.push(RecRule {
+                        ctor: Self::require_u32(rule, "ctor")?,
+                        nfields: Self::require_u32(rule, "nfields")?,
+                        rhs: self.require_expr(rule, "rhs")?,
+                    });
+                }
+                out
+            } else {
+                Vec::new()
+            };
             self.env.insert(
                 name,
                 ConstantInfo::Recursor {
@@ -657,7 +656,7 @@ impl Parser {
             return Ok(());
         }
         if let Some(idx) = v.get("ie").and_then(|x| x.as_u64()) {
-            self.handle_expr(idx as u32, v);
+            self.handle_expr(idx as u32, v)?;
             return Ok(());
         }
         if let Some(d) = v.get("axiom") {

@@ -157,3 +157,23 @@ fn quot_wrong_kind_rejects() {
 fn quot_bare_sort_rejects() {
     assert_reject("quot-bare-sort.reject.ndjson");
 }
+
+#[test]
+fn missing_rec_rule_ctor_rejects() {
+    assert_reject("missing-rec-rule-ctor.reject.ndjson");
+}
+
+#[test]
+fn missing_rec_rule_nfields_rejects() {
+    assert_reject("missing-rec-rule-nfields.reject.ndjson");
+}
+
+#[test]
+fn missing_rec_rule_rhs_rejects() {
+    assert_reject("missing-rec-rule-rhs.reject.ndjson");
+}
+
+#[test]
+fn unknown_expr_kind_rejects() {
+    assert_reject("unknown-expr-kind.reject.ndjson");
+}
