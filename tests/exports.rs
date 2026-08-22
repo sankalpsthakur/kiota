@@ -106,3 +106,74 @@ fn partial_def_rejects() {
 fn quot_false_rejects() {
     assert_reject("quot-false.reject.ndjson");
 }
+
+#[test]
+fn missing_required_u32_rejects() {
+    assert_reject("missing-required-u32.reject.ndjson");
+}
+
+#[test]
+fn missing_ctor_num_fields_rejects() {
+    assert_reject("missing-ctor-num-fields.reject.ndjson");
+}
+
+#[test]
+fn missing_rec_num_minors_rejects() {
+    assert_reject("missing-rec-num-minors.reject.ndjson");
+}
+
+#[test]
+fn missing_decl_name_rejects() {
+    assert_reject("missing-decl-name.reject.ndjson");
+}
+
+#[test]
+fn missing_decl_type_rejects() {
+    assert_reject("missing-decl-type.reject.ndjson");
+}
+
+#[test]
+fn non_u32_num_params_rejects() {
+    assert_reject("non-u32-num-params.reject.ndjson");
+}
+
+/// Recursor type `False → False` is a Pi but not a recursor telescope.
+#[test]
+fn extra_rec_wrong_pi_type_rejects() {
+    assert_reject("extra-rec-wrong-pi-type.reject.ndjson");
+}
+
+#[test]
+fn quot_wrong_pi_rejects() {
+    assert_reject("quot-wrong-pi.reject.ndjson");
+}
+
+#[test]
+fn quot_wrong_kind_rejects() {
+    assert_reject("quot-wrong-kind.reject.ndjson");
+}
+
+#[test]
+fn quot_bare_sort_rejects() {
+    assert_reject("quot-bare-sort.reject.ndjson");
+}
+
+#[test]
+fn missing_rec_rule_ctor_rejects() {
+    assert_reject("missing-rec-rule-ctor.reject.ndjson");
+}
+
+#[test]
+fn missing_rec_rule_nfields_rejects() {
+    assert_reject("missing-rec-rule-nfields.reject.ndjson");
+}
+
+#[test]
+fn missing_rec_rule_rhs_rejects() {
+    assert_reject("missing-rec-rule-rhs.reject.ndjson");
+}
+
+#[test]
+fn unknown_expr_kind_rejects() {
+    assert_reject("unknown-expr-kind.reject.ndjson");
+}
