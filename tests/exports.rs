@@ -185,6 +185,27 @@ fn unknown_expr_kind_rejects() {
     assert_reject("unknown-expr-kind.reject.ndjson");
 }
 
+/// Missing interned app/lam indices used to become expr 0 via `get_u32`.
+#[test]
+fn missing_app_fn_rejects() {
+    assert_reject("missing-app-fn.reject.ndjson");
+}
+
+#[test]
+fn missing_app_arg_rejects() {
+    assert_reject("missing-app-arg.reject.ndjson");
+}
+
+#[test]
+fn missing_lam_type_rejects() {
+    assert_reject("missing-lam-type.reject.ndjson");
+}
+
+#[test]
+fn non_u32_app_fn_rejects() {
+    assert_reject("non-u32-app-fn.reject.ndjson");
+}
+
 /// Missing `hints` used to become `Regular(0)` and unfold like a transparent def.
 #[test]
 fn missing_hints_unfolds_rejects() {
