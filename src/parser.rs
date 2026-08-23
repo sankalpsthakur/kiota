@@ -544,6 +544,84 @@ impl Parser {
             .collect::<Result<_, _>>()?;
         let nested_n = self.counted_nested(&type_names);
         let nested = nested_n > 0;
+
+        // Reconstruct constructor identity from the checked block instead of
+        // trusting the redundant export metadata used later by projection and
+        // iota reduction.
+        let declared_ctor_names: FxHashSet<u32> =
+            ctors.iter().map(|c| Self::get_u32(c, "name")).collect();
+        if declared_ctor_names.len() != ctors.len() {
+            return Err(TcError::Reject(
+                "duplicate constructor declaration in inductive group".into(),
+            ));
+        }
+        let mut owned_ctor_names: FxHashSet<u32> = FxHashSet::default();
+        for t in &types {
+            let tname = Self::get_u32(t, "name");
+            if Self::get_vec_u32(t, "all") != type_names {
+                return Err(TcError::Reject(
+                    "inductive type has inconsistent mutual-group identity".into(),
+                ));
+            }
+            let t_num_params = Self::get_u32(t, "numParams");
+            let listed = Self::get_vec_u32(t, "ctors");
+            let mut recursive = false;
+            for (expected_cidx, &cname) in listed.iter().enumerate() {
+                if !owned_ctor_names.insert(cname) {
+                    return Err(TcError::Reject(
+                        "constructor is listed more than once in inductive group".into(),
+                    ));
+                }
+                let Some(ConstantInfo::Constructor {
+                    typ,
+                    induct,
+                    cidx,
+                    num_params,
+                    num_fields,
+                    ..
+                }) = self.env.get(cname)
+                else {
+                    return Err(TcError::Reject(
+                        "inductive type lists a non-constructor declaration".into(),
+                    ));
+                };
+                if *induct != tname {
+                    return Err(TcError::Reject(
+                        "constructor owner does not match its inductive type".into(),
+                    ));
+                }
+                if *cidx != expected_cidx as u32 {
+                    return Err(TcError::Reject(
+                        "constructor index does not match declaration order".into(),
+                    ));
+                }
+                if *num_params != t_num_params {
+                    return Err(TcError::Reject(
+                        "constructor numParams does not match its inductive type".into(),
+                    ));
+                }
+                let arity = pi_telescope_len(typ);
+                if arity < t_num_params || arity - t_num_params != *num_fields {
+                    return Err(TcError::Reject(
+                        "constructor numFields does not match its checked telescope".into(),
+                    ));
+                }
+                recursive |= ctor_field_tys(typ, t_num_params, None)
+                    .iter()
+                    .any(|field| expr_occurs_names(field, &type_names));
+            }
+            if Self::require_bool(t, "isRec")? != recursive {
+                return Err(TcError::Reject(
+                    "inductive isRec does not match its constructor fields".into(),
+                ));
+            }
+        }
+        if owned_ctor_names != declared_ctor_names {
+            return Err(TcError::Reject(
+                "constructor declarations do not match inductive constructor lists".into(),
+            ));
+        }
+
         let expected_recs = type_names.len() + nested_n;
         if recs.len() > expected_recs {
             return Err(TcError::Reject(format!(

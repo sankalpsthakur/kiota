@@ -35,6 +35,17 @@ fn assert_reject(name: &str) {
     }
 }
 
+fn assert_fixture_mutation_rejects(name: &str, from: &str, to: &str) {
+    let bytes = fs::read_to_string(fixture(name)).expect("read fixture");
+    assert_eq!(bytes.matches(from).count(), 1, "mutation must be unique");
+    let mutated = bytes.replacen(from, to, 1);
+    let mut p = Parser::new();
+    match p.run(Cursor::new(mutated.into_bytes())) {
+        Err(TcError::Reject(_)) => {}
+        other => panic!("mutated {name} should reject, got {other:?}"),
+    }
+}
+
 #[test]
 fn eq_rec_accepts() {
     assert_accept("067_eqRec.accept.ndjson");
@@ -263,4 +274,49 @@ fn nested_neg_functor_rejects() {
 #[test]
 fn nested_list_tree_accepts() {
     assert_accept("nested-list-tree.accept.ndjson");
+}
+
+#[test]
+fn wrong_constructor_owner_rejects() {
+    assert_fixture_mutation_rejects(
+        "nested-list-tree.accept.ndjson",
+        "\"cidx\":0,\"induct\":1",
+        "\"cidx\":0,\"induct\":2",
+    );
+}
+
+#[test]
+fn wrong_constructor_index_rejects() {
+    assert_fixture_mutation_rejects(
+        "nested-list-tree.accept.ndjson",
+        "\"cidx\":1,\"induct\":1",
+        "\"cidx\":0,\"induct\":1",
+    );
+}
+
+#[test]
+fn wrong_constructor_field_count_rejects() {
+    assert_fixture_mutation_rejects(
+        "nested-list-tree.accept.ndjson",
+        "\"numFields\":2,\"numParams\":1",
+        "\"numFields\":1,\"numParams\":1",
+    );
+}
+
+#[test]
+fn wrong_inductive_is_rec_rejects() {
+    assert_fixture_mutation_rejects(
+        "nested-list-tree.accept.ndjson",
+        "\"ctors\":[3,4],\"isRec\":true",
+        "\"ctors\":[3,4],\"isRec\":false",
+    );
+}
+
+#[test]
+fn inconsistent_mutual_group_identity_rejects() {
+    assert_fixture_mutation_rejects(
+        "nested-list-tree.accept.ndjson",
+        "\"all\":[1],\"ctors\":[3,4]",
+        "\"all\":[1,6],\"ctors\":[3,4]",
+    );
 }
