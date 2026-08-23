@@ -833,6 +833,13 @@ fn decline<T>(msg: impl Into<String>) -> R<T> {
     Err(TcError::Decline(msg.into()))
 }
 
+fn decline_or_false(e: TcError) -> R<bool> {
+    match e {
+        TcError::Decline(msg) => Err(TcError::Decline(msg)),
+        _ => Ok(false),
+    }
+}
+
 pub struct Checker<'e> {
     pub env: &'e Environment,
     pub names: &'e [std::rc::Rc<String>],
@@ -1134,6 +1141,12 @@ impl<'e> Checker<'e> {
         // of a bvar major) infer the major's type, so the key includes `ctx.id`.
         let ctx_key = if expr::is_closed(e) { 0 } else { ctx.id };
         (ctx_key, Self::ptr_key(e))
+    }
+
+    fn insert_defeq(&self, key: (u64, usize, usize), r: bool) {
+        if !CORE_ABORTED.with(|a| a.get()) {
+            self.defeq_cache.borrow_mut().insert(key, r);
+        }
     }
 
     fn name_str(&self, n: u32) -> &str {
@@ -1791,11 +1804,11 @@ impl<'e> Checker<'e> {
     fn is_unit_like_pair(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         let ta = match self.infer_type(ctx, a) {
             Ok(t) => t,
-            Err(_) => return Ok(false),
+            Err(e) => return decline_or_false(e),
         };
         let tb = match self.infer_type(ctx, b) {
             Ok(t) => t,
-            Err(_) => return Ok(false),
+            Err(e) => return decline_or_false(e),
         };
         if !self.is_def_eq(ctx, &ta, &tb)? {
             return Ok(false);
@@ -1906,7 +1919,7 @@ impl<'e> Checker<'e> {
     fn is_prop(&self, ctx: &Ctx, ty: &Expr) -> R<bool> {
         let w = match self.whnf(ctx, ty) {
             Ok(w) => w,
-            Err(_) => return Ok(false),
+            Err(e) => return decline_or_false(e),
         };
         match &**w {
             ExprData::Sort(_) => Ok(false),
@@ -1916,7 +1929,7 @@ impl<'e> Checker<'e> {
                 };
                 let tw = match self.whnf(ctx, &t) {
                     Ok(x) => x,
-                    Err(_) => return Ok(false),
+                    Err(e) => return decline_or_false(e),
                 };
                 Ok(matches!(&**tw, ExprData::Sort(l) if level::is_def_eq(l, &level::zero())))
             }
@@ -1955,14 +1968,12 @@ impl<'e> Checker<'e> {
     /// InferOnly typeof. Check-mode infer here re-entered PI on huge type
     /// spines (`blastAdd`). Lean `is_prop` uses `infer`, not `check`.
     fn is_prop_by_infer(&self, ctx: &Ctx, ty: &Expr) -> R<bool> {
-        self.with_infer_only(|| {
-            match self.infer_type(ctx, ty) {
-                Ok(s) => match self.ensure_sort(ctx, &s) {
-                    Ok(l) => Ok(level::is_def_eq(&l, &level::zero())),
-                    Err(_) => Ok(false),
-                },
-                Err(_) => Ok(false),
-            }
+        self.with_infer_only(|| match self.infer_type(ctx, ty) {
+            Ok(s) => match self.ensure_sort(ctx, &s) {
+                Ok(l) => Ok(level::is_def_eq(&l, &level::zero())),
+                Err(e) => decline_or_false(e),
+            },
+            Err(e) => decline_or_false(e),
         })
     }
 
@@ -2040,7 +2051,7 @@ impl<'e> Checker<'e> {
     fn domain_is_prop_inductive(&self, ctx: &Ctx, ty: &Expr) -> R<bool> {
         let w = match self.whnf(ctx, ty) {
             Ok(w) => w,
-            Err(_) => return Ok(false),
+            Err(e) => return decline_or_false(e),
         };
         if matches!(&**w, ExprData::Sort(_)) {
             return Ok(false);
@@ -2075,7 +2086,7 @@ impl<'e> Checker<'e> {
     fn proofs_of_same_prop_go(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         let ta = match self.infer_type(ctx, a) {
             Ok(t) => t,
-            Err(_) => return Ok(false),
+            Err(e) => return decline_or_false(e),
         };
         let prop_a = self.is_prop(ctx, &ta)?;
         if !prop_a {
@@ -2083,7 +2094,7 @@ impl<'e> Checker<'e> {
         }
         let tb = match self.infer_type(ctx, b) {
             Ok(t) => t,
-            Err(_) => return Ok(false),
+            Err(e) => return decline_or_false(e),
         };
         let eq = self.is_def_eq(ctx, &ta, &tb)?;
         if !eq {
@@ -2282,7 +2293,7 @@ impl<'e> Checker<'e> {
                     return Ok(true);
                 }
             };
-            if self.domain_is_prop_inductive(ctx, &dom)? || self.is_prop(ctx, &dom).unwrap_or(false)
+            if self.domain_is_prop_inductive(ctx, &dom)? || self.is_prop(ctx, &dom)?
             {
                 ty = expr::instantiate1(&body, &a1[i]);
                 i += 1;
@@ -2609,6 +2620,9 @@ impl<'e> Checker<'e> {
         let r = self.whnf_core_go(ctx, &e);
         CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         let r = r?;
+        if CORE_ABORTED.with(|a| a.get()) {
+            return Ok(r);
+        }
         self.whnf_core_cache.borrow_mut().insert(k, r.clone());
         Ok(r)
     }
@@ -3181,11 +3195,11 @@ impl<'e> Checker<'e> {
         // class types instead. Acc `f 1 a` vs `f 1 (Acc.intro …)` is Bool,
         // so PI is false there and unreduced congruence still runs.
         if self.proofs_of_same_prop(ctx, a, b)? {
-            self.defeq_cache.borrow_mut().insert(key, true);
+            self.insert_defeq(key, true);
             return Ok(true);
         }
         if self.try_unreduced_const_congruence(ctx, a, b)? {
-            self.defeq_cache.borrow_mut().insert(key, true);
+            self.insert_defeq(key, true);
             return Ok(true);
         }
         let aw = self.whnf_for_defeq(ctx, a)?;
@@ -3224,7 +3238,7 @@ impl<'e> Checker<'e> {
         }
         if let (Ok(Some(x)), Ok(Some(y))) = (self.closed_int_value(ctx, &aw), self.closed_int_value(ctx, &bw)) {
             let r = x == y;
-            self.defeq_cache.borrow_mut().insert(key, r);
+            self.insert_defeq(key, r);
             return Ok(r);
         }
         let r = self.is_def_eq_core(ctx, &aw, &bw)?;
@@ -3232,9 +3246,7 @@ impl<'e> Checker<'e> {
         // false is a completed answer. True-only left std `#18000` retrying the
         // same failing pair — 1e9 intern hits, intern size unchanged.
         // Do not cache a result produced under a CORE_DEPTH stuck WHNF.
-        if !CORE_ABORTED.with(|a| a.get()) {
-            self.defeq_cache.borrow_mut().insert(key, r);
-        }
+        self.insert_defeq(key, r);
         Ok(r)
     }
 
@@ -3475,14 +3487,14 @@ impl<'e> Checker<'e> {
             let same = self.with_infer_only(|| -> R<bool> {
                 let ta = match self.infer_type(ctx, a) {
                     Ok(t) => t,
-                    Err(_) => return Ok(false),
+                    Err(e) => return decline_or_false(e),
                 };
                 if !self.is_prop(ctx, &ta)? {
                     return Ok(false);
                 }
                 let tb = match self.infer_type(ctx, b) {
                     Ok(t) => t,
-                    Err(_) => return Ok(false),
+                    Err(e) => return decline_or_false(e),
                 };
                 self.is_def_eq(ctx, &ta, &tb)
             })?;
@@ -3938,19 +3950,19 @@ impl<'e> Checker<'e> {
                     ctx.push(dom);
                     cur = body;
                 }
-                Err(_) => return Ok(false),
+                Err(e) => return decline_or_false(e),
             }
         }
         let w = match self.whnf(&ctx, &cur) {
             Ok(w) => w,
-            Err(_) => return Ok(false),
+            Err(e) => return decline_or_false(e),
         };
         if matches!(&**w, ExprData::Pi(_, _, _)) {
             return Ok(false);
         }
         let lvl = match self.ensure_sort(&ctx, &w) {
             Ok(l) => l,
-            Err(_) => return Ok(false),
+            Err(e) => return decline_or_false(e),
         };
         if !level::is_def_eq(&lvl, &level::zero()) {
             return Ok(false);
@@ -8785,7 +8797,7 @@ mod tests {
             },
         );
         let names = test_names(&["Nat", "Int", "OfNat.ofNat", "inst"]);
-        let tc = Checker::new(&env, &names, None, None);
+        let tc = Checker::new(&env, &names, Some(0), None);
         let n3 = expr::lit_nat(3u32.into());
         let int3 = expr::apps(
             expr::const_(2, vec![]),
@@ -8853,7 +8865,7 @@ mod tests {
             },
         );
         let names = test_names(&["Nat", "Int", "Nat.cast", "inst"]);
-        let tc = Checker::new(&env, &names, None, None);
+        let tc = Checker::new(&env, &names, Some(0), None);
         let n3 = expr::lit_nat(3u32.into());
         let cast = |ty: u32| {
             expr::apps(
@@ -9613,6 +9625,132 @@ mod tests {
             Err(TcError::Decline(_)) => {}
             other => panic!("CORE_DEPTH abort must Decline defeq, not {other:?}"),
         }
+        // Stuck axiom is already WHNF. Treating it as a core redex Declines
+        // Init `Int16.ofInt_eq_ofNat` / `Nat.rec`.
+        CORE_DEPTH.with(|d| d.set(CONV_DEPTH));
+        CORE_ABORTED.with(|a| a.set(false));
+        let stuck = tc.whnf(&Ctx::new(), &expr::const_(1, vec![]));
+        CORE_DEPTH.with(|d| d.set(0));
+        CORE_ABORTED.with(|a| a.set(false));
+        match stuck {
+            Ok(_) => {}
+            other => panic!("stuck axiom at CORE_DEPTH must not Decline, got {other:?}"),
+        }
+    }
+
+    /// Decline during is_prop/PI must not be stored as `false` in defeq_cache.
+    /// `p intro` / `q intro` with `p, q : ((λ _. True → True) a)`: infer of the
+    /// apps hits a β-redex type; the apps themselves are stuck axiom heads
+    /// (not core redexes), so a swallowed Decline would cache `false`.
+    #[test]
+    fn decline_during_pi_not_cached_as_false() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        insert_false_true(&mut env);
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            3,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            4,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::const_(3, vec![]),
+                is_unsafe: false,
+            },
+        );
+        let true_ty = expr::const_(1, vec![]);
+        let a_ty = expr::const_(3, vec![]);
+        let a = expr::const_(4, vec![]);
+        let true_to_true = expr::pi(expr::BinderInfo::Default, true_ty.clone(), true_ty.clone());
+        let wrap = expr::app(expr::lam(expr::BinderInfo::Default, a_ty, true_to_true), a);
+        env.insert(
+            5,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: wrap.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            6,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: wrap,
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["False", "True", "True.intro", "A", "a", "p", "q"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let intro = expr::const_(2, vec![]);
+        let p_app = expr::app(expr::const_(5, vec![]), intro.clone());
+        let q_app = expr::app(expr::const_(6, vec![]), intro);
+        CORE_DEPTH.with(|d| d.set(CONV_DEPTH));
+        CORE_ABORTED.with(|a| a.set(false));
+        let first = tc.is_def_eq(&Ctx::new(), &p_app, &q_app);
+        CORE_DEPTH.with(|d| d.set(0));
+        CORE_ABORTED.with(|a| a.set(false));
+        match first {
+            Err(TcError::Decline(_)) => {}
+            other => panic!("PI/is_prop at CORE_DEPTH must Decline, got {other:?}"),
+        }
+        let second = tc
+            .is_def_eq(&Ctx::new(), &p_app, &q_app)
+            .expect("defeq after reset");
+        assert!(
+            second,
+            "Decline during PI must not cache false; p intro and q intro are proofs of True"
+        );
+    }
+
+    /// Recursor/quot apps are not core redexes. A ctor-major rec at CONV_DEPTH
+    /// is Ok (not Decline); abort must not cache the unreduced app.
+    #[test]
+    fn core_depth_abort_does_not_decline_or_cache_recursor() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_psigma(&mut env);
+        let names = test_names(&["PSigma", "PSigma.mk", "PSigma.rec", "A", "B"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let a = expr::const_(3, vec![]);
+        let b = expr::const_(4, vec![]);
+        let psigma_ab = expr::apps(expr::const_(0, vec![]), &[a.clone(), b.clone()]);
+        let sort1 = expr::sort(level::succ(level::zero()));
+        let motive = expr::lam(expr::BinderInfo::Default, psigma_ab, sort1);
+        let minor = expr::lam(
+            expr::BinderInfo::Default,
+            a.clone(),
+            expr::lam(expr::BinderInfo::Default, b.clone(), expr::bvar(1)),
+        );
+        let x = expr::const_(3, vec![]);
+        let y = expr::const_(4, vec![]);
+        let mk = expr::apps(expr::const_(1, vec![]), &[a.clone(), b, x.clone(), y]);
+        let rec_app = expr::apps(
+            expr::const_(2, vec![]),
+            &[a, expr::const_(4, vec![]), motive, minor, mk],
+        );
+        CORE_DEPTH.with(|d| d.set(CONV_DEPTH));
+        CORE_ABORTED.with(|ab| ab.set(false));
+        let at_cap = tc.whnf(&Ctx::new(), &rec_app);
+        CORE_DEPTH.with(|d| d.set(0));
+        CORE_ABORTED.with(|ab| ab.set(false));
+        match at_cap {
+            Ok(_) => {}
+            other => panic!(
+                "recursor app at CORE_DEPTH must not Decline (not a β/ζ/proj redex), got {other:?}"
+            ),
+        }
+        let w = tc.whnf(&Ctx::new(), &rec_app).expect("WHNF after reset");
+        assert!(
+            Rc::ptr_eq(&w, &x),
+            "abort must not cache a stuck rec app; later WHNF must ι, got {}",
+            tc.pp(&w)
+        );
     }
 
     /// Let-zeta is part of WHNF. Defeq of `let x := v; x` vs `v` must hold
