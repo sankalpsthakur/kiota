@@ -2153,14 +2153,18 @@ impl<'e> Checker<'e> {
         for _ in 0..64 {
             match &**t {
                 ExprData::Pi(_, dom, body) => {
-                    if self.domain_is_prop_inductive(&empty, dom).unwrap_or(false) {
+                    // On an incomplete probe, take the typed argument path.
+                    // `false` selects raw pairwise comparison and can turn a
+                    // depth limit into a cached negative result.
+                    if self.domain_is_prop_inductive(&empty, dom).unwrap_or(true) {
                         return true;
                     }
                     t = body.clone();
                 }
                 _ => match self.whnf(&empty, &t) {
                     Ok(w) if !Rc::ptr_eq(&w, &t) => t = w,
-                    _ => return false,
+                    Ok(_) => return false,
+                    Err(_) => return true,
                 },
             }
         }
@@ -2559,7 +2563,7 @@ impl<'e> Checker<'e> {
     /// beta/zeta/proj/iota reduction to whnf, WITHOUT unfolding delta.
     /// True when `whnf_core` still has a β/ζ/proj redex. Delta/ι are the
     /// outer `whnf` / `try_iota` steps; a recursor app with a stuck major
-    /// is already core-WHNF.
+    /// is already core-WHNF. Such a result is never cached after an abort.
     fn is_whnf_core_redex(e: &Expr) -> bool {
         match &***e {
             ExprData::Let(_, _, _) => true,
@@ -2596,9 +2600,8 @@ impl<'e> Checker<'e> {
         if depth > CONV_DEPTH {
             CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
             CORE_ABORTED.with(|a| a.set(true));
-            // Do not cache. A β/ζ/proj redex at the cap is not WHNF — Decline.
-            // A stuck recursor/axiom app is already WHNF; returning it as Ok
-            // is honest (Init `Int8.toInt_toInt32`).
+            // Do not cache. A potentially reducible term at the cap is not
+            // established WHNF, so propagate Decline.
             if std::env::var_os("KIOTA_TRACE_IOTA").is_some()
                 || std::env::var_os("KIOTA_TRACE_EQ").is_some()
             {
@@ -2717,35 +2720,47 @@ impl<'e> Checker<'e> {
                                 cur = r;
                                 continue;
                             }
-                            if let Some(r) = self.try_omega_combo(ctx, &head, &args)? {
-                                crate::stats::l_omega();
-                                cur = r;
-                                continue;
-                            }
-                            if let Some(r) = self.try_omega_constraint(ctx, &head, &args)? {
-                                crate::stats::l_omega();
-                                cur = r;
-                                continue;
-                            }
-                            if let Some(r) = self.try_intlist(ctx, &head, &args)? {
-                                crate::stats::l_omega();
-                                cur = r;
-                                continue;
-                            }
-                            if let Some(r) = self.try_int_linear(ctx, &head, &args)? {
-                                crate::stats::l_linear();
-                                cur = r;
-                                continue;
-                            }
-                            if let Some(r) = self.try_comm_ring(ctx, &head, &args)? {
-                                crate::stats::l_commring();
-                                cur = r;
-                                continue;
-                            }
-                            if let Some(r) = self.try_rat(ctx, &head, &args)? {
-                                crate::stats::l_rat();
-                                cur = r;
-                                continue;
+                            // These evaluators summarize non-kernel library definitions.
+                            // An axiom, opaque constant, constructor, or recursor with the
+                            // same name has no such reduction rule. Definitions still need
+                            // their bodies authenticated before this gate is a complete
+                            // identity check; this prevents declaration-kind substitution.
+                            let semantic_def = matches!(
+                                &**head,
+                                ExprData::Const(n, _)
+                                    if matches!(self.env.get(*n), Some(ConstantInfo::Def { .. }))
+                            );
+                            if semantic_def {
+                                if let Some(r) = self.try_omega_combo(ctx, &head, &args)? {
+                                    crate::stats::l_omega();
+                                    cur = r;
+                                    continue;
+                                }
+                                if let Some(r) = self.try_omega_constraint(ctx, &head, &args)? {
+                                    crate::stats::l_omega();
+                                    cur = r;
+                                    continue;
+                                }
+                                if let Some(r) = self.try_intlist(ctx, &head, &args)? {
+                                    crate::stats::l_omega();
+                                    cur = r;
+                                    continue;
+                                }
+                                if let Some(r) = self.try_int_linear(ctx, &head, &args)? {
+                                    crate::stats::l_linear();
+                                    cur = r;
+                                    continue;
+                                }
+                                if let Some(r) = self.try_comm_ring(ctx, &head, &args)? {
+                                    crate::stats::l_commring();
+                                    cur = r;
+                                    continue;
+                                }
+                                if let Some(r) = self.try_rat(ctx, &head, &args)? {
+                                    crate::stats::l_rat();
+                                    cur = r;
+                                    continue;
+                                }
                             }
                             if let Some(r) = self.try_dite(ctx, &head, &args)? {
                                 cur = r;
@@ -3236,7 +3251,9 @@ impl<'e> Checker<'e> {
                 );
             }
         }
-        if let (Ok(Some(x)), Ok(Some(y))) = (self.closed_int_value(ctx, &aw), self.closed_int_value(ctx, &bw)) {
+        let int_aw = self.closed_int_value(ctx, &aw)?;
+        let int_bw = self.closed_int_value(ctx, &bw)?;
+        if let (Some(x), Some(y)) = (int_aw, int_bw) {
             let r = x == y;
             self.insert_defeq(key, r);
             return Ok(r);
@@ -4144,6 +4161,7 @@ impl<'e> Checker<'e> {
         for f in fields {
             let (_, dom, body) = match self.ensure_pi(&cctx, &ct) {
                 Ok(x) => x,
+                Err(e @ TcError::Decline(_)) => return Err(e),
                 Err(_) => break,
             };
             result = expr::app(result, f.clone());
@@ -4191,9 +4209,11 @@ impl<'e> Checker<'e> {
         if !is_rec {
             return Ok(None);
         }
-        let mut ty = self
-            .whnf(ctx, field_ty)
-            .unwrap_or_else(|_| field_ty.clone());
+        let mut ty = match self.whnf(ctx, field_ty) {
+            Ok(ty) => ty,
+            Err(e @ TcError::Decline(_)) => return Err(e),
+            Err(_) => field_ty.clone(),
+        };
         let mut binders: Vec<Expr> = Vec::new();
         let mut tctx = ctx.clone();
         loop {
@@ -4201,7 +4221,11 @@ impl<'e> Checker<'e> {
                 ExprData::Pi(_, dom, body) => {
                     binders.push(dom.clone());
                     tctx.push(dom.clone());
-                    ty = self.whnf(&tctx, body).unwrap_or_else(|_| body.clone());
+                    ty = match self.whnf(&tctx, body) {
+                        Ok(ty) => ty,
+                        Err(e @ TcError::Decline(_)) => return Err(e),
+                        Err(_) => body.clone(),
+                    };
                 }
                 _ => break,
             }
@@ -8883,10 +8907,11 @@ mod tests {
         assert!(!eq, "Nat.cast Nat 3 must not defeq Nat.cast Int 3");
     }
 
-    /// Forged `CommRing.norm_eq_cert` (not `Lean.Grind.CommRing.*`) must not
-    /// WHNF to `Bool.true` even when the arguments parse as equal monomials.
+    /// An axiom with the exact library name `Lean.Grind.CommRing.norm_eq_cert`
+    /// must not WHNF to `Bool.true` even when its arguments parse as equal
+    /// monomials. Exact spelling does not turn an axiom into a definition.
     #[test]
-    fn forged_commring_norm_eq_cert_does_not_whnf_true() {
+    fn canonical_commring_axiom_does_not_whnf_true() {
         let mut env = Environment::default();
         let sort1 = expr::sort(level::succ(level::zero()));
         let sort0 = expr::sort(level::zero());
@@ -8911,7 +8936,7 @@ mod tests {
                 expr::const_(1, vec![]),
                 sort0.clone(),
             ),
-        ); // CommRing.Expr.num
+        ); // Lean.Grind.CommRing.Expr.num
         let bool_ty = sort0.clone();
         let expr_ty = sort0;
         let cert_ty = expr::pi(
@@ -8927,15 +8952,15 @@ mod tests {
                 ),
             ),
         );
-        axiom_sort(&mut env, 6, cert_ty); // CommRing.norm_eq_cert
+        axiom_sort(&mut env, 6, cert_ty); // Lean.Grind.CommRing.norm_eq_cert
         let names = test_names(&[
             "Nat",
             "Int",
             "Int.ofNat",
             "Bool.true",
             "Bool.false",
-            "CommRing.Expr.num",
-            "CommRing.norm_eq_cert",
+            "Lean.Grind.CommRing.Expr.num",
+            "Lean.Grind.CommRing.norm_eq_cert",
         ]);
         let tc = Checker::new(&env, &names, None, None);
         let z = expr::app(expr::const_(2, vec![]), expr::lit_nat(0u32.into()));
@@ -8949,7 +8974,7 @@ mod tests {
         let reduced_true = matches!(&**h, ExprData::Const(n, _) if *n == 3);
         assert!(
             !reduced_true,
-            "forged CommRing.norm_eq_cert must not WHNF to Bool.true, got {}",
+            "axiom Lean.Grind.CommRing.norm_eq_cert must stay stuck, got {}",
             tc.pp(&w)
         );
     }
@@ -9708,10 +9733,10 @@ mod tests {
         );
     }
 
-    /// Recursor/quot apps are not core redexes. A ctor-major rec at CONV_DEPTH
-    /// is Ok (not Decline); abort must not cache the unreduced app.
+    /// A ctor-major recursor at CONV_DEPTH is returned without caching. A later
+    /// call at ordinary depth must still iota-reduce it.
     #[test]
-    fn core_depth_abort_does_not_decline_or_cache_recursor() {
+    fn core_depth_abort_does_not_cache_recursor() {
         use crate::env::Environment;
         let mut env = Environment::default();
         insert_mini_psigma(&mut env);
@@ -9741,9 +9766,7 @@ mod tests {
         CORE_ABORTED.with(|ab| ab.set(false));
         match at_cap {
             Ok(_) => {}
-            other => panic!(
-                "recursor app at CORE_DEPTH must not Decline (not a β/ζ/proj redex), got {other:?}"
-            ),
+            other => panic!("recursor app at CORE_DEPTH may stay stuck, got {other:?}"),
         }
         let w = tc.whnf(&Ctx::new(), &rec_app).expect("WHNF after reset");
         assert!(
