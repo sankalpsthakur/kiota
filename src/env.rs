@@ -1,5 +1,5 @@
 use crate::expr::Expr;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReducibilityHints {
@@ -140,6 +140,10 @@ pub struct Environment {
     /// Recursor → every recursor in its inductive block (`.rec`, `.rec_1`, …),
     /// sorted so main comes first. Used for nested ι, not for trusting RHS.
     pub rec_group: FxHashMap<u32, Vec<u32>>,
+    /// Nat operations whose checked definitions satisfy the kernel primitive
+    /// equations. A standalone export must establish this before using Lean's
+    /// native numeral evaluator for a canonical operation name.
+    pub native_nat_ops: FxHashSet<u32>,
 }
 
 impl Environment {

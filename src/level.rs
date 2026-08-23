@@ -56,6 +56,17 @@ pub fn is_not_zero(l: &Level) -> bool {
     }
 }
 
+/// Lean kernel `normalizes_to_zero`: true exactly when every universe
+/// parameter assignment normalizes this level to zero.
+pub fn normalizes_to_zero(l: &Level) -> bool {
+    match &**l {
+        LevelData::Zero => true,
+        LevelData::Param(_) | LevelData::Succ(_) => false,
+        LevelData::Max(a, b) => normalizes_to_zero(a) && normalizes_to_zero(b),
+        LevelData::IMax(_, b) => normalizes_to_zero(b),
+    }
+}
+
 fn is_one(l: &Level) -> bool {
     matches!(&**l, LevelData::Succ(z) if matches!(&**z, LevelData::Zero))
 }
@@ -196,6 +207,39 @@ pub fn leq(l1: &Level, l2: &Level, diff: i64) -> bool {
     }
 }
 
+/// Lean kernel `is_geq(l1, l2)`, used by inductive universe checking.
+/// This is intentionally separate from definitional level equality: it asks
+/// whether `l1 >= l2` for every assignment of the universe parameters.
+pub fn is_geq(l1: &Level, l2: &Level) -> bool {
+    fn core(l1: &Level, l2: &Level) -> bool {
+        if l1 == l2 || is_zero(l2) {
+            return true;
+        }
+        if let LevelData::Max(a, b) = &**l2 {
+            return is_geq(l1, a) && is_geq(l1, b);
+        }
+        if let LevelData::Max(a, b) = &**l1 {
+            if is_geq(a, l2) || is_geq(b, l2) {
+                return true;
+            }
+        }
+        if let LevelData::IMax(a, b) = &**l2 {
+            return is_geq(l1, a) && is_geq(l1, b);
+        }
+        if let LevelData::IMax(_, b) = &**l1 {
+            return is_geq(b, l2);
+        }
+        let (base1, off1) = to_offset(l1);
+        let (base2, off2) = to_offset(l2);
+        if base1 == base2 || is_zero(&base2) {
+            return off1 >= off2;
+        }
+        off1 == off2 && off1 > 0 && is_geq(&base1, &base2)
+    }
+
+    core(&normalize(l1), &normalize(l2))
+}
+
 pub fn pp(l: &Level) -> String {
     match &**l {
         LevelData::Zero => "0".into(),
@@ -281,5 +325,22 @@ mod tests {
         let lhs = max(u22.clone(), max(u128.clone(), succ(u6.clone())));
         let rhs = max(max(succ(u6), u22), u128);
         assert!(is_def_eq(&lhs, &rhs), "{} vs {}", pp(&lhs), pp(&rhs));
+    }
+
+    #[test]
+    fn geq_matches_kernel_max_and_offsets() {
+        let u = param(1);
+        let v = param(2);
+        assert!(is_geq(&max(u.clone(), v.clone()), &u));
+        assert!(is_geq(&succ(u.clone()), &u));
+        assert!(!is_geq(&u, &succ(u.clone())));
+        assert!(!is_geq(&u, &v));
+    }
+
+    #[test]
+    fn normalizes_to_zero_follows_imax_rhs() {
+        let u = param(1);
+        assert!(normalizes_to_zero(&imax(u.clone(), zero())));
+        assert!(!normalizes_to_zero(&imax(u.clone(), param(2))));
     }
 }

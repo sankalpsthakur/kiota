@@ -46,6 +46,24 @@ fn assert_fixture_mutation_rejects(name: &str, from: &str, to: &str) {
     }
 }
 
+fn check_inline(lines: &[&str]) -> Result<(), TcError> {
+    let mut input = lines.join("\n");
+    input.push('\n');
+    let mut p = Parser::new();
+    p.run(Cursor::new(input.into_bytes()))
+}
+
+#[test]
+fn direct_self_referential_definition_rejects() {
+    let result = check_inline(&[
+        r#"{"in":1,"str":{"pre":0,"str":"Self"}}"#,
+        r#"{"ie":0,"sort":0}"#,
+        r#"{"const":{"name":1,"us":[]},"ie":1}"#,
+        r#"{"def":{"all":[1],"hints":{"regular":1},"levelParams":[],"name":1,"safety":"safe","type":0,"value":1}}"#,
+    ]);
+    assert!(matches!(result, Err(TcError::Reject(_))), "got {result:?}");
+}
+
 #[test]
 fn eq_rec_accepts() {
     assert_accept("067_eqRec.accept.ndjson");
@@ -269,10 +287,10 @@ fn nested_neg_functor_rejects() {
     assert_reject("nested-neg-functor.reject.ndjson");
 }
 
-/// `List` is strictly positive; `Tree` with a `List Tree` field is a nested
-/// inductive Lean accepts (`Syntax` is the same shape).
+/// A hand-minimized but kernel-formed `List` block keeps constructor metadata
+/// mutation tests non-vacuous now that recursor types are authenticated.
 #[test]
-fn nested_list_tree_accepts() {
+fn canonical_list_recursor_accepts() {
     assert_accept("nested-list-tree.accept.ndjson");
 }
 
@@ -319,4 +337,58 @@ fn inconsistent_mutual_group_identity_rejects() {
         "\"all\":[1],\"ctors\":[3,4]",
         "\"all\":[1,6],\"ctors\":[3,4]",
     );
+}
+
+#[test]
+fn constructor_field_domain_must_be_a_type() {
+    let bytes = fs::read_to_string(fixture("nested-list-tree.accept.ndjson"))
+        .expect("read fixture");
+    let extra = concat!(
+        "{\"ie\":27,\"const\":{\"name\":3,\"us\":[]}}\n",
+        "{\"app\":{\"arg\":2,\"fn\":27},\"ie\":28}\n",
+    );
+    let mutated = bytes
+        .replacen("{\"inductive\":", &format!("{extra}{{\"inductive\":"), 1)
+        .replacen(
+            "{\"forallE\":{\"binderInfo\":\"default\",\"body\":10,\"name\":0,\"type\":2},\"ie\":11}",
+            "{\"forallE\":{\"binderInfo\":\"default\",\"body\":10,\"name\":0,\"type\":28},\"ie\":11}",
+            1,
+        );
+    assert_ne!(mutated, bytes);
+    let mut p = Parser::new();
+    match p.run(Cursor::new(mutated.into_bytes())) {
+        Err(TcError::Reject(_)) => {}
+        other => panic!("constructor field with a term domain should reject, got {other:?}"),
+    }
+}
+
+#[test]
+fn duplicate_fully_qualified_name_rejects() {
+    let bytes = fs::read_to_string(fixture("067_eqRec.accept.ndjson")).expect("read fixture");
+    let duplicate = concat!(
+        "{\"in\":1,\"str\":{\"pre\":0,\"str\":\"Eq\"}}\n",
+        "{\"in\":999,\"str\":{\"pre\":0,\"str\":\"Eq\"}}\n",
+    );
+    let mutated = bytes.replacen(
+        "{\"in\":1,\"str\":{\"pre\":0,\"str\":\"Eq\"}}\n",
+        duplicate,
+        1,
+    );
+    let mut p = Parser::new();
+    match p.run(Cursor::new(mutated.into_bytes())) {
+        Err(TcError::Reject(_)) => {}
+        other => panic!("duplicate fully qualified name should reject, got {other:?}"),
+    }
+}
+
+#[test]
+fn overflowing_name_index_rejects() {
+    let bytes = fs::read_to_string(fixture("067_eqRec.accept.ndjson")).expect("read fixture");
+    let mutated = bytes.replacen("{\"in\":1,", "{\"in\":4294967297,", 1);
+    assert_ne!(mutated, bytes);
+    let mut p = Parser::new();
+    match p.run(Cursor::new(mutated.into_bytes())) {
+        Err(TcError::Reject(_)) => {}
+        other => panic!("overflowing name index should reject, got {other:?}"),
+    }
 }

@@ -1666,13 +1666,32 @@ impl<'e> Checker<'e> {
 
     fn nat_type(&self) -> R<Expr> {
         match self.nat_ref {
-            Some(n) => Ok(expr::const_(n, vec![])),
+            Some(n) if self.nat_ctors().is_some() => Ok(expr::const_(n, vec![])),
+            Some(_) => reject("Nat literal used with a malformed native Nat declaration"),
             None => decline("Nat literal used but Nat type unavailable"),
         }
     }
     fn string_type(&self) -> R<Expr> {
         match self.string_ref {
-            Some(n) => Ok(expr::const_(n, vec![])),
+            Some(n)
+                if matches!(
+                    self.env.get(n),
+                    Some(ConstantInfo::InductiveType {
+                        level_params,
+                        typ,
+                        num_params: 0,
+                        num_indices: 0,
+                        all,
+                        ctors,
+                        is_unsafe: false,
+                        ..
+                    }) if self.name_str(n) == "String"
+                        && level_params.is_empty()
+                        && **typ == *expr::sort(level::succ(level::zero()))
+                        && all.as_slice() == [n]
+                        && !ctors.is_empty()
+                ) => Ok(expr::const_(n, vec![])),
+            Some(_) => reject("String literal used with a malformed native String declaration"),
             None => decline("String literal used but String type unavailable"),
         }
     }
@@ -1739,7 +1758,19 @@ impl<'e> Checker<'e> {
             t
         };
         for i in 0..idx {
-            let (_, _dom, body) = self.ensure_pi(ctx, &ct2)?;
+            let (_, prior_dom, body) = self.ensure_pi(ctx, &ct2)?;
+            // Lean permits proof projections from a Prop structure only up to
+            // the first *dependent* data field.  A later proof field is still
+            // forbidden even when its own type is Prop: substituting a
+            // projection of data out of a proof would already violate proof
+            // irrelevance.  `body` is under the current field binder, so bvar
+            // 0 records exactly that dependency.
+            if self.is_prop(ctx, &vtw)?
+                && Self::occurs_bvar(&body, 0)
+                && !self.is_prop(ctx, &prior_dom)?
+            {
+                return reject("cannot project past a dependent Type field from a Prop structure");
+            }
             let proj_i = expr::proj(sname, i, v.clone());
             ct2 = expr::instantiate1(&body, &proj_i);
         }
@@ -1769,12 +1800,258 @@ impl<'e> Checker<'e> {
 
     fn nat_ctors(&self) -> Option<(u32, u32)> {
         let n = self.nat_ref?;
-        match self.env.get(n) {
-            Some(ConstantInfo::InductiveType { ctors, .. }) if ctors.len() == 2 => {
-                Some((ctors[0], ctors[1]))
-            }
-            _ => None,
+        let Some(ConstantInfo::InductiveType {
+            level_params,
+            typ,
+            num_params,
+            num_indices,
+            all,
+            ctors,
+            is_rec,
+            is_unsafe,
+        }) = self.env.get(n)
+        else {
+            return None;
+        };
+        if self.name_str(n) != "Nat"
+            || !level_params.is_empty()
+            || **typ != *expr::sort(level::succ(level::zero()))
+            || *num_params != 0
+            || *num_indices != 0
+            || all.as_slice() != [n]
+            || ctors.len() != 2
+            || !*is_rec
+            || *is_unsafe
+        {
+            return None;
         }
+        let (zero, succ) = (ctors[0], ctors[1]);
+        let nat = expr::const_(n, vec![]);
+        let succ_ty = expr::pi(expr::BinderInfo::Default, nat.clone(), nat.clone());
+        let zero_ok = matches!(
+            self.env.get(zero),
+            Some(ConstantInfo::Constructor {
+                level_params,
+                typ,
+                induct,
+                cidx: 0,
+                num_params: 0,
+                num_fields: 0,
+                is_unsafe: false,
+            }) if self.name_str(zero) == "Nat.zero" && level_params.is_empty() && **typ == *nat && *induct == n
+        );
+        let succ_ok = matches!(
+            self.env.get(succ),
+            Some(ConstantInfo::Constructor {
+                level_params,
+                typ,
+                induct,
+                cidx: 1,
+                num_params: 0,
+                num_fields: 1,
+                is_unsafe: false,
+            }) if self.name_str(succ) == "Nat.succ" && level_params.is_empty() && **typ == *succ_ty && *induct == n
+        );
+        (zero_ok && succ_ok).then_some((zero, succ))
+    }
+
+    fn nat_numeral_value_whnf(&self, ctx: &Ctx, e: &Expr) -> R<Option<BigUint>> {
+        let Some((zero, succ)) = self.nat_ctors() else {
+            return Ok(None);
+        };
+        let mut cur = self.whnf(ctx, e)?;
+        let mut offset = BigUint::from(0u32);
+        for _ in 0..256 {
+            if let Some(n) = nat::as_lit(&cur) {
+                return Ok(Some(n + &offset));
+            }
+            match &**cur {
+                ExprData::Const(n, us) if *n == zero && us.is_empty() => {
+                    return Ok(Some(offset));
+                }
+                ExprData::App(f, a)
+                    if matches!(&***f, ExprData::Const(n, us) if *n == succ && us.is_empty()) =>
+                {
+                    offset += 1u32;
+                    cur = self.whnf(ctx, a)?;
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    fn bool_ctors(&self) -> Option<(u32, u32)> {
+        let bool_name = self
+            .names
+            .iter()
+            .position(|s| s.as_str() == "Bool")? as u32;
+        let Some(ConstantInfo::InductiveType {
+            level_params,
+            typ,
+            num_params,
+            num_indices,
+            all,
+            ctors,
+            is_rec,
+            is_unsafe,
+        }) = self.env.get(bool_name)
+        else {
+            return None;
+        };
+        if !level_params.is_empty()
+            || **typ != *expr::sort(level::succ(level::zero()))
+            || *num_params != 0
+            || *num_indices != 0
+            || all.as_slice() != [bool_name]
+            || ctors.len() != 2
+            || *is_rec
+            || *is_unsafe
+        {
+            return None;
+        }
+        let (false_name, true_name) = (ctors[0], ctors[1]);
+        let bool_ty = expr::const_(bool_name, vec![]);
+        let ctor_ok = |name: u32, expected: &str, cidx: u32| {
+            matches!(
+                self.env.get(name),
+                Some(ConstantInfo::Constructor {
+                    level_params,
+                    typ,
+                    induct,
+                    cidx: actual_cidx,
+                    num_params: 0,
+                    num_fields: 0,
+                    is_unsafe: false,
+                }) if self.name_str(name) == expected
+                    && level_params.is_empty()
+                    && **typ == *bool_ty
+                    && *induct == bool_name
+                    && *actual_cidx == cidx
+            )
+        };
+        (ctor_ok(false_name, "Bool.false", 0) && ctor_ok(true_name, "Bool.true", 1))
+            .then_some((false_name, true_name))
+    }
+
+    /// A standalone export does not inherit Lean's trusted bootstrap
+    /// environment. Before mirroring a native Nat reducer, establish its
+    /// defining equations using ordinary delta/beta/iota reduction on the
+    /// already checked declaration body.
+    pub fn authenticate_native_nat_decl(&self, n: u32) -> R<bool> {
+        let name = self.name_str(n);
+        if !matches!(
+            name,
+            "Nat.add" | "Nat.mul" | "Nat.sub" | "Nat.pow" | "Nat.beq" | "Nat.ble"
+        ) {
+            return Ok(false);
+        }
+        if !matches!(
+            self.env.get(n),
+            Some(ConstantInfo::Def {
+                level_params,
+                is_unsafe: false,
+                ..
+            }) if level_params.is_empty()
+        ) {
+            return Ok(false);
+        }
+        let Some((zero_name, succ_name)) = self.nat_ctors() else {
+            return Ok(false);
+        };
+        let nat_ty = expr::const_(self.nat_ref.unwrap(), vec![]);
+        let zero = expr::const_(zero_name, vec![]);
+        let succ = |a: Expr| expr::app(expr::const_(succ_name, vec![]), a);
+        let op = |a: Expr, b: Expr| expr::apps(expr::const_(n, vec![]), &[a, b]);
+        let mut ctx = Ctx::new();
+        ctx.push(nat_ty.clone());
+        ctx.push(nat_ty);
+        let x = expr::bvar(1);
+        let y = expr::bvar(0);
+        let sx = succ(x.clone());
+        let sy = succ(y.clone());
+
+        let equations: Vec<(Expr, Expr)> = match name {
+            "Nat.add" => vec![
+                (op(x.clone(), zero.clone()), x.clone()),
+                (op(x.clone(), sy.clone()), succ(op(x.clone(), y.clone()))),
+            ],
+            "Nat.mul" => {
+                let Some(add_name) = self
+                    .env
+                    .native_nat_ops
+                    .iter()
+                    .copied()
+                    .find(|m| self.name_str(*m) == "Nat.add")
+                else {
+                    return Ok(false);
+                };
+                let add = |a: Expr, b: Expr| {
+                    expr::apps(expr::const_(add_name, vec![]), &[a, b])
+                };
+                vec![
+                    (op(x.clone(), zero.clone()), zero.clone()),
+                    (
+                        op(x.clone(), sy.clone()),
+                        add(op(x.clone(), y.clone()), x.clone()),
+                    ),
+                ]
+            }
+            "Nat.sub" => vec![
+                (op(x.clone(), zero.clone()), x.clone()),
+                (op(zero.clone(), sy.clone()), zero.clone()),
+                (op(sx, sy), op(x.clone(), y.clone())),
+            ],
+            "Nat.pow" => {
+                let Some(mul_name) = self
+                    .env
+                    .native_nat_ops
+                    .iter()
+                    .copied()
+                    .find(|m| self.name_str(*m) == "Nat.mul")
+                else {
+                    return Ok(false);
+                };
+                let mul = |a: Expr, b: Expr| {
+                    expr::apps(expr::const_(mul_name, vec![]), &[a, b])
+                };
+                vec![
+                    (op(x.clone(), zero.clone()), expr::lit_nat(1u32.into())),
+                    (
+                        op(x.clone(), sy),
+                        mul(op(x.clone(), y.clone()), x.clone()),
+                    ),
+                ]
+            }
+            "Nat.beq" | "Nat.ble" => {
+                let Some((false_name, true_name)) = self.bool_ctors() else {
+                    return Ok(false);
+                };
+                let f = expr::const_(false_name, vec![]);
+                let t = expr::const_(true_name, vec![]);
+                if name == "Nat.beq" {
+                    vec![
+                        (op(zero.clone(), zero.clone()), t),
+                        (op(zero.clone(), sy.clone()), f.clone()),
+                        (op(sx.clone(), zero.clone()), f),
+                        (op(sx, sy), op(x.clone(), y.clone())),
+                    ]
+                } else {
+                    vec![
+                        (op(zero.clone(), y.clone()), t),
+                        (op(sx.clone(), zero.clone()), f),
+                        (op(sx, sy), op(x.clone(), y.clone())),
+                    ]
+                }
+            }
+            _ => unreachable!(),
+        };
+        for (lhs, rhs) in equations {
+            if !self.is_def_eq(&ctx, &lhs, &rhs)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn is_non_rec_structure(&self, name: u32) -> bool {
@@ -1943,15 +2220,20 @@ impl<'e> Checker<'e> {
             }
             _ => {
                 let (h, args) = expr::unfold_apps(&w);
-                let ExprData::Const(n, _) = &**h else {
+                let ExprData::Const(n, us) = &**h else {
                     return self.is_prop_by_infer(ctx, &w);
                 };
                 if let Some(ConstantInfo::InductiveType {
-                    typ, num_params, ..
+                    typ,
+                    num_params,
+                    level_params,
+                    ..
                 }) = self.env.get(*n)
                 {
                     if (args.len() as u32) >= *num_params {
-                        return Ok(self.sort_codomain_is_prop(typ));
+                        let subst = level::subst_map(level_params, us);
+                        let instantiated = expr::instantiate_level_params(typ, &subst);
+                        return Ok(self.sort_codomain_is_prop(&instantiated));
                     }
                 }
                 let Some(cty) = self.const_typ(*n) else {
@@ -2375,7 +2657,7 @@ impl<'e> Checker<'e> {
         // abort result).
         let aborted = CORE_ABORTED.with(|a| a.replace(false));
         if aborted {
-            if Self::is_whnf_core_redex(&r) {
+            if self.is_whnf_core_redex(&r) {
                 return decline(format!(
                     "WHNF core depth limit: {}",
                     self.pp_budget(&r, 12)
@@ -2564,7 +2846,7 @@ impl<'e> Checker<'e> {
     /// True when `whnf_core` still has a β/ζ/proj redex. Delta/ι are the
     /// outer `whnf` / `try_iota` steps; a recursor app with a stuck major
     /// is already core-WHNF. Such a result is never cached after an abort.
-    fn is_whnf_core_redex(e: &Expr) -> bool {
+    fn is_whnf_core_redex(&self, e: &Expr) -> bool {
         match &***e {
             ExprData::Let(_, _, _) => true,
             ExprData::Proj(_, _, _) => true,
@@ -2573,10 +2855,23 @@ impl<'e> Checker<'e> {
                 matches!(
                     &**head,
                     ExprData::Lam(_, _, _) | ExprData::Let(_, _, _) | ExprData::Proj(_, _, _)
+                ) || matches!(
+                    &**head,
+                    ExprData::Const(n, _) if matches!(
+                        self.env.get(*n),
+                        Some(ConstantInfo::Def { .. })
+                            | Some(ConstantInfo::Recursor { .. })
+                            | Some(ConstantInfo::Quot { .. })
+                    ) || self.env.native_nat_ops.contains(n)
                 )
             }
             _ => false,
         }
+    }
+
+    fn is_beta_app(e: &Expr) -> bool {
+        let (head, args) = expr::unfold_apps(e);
+        !args.is_empty() && matches!(&**head, ExprData::Lam(_, _, _))
     }
 
     fn cheap_zeta(e: &Expr) -> Expr {
@@ -2607,7 +2902,7 @@ impl<'e> Checker<'e> {
             {
                 eprintln!("CORE_DEPTH abort {}", crate::expr::loose_bvar_range(&e));
             }
-            if Self::is_whnf_core_redex(&e) {
+            if self.is_whnf_core_redex(&e) {
                 return decline(format!(
                     "WHNF core depth limit: {}",
                     self.pp_budget(&e, 12)
@@ -2694,7 +2989,10 @@ impl<'e> Checker<'e> {
                                 }
                             }
                             if let ExprData::Lit(Lit::Str(s)) = &**vw {
-                                if self.name_str(*sname) == "String" && *idx == 0 {
+                                if std::env::var_os("KIOTA_TRUST_STRING_REPR").is_some()
+                                    && self.name_str(*sname) == "String"
+                                    && *idx == 0
+                                {
                                     if let Some(ba) = self.string_to_byte_array(s) {
                                         cur = expr::apps(ba, &args);
                                         continue;
@@ -2724,7 +3022,14 @@ impl<'e> Checker<'e> {
                             // checker stays on kernel-derived reductions.
                             let trusted_library_oracles =
                                 std::env::var_os("KIOTA_TRUST_LIBRARY_ORACLES").is_some();
-                            if trusted_library_oracles {
+                            let authenticated_nat_op = matches!(
+                                &**head,
+                                ExprData::Const(n, _)
+                                    if self.env.native_nat_ops.contains(n)
+                                        || (self.name_str(*n) == "Nat.succ"
+                                            && self.nat_ctors().is_some())
+                            );
+                            if trusted_library_oracles || authenticated_nat_op {
                                 if let Some(r) = self.try_nat_extension(ctx, &head, &args)? {
                                     crate::stats::n_nat();
                                     cur = r;
@@ -2811,7 +3116,10 @@ impl<'e> Checker<'e> {
                         }
                     }
                     if let ExprData::Lit(Lit::Str(s)) = &**vw {
-                        if self.name_str(*sname) == "String" && *idx == 0 {
+                        if std::env::var_os("KIOTA_TRUST_STRING_REPR").is_some()
+                            && self.name_str(*sname) == "String"
+                            && *idx == 0
+                        {
                             if let Some(ba) = self.string_to_byte_array(s) {
                                 cur = ba;
                                 continue;
@@ -3158,13 +3466,11 @@ impl<'e> Checker<'e> {
         // (`eager_whnf_unfolds`). Lazy delta still unfolds theorems that
         // pass the small-body cut so `Bind.bind inst.1` can reach
         // `StateT.bind` / `match_1`.
-        let is_def = matches!(
-            self.env.get(n),
-            Some(ConstantInfo::Def {
-                hints: ReducibilityHints::Abbrev | ReducibilityHints::Regular(_),
-                ..
-            })
-        );
+        // Reducibility hints are elaborator guidance. Every checked `Def` has
+        // a kernel value and is a legal delta target, including a declaration
+        // exported with the `opaque` hint. (An `Opaque` declaration is a
+        // different environment kind and remains irreducible.)
+        let is_def = matches!(self.env.get(n), Some(ConstantInfo::Def { .. }));
         is_def || is_thm
     }
 
@@ -3209,6 +3515,34 @@ impl<'e> Checker<'e> {
         }
         if Rc::ptr_eq(a, b) || a == b {
             return Ok(true);
+        }
+        // Compare long chains such as `s (s (... z))` iteratively.  Recursive
+        // congruence consumes one conversion-stack frame per application and
+        // made the 14,520-step Church numeral benchmark hit CONV_DEPTH even
+        // though every shared function head is syntactically identical.
+        let mut aa = a.clone();
+        let mut bb = b.clone();
+        let mut peeled = false;
+        loop {
+            match (&**aa, &**bb) {
+                (ExprData::App(fa, xa), ExprData::App(fb, xb))
+                    if Rc::ptr_eq(fa, fb) || fa == fb =>
+                {
+                    aa = xa.clone();
+                    bb = xb.clone();
+                    peeled = true;
+                }
+                _ => break,
+            }
+        }
+        if peeled {
+            // Congruence proves equality when the tails convert.  A negative
+            // tail result is not conclusive because the shared function may
+            // erase its argument after delta reduction, so retain the full
+            // conversion path in that case.
+            if self.is_def_eq(ctx, &aa, &bb)? {
+                return Ok(true);
+            }
         }
         let (ka, kb) = (Self::ptr_key(a), Self::ptr_key(b));
         let (min_k, max_k) = if ka <= kb { (ka, kb) } else { (kb, ka) };
@@ -3316,6 +3650,16 @@ impl<'e> Checker<'e> {
         if self.proofs_of_same_prop(ctx, a, b)? {
             return Ok(true);
         }
+        if matches!(&***a, ExprData::Lit(Lit::Nat(_)))
+            || matches!(&***b, ExprData::Lit(Lit::Nat(_)))
+        {
+            if let (Some(x), Some(y)) = (
+                self.nat_numeral_value_whnf(ctx, a)?,
+                self.nat_numeral_value_whnf(ctx, b)?,
+            ) {
+                return Ok(x == y);
+            }
+        }
         if let Some((zero, succ)) = self.nat_ctors() {
             if let (Some(x), Some(y)) = (
                 nat::numeral_value(a, zero, succ),
@@ -3324,14 +3668,30 @@ impl<'e> Checker<'e> {
                 return Ok(x == y);
             }
         }
+        // One-sided delta can re-enter the core with a fresh zeta/beta redex.
+        // Normalize it through the ordinary kernel reduction path before
+        // structural spine comparison.
+        if let ExprData::Let(_, v, body) = &***a {
+            return self.is_def_eq(ctx, &expr::instantiate1(body, v), b);
+        }
+        if let ExprData::Let(_, v, body) = &***b {
+            return self.is_def_eq(ctx, a, &expr::instantiate1(body, v));
+        }
+        if Self::is_beta_app(a) {
+            let w = self.whnf(ctx, a)?;
+            if !Rc::ptr_eq(&w, a) {
+                return self.is_def_eq(ctx, &w, b);
+            }
+        }
+        if Self::is_beta_app(b) {
+            let w = self.whnf(ctx, b)?;
+            if !Rc::ptr_eq(&w, b) {
+                return self.is_def_eq(ctx, a, &w);
+            }
+        }
+
         // Structural match without delta.
         match (&***a, &***b) {
-            (ExprData::Let(_, v, body), _) => {
-                return self.is_def_eq(ctx, &expr::instantiate1(body, v), b);
-            }
-            (_, ExprData::Let(_, v, body)) => {
-                return self.is_def_eq(ctx, a, &expr::instantiate1(body, v));
-            }
             (ExprData::Sort(l1), ExprData::Sort(l2)) => return Ok(level::is_def_eq(l1, l2)),
             (ExprData::BVar(i), ExprData::BVar(j)) if i == j => return Ok(true),
             (ExprData::Lit(x), ExprData::Lit(y)) => return Ok(x == y),
@@ -4216,11 +4576,28 @@ impl<'e> Checker<'e> {
         if !is_rec {
             return Ok(None);
         }
-        let mut ty = match self.whnf(ctx, field_ty) {
+        // Recursive-field classification is part of inductive/recursor
+        // semantics, so it uses the same full-definition transparency as the
+        // positivity checker. A reducibility hint on an ordinary `Def` must
+        // not erase a recursive occurrence (tutorial/053, /121, /122).
+        let mut ty = match self.positivity_whnf(ctx, field_ty) {
             Ok(ty) => ty,
             Err(e @ TcError::Decline(_)) => return Err(e),
             Err(_) => field_ty.clone(),
         };
+        if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
+            eprintln!(
+                "REC-CALL field={} field_ty={} whnf={} params={}",
+                self.pp_budget(field, 20),
+                self.pp_budget(field_ty, 30),
+                self.pp_budget(&ty, 30),
+                params
+                    .iter()
+                    .map(|p| self.pp_budget(p, 10))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         let mut binders: Vec<Expr> = Vec::new();
         let mut tctx = ctx.clone();
         loop {
@@ -4228,7 +4605,7 @@ impl<'e> Checker<'e> {
                 ExprData::Pi(_, dom, body) => {
                     binders.push(dom.clone());
                     tctx.push(dom.clone());
-                    ty = match self.whnf(&tctx, body) {
+                    ty = match self.positivity_whnf(&tctx, body) {
                         Ok(ty) => ty,
                         Err(e @ TcError::Decline(_)) => return Err(e),
                         Err(_) => body.clone(),
@@ -7334,24 +7711,6 @@ impl<'e> Checker<'e> {
 
     // ---------------- Inductive/recursor validation ----------------
 
-    fn is_closed_numeral(l: &Level) -> bool {
-        match &**l {
-            crate::level::LevelData::Zero => true,
-            crate::level::LevelData::Succ(a) => Self::is_closed_numeral(a),
-            _ => false,
-        }
-    }
-
-    fn is_strict_succ_of(hi: &Level, lo: &Level) -> bool {
-        let mut n = 0u32;
-        let mut cur = hi.clone();
-        while let crate::level::LevelData::Succ(a) = &*cur {
-            n += 1;
-            cur = a.clone();
-        }
-        n > 0 && level::is_def_eq(&cur, lo)
-    }
-
     pub fn check_inductive_group(&self, first_name: u32) -> R<()> {
         let ci = self
             .env
@@ -7374,6 +7733,29 @@ impl<'e> Checker<'e> {
                     return reject("inductive type: duplicate universe parameter");
                 }
                 seen.push(*p);
+            }
+        }
+        // Kernel formation is a separate gate from the redundant metadata
+        // checks below.  Check the complete inductive, constructor, and
+        // recursor types so malformed binder domains or ill-typed conclusion
+        // indices cannot hide behind a well-shaped telescope.
+        for tname in &all {
+            self.check_decl(*tname, "inductive type")?;
+            if let Some(ConstantInfo::InductiveType { ctors, .. }) = self.env.get(*tname) {
+                for cname in ctors {
+                    self.check_decl(*cname, "constructor")?;
+                }
+            }
+        }
+        if let Some(main_rec) = self.env.rec_of.get(&first_name) {
+            let recs = self
+                .env
+                .rec_group
+                .get(main_rec)
+                .cloned()
+                .unwrap_or_else(|| vec![*main_rec]);
+            for rname in recs {
+                self.check_decl(rname, "recursor")?;
             }
         }
         // Shared parameter telescope, taken from the first type's arity.
@@ -7478,18 +7860,13 @@ impl<'e> Checker<'e> {
                         ExprData::Pi(_, dom, body) => {
                             self.check_arg_positive(&c2, dom, &all, num_params)?;
                             let ds = self.infer_type(&c2, dom)?;
-                            if let Ok(field_lvl) = self.ensure_sort(&c2, &ds) {
-                                let too_big_closed = Self::is_closed_numeral(&field_lvl)
-                                    && Self::is_closed_numeral(&t_sort)
-                                    && !level::leq(&field_lvl, &t_sort, 0);
-                                let too_big_succ = Self::is_strict_succ_of(&field_lvl, &t_sort);
-                                if (too_big_closed || too_big_succ)
-                                    && !level::is_def_eq(&t_sort, &level::zero())
-                                {
-                                    return reject(
-                                        "constructor field universe is too big for the inductive type",
-                                    );
-                                }
+                            let field_lvl = self.ensure_sort(&c2, &ds)?;
+                            if !level::is_geq(&t_sort, &field_lvl)
+                                && !level::normalizes_to_zero(&t_sort)
+                            {
+                                return reject(
+                                    "constructor field universe is too big for the inductive type",
+                                );
                             }
                             c2.push(dom.clone());
                             cur2 = body.clone();
@@ -7536,6 +7913,173 @@ impl<'e> Checker<'e> {
                 }
             }
         }
+        for tname in &all {
+            if let Some(rname) = self.env.rec_of.get(tname) {
+                self.check_main_recursor(*rname, *tname, &all)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Authenticate a main recursor independently of exported rule RHS terms.
+    /// Its result must be the appropriate motive applied to the declared
+    /// indices and major premise, and reducing it on every constructor must
+    /// preserve that result type.  This is the defensive `check_recursors`
+    /// boundary used by Lean's kernel, adapted to de Bruijn contexts.
+    fn check_main_recursor(&self, rname: u32, owner: u32, all: &[u32]) -> R<()> {
+        let (r_lp, r_typ, num_params, num_indices, num_motives, num_minors) =
+            match self.env.get(rname) {
+                Some(ConstantInfo::Recursor {
+                    level_params,
+                    typ,
+                    num_params,
+                    num_indices,
+                    num_motives,
+                    num_minors,
+                    ..
+                }) => (
+                    level_params.clone(),
+                    typ.clone(),
+                    *num_params,
+                    *num_indices,
+                    *num_motives,
+                    *num_minors,
+                ),
+                _ => return reject("main recursor declaration is missing"),
+            };
+        let owner_pos = all
+            .iter()
+            .position(|n| *n == owner)
+            .ok_or_else(|| TcError::Reject("recursor owner is outside its mutual group".into()))?;
+        if owner_pos >= num_motives as usize {
+            return reject("recursor has no motive for its owner");
+        }
+        let prefix = (num_params + num_motives + num_minors) as usize;
+
+        // Check the final `indices -> major -> motive indices major` spine.
+        let mut ctx = Ctx::new();
+        let mut cur = r_typ.clone();
+        for _ in 0..prefix {
+            let (_, dom, body) = self.ensure_pi(&ctx, &cur)?;
+            ctx.push(dom);
+            cur = body;
+        }
+        for _ in 0..num_indices {
+            let (_, dom, body) = self.ensure_pi(&ctx, &cur)?;
+            ctx.push(dom);
+            cur = body;
+        }
+        let (_, major_dom, result) = self.ensure_pi(&ctx, &cur)?;
+        let (major_head, major_args) = expr::unfold_apps(&major_dom);
+        if !matches!(&**major_head, ExprData::Const(n, _) if *n == owner)
+            || major_args.len() != (num_params + num_indices) as usize
+        {
+            return reject("recursor major premise does not match its inductive owner");
+        }
+        for i in 0..num_params as usize {
+            let expected = expr::bvar((ctx.len() - 1 - i) as u32);
+            if !self.is_def_eq(&ctx, &major_args[i], &expected)? {
+                return reject("recursor major premise uses the wrong parameter");
+            }
+        }
+        for i in 0..num_indices as usize {
+            let pos = prefix + i;
+            let expected = expr::bvar((ctx.len() - 1 - pos) as u32);
+            if !self.is_def_eq(&ctx, &major_args[num_params as usize + i], &expected)? {
+                return reject("recursor major premise uses the wrong index");
+            }
+        }
+        ctx.push(major_dom);
+        let motive_pos = num_params as usize + owner_pos;
+        let mut expected_result = expr::bvar((ctx.len() - 1 - motive_pos) as u32);
+        for i in 0..num_indices as usize {
+            let pos = prefix + i;
+            expected_result = expr::app(
+                expected_result,
+                expr::bvar((ctx.len() - 1 - pos) as u32),
+            );
+        }
+        expected_result = expr::app(expected_result, expr::bvar(0));
+        if !self.is_def_eq(&ctx, &result, &expected_result)? {
+            return reject("recursor result is not its motive applied to indices and major");
+        }
+
+        let ctors = match self.env.get(owner) {
+            Some(ConstantInfo::InductiveType { ctors, .. }) => ctors.clone(),
+            _ => return reject("recursor owner is not an inductive type"),
+        };
+        let r_levels: Vec<Level> = r_lp.iter().map(|p| level::param(*p)).collect();
+        for cname in ctors {
+            let (c_lp, c_typ) = match self.env.get(cname) {
+                Some(ConstantInfo::Constructor {
+                    level_params, typ, ..
+                }) => (level_params.clone(), typ.clone()),
+                _ => return reject("recursor owner lists a non-constructor"),
+            };
+            let mut cctx = Ctx::new();
+            let mut rcur = r_typ.clone();
+            for _ in 0..prefix {
+                let (_, dom, body) = self.ensure_pi(&cctx, &rcur)?;
+                cctx.push(dom);
+                rcur = body;
+            }
+            let mut ccur = c_typ;
+            for i in 0..num_params as usize {
+                let (_, _, body) = self.ensure_pi(&cctx, &ccur)?;
+                let param = expr::bvar((cctx.len() - 1 - i) as u32);
+                ccur = expr::instantiate1(&body, &param);
+            }
+            let field_start = cctx.len();
+            loop {
+                match &**ccur {
+                    ExprData::Pi(_, dom, body) => {
+                        cctx.push(dom.clone());
+                        ccur = body.clone();
+                    }
+                    _ => break,
+                }
+            }
+            let (conclusion_head, conclusion_args) = expr::unfold_apps(&ccur);
+            if !matches!(&**conclusion_head, ExprData::Const(n, _) if *n == owner)
+                || conclusion_args.len() != (num_params + num_indices) as usize
+            {
+                return reject("constructor conclusion does not match recursor owner");
+            }
+            let mut lhs = expr::const_(rname, r_levels.clone());
+            for pos in 0..prefix {
+                lhs = expr::app(lhs, expr::bvar((cctx.len() - 1 - pos) as u32));
+            }
+            for index in &conclusion_args[num_params as usize..] {
+                lhs = expr::app(lhs, index.clone());
+            }
+            let c_levels: Vec<Level> = c_lp.iter().map(|p| level::param(*p)).collect();
+            let mut intro = expr::const_(cname, c_levels);
+            for pos in 0..num_params as usize {
+                intro = expr::app(intro, expr::bvar((cctx.len() - 1 - pos) as u32));
+            }
+            for pos in field_start..cctx.len() {
+                intro = expr::app(intro, expr::bvar((cctx.len() - 1 - pos) as u32));
+            }
+            lhs = expr::app(lhs, intro);
+            let expected = self.infer_type(&cctx, &lhs)?;
+            let reduct = self.whnf(&cctx, &lhs)?;
+            if Rc::ptr_eq(&reduct, &lhs) {
+                return reject("recursor did not reduce on its constructor");
+            }
+            let actual = self.infer_type(&cctx, &reduct)?;
+            if !self.is_def_eq(&cctx, &actual, &expected)? {
+                if std::env::var_os("KIOTA_DEBUG").is_some() {
+                    return reject(format!(
+                        "recursor computation is not type-preserving\n  lhs:      {}\n  reduct:   {}\n  actual:   {}\n  expected: {}",
+                        self.pp_budget(&lhs, 80),
+                        self.pp_budget(&reduct, 80),
+                        self.pp_budget(&actual, 80),
+                        self.pp_budget(&expected, 80),
+                    ));
+                }
+                return reject("recursor computation is not type-preserving");
+            }
+        }
         Ok(())
     }
 
@@ -7558,11 +8102,27 @@ impl<'e> Checker<'e> {
     }
 
     fn positivity_whnf(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
-        match self.whnf(ctx, e) {
-            Ok(w) => Ok(w),
-            Err(TcError::Decline(m)) => Err(TcError::Decline(m)),
-            Err(_) => reject("cannot prove constructor argument is positive"),
+        // Lean's inductive checker uses the kernel's full WHNF here.  Unlike
+        // our hot-path WHNF heuristic, that unfolds every `Def`, including a
+        // definition exported with the opaque reducibility *hint*.  (`Opaque`
+        // declarations remain a distinct, irreducible kind.)
+        let mut cur = e.clone();
+        for _ in 0..CONV_DEPTH {
+            let w = match self.whnf(ctx, &cur) {
+                Ok(w) => w,
+                Err(TcError::Decline(m)) => return Err(TcError::Decline(m)),
+                Err(_) => return reject("cannot prove constructor argument is positive"),
+            };
+            match self.try_unfold_const_head(&w) {
+                Ok(Some(next)) if !Rc::ptr_eq(&next, &w) => {
+                    cur = next;
+                }
+                Ok(_) => return Ok(w),
+                Err(TcError::Decline(m)) => return Err(TcError::Decline(m)),
+                Err(_) => return reject("cannot prove constructor argument is positive"),
+            }
         }
+        decline("positivity WHNF depth limit")
     }
 
     /// Strict positivity: `bound` may not occur in a Pi domain. Direct
@@ -9808,8 +10368,8 @@ mod tests {
         CORE_DEPTH.with(|d| d.set(0));
         CORE_ABORTED.with(|ab| ab.set(false));
         match at_cap {
-            Ok(_) => {}
-            other => panic!("recursor app at CORE_DEPTH may stay stuck, got {other:?}"),
+            Err(TcError::Decline(_)) => {}
+            other => panic!("recursor app at CORE_DEPTH must Decline, got {other:?}"),
         }
         let w = tc.whnf(&Ctx::new(), &rec_app).expect("WHNF after reset");
         assert!(

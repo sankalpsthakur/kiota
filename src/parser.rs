@@ -12,6 +12,7 @@ pub struct Parser {
     pub names: Vec<Rc<String>>, // index -> full dotted name (for diagnostics / builtin lookup)
     pub name_by_str: FxHashMap<String, u32>,
     pub levels: Vec<Level>,
+    defined_levels: FxHashSet<u32>,
     pub exprs: Vec<Expr>,
     pub env: Environment,
     pub decl_count: usize,
@@ -38,14 +39,11 @@ impl Parser {
             names: vec![Rc::new(String::new())], // index 0 = anonymous
             name_by_str: FxHashMap::default(),
             levels: vec![level::zero()], // index 0 = zero
+            defined_levels: FxHashSet::from_iter([0]),
             exprs: Vec::new(),
             env: Environment::default(),
             decl_count: 0,
         }
-    }
-
-    fn get_u32(v: &Value, k: &str) -> u32 {
-        v.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as u32
     }
 
     fn require_u32(v: &Value, k: &str) -> Result<u32, TcError> {
@@ -99,79 +97,134 @@ impl Parser {
                 .ok_or_else(|| TcError::Reject(format!("field `{k}` must be a bool"))),
         }
     }
-    fn get_vec_u32(v: &Value, k: &str) -> Vec<u32> {
-        v.get(k)
-            .and_then(|x| x.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|e| e.as_u64())
-                    .map(|n| n as u32)
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn require_vec_u32(v: &Value, k: &str) -> Result<Vec<u32>, TcError> {
+        let values = v
+            .get(k)
+            .and_then(Value::as_array)
+            .ok_or_else(|| TcError::Reject(format!("field `{k}` must be an array")))?;
+        values
+            .iter()
+            .map(|e| Self::require_u32_value(e, k))
+            .collect()
     }
 
-    fn pair_u32(v: &Value) -> (u32, u32) {
+    fn require_pair_u32(v: &Value, k: &str) -> Result<(u32, u32), TcError> {
         if let Some(arr) = v.as_array() {
-            let a = arr.get(0).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-            let b = arr.get(1).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-            (a, b)
+            if arr.len() != 2 {
+                return Err(TcError::Reject(format!(
+                    "level `{k}` pair must have exactly two entries"
+                )));
+            }
+            Ok((
+                Self::require_u32_value(&arr[0], k)?,
+                Self::require_u32_value(&arr[1], k)?,
+            ))
         } else {
-            (Self::get_u32(v, "lhs"), Self::get_u32(v, "rhs"))
+            Ok((Self::require_u32(v, "lhs")?, Self::require_u32(v, "rhs")?))
         }
     }
 
-    fn level_at(&self, i: u32) -> Level {
-        self.levels[i as usize].clone()
-    }
-
-    fn handle_name(&mut self, idx: u32, v: &Value) {
+    fn handle_name(&mut self, idx: u32, v: &Value) -> Result<(), TcError> {
+        if idx == 0 {
+            return Err(TcError::Reject(
+                "name index 0 is reserved for the anonymous name".into(),
+            ));
+        }
         let full = if let Some(s) = v.get("str") {
-            let pre = Self::get_u32(s, "pre");
-            let seg = Self::get_str(s, "str");
-            let parent = &*self.names[pre as usize];
+            let pre = Self::require_u32(s, "pre")?;
+            let seg = s
+                .get("str")
+                .and_then(Value::as_str)
+                .ok_or_else(|| TcError::Reject("name string segment must be a string".into()))?;
+            if seg.is_empty() {
+                return Err(TcError::Reject("name string segment must not be empty".into()));
+            }
+            let parent = self
+                .names
+                .get(pre as usize)
+                .ok_or_else(|| TcError::Reject(format!("name parent index {pre} is out of range")))?;
+            if pre != 0 && parent.is_empty() {
+                return Err(TcError::Reject(format!(
+                    "name parent index {pre} is undefined"
+                )));
+            }
             if parent.is_empty() {
                 seg.to_string()
             } else {
                 format!("{}.{}", parent, seg)
             }
         } else if let Some(n) = v.get("num") {
-            let pre = Self::get_u32(n, "pre");
-            let i = n.get("i").and_then(|x| x.as_u64()).unwrap_or(0);
-            let parent = &*self.names[pre as usize];
+            let pre = Self::require_u32(n, "pre")?;
+            let i = n
+                .get("i")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| TcError::Reject("numeric name segment must be a u64".into()))?;
+            let parent = self
+                .names
+                .get(pre as usize)
+                .ok_or_else(|| TcError::Reject(format!("name parent index {pre} is out of range")))?;
+            if pre != 0 && parent.is_empty() {
+                return Err(TcError::Reject(format!(
+                    "name parent index {pre} is undefined"
+                )));
+            }
             if parent.is_empty() {
                 format!("{}", i)
             } else {
                 format!("{}.{}", parent, i)
             }
         } else {
-            String::new()
+            return Err(TcError::Reject("invalid name record".into()));
         };
+        if let Some(previous) = self.name_by_str.get(&full) {
+            return Err(TcError::Reject(format!(
+                "duplicate fully qualified name `{full}` at indices {previous} and {idx}"
+            )));
+        }
         while self.names.len() <= idx as usize {
             self.names.push(Rc::new(String::new()));
         }
+        if !self.names[idx as usize].is_empty() {
+            return Err(TcError::Reject(format!(
+                "duplicate name index {idx}"
+            )));
+        }
         self.name_by_str.insert(full.clone(), idx);
         self.names[idx as usize] = Rc::new(full);
+        Ok(())
     }
 
-    fn handle_level(&mut self, idx: u32, v: &Value) {
+    fn handle_level(&mut self, idx: u32, v: &Value) -> Result<(), TcError> {
+        if idx == 0 || !self.defined_levels.insert(idx) {
+            return Err(TcError::Reject(format!(
+                "duplicate or reserved level index {idx}"
+            )));
+        }
         let l = if let Some(a) = v.get("succ") {
-            level::succ(self.level_at(a.as_u64().unwrap() as u32))
+            let a = Self::require_u32_value(a, "succ")?;
+            level::succ(self.require_level(a)?)
         } else if let Some(m) = v.get("max") {
-            let (a, b) = Self::pair_u32(m);
-            level::max(self.level_at(a), self.level_at(b))
+            let (a, b) = Self::require_pair_u32(m, "max")?;
+            level::max(self.require_level(a)?, self.require_level(b)?)
         } else if let Some(m) = v.get("imax") {
-            let (a, b) = Self::pair_u32(m);
-            level::imax(self.level_at(a), self.level_at(b))
+            let (a, b) = Self::require_pair_u32(m, "imax")?;
+            level::imax(self.require_level(a)?, self.require_level(b)?)
         } else if let Some(p) = v.get("param") {
-            level::param(p.as_u64().unwrap() as u32)
+            let p = Self::require_u32_value(p, "param")?;
+            if self.names.get(p as usize).is_none_or(|n| n.is_empty()) {
+                return Err(TcError::Reject(format!(
+                    "universe parameter name index {p} is undefined"
+                )));
+            }
+            level::param(p)
         } else {
-            level::zero()
+            return Err(TcError::Reject("invalid level record".into()));
         };
         while self.levels.len() <= idx as usize {
             self.levels.push(level::zero());
         }
         self.levels[idx as usize] = l;
+        Ok(())
     }
 
     fn handle_expr(&mut self, idx: u32, v: &Value) -> Result<(), TcError> {
@@ -180,7 +233,7 @@ impl Parser {
             expr::sort(self.require_level(i)?)
         } else if let Some(c) = v.get("const") {
             let name = Self::require_u32(c, "name")?;
-            let us = Self::get_vec_u32(c, "us")
+            let us = Self::require_vec_u32(c, "us")?
                 .into_iter()
                 .map(|i| self.require_level(i))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -267,8 +320,18 @@ impl Parser {
     fn handle_def_like(&mut self, kind: &str, v: &Value) -> Result<(), TcError> {
         let name = Self::require_u32(v, "name")?;
         self.reject_if_dup(name)?;
-        let level_params = Self::get_vec_u32(v, "levelParams");
+        let level_params = Self::require_vec_u32(v, "levelParams")?;
         let typ = self.require_expr(v, "type")?;
+        // Ordinary declarations are checked in the environment that precedes
+        // them. Lean compiles structural recursion through recursors; a raw
+        // constant may never occur in its own declared type or value. Since
+        // this parser installs the record before `check_last`, reject the
+        // otherwise-in-scope cycle explicitly at the boundary.
+        if expr_occurs_names(&typ, &[name]) {
+            return Err(TcError::Reject(
+                "declaration type refers to the declaration being defined".into(),
+            ));
+        }
         match kind {
             "axiomDecl" | "axiom" => {
                 let is_unsafe = Self::require_bool(v, "isUnsafe")?;
@@ -286,6 +349,11 @@ impl Parser {
             }
             "defnDecl" | "def" => {
                 let value = self.require_expr(v, "value")?;
+                if expr_occurs_names(&value, &[name]) {
+                    return Err(TcError::Reject(
+                        "definition value refers to the declaration being defined".into(),
+                    ));
+                }
                 let hints = Self::require_hints(v)?;
                 let safety = Self::get_str(v, "safety");
                 if safety == "unsafe" || safety == "partial" {
@@ -308,6 +376,11 @@ impl Parser {
             }
             "thmDecl" | "theorem" => {
                 let value = self.require_expr(v, "value")?;
+                if expr_occurs_names(&value, &[name]) {
+                    return Err(TcError::Reject(
+                        "theorem value refers to the declaration being defined".into(),
+                    ));
+                }
                 if Self::bool_if_present(v, "isUnsafe")? {
                     return Err(TcError::Reject("unsafe theorem".into()));
                 }
@@ -322,6 +395,11 @@ impl Parser {
             }
             "opaqueDecl" | "opaque" => {
                 let value = self.require_expr(v, "value")?;
+                if expr_occurs_names(&value, &[name]) {
+                    return Err(TcError::Reject(
+                        "opaque value refers to the declaration being defined".into(),
+                    ));
+                }
                 let safety = Self::get_str(v, "safety");
                 if safety == "unsafe" || safety == "partial" {
                     return Err(TcError::Reject(format!("{safety} opaque")));
@@ -362,7 +440,7 @@ impl Parser {
             }
         };
         let name = Self::require_u32(v, "name")?;
-        let level_params = Self::get_vec_u32(v, "levelParams");
+        let level_params = Self::require_vec_u32(v, "levelParams")?;
         let typ = self.require_expr(v, "type")?;
         self.reject_if_dup(name)?;
         if !quot_type_matches_kind(self, &kind, name, &level_params, &typ) {
@@ -401,12 +479,12 @@ impl Parser {
         for t in &types {
             let name = Self::require_u32(t, "name")?;
             self.reject_if_dup(name)?;
-            let level_params = Self::get_vec_u32(t, "levelParams");
+            let level_params = Self::require_vec_u32(t, "levelParams")?;
             let typ = self.require_expr(t, "type")?;
             let num_params = Self::require_u32(t, "numParams")?;
             let num_indices = Self::require_u32(t, "numIndices")?;
-            let all = Self::get_vec_u32(t, "all");
-            let ctor_names = Self::get_vec_u32(t, "ctors");
+            let all = Self::require_vec_u32(t, "all")?;
+            let ctor_names = Self::require_vec_u32(t, "ctors")?;
             let is_rec = Self::require_bool(t, "isRec")?;
             let is_unsafe = Self::require_bool(t, "isUnsafe")?;
             if is_unsafe {
@@ -435,7 +513,7 @@ impl Parser {
         for c in &ctors {
             let name = Self::require_u32(c, "name")?;
             self.reject_if_dup(name)?;
-            let level_params = Self::get_vec_u32(c, "levelParams");
+            let level_params = Self::require_vec_u32(c, "levelParams")?;
             let typ = self.require_expr(c, "type")?;
             let induct = Self::require_u32(c, "induct")?;
             let cidx = Self::require_u32(c, "cidx")?;
@@ -467,9 +545,9 @@ impl Parser {
         for r in &recs {
             let name = Self::require_u32(r, "name")?;
             self.reject_if_dup(name)?;
-            let level_params = Self::get_vec_u32(r, "levelParams");
+            let level_params = Self::require_vec_u32(r, "levelParams")?;
             let typ = self.require_expr(r, "type")?;
-            let all = Self::get_vec_u32(r, "all");
+            let all = Self::require_vec_u32(r, "all")?;
             let num_params = Self::require_u32(r, "numParams")?;
             let num_indices = Self::require_u32(r, "numIndices")?;
             let num_motives = Self::require_u32(r, "numMotives")?;
@@ -548,8 +626,10 @@ impl Parser {
         // Reconstruct constructor identity from the checked block instead of
         // trusting the redundant export metadata used later by projection and
         // iota reduction.
-        let declared_ctor_names: FxHashSet<u32> =
-            ctors.iter().map(|c| Self::get_u32(c, "name")).collect();
+        let declared_ctor_names: FxHashSet<u32> = ctors
+            .iter()
+            .map(|c| Self::require_u32(c, "name"))
+            .collect::<Result<_, _>>()?;
         if declared_ctor_names.len() != ctors.len() {
             return Err(TcError::Reject(
                 "duplicate constructor declaration in inductive group".into(),
@@ -557,14 +637,14 @@ impl Parser {
         }
         let mut owned_ctor_names: FxHashSet<u32> = FxHashSet::default();
         for t in &types {
-            let tname = Self::get_u32(t, "name");
-            if Self::get_vec_u32(t, "all") != type_names {
+            let tname = Self::require_u32(t, "name")?;
+            if Self::require_vec_u32(t, "all")? != type_names {
                 return Err(TcError::Reject(
                     "inductive type has inconsistent mutual-group identity".into(),
                 ));
             }
-            let t_num_params = Self::get_u32(t, "numParams");
-            let listed = Self::get_vec_u32(t, "ctors");
+            let t_num_params = Self::require_u32(t, "numParams")?;
+            let listed = Self::require_vec_u32(t, "ctors")?;
             let mut recursive = false;
             for (expected_cidx, &cname) in listed.iter().enumerate() {
                 if !owned_ctor_names.insert(cname) {
@@ -639,7 +719,7 @@ impl Parser {
         let mut main_rec_seen: FxHashSet<u32> = FxHashSet::default();
         let mut nested_rec_seen: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
         for r in &recs {
-            let rname = Self::get_u32(r, "name");
+            let rname = Self::require_u32(r, "name")?;
             let rstr = self
                 .names
                 .get(rname as usize)
@@ -710,6 +790,103 @@ impl Parser {
             }
         }
 
+        // Exported rule RHS terms are never used for reduction, but the rule
+        // constructor list selects the minor premise.  Reconstruct that list
+        // from declaration identity and constructor order so a forged export
+        // cannot swap or omit minors while retaining a well-formed recursor
+        // telescope.
+        let mut total_rule_count = 0usize;
+        for r in &recs {
+            let rname = Self::require_u32(r, "name")?;
+            let rstr = self
+                .names
+                .get(rname as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let rules = r
+                .get("rules")
+                .and_then(Value::as_array)
+                .ok_or_else(|| TcError::Reject(format!("recursor `{rstr}` rules must be an array")))?;
+            let main_owner = type_names.iter().copied().find(|tname| {
+                let tstr = self
+                    .names
+                    .get(*tname as usize)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                rstr == format!("{tstr}.rec")
+            });
+            let is_main = main_owner.is_some();
+            let rule_owner = if let Some(owner) = main_owner {
+                owner
+            } else {
+                let first_ctor = rules
+                    .first()
+                    .ok_or_else(|| TcError::Reject(format!(
+                        "nested recursor `{rstr}` has no constructor rules"
+                    )))
+                    .and_then(|rule| Self::require_u32(rule, "ctor"))?;
+                match self.env.get(first_ctor) {
+                    Some(ConstantInfo::Constructor { induct, .. }) => *induct,
+                    _ => {
+                        return Err(TcError::Reject(format!(
+                            "recursor `{rstr}` rule does not name a constructor"
+                        )))
+                    }
+                }
+            };
+            let expected_ctors = match self.env.get(rule_owner) {
+                Some(ConstantInfo::InductiveType { ctors, .. }) => ctors,
+                _ => {
+                    return Err(TcError::Reject(format!(
+                        "recursor `{rstr}` rule owner is not an inductive type"
+                    )))
+                }
+            };
+            if rules.is_empty() && is_main {
+                // Older minimized fixtures omit redundant main-rec rules.
+                // Reduction already derives their order from the inductive's
+                // checked constructor list.
+                total_rule_count += expected_ctors.len();
+                continue;
+            }
+            if rules.len() != expected_ctors.len() {
+                return Err(TcError::Reject(format!(
+                    "recursor `{rstr}` rule count does not match its constructor count"
+                )));
+            }
+            for (rule, expected_ctor) in rules.iter().zip(expected_ctors.iter()) {
+                let actual_ctor = Self::require_u32(rule, "ctor")?;
+                if actual_ctor != *expected_ctor {
+                    return Err(TcError::Reject(format!(
+                        "recursor `{rstr}` rule order does not match constructor order"
+                    )));
+                }
+                let expected_fields = match self.env.get(*expected_ctor) {
+                    Some(ConstantInfo::Constructor { num_fields, .. }) => *num_fields,
+                    _ => unreachable!(),
+                };
+                if Self::require_u32(rule, "nfields")? != expected_fields {
+                    return Err(TcError::Reject(format!(
+                        "recursor `{rstr}` rule field count does not match its constructor"
+                    )));
+                }
+            }
+            total_rule_count += rules.len();
+        }
+        for r in &recs {
+            let rname = Self::require_u32(r, "name")?;
+            let declared = Self::require_u32(r, "numMinors")? as usize;
+            if declared != total_rule_count {
+                return Err(TcError::Reject(format!(
+                    "recursor `{}` numMinors does not match reconstructed group rule count",
+                    self.names
+                        .get(rname as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or("?")
+                )));
+            }
+        }
+
         let mut seen_rec_for: FxHashSet<u32> = FxHashSet::default();
         for r in &recs {
             let rname = Self::require_u32(r, "name")?;
@@ -718,7 +895,7 @@ impl Parser {
                 .get(rname as usize)
                 .map(|s| s.as_str())
                 .unwrap_or("");
-            let all = Self::get_vec_u32(r, "all");
+            let all = Self::require_vec_u32(r, "all")?;
             let rules_arr = r.get("rules").and_then(|x| x.as_array());
             let n_rules = rules_arr.map(|a| a.len()).unwrap_or(0);
             let mut claimed: Vec<u32> = Vec::new();
@@ -958,12 +1135,14 @@ impl Parser {
         if v.get("meta").is_some() {
             return Ok(());
         }
-        if let Some(idx) = v.get("in").and_then(|x| x.as_u64()) {
-            self.handle_name(idx as u32, v);
+        if v.get("in").is_some() {
+            let idx = Self::require_u32(v, "in")?;
+            self.handle_name(idx, v)?;
             return Ok(());
         }
-        if let Some(idx) = v.get("il").and_then(|x| x.as_u64()) {
-            self.handle_level(idx as u32, v);
+        if v.get("il").is_some() {
+            let idx = Self::require_u32(v, "il")?;
+            self.handle_level(idx, v)?;
             return Ok(());
         }
         if let Some(idx) = v.get("ie").and_then(|x| x.as_u64()) {
@@ -1077,7 +1256,14 @@ impl Parser {
         let string_ref = self.name_by_str.get("String").copied();
         Checker::new(&self.env, &self.names, nat_ref, string_ref)
             .check_decl(name, kind)
-            .map_err(|e| self.annotate(name, e))
+            .map_err(|e| self.annotate(name, e))?;
+        let native_nat = Checker::new(&self.env, &self.names, nat_ref, string_ref)
+            .authenticate_native_nat_decl(name)
+            .map_err(|e| self.annotate(name, e))?;
+        if native_nat {
+            self.env.native_nat_ops.insert(name);
+        }
+        Ok(())
     }
 
     fn annotate(&self, name: u32, e: TcError) -> TcError {
