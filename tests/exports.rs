@@ -87,6 +87,13 @@ fn extra_rec_all_field_not_pretty_name_accepts() {
     assert_accept("extra-rec-alt-name.accept.ndjson");
 }
 
+/// `Color.rec` rules start at `True.intro` (a ctor of a different inductive).
+/// Iota must not take that rule's minor for `Color.r`.
+#[test]
+fn forged_rule_ctor_rejects() {
+    assert_reject("forged-rule-ctor.reject.ndjson");
+}
+
 #[test]
 fn extra_rec_sole_false_type_rejects() {
     assert_reject("extra-rec-sole-false-typ.reject.ndjson");
