@@ -878,6 +878,20 @@ impl Parser {
                 }
             }
         }
+        // Lean adds a declaration to the environment only after its value
+        // typechecks, so the constant is not in scope inside its own body. We
+        // insert before checking (check_decl reads the decl back out of `env`),
+        // so reject self-reference here — otherwise `def bad : False := bad`
+        // typechecks against its own declared type.
+        let self_ref = self
+            .env
+            .get(name)
+            .and_then(|c| c.value())
+            .map(|v| mentions_const(v, name))
+            .unwrap_or(false);
+        if self_ref {
+            return Err(self.annotate(name, TcError::Reject("declaration refers to itself".into())));
+        }
         let nat_ref = self.name_by_str.get("Nat").copied();
         let string_ref = self.name_by_str.get("String").copied();
         Checker::new(&self.env, &self.names, nat_ref, string_ref)
@@ -897,6 +911,44 @@ impl Parser {
             TcError::Other(m) => TcError::Other(format!("[{nm}] {m}")),
         }
     }
+}
+
+/// Does `e` mention `Const(name, _)` anywhere?
+///
+/// Interned exprs form a DAG, so visit each node once by pointer identity; a
+/// naive walk re-traverses shared subterms and blows up on real corpora.
+fn mentions_const(e: &Expr, name: u32) -> bool {
+    use std::collections::HashSet;
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut stack: Vec<Expr> = vec![e.clone()];
+    while let Some(cur) = stack.pop() {
+        if !seen.insert(std::rc::Rc::as_ptr(&cur) as usize) {
+            continue;
+        }
+        match &**cur {
+            crate::expr::ExprData::Const(n, _) => {
+                if *n == name {
+                    return true;
+                }
+            }
+            crate::expr::ExprData::App(f, a) => {
+                stack.push(f.clone());
+                stack.push(a.clone());
+            }
+            crate::expr::ExprData::Lam(_, t, b) | crate::expr::ExprData::Pi(_, t, b) => {
+                stack.push(t.clone());
+                stack.push(b.clone());
+            }
+            crate::expr::ExprData::Let(t, v, b) => {
+                stack.push(t.clone());
+                stack.push(v.clone());
+                stack.push(b.clone());
+            }
+            crate::expr::ExprData::Proj(_, _, v) => stack.push(v.clone()),
+            _ => {}
+        }
+    }
+    false
 }
 
 fn kind_or_direct(_v: &Value) {}
