@@ -3062,16 +3062,17 @@ impl<'e> Checker<'e> {
     }
 
     fn eager_whnf_unfolds(&self, n: u32) -> bool {
-        // Lean `is_delta` = `has_value`. Abbrev and Regular both have a
-        // kernel value; Opaque does not unfold. Nested `Syntax.rec_k` ι is
+        // Lean `is_delta` = `has_value`, and every `def` has one. Hints only
+        // order which side unfolds first in lazy delta (`def_height`); they
+        // never make a definition irreducible to the kernel — that is
+        // `opaqueDecl`, a different declaration kind. Gating on `Opaque` here
+        // hid a recursive constructor field behind `constType` (a `def` with
+        // opaque hints), so iota dropped the induction hypothesis
+        // (tutorial/053, /121, /122). Nested `Syntax.rec_k` ι is
         // rule-ctor identity + specialization-order rec_group, not a size
         // band. Lazy delta (`is_delta_reducible`) still unfolds theorems
         // that pass the small-body cut.
         match self.env.get(n) {
-            Some(ConstantInfo::Def {
-                hints: ReducibilityHints::Opaque,
-                ..
-            }) => false,
             Some(ConstantInfo::Def { .. }) => true,
             _ => false,
         }
