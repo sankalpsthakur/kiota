@@ -3539,6 +3539,225 @@ impl<'e> Checker<'e> {
         Ok(Some(true))
     }
 
+    /// Constructor field types after `num_params`, optionally instantiated.
+    /// Used to reconstruct nested `F … I …` owners; not rule `nfields`.
+    fn ctor_field_tys(typ: &Expr, num_params: u32, inst: Option<&[Expr]>) -> Vec<Expr> {
+        let mut cur = typ.clone();
+        let mut peeled = 0u32;
+        while peeled < num_params {
+            match &**cur {
+                ExprData::Pi(_, _, body) => {
+                    cur = body.clone();
+                    peeled += 1;
+                }
+                _ => return Vec::new(),
+            }
+        }
+        if let Some(args) = inst {
+            let rev: Vec<Expr> = args.iter().rev().cloned().collect();
+            cur = expr::instantiate(&cur, &rev);
+        }
+        let mut fields = Vec::new();
+        loop {
+            match &**cur {
+                ExprData::Pi(_, dom, body) => {
+                    fields.push(dom.clone());
+                    cur = body.clone();
+                }
+                _ => break,
+            }
+        }
+        fields
+    }
+
+    fn rec_group_all(&self, rname: u32) -> Vec<u32> {
+        let mut ts = Vec::new();
+        for rec in self.rec_group(rname) {
+            if let Some(ConstantInfo::Recursor { all, .. }) = self.env.get(rec) {
+                for t in all {
+                    if !ts.contains(t) {
+                        ts.push(*t);
+                    }
+                }
+            }
+        }
+        if ts.is_empty() {
+            if let Some(ConstantInfo::Recursor { all, .. }) = self.env.get(rname) {
+                return all.clone();
+            }
+        }
+        ts
+    }
+
+    fn expr_collect_nested(
+        &self,
+        e: &Expr,
+        group: &[u32],
+        nested: &mut Vec<u32>,
+        work: &mut Vec<Expr>,
+        seen: &mut Vec<u32>,
+    ) {
+        match &***e {
+            ExprData::App(_, _) => {
+                let (h, args) = expr::unfold_apps(e);
+                if let ExprData::Const(n, us) = &**h {
+                    self.note_nested_induct(*n, us, &args, group, nested, work, seen);
+                }
+                match &***e {
+                    ExprData::App(f, a) => {
+                        self.expr_collect_nested(f, group, nested, work, seen);
+                        self.expr_collect_nested(a, group, nested, work, seen);
+                    }
+                    _ => {}
+                }
+            }
+            ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
+                self.expr_collect_nested(t, group, nested, work, seen);
+                self.expr_collect_nested(b, group, nested, work, seen);
+            }
+            ExprData::Let(t, v, b) => {
+                self.expr_collect_nested(t, group, nested, work, seen);
+                self.expr_collect_nested(v, group, nested, work, seen);
+                self.expr_collect_nested(b, group, nested, work, seen);
+            }
+            ExprData::Proj(_, _, v) => self.expr_collect_nested(v, group, nested, work, seen),
+            ExprData::Const(n, us) => {
+                self.note_nested_induct(*n, us, &[], group, nested, work, seen)
+            }
+            _ => {}
+        }
+    }
+
+    /// Record `F` when the spine is `F … I …` with `I` in `group`, then
+    /// instantiate `F`'s constructors (`Array Syntax` yields `List Syntax`).
+    fn note_nested_induct(
+        &self,
+        n: u32,
+        us: &[Level],
+        args: &[Expr],
+        group: &[u32],
+        nested: &mut Vec<u32>,
+        work: &mut Vec<Expr>,
+        seen: &mut Vec<u32>,
+    ) {
+        if group.contains(&n) {
+            return;
+        }
+        let Some(ConstantInfo::InductiveType {
+            num_params, all, ..
+        }) = self.env.get(n)
+        else {
+            return;
+        };
+        let num_params = *num_params;
+        if (args.len() as u32) < num_params {
+            return;
+        }
+        let params = &args[..num_params as usize];
+        if !params.iter().any(|a| self.occurs_any(a, group)) {
+            return;
+        }
+        let all = all.clone();
+        for m in all {
+            if !nested.contains(&m) {
+                nested.push(m);
+            }
+            if seen.contains(&m) {
+                continue;
+            }
+            seen.push(m);
+            let (ctors, m_params, subst) = match self.env.get(m) {
+                Some(ConstantInfo::InductiveType {
+                    ctors,
+                    num_params: m_params,
+                    level_params,
+                    ..
+                }) => (ctors.clone(), *m_params, level::subst_map(level_params, us)),
+                _ => continue,
+            };
+            for c in ctors {
+                if let Some(ConstantInfo::Constructor { typ, .. }) = self.env.get(c) {
+                    let ty = expr::instantiate_level_params(typ, &subst);
+                    work.extend(Self::ctor_field_tys(&ty, m_params, Some(params)));
+                }
+            }
+        }
+    }
+
+    /// `tname` occurs as nested `F … I …` in a constructor field of the
+    /// recursor group (`I` in `rec.all`). `Array Syntax` and `List Syntax`
+    /// both count; `List Preresolved` does not.
+    fn nested_type_in_group(&self, rname: u32, tname: u32) -> bool {
+        let group = match self.env.get(rname) {
+            Some(ConstantInfo::Recursor { all, .. }) => all.clone(),
+            _ => return false,
+        };
+        if group.contains(&tname) {
+            return false;
+        }
+        let mut scan = group.clone();
+        for t in self.rec_group_all(rname) {
+            if !scan.contains(&t) {
+                scan.push(t);
+            }
+        }
+        let mut nested = Vec::new();
+        let mut work: Vec<Expr> = Vec::new();
+        let mut seen: Vec<u32> = Vec::new();
+        for t in &scan {
+            let (ctors, nparams) = match self.env.get(*t) {
+                Some(ConstantInfo::InductiveType {
+                    ctors, num_params, ..
+                }) => (ctors.clone(), *num_params),
+                _ => continue,
+            };
+            for c in ctors {
+                if let Some(ConstantInfo::Constructor { typ, .. }) = self.env.get(c) {
+                    work.extend(Self::ctor_field_tys(typ, nparams, None));
+                }
+            }
+        }
+        let mut i = 0;
+        while i < work.len() {
+            let e = work[i].clone();
+            self.expr_collect_nested(&e, &group, &mut nested, &mut work, &mut seen);
+            i += 1;
+        }
+        nested.contains(&tname)
+    }
+
+    /// Owner: `cname.induct` is in `rec.all`, or a nested inductive in a
+    /// group constructor field. Not “listed in `rules`”. `Syntax.rec_2` owns
+    /// `List.nil`.
+    fn rec_owns_ctor(&self, rname: u32, cname: u32) -> bool {
+        let induct = match self.env.get(cname) {
+            Some(ConstantInfo::Constructor { induct, .. }) => *induct,
+            _ => return false,
+        };
+        let Some(ConstantInfo::Recursor { all, .. }) = self.env.get(rname) else {
+            return false;
+        };
+        all.contains(&induct) || self.nested_type_in_group(rname, induct)
+    }
+
+    fn ctor_num_fields(&self, cname: u32) -> Option<u32> {
+        match self.env.get(cname) {
+            Some(ConstantInfo::Constructor { num_fields, .. }) => Some(*num_fields),
+            _ => None,
+        }
+    }
+
+    /// No ι when a rule for `cname` has `nfields` ≠ constructor `num_fields`.
+    fn rule_nfields_agrees(&self, rname: u32, cname: u32, num_fields: u32) -> bool {
+        let Some(ConstantInfo::Recursor { rules, .. }) = self.env.get(rname) else {
+            return true;
+        };
+        match rules.iter().find(|r| r.ctor == cname) {
+            Some(rule) => rule.nfields == num_fields,
+            None => true,
+        }
+    }
+
     fn try_iota(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
         let (rname, us) = match &***head {
             ExprData::Const(n, us) => (*n, us.clone()),
@@ -3567,12 +3786,6 @@ impl<'e> Checker<'e> {
                 ),
                 _ => return Ok(None),
             };
-        let rec_owns_ctor = |cname: u32| -> bool {
-            match self.env.get(rname) {
-                Some(ConstantInfo::Recursor { rules, .. }) => rules.iter().any(|r| r.ctor == cname),
-                _ => false,
-            }
-        };
         let major_pos = (num_params + num_motives + num_minors + num_indices) as usize;
         if args.len() <= major_pos {
             return Ok(None);
@@ -3600,21 +3813,13 @@ impl<'e> Checker<'e> {
         let ctor = match &**mhead {
             ExprData::Const(cname, _) => match self.env.get(*cname) {
                 Some(ConstantInfo::Constructor {
-                    induct,
-                    num_params: cnp,
-                    ..
-                }) if all.contains(induct) || rec_owns_ctor(*cname) => {
-                    Some((*cname, *cnp, margs.clone()))
-                }
+                    num_params: cnp, ..
+                }) if self.rec_owns_ctor(rname, *cname) => Some((*cname, *cnp, margs.clone())),
                 _ => None,
             },
             ExprData::Lit(Lit::Nat(n)) => {
                 if let Some((zero, succ)) = self.nat_ctors() {
-                    let nat_induct = match self.env.get(zero) {
-                        Some(ConstantInfo::Constructor { induct, .. }) => Some(*induct),
-                        _ => None,
-                    };
-                    if nat_induct.map(|ind| all.contains(&ind)).unwrap_or(false) || rec_owns_ctor(zero) {
+                    if self.rec_owns_ctor(rname, zero) {
                         if n == &num_bigint::BigUint::from(0u32) {
                             Some((zero, 0, vec![]))
                         } else if n.bits() > 256 {
@@ -3660,11 +3865,20 @@ impl<'e> Checker<'e> {
             return Ok(None);
         };
 
+        if !self.rec_owns_ctor(rname, cname) {
+            return Ok(None);
+        }
         if (ctor_args.len() as u32) < cnp {
             return Ok(None);
         }
         let ctor_params = &ctor_args[..cnp as usize];
         let fields = &ctor_args[cnp as usize..];
+        let Some(nfields) = self.ctor_num_fields(cname) else {
+            return Ok(None);
+        };
+        if fields.len() as u32 != nfields || !self.rule_nfields_agrees(rname, cname, nfields) {
+            return Ok(None);
+        }
 
         let minor_idx = self.ctor_minor_index(cname, rname, &all);
         if minor_idx >= minors.len() {
@@ -3687,20 +3901,25 @@ impl<'e> Checker<'e> {
         Ok(Some(expr::apps(rhs, rest)))
     }
 
-    /// K-like iff: not mutual, result sort is Prop, one constructor, zero fields.
-    /// Independently computed; the exported `k` flag is never trusted.
+    /// K-like from the inductive: not mutual, one ctor, result Prop, zero
+    /// fields. `num_params` / `num_indices` are the inductive's, never the
+    /// recursor export. Exported `k` unused. Eq stays K-like (1 index).
     fn is_k_like(&self, all: &[u32]) -> R<bool> {
         if all.len() != 1 {
             return Ok(false);
         }
-        let tname = all[0];
-        let (ctors, num_params, typ) = match self.env.get(tname) {
+        self.is_k_like_ind(all[0])
+    }
+
+    fn is_k_like_ind(&self, tname: u32) -> R<bool> {
+        let (ctors, num_params, num_indices, typ) = match self.env.get(tname) {
             Some(ConstantInfo::InductiveType {
                 ctors,
                 num_params,
+                num_indices,
                 typ,
                 ..
-            }) => (ctors.clone(), *num_params, typ.clone()),
+            }) => (ctors.clone(), *num_params, *num_indices, typ.clone()),
             _ => return Ok(false),
         };
         if ctors.len() != 1 {
@@ -3708,7 +3927,7 @@ impl<'e> Checker<'e> {
         }
         let mut ctx: Ctx = Ctx::new();
         let mut cur = typ;
-        for _ in 0..num_params {
+        for _ in 0..(num_params + num_indices) {
             match self.ensure_pi(&ctx, &cur) {
                 Ok((_, dom, body)) => {
                     ctx.push(dom);
@@ -3717,32 +3936,29 @@ impl<'e> Checker<'e> {
                 Err(_) => return Ok(false),
             }
         }
-        loop {
-            match self.whnf(&ctx, &cur) {
-                Ok(w) => match &**w {
-                    ExprData::Pi(_, dom, body) => {
-                        ctx.push(dom.clone());
-                        cur = body.clone();
-                    }
-                    _ => {
-                        cur = w;
-                        break;
-                    }
-                },
-                Err(_) => return Ok(false),
-            }
+        let w = match self.whnf(&ctx, &cur) {
+            Ok(w) => w,
+            Err(_) => return Ok(false),
+        };
+        if matches!(&**w, ExprData::Pi(_, _, _)) {
+            return Ok(false);
         }
-        let lvl = match self.ensure_sort(&ctx, &cur) {
+        let lvl = match self.ensure_sort(&ctx, &w) {
             Ok(l) => l,
             Err(_) => return Ok(false),
         };
         if !level::is_def_eq(&lvl, &level::zero()) {
             return Ok(false);
         }
-        let ctor_typ = match self.env.get(ctors[0]) {
-            Some(ConstantInfo::Constructor { typ, .. }) => typ.clone(),
+        let (ctor_typ, ctor_nfields) = match self.env.get(ctors[0]) {
+            Some(ConstantInfo::Constructor {
+                typ, num_fields, ..
+            }) => (typ.clone(), *num_fields),
             _ => return Ok(false),
         };
+        if ctor_nfields != 0 {
+            return Ok(false);
+        }
         let mut nfields = 0u32;
         let mut ct = ctor_typ;
         loop {
@@ -3846,6 +4062,9 @@ impl<'e> Checker<'e> {
         for rec in self.rec_group(rname) {
             if let Some(ConstantInfo::Recursor { rules, .. }) = self.env.get(rec) {
                 for rule in rules {
+                    if !self.rec_owns_ctor(rname, rule.ctor) {
+                        continue;
+                    }
                     if rule.ctor == cname {
                         return idx;
                     }
