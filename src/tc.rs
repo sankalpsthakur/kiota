@@ -2715,21 +2715,33 @@ impl<'e> Checker<'e> {
                                 cur = r;
                                 continue;
                             }
-                            if let Some(r) = self.try_nat_extension(ctx, &head, &args)? {
-                                crate::stats::n_nat();
-                                cur = r;
-                                continue;
+                            // These shortcuts implement library definitions,
+                            // not kernel reduction rules. A checked export may
+                            // bind the same canonical name to a different
+                            // definition, so names and declaration kinds do not
+                            // authenticate them. They are available only for an
+                            // explicitly trusted input corpus; the default
+                            // checker stays on kernel-derived reductions.
+                            let trusted_library_oracles =
+                                std::env::var_os("KIOTA_TRUST_LIBRARY_ORACLES").is_some();
+                            if trusted_library_oracles {
+                                if let Some(r) = self.try_nat_extension(ctx, &head, &args)? {
+                                    crate::stats::n_nat();
+                                    cur = r;
+                                    continue;
+                                }
                             }
                             // These evaluators summarize non-kernel library definitions.
                             // An axiom, opaque constant, constructor, or recursor with the
                             // same name has no such reduction rule. Definitions still need
                             // their bodies authenticated before this gate is a complete
                             // identity check; this prevents declaration-kind substitution.
-                            let semantic_def = matches!(
-                                &**head,
-                                ExprData::Const(n, _)
-                                    if matches!(self.env.get(*n), Some(ConstantInfo::Def { .. }))
-                            );
+                            let semantic_def = trusted_library_oracles
+                                && matches!(
+                                    &**head,
+                                    ExprData::Const(n, _)
+                                        if matches!(self.env.get(*n), Some(ConstantInfo::Def { .. }))
+                                );
                             if semantic_def {
                                 if let Some(r) = self.try_omega_combo(ctx, &head, &args)? {
                                     crate::stats::l_omega();
@@ -2762,9 +2774,11 @@ impl<'e> Checker<'e> {
                                     continue;
                                 }
                             }
-                            if let Some(r) = self.try_dite(ctx, &head, &args)? {
-                                cur = r;
-                                continue;
+                            if trusted_library_oracles {
+                                if let Some(r) = self.try_dite(ctx, &head, &args)? {
+                                    cur = r;
+                                    continue;
+                                }
                             }
                             return Ok(cur);
                         }
@@ -3250,13 +3264,6 @@ impl<'e> Checker<'e> {
                     self.pp_budget(&bw, 24)
                 );
             }
-        }
-        let int_aw = self.closed_int_value(ctx, &aw)?;
-        let int_bw = self.closed_int_value(ctx, &bw)?;
-        if let (Some(x), Some(y)) = (int_aw, int_bw) {
-            let r = x == y;
-            self.insert_defeq(key, r);
-            return Ok(r);
         }
         let r = self.is_def_eq_core(ctx, &aw, &bw)?;
         // CONV_DEPTH / CORE_DEPTH abort as Decline, not Ok(false), so a stored
@@ -8835,6 +8842,42 @@ mod tests {
         assert!(
             !eq,
             "Nat literal 3 must not defeq OfNat.ofNat Int 3 inst"
+        );
+    }
+
+    /// Parsing closed integers is an evaluator aid, not a conversion rule.
+    /// An unrelated `Shadow.Int.add` axiom must not become definitionally
+    /// equal to the integer numeral computed from its arguments.
+    #[test]
+    fn namespaced_int_axiom_is_not_defeq_computed_numeral() {
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        axiom_sort(&mut env, 0, sort1.clone()); // Nat
+        axiom_sort(&mut env, 1, sort1); // Int
+        let nat = expr::const_(0, vec![]);
+        let int = expr::const_(1, vec![]);
+        axiom_sort(
+            &mut env,
+            2,
+            expr::pi(expr::BinderInfo::Default, nat, int.clone()),
+        ); // Int.ofNat
+        axiom_sort(
+            &mut env,
+            3,
+            expr::pi(
+                expr::BinderInfo::Default,
+                int.clone(),
+                expr::pi(expr::BinderInfo::Default, int.clone(), int),
+            ),
+        ); // Shadow.Int.add
+        let names = test_names(&["Nat", "Int", "Int.ofNat", "Shadow.Int.add"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let of_nat = |n: u32| expr::app(expr::const_(2, vec![]), expr::lit_nat(n.into()));
+        let shadow_add = expr::apps(expr::const_(3, vec![]), &[of_nat(1), of_nat(2)]);
+        assert!(
+            !tc.is_def_eq(&Ctx::new(), &shadow_add, &of_nat(3))
+                .expect("defeq"),
+            "Shadow.Int.add 1 2 is stuck and must not convert to Int.ofNat 3"
         );
     }
 
