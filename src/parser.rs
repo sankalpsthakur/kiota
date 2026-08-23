@@ -365,7 +365,7 @@ impl Parser {
         let level_params = Self::get_vec_u32(v, "levelParams");
         let typ = self.require_expr(v, "type")?;
         self.reject_if_dup(name)?;
-        if !quot_type_matches_kind(&kind, &typ) {
+        if !quot_type_matches_kind(self, &kind, name, &level_params, &typ) {
             return Err(TcError::Reject(
                 "quot type does not match kernel quotient shape".into(),
             ));
@@ -551,6 +551,87 @@ impl Parser {
                 recs.len()
             )));
         }
+
+        // Recursor names are declaration identity, not presentation metadata.
+        // Lean exports one `I.rec` for every type in the mutual group. Nested
+        // specializations are named `I.rec_1`, `I.rec_2`, ... contiguously for
+        // whichever group type owns them. Accepting an arbitrary name here
+        // lets an export install a second recursor while an unrelated
+        // declaration already occupies the canonical `I.rec` name.
+        let mut main_rec_seen: FxHashSet<u32> = FxHashSet::default();
+        let mut nested_rec_seen: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        for r in &recs {
+            let rname = Self::get_u32(r, "name");
+            let rstr = self
+                .names
+                .get(rname as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let mut owner = None;
+            for &tname in &type_names {
+                let tstr = self
+                    .names
+                    .get(tname as usize)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let main = format!("{tstr}.rec");
+                if rstr == main {
+                    main_rec_seen.insert(tname);
+                    owner = Some(tname);
+                    break;
+                }
+            }
+            if owner.is_none() {
+                for &tname in &type_names {
+                    let tstr = self
+                        .names
+                        .get(tname as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    let prefix = format!("{tstr}.rec_");
+                    let Some(suffix) = rstr.strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    let Ok(n) = suffix.parse::<u32>() else {
+                        continue;
+                    };
+                    if n > 0 && suffix == n.to_string() {
+                        nested_rec_seen.entry(tname).or_default().push(n);
+                        owner = Some(tname);
+                        break;
+                    }
+                }
+            }
+            if owner.is_none() {
+                return Err(TcError::Reject(format!(
+                    "recursor `{rstr}` does not have a canonical name for its inductive group"
+                )));
+            }
+        }
+        for &tname in &type_names {
+            let tstr = self
+                .names
+                .get(tname as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("?");
+            if !main_rec_seen.contains(&tname) {
+                return Err(TcError::Reject(format!(
+                    "inductive `{tstr}` is missing its canonical recursor `{tstr}.rec`"
+                )));
+            }
+            if let Some(suffixes) = nested_rec_seen.get_mut(&tname) {
+                suffixes.sort_unstable();
+                for (i, &suffix) in suffixes.iter().enumerate() {
+                    let expected = i as u32 + 1;
+                    if suffix != expected {
+                        return Err(TcError::Reject(format!(
+                            "nested recursors for inductive `{tstr}` are not contiguous at `{tstr}.rec_{expected}`"
+                        )));
+                    }
+                }
+            }
+        }
+
         let mut seen_rec_for: FxHashSet<u32> = FxHashSet::default();
         for r in &recs {
             let rname = Self::require_u32(r, "name")?;
@@ -997,47 +1078,180 @@ fn expr_occurs_names(e: &Expr, names: &[u32]) -> bool {
     }
 }
 
-fn is_quot_rel(e: &Expr) -> bool {
-    match &***e {
-        ExprData::Pi(_, _, b1) => match &***b1 {
-            ExprData::Pi(_, _, b2) => matches!(&***b2, ExprData::Sort(l) if level::is_zero(l)),
-            _ => false,
-        },
-        _ => false,
+/// The four quotient declarations are kernel primitives. Their canonical
+/// names, universe parameters, dependencies, binder information, and complete
+/// types must match Lean's declarations exactly; a telescope length is not an
+/// identity check.
+fn quot_type_matches_kind(
+    parser: &Parser,
+    kind: &QuotKind,
+    name: u32,
+    level_params: &[u32],
+    typ: &Expr,
+) -> bool {
+    let expected_name = match kind {
+        QuotKind::Type => "Quot",
+        QuotKind::Ctor => "Quot.mk",
+        QuotKind::Lift => "Quot.lift",
+        QuotKind::Ind => "Quot.ind",
+    };
+    if parser.names.get(name as usize).map(|s| s.as_str()) != Some(expected_name) {
+        return false;
     }
-}
+    let expected_levels = if matches!(kind, QuotKind::Lift) { 2 } else { 1 };
+    if level_params.len() != expected_levels {
+        return false;
+    }
 
-/// Kernel quot shapes: Type 2-Pi Sort-dom + rel + Sort; Ctor 3-Pi Sort-dom + rel + App; Lift 6; Ind 5.
-fn quot_type_matches_kind(kind: &QuotKind, typ: &Expr) -> bool {
-    let mut doms: Vec<Expr> = Vec::new();
-    let mut cur = typ.clone();
-    loop {
-        match &**cur {
-            ExprData::Pi(_, dom, body) => {
-                doms.push(dom.clone());
-                cur = body.clone();
-            }
-            rest => {
-                let n = doms.len();
-                return match kind {
-                    QuotKind::Type => {
-                        n == 2
-                            && matches!(rest, ExprData::Sort(_))
-                            && matches!(&**doms[0], ExprData::Sort(_))
-                            && is_quot_rel(&doms[1])
-                    }
-                    QuotKind::Ctor => {
-                        n == 3
-                            && matches!(rest, ExprData::App(_, _))
-                            && matches!(&**doms[0], ExprData::Sort(_))
-                            && is_quot_rel(&doms[1])
-                    }
-                    QuotKind::Lift => n == 6,
-                    QuotKind::Ind => n == 5,
-                };
-            }
-        }
+    let quot = match parser.name_by_str.get("Quot").copied() {
+        Some(n) => n,
+        None if matches!(kind, QuotKind::Type) => name,
+        None => return false,
+    };
+    if !matches!(kind, QuotKind::Type)
+        && !matches!(
+            parser.env.get(quot),
+            Some(ConstantInfo::Quot {
+                kind: QuotKind::Type,
+                ..
+            })
+        )
+    {
+        return false;
     }
+    let quot_mk = parser.name_by_str.get("Quot.mk").copied();
+    if matches!(kind, QuotKind::Ind)
+        && !matches!(
+            quot_mk.and_then(|n| parser.env.get(n)),
+            Some(ConstantInfo::Quot {
+                kind: QuotKind::Ctor,
+                ..
+            })
+        )
+    {
+        return false;
+    }
+
+    let u = level::param(level_params[0]);
+    let sort_u = expr::sort(u.clone());
+    let sort_0 = expr::sort(level::zero());
+    let rel = expr::pi(
+        BinderInfo::Default,
+        expr::bvar(0),
+        expr::pi(BinderInfo::Default, expr::bvar(1), sort_0.clone()),
+    );
+    let expected = match kind {
+        QuotKind::Type => expr::pi(
+            BinderInfo::Implicit,
+            sort_u.clone(),
+            expr::pi(BinderInfo::Default, rel.clone(), sort_u),
+        ),
+        QuotKind::Ctor => {
+            let result = expr::apps(
+                expr::const_(quot, vec![u.clone()]),
+                &[expr::bvar(2), expr::bvar(1)],
+            );
+            expr::pi(
+                BinderInfo::Implicit,
+                sort_u,
+                expr::pi(
+                    BinderInfo::Default,
+                    rel.clone(),
+                    expr::pi(BinderInfo::Default, expr::bvar(1), result),
+                ),
+            )
+        }
+        QuotKind::Lift => {
+            let Some(eq) = parser.name_by_str.get("Eq").copied() else {
+                return false;
+            };
+            let v = level::param(level_params[1]);
+            let f_dom = expr::pi(BinderInfo::Default, expr::bvar(2), expr::bvar(1));
+            let rel_ab = expr::apps(expr::bvar(4), &[expr::bvar(1), expr::bvar(0)]);
+            let fa = expr::app(expr::bvar(3), expr::bvar(2));
+            let fb = expr::app(expr::bvar(3), expr::bvar(1));
+            let eq_fa_fb = expr::apps(expr::const_(eq, vec![v.clone()]), &[expr::bvar(4), fa, fb]);
+            let respects = expr::pi(
+                BinderInfo::Default,
+                expr::bvar(3),
+                expr::pi(
+                    BinderInfo::Default,
+                    expr::bvar(4),
+                    expr::pi(BinderInfo::Default, rel_ab, eq_fa_fb),
+                ),
+            );
+            let q_dom = expr::apps(
+                expr::const_(quot, vec![u.clone()]),
+                &[expr::bvar(4), expr::bvar(3)],
+            );
+            expr::pi(
+                BinderInfo::Implicit,
+                sort_u,
+                expr::pi(
+                    BinderInfo::Implicit,
+                    rel.clone(),
+                    expr::pi(
+                        BinderInfo::Implicit,
+                        expr::sort(v),
+                        expr::pi(
+                            BinderInfo::Default,
+                            f_dom,
+                            expr::pi(
+                                BinderInfo::Default,
+                                respects,
+                                expr::pi(BinderInfo::Default, q_dom, expr::bvar(3)),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        }
+        QuotKind::Ind => {
+            let Some(quot_mk) = quot_mk else {
+                return false;
+            };
+            let beta_dom = expr::pi(
+                BinderInfo::Default,
+                expr::apps(
+                    expr::const_(quot, vec![u.clone()]),
+                    &[expr::bvar(1), expr::bvar(0)],
+                ),
+                sort_0,
+            );
+            let mk_a = expr::apps(
+                expr::const_(quot_mk, vec![u.clone()]),
+                &[expr::bvar(3), expr::bvar(2), expr::bvar(0)],
+            );
+            let h_dom = expr::pi(
+                BinderInfo::Default,
+                expr::bvar(2),
+                expr::app(expr::bvar(1), mk_a),
+            );
+            let q_dom = expr::apps(expr::const_(quot, vec![u]), &[expr::bvar(3), expr::bvar(2)]);
+            expr::pi(
+                BinderInfo::Implicit,
+                sort_u,
+                expr::pi(
+                    BinderInfo::Implicit,
+                    rel,
+                    expr::pi(
+                        BinderInfo::Implicit,
+                        beta_dom,
+                        expr::pi(
+                            BinderInfo::Default,
+                            h_dom,
+                            expr::pi(
+                                BinderInfo::Default,
+                                q_dom,
+                                expr::app(expr::bvar(2), expr::bvar(0)),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        }
+    };
+    Rc::ptr_eq(typ, &expected)
 }
 
 /// Lean nested recursor numbering: `.rec` first, then `.rec_1`, `.rec_2`, …

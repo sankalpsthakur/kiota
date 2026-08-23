@@ -80,11 +80,15 @@ fn extra_rec_rejects() {
     assert_reject("extra-rec.reject.ndjson");
 }
 
-/// Recursor identity is rule constructors / `all ∩ group`, not `I.rec`.
-/// `elim` is a well-typed recursor for `False`; a pretty-name gate used to reject it.
+/// A recursor's canonical name is part of declaration identity.
 #[test]
-fn extra_rec_all_field_not_pretty_name_accepts() {
-    assert_accept("extra-rec-alt-name.accept.ndjson");
+fn misnamed_recursor_rejects() {
+    assert_reject("misnamed-recursor.reject.ndjson");
+}
+
+#[test]
+fn canonical_name_occupied_by_definition_rejects() {
+    assert_reject("canonical-rec-name-occupied.reject.ndjson");
 }
 
 /// `Color.rec` rules start at `True.intro` (a ctor of a different inductive).
@@ -227,6 +231,18 @@ fn missing_is_rec_rejects() {
 #[test]
 fn quot_2pi_false_dom_rejects() {
     assert_reject("quot-2pi-false-dom.reject.ndjson");
+}
+
+/// A six-Pi telescope is not sufficient to grant `Quot.lift` reduction.
+#[test]
+fn quot_lift_six_false_rejects() {
+    assert_reject("quot-lift-six-false.reject.ndjson");
+}
+
+/// A five-Pi telescope is not sufficient to grant `Quot.ind` reduction.
+#[test]
+fn quot_ind_five_false_rejects() {
+    assert_reject("quot-ind-five-false.reject.ndjson");
 }
 
 /// `inductive Bad.{u} : Sort u | mk : Sort (u+1) → Bad`.
