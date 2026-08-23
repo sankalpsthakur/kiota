@@ -131,11 +131,11 @@ fn is_int_linear_ident(name: &str, ident: &str) -> bool {
     if name == ident {
         return true;
     }
-    if !name.ends_with(ident) {
-        return false;
+    if let Some(rest) = name.strip_suffix(ident) {
+        rest == "Int.Linear." || rest.ends_with(".Int.Linear.")
+    } else {
+        false
     }
-    let rest = &name[..name.len() - ident.len()];
-    rest.ends_with('.') && (name.contains("Int.Linear") || name == ident)
 }
 
 /// Closed `Int.Linear.Poly` spine (larger `Var` first). Used to evaluate
@@ -359,17 +359,22 @@ impl LinearExpr {
 }
 
 fn is_commring_ident(name: &str, ident: &str) -> bool {
-    if !name.contains("CommRing") {
-        return false;
-    }
     if name == ident {
         return true;
     }
-    if !name.ends_with(ident) {
-        return false;
+    if let Some(rest) = name.strip_suffix(ident) {
+        rest == "Lean.Grind.CommRing." || rest.ends_with(".Lean.Grind.CommRing.")
+    } else {
+        false
     }
-    let rest = &name[..name.len() - ident.len()];
-    rest.ends_with('.')
+}
+
+fn is_rat_ident(name: &str, ident: &str) -> bool {
+    if let Some(rest) = name.strip_suffix(ident) {
+        rest == "Rat." || rest.ends_with(".Rat.")
+    } else {
+        false
+    }
 }
 
 /// Closed `Lean.Grind.CommRing` monomials: smaller `Var` first (`Power.varLt`).
@@ -4496,30 +4501,32 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
-            "Int.decLe" | "Int.decLt" if args.len() >= 2 => {
-                let aw = self.whnf(ctx, &args[0])?;
-                let bw = self.whnf(ctx, &args[1])?;
-                let va = self.closed_int_value(ctx, &aw)?;
-                let vb = self.closed_int_value(ctx, &bw)?;
-                if let (Some(a), Some(b)) = (va, vb) {
-                    let yes = if name == "Int.decLt" { a < b } else { a <= b };
-                    if let Some(r) = self.mk_decidable_bool(yes) {
-                        return Ok(Some(expr::apps(r, &args[2..])));
-                    }
-                }
-                Ok(None)
-            }
             "Decidable.decide" | "decide" if args.len() >= 2 => {
                 let inst = self.whnf(ctx, &args[1])?;
-                let (ih, _) = expr::unfold_apps(&inst);
+                let (ih, iargs) = expr::unfold_apps(&inst);
                 let iname = match &**ih {
                     ExprData::Const(n, _) => self.name_str(*n),
                     _ => return Ok(None),
                 };
-                let tname = if matches!(iname, "Decidable.isTrue" | "isTrue") {
+                let tname = if iname == "Decidable.isTrue" {
                     "Bool.true"
-                } else if matches!(iname, "Decidable.isFalse" | "isFalse") {
+                } else if iname == "Decidable.isFalse" {
                     "Bool.false"
+                } else if (iname == "Int.decLe" || iname == "Int.decLt") && iargs.len() >= 2 {
+                    let aw = self.whnf(ctx, &iargs[0])?;
+                    let bw = self.whnf(ctx, &iargs[1])?;
+                    let (Some(a), Some(b)) = (
+                        self.closed_int_value(ctx, &aw)?,
+                        self.closed_int_value(ctx, &bw)?,
+                    ) else {
+                        return Ok(None);
+                    };
+                    let yes = if iname == "Int.decLt" { a < b } else { a <= b };
+                    if yes {
+                        "Bool.true"
+                    } else {
+                        "Bool.false"
+                    }
                 } else {
                     return Ok(None);
                 };
@@ -4565,7 +4572,7 @@ impl<'e> Checker<'e> {
                     ExprData::Const(t, _) => self.name_str(*t),
                     _ => return Ok(None),
                 };
-                if ty_name == "Int" || ty_name.ends_with(".Int") {
+                if ty_name == "Int" {
                     if let (Some(a), Some(b)) = (
                         self.closed_int_value(ctx, &args[4])?,
                         self.closed_int_value(ctx, &args[5])?,
@@ -4604,7 +4611,7 @@ impl<'e> Checker<'e> {
                     ExprData::Const(t, _) => self.name_str(*t),
                     _ => return Ok(None),
                 };
-                if ty_name != "Int" && !ty_name.ends_with(".Int") {
+                if ty_name != "Int" {
                     return Ok(None);
                 }
                 if let Some(inner) = self.peel_int_neg(&args[2]) {
@@ -4639,7 +4646,7 @@ impl<'e> Checker<'e> {
                     ExprData::Const(t, _) => self.name_str(*t),
                     _ => return Ok(None),
                 };
-                if ty_name == "Int" || ty_name.ends_with(".Int") {
+                if ty_name == "Int" {
                     if let Some(n) = self.closed_nat_value(ctx, &args[val_i])? {
                         if let Some(r) = self.mk_closed_int(&BigInt::from(n)) {
                             return Ok(Some(expr::apps(r, &args[val_i + 1..])));
@@ -4665,7 +4672,7 @@ impl<'e> Checker<'e> {
                     ExprData::Const(t, _) => self.name_str(*t),
                     _ => return Ok(None),
                 };
-                if ty_name == "Int" || ty_name.ends_with(".Int") {
+                if ty_name == "Int" {
                     if let Some(n) = self.closed_nat_value(ctx, &args[1])? {
                         if let Some(ofn) = self.find_name_ending("Int.ofNat") {
                             let r = expr::app(expr::const_(ofn, vec![]), nat::mk_lit(n));
@@ -4742,7 +4749,7 @@ impl<'e> Checker<'e> {
             .nat_ref
             .is_some_and(|n| matches!(&**ty, ExprData::Const(t, _) if *t == n));
         let is_combo = ty_name == "LinearCombo" || ty_name.ends_with(".LinearCombo");
-        let is_int_name = |s: &str| s == "Int" || s.ends_with(".Int");
+        let is_int_name = |s: &str| s == "Int";
         // HMul Int IntList IntList has first type Int — do not rewrite to Int.mul.
         let is_int = if matches!(
             name,
@@ -4809,9 +4816,9 @@ impl<'e> Checker<'e> {
         };
         let name = self.name_str(n);
         let ident = name.rsplit('.').next().unwrap_or(name);
-        let is_inv = ident == "inv" && (name.contains("Rat") || name.contains("Inv"));
-        let is_num = ident == "num" && name.contains("Rat");
-        let is_den = ident == "den" && name.contains("Rat");
+        let is_inv = ident == "inv" && is_rat_ident(name, ident);
+        let is_num = ident == "num" && is_rat_ident(name, ident);
+        let is_den = ident == "den" && is_rat_ident(name, ident);
         if !is_inv && !is_num && !is_den {
             return Ok(None);
         }
@@ -4850,7 +4857,7 @@ impl<'e> Checker<'e> {
         match &**h {
             ExprData::Const(n, _) => {
                 let s = self.name_str(*n);
-                s == "Rat" || s.ends_with(".Rat")
+                s == "Rat"
             }
             _ => false,
         }
@@ -4868,7 +4875,7 @@ impl<'e> Checker<'e> {
             _ => return Ok(None),
         };
         let ident = name.rsplit('.').next().unwrap_or(name);
-        if ident == "mk'" && name.contains("Rat") && args.len() >= 4 {
+        if ident == "mk'" && is_rat_ident(name, ident) && args.len() >= 4 {
             let Some(num) = self.closed_int_value(ctx, &args[args.len() - 4])? else {
                 return Ok(None);
             };
@@ -4877,7 +4884,7 @@ impl<'e> Checker<'e> {
             };
             return Ok(Some((num, den, e)));
         }
-        if ident == "ofInt" && name.contains("Rat") && !args.is_empty() {
+        if ident == "ofInt" && is_rat_ident(name, ident) && !args.is_empty() {
             let Some(num) = self.closed_int_value(ctx, args.last().unwrap())? else {
                 return Ok(None);
             };
@@ -4924,9 +4931,22 @@ impl<'e> Checker<'e> {
             ExprData::Const(cn, _) => self.name_str(*cn),
             _ => return Ok(None),
         };
-        let is_true = matches!(iname, "Decidable.isTrue" | "isTrue");
-        let is_false = matches!(iname, "Decidable.isFalse" | "isFalse");
+        let is_true = iname == "Decidable.isTrue";
+        let is_false = iname == "Decidable.isFalse";
         if !is_true && !is_false {
+            if is_ite && (iname == "Int.decLe" || iname == "Int.decLt") && iargs.len() >= 2 {
+                let aw = self.whnf(ctx, &iargs[0])?;
+                let bw = self.whnf(ctx, &iargs[1])?;
+                let (Some(a), Some(b)) = (
+                    self.closed_int_value(ctx, &aw)?,
+                    self.closed_int_value(ctx, &bw)?,
+                ) else {
+                    return Ok(None);
+                };
+                let yes = if iname == "Int.decLt" { a < b } else { a <= b };
+                let branch = if yes { &args[3] } else { &args[4] };
+                return Ok(Some(expr::apps(branch.clone(), &args[5..])));
+            }
             return Ok(None);
         }
         let proof = match iargs.last() {
@@ -5967,10 +5987,10 @@ impl<'e> Checker<'e> {
             _ => return Ok(None),
         };
         let name = self.name_str(n);
-        if !name.contains("CommRing") {
+        let ident = name.rsplit('.').next().unwrap_or(name);
+        if !is_commring_ident(name, ident) {
             return Ok(None);
         }
-        let ident = name.rsplit('.').next().unwrap_or(name);
         let bool_r = match ident {
             "norm_cnstr_cert" if args.len() >= 4 => {
                 let Some(lhs) = self.parse_commring_expr(ctx, &args[0])? else {
@@ -5993,7 +6013,7 @@ impl<'e> Checker<'e> {
                 };
                 Some(p.beq(&q))
             }
-            "norm_eq_cert" if args.len() >= 4 && name.contains("CommRing") => {
+            "norm_eq_cert" if args.len() >= 4 => {
                 let Some(lhs) = self.parse_commring_expr(ctx, &args[0])? else {
                     return Ok(None);
                 };
@@ -6527,10 +6547,7 @@ impl<'e> Checker<'e> {
     fn type_head_is_int(&self, e: &Expr) -> bool {
         let (h, _) = expr::unfold_apps(e);
         match &**h {
-            ExprData::Const(n, _) => {
-                let s = self.name_str(*n);
-                s == "Int" || s.ends_with(".Int")
-            }
+            ExprData::Const(n, _) => self.name_str(*n) == "Int",
             _ => false,
         }
     }
@@ -6728,25 +6745,6 @@ impl<'e> Checker<'e> {
         Some(expr::app(
             expr::const_(ns, vec![]),
             nat::mk_lit(mag - 1u32),
-        ))
-    }
-
-    /// Kernel-native `Int.decLe`/`Int.decLt` result. The proof payload is
-    /// `True.intro`; `ite`/`decide` only inspect the constructor.
-    fn mk_decidable_bool(&self, yes: bool) -> Option<Expr> {
-        let ctor = if yes {
-            "Decidable.isTrue"
-        } else {
-            "Decidable.isFalse"
-        };
-        let c = self
-            .find_name(ctor)
-            .or_else(|| self.find_name_ending(if yes { "isTrue" } else { "isFalse" }))?;
-        let true_ty = self.find_name("True")?;
-        let intro = self.find_name("True.intro")?;
-        Some(expr::apps(
-            expr::const_(c, vec![level::zero()]),
-            &[expr::const_(true_ty, vec![]), expr::const_(intro, vec![])],
         ))
     }
 
@@ -7578,6 +7576,7 @@ impl<'e> Checker<'e> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env::{ConstantInfo, Environment};
     use crate::level;
 
     fn ty(n: u32) -> Expr {
@@ -8055,6 +8054,17 @@ mod tests {
 
     fn test_names(ss: &[&str]) -> Vec<std::rc::Rc<String>> {
         ss.iter().map(|s| std::rc::Rc::new((*s).into())).collect()
+    }
+
+    fn axiom_sort(env: &mut Environment, name: u32, typ: Expr) {
+        env.insert(
+            name,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ,
+                is_unsafe: false,
+            },
+        );
     }
 
     /// `False` / `True` as inductives (not axioms). `True.intro` is a ctor.
@@ -8640,6 +8650,240 @@ mod tests {
             .is_def_eq(&Ctx::new(), &cast(0), &cast(1))
             .unwrap();
         assert!(!eq, "Nat.cast Nat 3 must not defeq Nat.cast Int 3");
+    }
+
+    /// Forged `CommRing.norm_eq_cert` (not `Lean.Grind.CommRing.*`) must not
+    /// WHNF to `Bool.true` even when the arguments parse as equal monomials.
+    #[test]
+    fn forged_commring_norm_eq_cert_does_not_whnf_true() {
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        let sort0 = expr::sort(level::zero());
+        axiom_sort(&mut env, 0, sort1.clone()); // Nat
+        axiom_sort(&mut env, 1, sort1.clone()); // Int
+        axiom_sort(
+            &mut env,
+            2,
+            expr::pi(
+                expr::BinderInfo::Default,
+                expr::const_(0, vec![]),
+                expr::const_(1, vec![]),
+            ),
+        ); // Int.ofNat
+        axiom_sort(&mut env, 3, sort0.clone()); // Bool.true
+        axiom_sort(&mut env, 4, sort0.clone()); // Bool.false
+        axiom_sort(
+            &mut env,
+            5,
+            expr::pi(
+                expr::BinderInfo::Default,
+                expr::const_(1, vec![]),
+                sort0.clone(),
+            ),
+        ); // CommRing.Expr.num
+        let bool_ty = sort0.clone();
+        let expr_ty = sort0;
+        let cert_ty = expr::pi(
+            expr::BinderInfo::Default,
+            expr_ty.clone(),
+            expr::pi(
+                expr::BinderInfo::Default,
+                expr_ty.clone(),
+                expr::pi(
+                    expr::BinderInfo::Default,
+                    expr_ty.clone(),
+                    expr::pi(expr::BinderInfo::Default, expr_ty, bool_ty),
+                ),
+            ),
+        );
+        axiom_sort(&mut env, 6, cert_ty); // CommRing.norm_eq_cert
+        let names = test_names(&[
+            "Nat",
+            "Int",
+            "Int.ofNat",
+            "Bool.true",
+            "Bool.false",
+            "CommRing.Expr.num",
+            "CommRing.norm_eq_cert",
+        ]);
+        let tc = Checker::new(&env, &names, None, None);
+        let z = expr::app(expr::const_(2, vec![]), expr::lit_nat(0u32.into()));
+        let num = expr::app(expr::const_(5, vec![]), z);
+        let cert = expr::apps(
+            expr::const_(6, vec![]),
+            &[num.clone(), num.clone(), num.clone(), num],
+        );
+        let w = tc.whnf(&Ctx::new(), &cert).expect("WHNF");
+        let (h, _) = expr::unfold_apps(&w);
+        let reduced_true = matches!(&**h, ExprData::Const(n, _) if *n == 3);
+        assert!(
+            !reduced_true,
+            "forged CommRing.norm_eq_cert must not WHNF to Bool.true, got {}",
+            tc.pp(&w)
+        );
+    }
+
+    /// Inductive `Foo.Int` is not Lean `Int`: HAdd/cast must not rewrite.
+    #[test]
+    fn foo_int_is_not_int_for_hadd() {
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        axiom_sort(&mut env, 0, sort1.clone()); // Nat
+        env.insert(
+            1,
+            ConstantInfo::InductiveType {
+                level_params: vec![],
+                typ: sort1.clone(),
+                num_params: 0,
+                num_indices: 0,
+                all: vec![1],
+                ctors: vec![],
+                is_rec: false,
+                is_unsafe: false,
+            },
+        ); // Foo.Int
+        axiom_sort(&mut env, 2, sort1.clone()); // Int
+        let bin = expr::pi(
+            expr::BinderInfo::Default,
+            expr::const_(2, vec![]),
+            expr::pi(
+                expr::BinderInfo::Default,
+                expr::const_(2, vec![]),
+                expr::const_(2, vec![]),
+            ),
+        );
+        axiom_sort(&mut env, 3, bin); // Int.add
+        let star = expr::sort(level::zero());
+        let hadd_ty = expr::pi(
+            expr::BinderInfo::Default,
+            sort1.clone(),
+            expr::pi(
+                expr::BinderInfo::Default,
+                sort1.clone(),
+                expr::pi(
+                    expr::BinderInfo::Default,
+                    sort1,
+                    expr::pi(
+                        expr::BinderInfo::Default,
+                        star.clone(),
+                        expr::pi(
+                            expr::BinderInfo::Default,
+                            star.clone(),
+                            expr::pi(expr::BinderInfo::Default, star.clone(), star),
+                        ),
+                    ),
+                ),
+            ),
+        );
+        axiom_sort(&mut env, 4, hadd_ty); // HAdd.hAdd
+        axiom_sort(&mut env, 5, expr::sort(level::zero())); // inst
+        axiom_sort(&mut env, 6, expr::const_(1, vec![])); // x
+        axiom_sort(&mut env, 7, expr::const_(1, vec![])); // y
+        let names = test_names(&[
+            "Nat",
+            "Foo.Int",
+            "Int",
+            "Int.add",
+            "HAdd.hAdd",
+            "inst",
+            "x",
+            "y",
+        ]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let foo = expr::const_(1, vec![]);
+        assert!(
+            !tc.type_head_is_int(&foo),
+            "Foo.Int must not be Int for HAdd/cast"
+        );
+        let e = expr::apps(
+            expr::const_(4, vec![]),
+            &[
+                foo.clone(),
+                foo.clone(),
+                foo,
+                expr::const_(5, vec![]),
+                expr::const_(6, vec![]),
+                expr::const_(7, vec![]),
+            ],
+        );
+        let w = tc.whnf(&Ctx::new(), &e).expect("WHNF");
+        let (h, _) = expr::unfold_apps(&w);
+        let became_int_add = matches!(&**h, ExprData::Const(n, _) if *n == 3);
+        assert!(
+            !became_int_add,
+            "HAdd on Foo.Int must not rewrite to Int.add, got {}",
+            tc.pp(&w)
+        );
+    }
+
+    /// Kernel must not synthesize `isTrue True True.intro` for `Int.decLe`.
+    #[test]
+    fn int_dec_le_does_not_synthesize_istrue_true() {
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        let sort0 = expr::sort(level::zero());
+        axiom_sort(&mut env, 0, sort1.clone()); // Nat
+        axiom_sort(&mut env, 1, sort1); // Int
+        axiom_sort(
+            &mut env,
+            2,
+            expr::pi(
+                expr::BinderInfo::Default,
+                expr::const_(0, vec![]),
+                expr::const_(1, vec![]),
+            ),
+        ); // Int.ofNat
+        axiom_sort(&mut env, 3, sort0.clone()); // True
+        axiom_sort(&mut env, 4, expr::const_(3, vec![])); // True.intro
+        axiom_sort(
+            &mut env,
+            5,
+            expr::pi(
+                expr::BinderInfo::Default,
+                sort0.clone(),
+                expr::pi(
+                    expr::BinderInfo::Default,
+                    expr::bvar(0),
+                    expr::sort(level::zero()),
+                ),
+            ),
+        ); // Decidable.isTrue
+        axiom_sort(
+            &mut env,
+            6,
+            expr::pi(
+                expr::BinderInfo::Default,
+                expr::const_(1, vec![]),
+                expr::pi(
+                    expr::BinderInfo::Default,
+                    expr::const_(1, vec![]),
+                    expr::sort(level::zero()),
+                ),
+            ),
+        ); // Int.decLe
+        let names = test_names(&[
+            "Nat",
+            "Int",
+            "Int.ofNat",
+            "True",
+            "True.intro",
+            "Decidable.isTrue",
+            "Int.decLe",
+        ]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ofn = |n: u32| expr::app(expr::const_(2, vec![]), expr::lit_nat(n.into()));
+        let e = expr::apps(expr::const_(6, vec![]), &[ofn(0), ofn(1)]);
+        let w = tc.whnf(&Ctx::new(), &e).expect("WHNF");
+        let (h, args) = expr::unfold_apps(&w);
+        let is_true_true = matches!(&**h, ExprData::Const(n, _) if *n == 5)
+            && args
+                .first()
+                .is_some_and(|a| matches!(&***a, ExprData::Const(t, _) if *t == 3));
+        assert!(
+            !is_true_true,
+            "Int.decLe must not WHNF to isTrue True True.intro, got {}",
+            tc.pp(&w)
+        );
     }
 
     /// Proj ι only if the constructor belongs to the projected inductive.
