@@ -1617,6 +1617,39 @@ impl<'e> Checker<'e> {
     // exercised only by their own dedicated tests (still green on both
     // flags), so this is available to pick back up with a fix for the
     // context-reconstruction gap rather than starting over.
+    //
+    // Day 6: rewired `infer_type_value`/`infer_type_via_nbe` to thread the
+    // real `Ctx` end to end (see the long comment above `vctx_new`) instead
+    // of reconstructing one by quoting — the preferred fix direction. That
+    // is a genuine improvement (it eliminates the quote round-trip this
+    // whole subsystem no longer needs for its own fallbacks) and it stays.
+    // But re-wiring `infer_type` with it did *not* clear the two accept
+    // fixtures Day 5 found failing; tracing `defeq_args` (KIOTA_TRACE_DEFEQ_ARGS)
+    // down to the actual disagreeing pair on `subject-reduction-redex`
+    // found the real cause is unrelated to context fidelity: the
+    // declaration's value type only matches its declared type because
+    // `Acc.rec motive minor x (Acc.intro r x g)` — a literal-constructor
+    // major — iota-reduces via a *higher-order* recursive occurrence
+    // (`Acc.intro`'s one field has type `∀ y, r y x → Acc r y`, a Pi, not
+    // a bare recursive occurrence). `try_iota_value`'s "simple" scope
+    // (zero-index, zero-binder fields; see `ctor_recursive_mask`) was
+    // built for exactly `Nat.rec`/`List.rec`/`brecOn`-shaped structural
+    // recursion and correctly declines this shape rather than mishandling
+    // it — but that means eager's own reduction handles this case (as it
+    // always has, via `recursor_unfolds_thm_major` + ordinary iota), and
+    // my Value-native path never confirms it, so `types_compatible`
+    // defers to eager for the *comparison*, but that comparison
+    // still needs eager to have unfolded the `Acc.rec` in the first place
+    // on both sides consistently, and this particular pair — one side
+    // computed by `eval` (native, no iota), the other by eager's `whnf`
+    // through my `infer_type_value_fallback` boundary — ends up
+    // comparing an unreduced form on one side against a reduced form on
+    // the other. That is a real, understood gap, not a ctx-fidelity bug,
+    // and closing it means teaching `try_iota_value`/`build_rec_call_value`
+    // to build lambda-wrapped (binder-introducing) recursive calls in
+    // Value space, not just a bookkeeping fix. Reverting the wire again
+    // rather than attempting that under this session's remaining budget —
+    // see the PR update for why, and the exact disagreeing pair.
     pub fn infer_type(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         crate::stats::infer_call();
         self.infer_type_cached(ctx, e)
@@ -2355,12 +2388,16 @@ impl<'e> Checker<'e> {
         if a1.len() != a2.len() {
             return Ok(false);
         }
+        let trace = std::env::var_os("KIOTA_TRACE_DEFEQ_ARGS").is_some();
         let mut ty = fn_ty.clone();
         let mut i = 0;
         while i < a1.len() {
             let (_, dom, body) = match self.ensure_pi(ctx, &ty) {
                 Ok(t) => t,
-                Err(_) => {
+                Err(e) => {
+                    if trace {
+                        eprintln!("DEFEQ_ARGS ensure_pi failed at i={i}: {e:?} ty={}", self.pp_budget(&ty, 60));
+                    }
                     while i < a1.len() {
                         if !self.is_def_eq(ctx, &a1[i], &a2[i])? {
                             return Ok(false);
@@ -2370,13 +2407,25 @@ impl<'e> Checker<'e> {
                     return Ok(true);
                 }
             };
-            if self.domain_is_prop_inductive(ctx, &dom)? || self.is_prop(ctx, &dom).unwrap_or(false)
-            {
+            let pi = self.domain_is_prop_inductive(ctx, &dom)?;
+            let ip = self.is_prop(ctx, &dom).unwrap_or(false);
+            if trace {
+                eprintln!(
+                    "DEFEQ_ARGS i={i} dom={} prop_inductive={pi} is_prop={ip} a1={} a2={}",
+                    self.pp_budget(&dom, 40),
+                    self.pp_budget(&a1[i], 30),
+                    self.pp_budget(&a2[i], 30),
+                );
+            }
+            if pi || ip {
                 ty = expr::instantiate1(&body, &a1[i]);
                 i += 1;
                 continue;
             }
             if !self.is_def_eq(ctx, &a1[i], &a2[i])? {
+                if trace {
+                    eprintln!("DEFEQ_ARGS i={i} is_def_eq FAILED");
+                }
                 return Ok(false);
             }
             ty = expr::instantiate1(&body, &a1[i]);
@@ -8256,95 +8305,71 @@ impl<'e> Checker<'e> {
         }
     }
 
-    // ---------------- NbE spike, Day 4: infer_type on Values ----------------
+    // ---------------- NbE spike, Day 4/5/6: infer_type on Values ----------------
     //
     // `pub fn infer_type` (the one every other part of the checker calls)
     // is untouched: it still always returns `Expr`, exactly as before, so
     // `check_decl`'s actual type-checking path has zero behavior change
-    // from anything in this section. `infer_type_value` is a new,
-    // additional, separately-tested entry point returning a `Value`
-    // instead, exercised directly by the tests below (and available for a
-    // future caller), not wired into the production dispatch.
+    // from anything in this section unless/until it's wired in.
     //
-    // Rationale for not swapping the production dispatch: `infer_type` is
-    // the soundness boundary for every application in the checker (it's
-    // what verifies an argument's type matches a Pi's domain). Threading a
-    // second, less-tested implementation through every one of its many
-    // call sites this same pass, under a squeezed timeline, is a
-    // meaningfully different risk profile than accelerating `is_def_eq`
-    // (which only ever *shortcuts an accept it would reach anyway*).
-    // `infer_type_value` mitigates that by construction: any type
-    // *inferred* here that needs a *decisive* compatibility check (an
-    // application argument, a let value) is verified via the existing,
-    // proven `is_def_eq` on quoted forms, not by trusting a second,
-    // independent equality routine's `false`. On anything it does not
-    // model, it defers entirely to the eager `infer_type` and `eval`s the
-    // (quoted) result back into a Value — a `Value -> Expr -> Value`
-    // round trip only at those specific fallback points, which is real
-    // quoting outside "declaration boundaries" and is reported as such
-    // rather than glossed over.
+    // Day 5 wired this once and found a real disagreement: two accept
+    // fixtures rejected under KIOTA_NBE=1, both on the same shape (a bound
+    // variable vs. a theorem applied to that variable, both proofs of the
+    // same Prop). The cause was `vctx_to_ctx`: every fallback point
+    // rebuilt an eager `Ctx` by *quoting* each tracked `Value` type, and
+    // that round trip (through `eval` once when the type was first tracked,
+    // then `quote` again to reconstruct `Ctx`, then `eval` *again* inside
+    // whatever eager function the fallback called — `proofs_of_same_prop`
+    // calls `infer_type` on `ctx`, which under the flag re-enters this same
+    // machinery) was enough to lose whatever the real, never-reconstructed
+    // `Ctx` preserves that eager's proof-irrelevance/App-argument checks
+    // depend on. `types_compatible` calling `is_def_eq_inner` directly
+    // (bypassing `KIOTA_NBE`'s own dispatch) ruled out a dispatch loop as
+    // the cause — swapping that in changed nothing, isolating the bug to
+    // the reconstruction itself, not to which comparator got called.
+    //
+    // Day 6 fix: never reconstruct `Ctx` by quoting. `infer_type_value`
+    // (and every helper below) now carries the *original* `ctx: &Ctx`
+    // alongside `tys`/`env`, growing it in lockstep for `Lam`/`Pi` (which
+    // eager's own `Ctx` grows for too) — and every eager fallback call
+    // (`infer_type_cached`, `is_def_eq_inner`, `infer_proj`, and anything
+    // eager calls transitively, e.g. `proofs_of_same_prop`) gets that real
+    // `ctx` plus the *original* sub-`Expr`, never a quoted stand-in. `Let`
+    // is handled the way eager's own `infer_type_uncached` already does —
+    // zeta first (`expr::instantiate1(body, val)`), then infer the
+    // substituted term under the *same* `ctx`/`tys`/`env`, no new level at
+    // all — so there is no separate "did `ctx` grow here" bookkeeping to
+    // get wrong between the two structures. `quote` is now used only where
+    // it always should have been: turning a *Value-native* successful
+    // result back into an `Expr` at `infer_type_via_nbe`'s own boundary
+    // (and inside `types_compatible`, to hand a genuinely Value-native
+    // `got`/`want` pair — with no original `Expr` at all — to eager for a
+    // decisive comparison).
 
-    /// Parallel to `Ctx`, but for Value-space inference: `tys[i]` is the
-    /// *type*, as a `Value`, of the variable at level `i`; `env` is the
-    /// matching value environment (same depth, in lockstep).
     fn vctx_new() -> (Vec<Rc<nbe::Value>>, nbe::VEnv) {
         (Vec::new(), nbe::empty_env())
     }
 
-    /// Push a fresh (unknown-value) binder of type `ty`, as `infer_type`
-    /// does for `Lam`/`Pi`/binder-introducing forms.
-    fn vctx_push(tys: &[Rc<nbe::Value>], env: &nbe::VEnv, ty: Rc<nbe::Value>) -> (Vec<Rc<nbe::Value>>, nbe::VEnv) {
-        let level = env.len() as u32;
-        let mut tys2 = tys.to_vec();
-        tys2.push(ty);
-        let mut env2 = (**env).clone();
-        env2.push(nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(nbe::Neutral::Var(level)))));
-        (tys2, Rc::new(env2))
-    }
-
-    /// Push a *known* (`let`) binder: same type-tracking as `vctx_push`,
-    /// but the value environment gets the real (possibly still deferred)
-    /// value rather than a fresh neutral, so referencing it later zeta-
-    /// reduces for free — no explicit substitution step needed.
-    fn vctx_push_let(
+    /// Push a fresh (unknown-value) binder of type `ty` into all three of
+    /// `ctx`/`tys`/`env` at once, as `infer_type_uncached` does for
+    /// `Lam`/`Pi` (the only forms whose eager `Ctx` actually grows).
+    fn vctx_push(
+        ctx: &Ctx,
         tys: &[Rc<nbe::Value>],
         env: &nbe::VEnv,
-        ty: Rc<nbe::Value>,
-        val: Rc<nbe::Thunk>,
-    ) -> (Vec<Rc<nbe::Value>>, nbe::VEnv) {
+        ty_expr: &Expr,
+        ty_v: Rc<nbe::Value>,
+    ) -> (Ctx, Vec<Rc<nbe::Value>>, nbe::VEnv) {
+        let level = env.len() as u32;
+        let mut ctx2 = ctx.clone();
+        ctx2.push(ty_expr.clone());
         let mut tys2 = tys.to_vec();
-        tys2.push(ty);
+        tys2.push(ty_v);
         let mut env2 = (**env).clone();
-        env2.push(val);
-        (tys2, Rc::new(env2))
-    }
-
-    /// Reconstruct an eager `Ctx` matching `tys`/`env`'s depth, for the
-    /// fallback points that need to hand a term to the proven eager
-    /// `is_def_eq`/`infer_type`/`is_prop`. Quotes each tracked type once,
-    /// at the depth it was introduced — bounded by binder depth, not by
-    /// any numeral a term happens to contain.
-    fn vctx_to_ctx(&self, tys: &[Rc<nbe::Value>]) -> R<Ctx> {
-        let mut ctx = Ctx::new();
-        for (i, ty) in tys.iter().enumerate() {
-            let q = self.quote(i as u32, ty)?;
-            ctx.push(q);
-        }
-        Ok(ctx)
-    }
-
-    /// Inverse of `vctx_to_ctx`: `eval`s each of `ctx`'s (raw, unshifted)
-    /// stored types against the value-env built so far, in lockstep — the
-    /// same direction `eval` always goes (`Expr -> Value`), no quoting.
-    fn ctx_to_vctx(&self, ctx: &Ctx) -> R<(Vec<Rc<nbe::Value>>, nbe::VEnv)> {
-        let (mut tys, mut env) = Checker::vctx_new();
-        for i in 0..ctx.len() {
-            let ty_v = self.eval(&env, &ctx[i])?;
-            let (tys2, env2) = Checker::vctx_push(&tys, &env, ty_v);
-            tys = tys2;
-            env = env2;
-        }
-        Ok((tys, env))
+        env2.push(nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(
+            nbe::Neutral::Var(level),
+        ))));
+        (ctx2, tys2, Rc::new(env2))
     }
 
     /// `KIOTA_NBE=1` dispatch target for `pub fn infer_type`. Computes the
@@ -8358,11 +8383,12 @@ impl<'e> Checker<'e> {
     /// it can produce is either a raw structural fact (an out-of-range
     /// bvar/projection index — not a soundness judgement, the same either
     /// representation) or backed by `types_compatible`/`is_prop`, which
-    /// only ever decide via the proven eager `is_def_eq`/`is_prop` on
-    /// quoted forms. Any other outcome (an internal `Other`/`Decline`, or
-    /// quoting failing on an otherwise-successful inference) defers to
-    /// `infer_type_cached` entirely: per the contract, a bug here may cost
-    /// completeness, never turn into a wrong accept.
+    /// only ever decide via the proven eager `is_def_eq`/`is_prop` — on the
+    /// real `ctx`, never a reconstructed one. Any other outcome (an
+    /// internal `Other`/`Decline`, or quoting failing on an otherwise-
+    /// successful inference) defers to `infer_type_cached` entirely: per
+    /// the contract, a bug here may cost completeness, never turn into a
+    /// wrong accept.
     fn infer_type_via_nbe(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         if std::env::var_os("KIOTA_TRACE_INFER_NBE").is_some() {
             eprintln!(
@@ -8371,11 +8397,22 @@ impl<'e> Checker<'e> {
                 self.pp_budget(e, 40)
             );
         }
-        let (tys, venv) = match self.ctx_to_vctx(ctx) {
-            Ok(x) => x,
-            Err(_) => return self.infer_type_cached(ctx, e),
-        };
-        match self.infer_type_value(&tys, &venv, e) {
+        let mut tys = Vec::with_capacity(ctx.len());
+        let mut env = nbe::empty_env();
+        for i in 0..ctx.len() {
+            let ty_v = match self.eval(&env, &ctx[i]) {
+                Ok(v) => v,
+                Err(_) => return self.infer_type_cached(ctx, e),
+            };
+            let level = env.len() as u32;
+            tys.push(ty_v);
+            let mut env2 = (*env).clone();
+            env2.push(nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(
+                nbe::Neutral::Var(level),
+            ))));
+            env = Rc::new(env2);
+        }
+        match self.infer_type_value(ctx, &tys, &env, e) {
             Ok(tv) => self
                 .quote(ctx.len() as u32, &tv)
                 .or_else(|_| self.infer_type_cached(ctx, e)),
@@ -8384,32 +8421,33 @@ impl<'e> Checker<'e> {
         }
     }
 
+    /// `infer_type_cached` on the *real* `ctx` and the *original* `e` —
+    /// never a quoted stand-in for either. Also never `infer_type`: that
+    /// re-dispatches to `infer_type_via_nbe` under `KIOTA_NBE=1`, which is
+    /// *this function's own caller* — an unconditional infinite loop the
+    /// instant this fallback ever fires with the flag on (confirmed by a
+    /// real stack overflow before that fix; see the Day 5 PR update).
     fn infer_type_value_fallback(
         &self,
-        tys: &[Rc<nbe::Value>],
+        ctx: &Ctx,
         env: &nbe::VEnv,
         e: &Expr,
     ) -> R<Rc<nbe::Value>> {
-        let actx = self.vctx_to_ctx(tys)?;
-        // `infer_type_cached`, never `infer_type`: the latter re-dispatches
-        // to `infer_type_via_nbe` whenever `KIOTA_NBE=1`, which is *this
-        // function's own caller* — an unconditional infinite loop the
-        // instant this fallback ever fires with the flag on (confirmed by
-        // a real stack overflow before this fix; see the Day 5 PR update).
-        let t = self.infer_type_cached(&actx, e)?;
+        let t = self.infer_type_cached(ctx, e)?;
         self.eval(env, &t)
     }
 
     /// Definitive type-compatibility check: try the fast Value-native
     /// comparison first (sound whenever it confirms `true`, per
     /// `values_def_eq`'s contract), and only when it doesn't, fall back to
-    /// the existing `is_def_eq` on quoted forms for a decisive answer —
-    /// mirroring `is_def_eq_via_nbe`'s own accelerate-or-defer discipline,
-    /// so an incompleteness in the Value-native path can only cost a
-    /// quote/requote, never a wrong verdict.
+    /// eager's own `is_def_eq_inner` (never `is_def_eq`'s dispatch) on the
+    /// real `ctx` — quoting `got`/`want` here is unavoidable (they may be
+    /// genuinely Value-native results, e.g. a `Pi` built from an inferred
+    /// `Lam` body, with no original `Expr` to fall back to at all), but
+    /// `ctx` itself is always the caller's real one, never reconstructed.
     fn types_compatible(
         &self,
-        tys: &[Rc<nbe::Value>],
+        ctx: &Ctx,
         depth: u32,
         got: &Rc<nbe::Value>,
         want: &Rc<nbe::Value>,
@@ -8417,14 +8455,14 @@ impl<'e> Checker<'e> {
         if self.values_def_eq(depth, got, want)? {
             return Ok(true);
         }
-        let actx = self.vctx_to_ctx(tys)?;
         let got_q = self.quote(depth, got)?;
         let want_q = self.quote(depth, want)?;
-        self.is_def_eq_inner(&actx, &got_q, &want_q)
+        self.is_def_eq_inner(ctx, &got_q, &want_q)
     }
 
     pub(crate) fn infer_type_value(
         &self,
+        ctx: &Ctx,
         tys: &[Rc<nbe::Value>],
         env: &nbe::VEnv,
         e: &Expr,
@@ -8452,18 +8490,18 @@ impl<'e> Checker<'e> {
                 self.eval(&nbe::empty_env(), &t)
             }
             ExprData::App(f, a) => {
-                let ft = self.infer_type_value(tys, env, f)?;
+                let ft = self.infer_type_value(ctx, tys, env, f)?;
                 let (dom, env_pi, body_pi) = match &*ft {
                     nbe::Value::Pi(_, dom, pi_env, body) => (dom.clone(), pi_env.clone(), body.clone()),
-                    _ => return self.infer_type_value_fallback(tys, env, e),
+                    _ => return self.infer_type_value_fallback(ctx, env, e),
                 };
                 let dom_v = dom.force(self)?;
                 // Lean `check` infers every App argument; InferOnly (only
                 // ever set for already-checked terms, see `with_infer_only`)
                 // skips it, matching the eager App case exactly.
                 if !self.infer_only.get() {
-                    let at = self.infer_type_value(tys, env, a)?;
-                    if !self.types_compatible(tys, depth, &at, &dom_v)? {
+                    let at = self.infer_type_value(ctx, tys, env, a)?;
+                    if !self.types_compatible(ctx, depth, &at, &dom_v)? {
                         if std::env::var_os("KIOTA_DEBUG").is_some() {
                             let at_q = self.quote(depth, &at).unwrap_or_else(|_| a.clone());
                             let dom_q = self.quote(depth, &dom_v).unwrap_or_else(|_| a.clone());
@@ -8484,13 +8522,13 @@ impl<'e> Checker<'e> {
                 self.eval(&Rc::new(env2), &body_pi)
             }
             ExprData::Lam(bi, ty, body) => {
-                let tt = self.infer_type_value(tys, env, ty)?;
+                let tt = self.infer_type_value(ctx, tys, env, ty)?;
                 if !matches!(&*tt, nbe::Value::Sort(_)) {
-                    return self.infer_type_value_fallback(tys, env, e);
+                    return self.infer_type_value_fallback(ctx, env, e);
                 }
                 let dom_v = self.eval(env, ty)?;
-                let (tys2, env2) = Checker::vctx_push(tys, env, dom_v.clone());
-                let bt = self.infer_type_value(&tys2, &env2, body)?;
+                let (ctx2, tys2, env2) = Checker::vctx_push(ctx, tys, env, ty, dom_v.clone());
+                let bt = self.infer_type_value(&ctx2, &tys2, &env2, body)?;
                 let bt_q = self.quote(depth + 1, &bt)?;
                 Ok(Rc::new(nbe::Value::Pi(
                     *bi,
@@ -8500,35 +8538,41 @@ impl<'e> Checker<'e> {
                 )))
             }
             ExprData::Pi(_bi, ty, body) => {
-                let tt = self.infer_type_value(tys, env, ty)?;
+                let tt = self.infer_type_value(ctx, tys, env, ty)?;
                 let l1 = match &*tt {
                     nbe::Value::Sort(l) => l.clone(),
-                    _ => return self.infer_type_value_fallback(tys, env, e),
+                    _ => return self.infer_type_value_fallback(ctx, env, e),
                 };
                 let dom_v = self.eval(env, ty)?;
-                let (tys2, env2) = Checker::vctx_push(tys, env, dom_v);
-                let bs = self.infer_type_value(&tys2, &env2, body)?;
+                let (ctx2, tys2, env2) = Checker::vctx_push(ctx, tys, env, ty, dom_v);
+                let bs = self.infer_type_value(&ctx2, &tys2, &env2, body)?;
                 let l2 = match &*bs {
                     nbe::Value::Sort(l) => l.clone(),
-                    _ => return self.infer_type_value_fallback(tys, env, e),
+                    _ => return self.infer_type_value_fallback(ctx, env, e),
                 };
                 Ok(Rc::new(nbe::Value::Sort(level::imax(l1, l2))))
             }
             ExprData::Let(ty, val, body) => {
-                let tt = self.infer_type_value(tys, env, ty)?;
+                let tt = self.infer_type_value(ctx, tys, env, ty)?;
                 if !matches!(&*tt, nbe::Value::Sort(_)) {
-                    return self.infer_type_value_fallback(tys, env, e);
+                    return self.infer_type_value_fallback(ctx, env, e);
                 }
                 let dom_v = self.eval(env, ty)?;
-                let vt = self.infer_type_value(tys, env, val)?;
-                if !self.types_compatible(tys, depth, &vt, &dom_v)? {
+                let vt = self.infer_type_value(ctx, tys, env, val)?;
+                if !self.types_compatible(ctx, depth, &vt, &dom_v)? {
                     return reject("let value type mismatch (nbe)");
                 }
-                let (tys2, env2) =
-                    Self::vctx_push_let(tys, env, dom_v, nbe::Thunk::deferred(env.clone(), val.clone()));
-                self.infer_type_value(&tys2, &env2, body)
+                // Zeta first, exactly like `infer_type_uncached`'s own Let
+                // case: `ctx` never grows for a `let` (eager substitutes,
+                // it doesn't push), so this is the one binder-introducing
+                // form that does not call `vctx_push` — matching that
+                // keeps `ctx`'s depth in lockstep with the *substituted*
+                // term's bvar numbering, with no separate "did ctx grow
+                // here" bookkeeping against `tys`/`env` to get wrong.
+                let b = expr::instantiate1(body, val);
+                self.infer_type_value(ctx, tys, env, &b)
             }
-            ExprData::Proj(sname, idx, v) => self.infer_proj_value(tys, env, *sname, *idx, v),
+            ExprData::Proj(sname, idx, v) => self.infer_proj_value(ctx, tys, env, *sname, *idx, v),
         }
     }
 
@@ -8541,14 +8585,15 @@ impl<'e> Checker<'e> {
     /// substituted, no `instantiate1` needed.
     fn infer_proj_value(
         &self,
+        ctx: &Ctx,
         tys: &[Rc<nbe::Value>],
         env: &nbe::VEnv,
         sname: u32,
         idx: u32,
         v: &Expr,
     ) -> R<Rc<nbe::Value>> {
-        let fallback = |tc: &Self| tc.infer_type_value_fallback_proj(tys, env, sname, idx, v);
-        let vt = self.infer_type_value(tys, env, v)?;
+        let fallback = |tc: &Self| tc.infer_type_value_fallback_proj(ctx, env, sname, idx, v);
+        let vt = self.infer_type_value(ctx, tys, env, v)?;
         let nv = match &*vt {
             nbe::Value::Neutral(nv) => nv,
             _ => return fallback(self),
@@ -8614,11 +8659,10 @@ impl<'e> Checker<'e> {
         };
         let result = self.eval(&fenv, &dom)?;
         let depth = env.len() as u32;
-        let actx = self.vctx_to_ctx(tys)?;
         let vt_q = self.quote(depth, &vt)?;
-        if self.is_prop(&actx, &vt_q)? {
+        if self.is_prop(ctx, &vt_q)? {
             let dom_q = self.quote(depth, &result)?;
-            if !self.is_prop(&actx, &dom_q)? {
+            if !self.is_prop(ctx, &dom_q)? {
                 return reject("cannot project a Type field from a Prop structure (nbe)");
             }
         }
@@ -8627,14 +8671,13 @@ impl<'e> Checker<'e> {
 
     fn infer_type_value_fallback_proj(
         &self,
-        tys: &[Rc<nbe::Value>],
+        ctx: &Ctx,
         env: &nbe::VEnv,
         sname: u32,
         idx: u32,
         v: &Expr,
     ) -> R<Rc<nbe::Value>> {
-        let actx = self.vctx_to_ctx(tys)?;
-        let t = self.infer_proj(&actx, sname, idx, v)?;
+        let t = self.infer_proj(ctx, sname, idx, v)?;
         self.eval(env, &t)
     }
 }
@@ -11096,9 +11139,9 @@ mod tests {
         let f = expr::lam(expr::BinderInfo::Default, a_ty.clone(), inner_let);
 
         let (tys, venv) = Checker::vctx_new();
-        let ft_v = tc.infer_type_value(&tys, &venv, &f).unwrap();
-        let ft_q = tc.quote(0, &ft_v).unwrap();
         let ctx = Ctx::new();
+        let ft_v = tc.infer_type_value(&ctx, &tys, &venv, &f).unwrap();
+        let ft_q = tc.quote(0, &ft_v).unwrap();
         let ft_eager = tc.infer_type(&ctx, &f).unwrap();
         assert!(
             tc.is_def_eq(&ctx, &ft_q, &ft_eager).unwrap(),
@@ -11112,7 +11155,7 @@ mod tests {
         // Applying `f` to `a` must type-check (App's argument-type path)
         // and infer `A`.
         let app = expr::app(f, a_val);
-        let at_v = tc.infer_type_value(&tys, &venv, &app).unwrap();
+        let at_v = tc.infer_type_value(&ctx, &tys, &venv, &app).unwrap();
         let at_q = tc.quote(0, &at_v).unwrap();
         assert!(
             tc.is_def_eq(&ctx, &at_q, &a_ty).unwrap(),
@@ -11127,7 +11170,7 @@ mod tests {
             expr::lam(expr::BinderInfo::Default, a_ty.clone(), expr::bvar(0)),
             a_ty,
         );
-        assert!(tc.infer_type_value(&tys, &venv, &bad_app).is_err());
+        assert!(tc.infer_type_value(&ctx, &tys, &venv, &bad_app).is_err());
     }
 
     /// `PSigma.rec α β motive minor (mk α β x y)`'s projection form:
@@ -11145,19 +11188,19 @@ mod tests {
         let psigma_ab = expr::apps(expr::const_(0, vec![]), &[a.clone(), b]);
 
         let (tys0, venv0) = Checker::vctx_new();
-        let psigma_ty_v = tc.infer_type_value(&tys0, &venv0, &psigma_ab).unwrap();
+        let ctx0 = Ctx::new();
+        let psigma_ty_v = tc.infer_type_value(&ctx0, &tys0, &venv0, &psigma_ab).unwrap();
         // `Sort 1`, so the binder we push below matches the eager `ensure_sort`
         // path that would've been used to introduce this same bvar.
         assert!(matches!(&*psigma_ty_v, nbe::Value::Sort(_)));
         let psigma_ty_val = tc.eval(&venv0, &psigma_ab).unwrap();
-        let (tys, venv) = Checker::vctx_push(&tys0, &venv0, psigma_ty_val);
+        let (ctx, tys, venv) =
+            Checker::vctx_push(&ctx0, &tys0, &venv0, &psigma_ab, psigma_ty_val);
 
         let proj0 = expr::proj(0, 0, expr::bvar(0));
-        let t_v = tc.infer_type_value(&tys, &venv, &proj0).unwrap();
+        let t_v = tc.infer_type_value(&ctx, &tys, &venv, &proj0).unwrap();
         let t_q = tc.quote(1, &t_v).unwrap();
 
-        let mut ctx = Ctx::new();
-        ctx.push(psigma_ab);
         let t_eager = tc.infer_proj(&ctx, 0, 0, &expr::bvar(0)).unwrap();
         assert!(
             tc.is_def_eq(&ctx, &t_q, &t_eager).unwrap(),
@@ -11166,5 +11209,173 @@ mod tests {
             tc.pp(&t_eager)
         );
         assert!(Rc::ptr_eq(&t_q, &a), "first field of PSigma A B must infer to A, got {}", tc.pp(&t_q));
+    }
+
+    // ---------------- NbE spike, Day 6: Acc-shape scope check ----------------
+    //
+    // Day 5's ctx-quoting hypothesis for the two failing accept fixtures
+    // (`alg-conv-trans-acc-left`, `subject-reduction-redex`) turned out to
+    // be wrong once tested to a fix: threading the real `Ctx` end to end
+    // (see `infer_type_value`'s signature and the comment above
+    // `vctx_new`) did not clear them. `KIOTA_TRACE_DEFEQ_ARGS`, traced on
+    // `subject-reduction-redex`, and `KIOTA_DEBUG`, on
+    // `alg-conv-trans-acc-left`, both point at the same real cause: with
+    // `infer_type` wired, a theorem's inferred value type comes out with
+    // `Acc.rec` *fully iota-reduced* on both sides of an `Eq`, while the
+    // declared type keeps one side as `f 1 (Acc.intro r 1 g)` — literally
+    // constructor-headed, and eager reduces that via ordinary iota (as it
+    // always could). My Value-native path never gets that far: `Acc.intro`
+    // has one field of type `∀ y, r y x → Acc r y` — a `Pi`, not a bare
+    // recursive occurrence — so `ctor_recursive_mask` correctly refuses to
+    // call it "simple," and separately `Acc` itself has a nonzero index
+    // (`num_indices`), which `try_iota_value` bails on even earlier. Both
+    // are deliberate scope boundaries, not surprises; this locks in that
+    // they're both real and exercised, so a future attempt at higher-order
+    // (binder-introducing) recursive occurrences has a concrete pair of
+    // regression tests to keep green.
+    fn insert_mini_acc(env: &mut crate::env::Environment) {
+        use crate::env::{ConstantInfo, RecRule};
+        let sort0 = expr::sort(level::zero());
+        let sort1 = expr::sort(level::succ(level::zero()));
+        let nat = expr::const_(0, vec![]);
+        // `MyAcc : Nat -> Prop` (one index, no params) — mirrors `Acc`'s
+        // shape (`Acc {α} (r : α → α → Prop) (x : α) : Prop`) collapsed to
+        // a fixed carrier/relation for the test.
+        let myacc_ty = expr::pi(expr::BinderInfo::Default, nat.clone(), sort0.clone());
+        env.insert(
+            1,
+            ConstantInfo::InductiveType {
+                level_params: vec![],
+                typ: myacc_ty.clone(),
+                num_params: 0,
+                num_indices: 1,
+                all: vec![1],
+                ctors: vec![2],
+                is_rec: true,
+                is_unsafe: false,
+            },
+        );
+        // `MyAcc.intro : (x : Nat) -> (∀ y, MyAcc y) -> MyAcc x` — the one
+        // field is a `Pi` returning the recursive occurrence, exactly
+        // `Acc.intro`'s higher-order shape (`∀ y, r y x → Acc r y`), just
+        // without the relation-membership hypothesis (irrelevant to the
+        // "is this field a bare recursive occurrence" question).
+        let field_ty = expr::pi(expr::BinderInfo::Default, nat.clone(), expr::app(expr::const_(1, vec![]), expr::bvar(0)));
+        let intro_ty = expr::pi(
+            expr::BinderInfo::Default,
+            nat.clone(),
+            expr::pi(
+                expr::BinderInfo::Default,
+                field_ty,
+                expr::app(expr::const_(1, vec![]), expr::bvar(1)),
+            ),
+        );
+        env.insert(
+            2,
+            ConstantInfo::Constructor {
+                level_params: vec![],
+                typ: intro_ty,
+                induct: 1,
+                cidx: 0,
+                num_params: 0,
+                num_fields: 2,
+                is_unsafe: false,
+            },
+        );
+        // `MyAcc.rec : (motive : Nat -> MyAcc #0 -> Sort 1) -> (minor) -> (x : Nat) -> (h : MyAcc x) -> motive x h`.
+        // The exact motive/minor types don't matter for `try_iota_value`
+        // (it never inspects them beyond position), only the telescope
+        // shape (`num_params=0, num_motives=1, num_minors=1, num_indices=1`).
+        env.insert(
+            3,
+            ConstantInfo::Recursor {
+                level_params: vec![],
+                typ: sort1,
+                all: vec![1],
+                num_params: 0,
+                num_indices: 1,
+                num_motives: 1,
+                num_minors: 1,
+                rules: vec![RecRule {
+                    ctor: 2,
+                    nfields: 2,
+                    rhs: expr::bvar(0),
+                }],
+                k: false,
+                is_unsafe: false,
+            },
+        );
+        env.rec_of.insert(1, 3);
+    }
+
+    /// `MyAcc.rec motive minor x (MyAcc.intro x g)` — a literal-constructor
+    /// major, exactly like eager's `Acc.rec motive minor x (Acc.intro x g)`
+    /// — must stay a stuck `Neutral`, not silently (and wrongly) reduce.
+    /// `num_indices == 1` bails `try_iota_value` before it ever inspects
+    /// the constructor at all.
+    #[test]
+    fn try_iota_value_declines_indexed_recursor_major() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_acc(&mut env);
+        let names = test_names(&["Nat0", "MyAcc", "MyAcc.intro", "MyAcc.rec"]);
+        let tc = Checker::new(&env, &names, None, None);
+
+        let nat = expr::const_(0, vec![]);
+        let x = expr::lit_nat(num_bigint::BigUint::from(7u32));
+        let motive = expr::lam(
+            expr::BinderInfo::Default,
+            nat.clone(),
+            expr::lam(
+                expr::BinderInfo::Default,
+                expr::app(expr::const_(1, vec![]), expr::bvar(0)),
+                nat.clone(),
+            ),
+        );
+        let minor = expr::lam(
+            expr::BinderInfo::Default,
+            nat.clone(),
+            expr::lam(
+                expr::BinderInfo::Default,
+                expr::pi(expr::BinderInfo::Default, nat.clone(), expr::app(expr::const_(1, vec![]), expr::bvar(0))),
+                x.clone(),
+            ),
+        );
+        let g = expr::lam(expr::BinderInfo::Default, nat.clone(), expr::app(expr::app(expr::const_(2, vec![]), expr::bvar(0)), expr::lam(expr::BinderInfo::Default, nat.clone(), expr::bvar(0))));
+        let intro = expr::apps(expr::const_(2, vec![]), &[x.clone(), g]);
+        let rec_app = expr::apps(expr::const_(3, vec![]), &[motive, minor, x, intro]);
+
+        let v = tc.eval(&crate::nbe::generic_env(0), &rec_app).unwrap();
+        assert!(
+            matches!(&*v, nbe::Value::Neutral(_)),
+            "indexed recursor major must stay neutral (declined, not reduced), got {}",
+            tc.pp(&tc.quote(0, &v).unwrap())
+        );
+    }
+
+    /// Isolate the *other* half of the `Acc.intro` shape from the index:
+    /// even a zero-index recursor with a constructor field of `Pi` type
+    /// (a higher-order recursive occurrence, like `Acc.intro`'s `∀ y, ...`
+    /// field) must not be treated as a "simple" (zero-binder) recursive
+    /// field. `ctor_recursive_mask` must mark it `false` — not attempt a
+    /// (currently unimplemented) binder-introducing recursive call — and
+    /// the resulting iota must stay neutral (missing the extra `ih`
+    /// argument the minor's own Pi-arity implies), not silently produce a
+    /// wrong constructor-shaped value.
+    #[test]
+    fn ctor_recursive_mask_rejects_pi_shaped_field() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_acc(&mut env);
+        let names: Vec<std::rc::Rc<String>> = Vec::new();
+        let tc = Checker::new(&env, &names, None, None);
+        let mask = tc.ctor_recursive_mask(2, &[1]).unwrap();
+        assert_eq!(
+            mask,
+            Some(vec![false, false]),
+            "MyAcc.intro's Nat field and its ∀y.MyAcc-y field must both be 'not a simple \
+             recursive occurrence' — the first genuinely isn't one, the second is one only \
+             in the higher-order (binder-introducing) sense this spike does not implement"
+        );
     }
 }
