@@ -94,20 +94,6 @@ pub enum Neutral {
 
 enum ThunkState {
     Deferred(VEnv, Expr),
-    /// A recursive-occurrence call built directly in value space by
-    /// `Checker::build_rec_call_value`: re-invoking the recursor on the
-    /// smaller field never re-serializes the accumulator to an `Expr`, and
-    /// re-entering the same `(rname, us, params, motives, minors, field)`
-    /// key elsewhere hits `Checker`'s iota memo instead of recomputing.
-    RecCall {
-        rname: u32,
-        us: Rc<Vec<Level>>,
-        params: Vec<Rc<Thunk>>,
-        motives: Vec<Rc<Thunk>>,
-        minors: Vec<Rc<Thunk>>,
-        field: Rc<Thunk>,
-        depth: u32,
-    },
     Forced(Rc<Value>),
 }
 
@@ -122,66 +108,28 @@ impl Thunk {
         Rc::new(Thunk(RefCell::new(ThunkState::Forced(v))))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn rec_call(
-        rname: u32,
-        us: Rc<Vec<Level>>,
-        params: Vec<Rc<Thunk>>,
-        motives: Vec<Rc<Thunk>>,
-        minors: Vec<Rc<Thunk>>,
-        field: Rc<Thunk>,
-        depth: u32,
-    ) -> Rc<Thunk> {
-        Rc::new(Thunk(RefCell::new(ThunkState::RecCall {
-            rname,
-            us,
-            params,
-            motives,
-            minors,
-            field,
-            depth,
-        })))
-    }
-
     /// Force-and-memoize. Never re-evaluates the same thunk twice: this is
     /// the whole sharing story — a value reached through two different
-    /// `Rc<Thunk>` clones only pays evaluation once.
+    /// `Rc<Thunk>` clones only pays evaluation once. In particular, the
+    /// recursive-occurrence ("ih"/rec-call) argument `eval`'s own `App`
+    /// case defers when applying a minor (see `Checker::try_iota_value`)
+    /// is exactly such a thunk: a minor that never looks at it never
+    /// forces it, and a `below`/`brecOn` accumulator built up through
+    /// nested rec-calls never gets serialized to an `Expr` as a whole —
+    /// only one (bounded) constructor application's worth at a time does,
+    /// inside `try_iota_value`'s eager bridge.
     pub fn force(&self, tc: &Checker) -> R<Rc<Value>> {
         if let ThunkState::Forced(v) = &*self.0.borrow() {
             return Ok(v.clone());
         }
-        let computed = {
-            let snapshot = {
-                let st = self.0.borrow();
-                match &*st {
-                    ThunkState::Deferred(env, e) => Ok((env.clone(), e.clone())),
-                    ThunkState::RecCall {
-                        rname,
-                        us,
-                        params,
-                        motives,
-                        minors,
-                        field,
-                        depth,
-                    } => Err((
-                        *rname,
-                        us.clone(),
-                        params.clone(),
-                        motives.clone(),
-                        minors.clone(),
-                        field.clone(),
-                        *depth,
-                    )),
-                    ThunkState::Forced(v) => return Ok(v.clone()),
-                }
-            };
-            match snapshot {
-                Ok((env, e)) => tc.eval(&env, &e)?,
-                Err((rname, us, params, motives, minors, field, depth)) => {
-                    tc.build_rec_call_value(rname, &us, &params, &motives, &minors, &field, depth)?
-                }
+        let (env, e) = {
+            let st = self.0.borrow();
+            match &*st {
+                ThunkState::Deferred(env, e) => (env.clone(), e.clone()),
+                ThunkState::Forced(v) => return Ok(v.clone()),
             }
         };
+        let computed = tc.eval(&env, &e)?;
         *self.0.borrow_mut() = ThunkState::Forced(computed.clone());
         Ok(computed)
     }

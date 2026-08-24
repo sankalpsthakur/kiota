@@ -1592,64 +1592,45 @@ impl<'e> Checker<'e> {
 
     // ---------------- Type inference ----------------
 
-    // Day 5: wiring `infer_type` behind `KIOTA_NBE=1` (dispatching to
-    // `infer_type_via_nbe`, exactly like `is_def_eq` does) was attempted
-    // and reverted. With the wire in, two accept fixtures newly rejected
-    // under the flag (`alg-conv-trans-acc-left`: "value type does not
-    // match declared type"; `subject-reduction-redex`: "application
-    // argument type mismatch (nbe)"), both on the same shape: an `Acc.rec`
-    // major that is a bound variable on one side and a theorem
-    // (`redex._proof_2`/equivalent) applied to that variable on the other
-    // — proof-irrelevant under eager's `is_def_eq`, but the *reconstructed*
-    // context (`vctx_to_ctx`, built by quoting each tracked `Value` type)
-    // fed to that same eager `is_def_eq` as the fallback no longer
-    // triggers the pattern. That ruled out the first hypothesis (a
-    // `self.is_def_eq` re-entering `KIOTA_NBE`'s own dispatch instead of
-    // the plain eager comparator, which was a real, separate, and now
-    // fixed bug — `types_compatible` below uses `is_def_eq_inner`
-    // directly); swapping that in changed nothing, confirming the gap is
-    // in what `vctx_to_ctx`/`quote` reproduce, not in which comparator
-    // gets called. Per the Day 5 instruction to revert rather than chase a
-    // soundness-adjacent bug under a squeezed timeline: `infer_type` is
-    // unconditionally the eager path again — zero behavior change on
-    // either flag from this file versus before this attempt.
-    // `infer_type_value`/`infer_type_via_nbe`/`types_compatible` all stay,
-    // exercised only by their own dedicated tests (still green on both
-    // flags), so this is available to pick back up with a fix for the
-    // context-reconstruction gap rather than starting over.
+    // History: Day 5 wired `infer_type` behind `KIOTA_NBE=1` and found two
+    // accept fixtures (`alg-conv-trans-acc-left`, `subject-reduction-redex`)
+    // newly rejecting, and reverted. Day 6 fixed the hypothesized cause
+    // (context reconstruction by quoting — `infer_type_value` now threads
+    // the real `Ctx` end to end, see the comment above `vctx_new`), but the
+    // fixtures still failed, tracing down to the *actual* cause: eager
+    // reduces `Acc.rec motive minor x (Acc.intro x g)` via ordinary iota
+    // (`Acc.intro`'s field `∀ y, r y x → Acc r y` is higher-order and
+    // `Acc` is indexed), and `try_iota_value` couldn't match that.
     //
-    // Day 6: rewired `infer_type_value`/`infer_type_via_nbe` to thread the
-    // real `Ctx` end to end (see the long comment above `vctx_new`) instead
-    // of reconstructing one by quoting — the preferred fix direction. That
-    // is a genuine improvement (it eliminates the quote round-trip this
-    // whole subsystem no longer needs for its own fallbacks) and it stays.
-    // But re-wiring `infer_type` with it did *not* clear the two accept
-    // fixtures Day 5 found failing; tracing `defeq_args` (KIOTA_TRACE_DEFEQ_ARGS)
-    // down to the actual disagreeing pair on `subject-reduction-redex`
-    // found the real cause is unrelated to context fidelity: the
-    // declaration's value type only matches its declared type because
-    // `Acc.rec motive minor x (Acc.intro r x g)` — a literal-constructor
-    // major — iota-reduces via a *higher-order* recursive occurrence
-    // (`Acc.intro`'s one field has type `∀ y, r y x → Acc r y`, a Pi, not
-    // a bare recursive occurrence). `try_iota_value`'s "simple" scope
-    // (zero-index, zero-binder fields; see `ctor_recursive_mask`) was
-    // built for exactly `Nat.rec`/`List.rec`/`brecOn`-shaped structural
-    // recursion and correctly declines this shape rather than mishandling
-    // it — but that means eager's own reduction handles this case (as it
-    // always has, via `recursor_unfolds_thm_major` + ordinary iota), and
-    // my Value-native path never confirms it, so `types_compatible`
-    // defers to eager for the *comparison*, but that comparison
-    // still needs eager to have unfolded the `Acc.rec` in the first place
-    // on both sides consistently, and this particular pair — one side
-    // computed by `eval` (native, no iota), the other by eager's `whnf`
-    // through my `infer_type_value_fallback` boundary — ends up
-    // comparing an unreduced form on one side against a reduced form on
-    // the other. That is a real, understood gap, not a ctx-fidelity bug,
-    // and closing it means teaching `try_iota_value`/`build_rec_call_value`
-    // to build lambda-wrapped (binder-introducing) recursive calls in
-    // Value space, not just a bookkeeping fix. Reverting the wire again
-    // rather than attempting that under this session's remaining budget —
-    // see the PR update for why, and the exact disagreeing pair.
+    // Day 7 implements that rule (see the comment above `insert_mini_acc`'s
+    // tests and `try_iota_value` itself) and it is real, working, and
+    // independently tested: `try_iota_value_reduces_indexed_higher_order_ctor_major`
+    // exercises exactly `Acc.intro`'s shape and gets the right answer, and
+    // re-wiring `infer_type` with it made *measurable* progress on
+    // `subject-reduction-redex` — `KIOTA_TRACE_DEFEQ_ARGS` shows a
+    // `redex._proof_2`-wrapped `Acc.intro` major now correctly unfolding
+    // and iota-reducing, then matching a `Acc.inv`-built proof of the same
+    // `Acc` index via ordinary proof irrelevance (a comparison that, before
+    // Day 7, never got past the unreduced theorem wrapper at all).
+    //
+    // But both fixtures still reject with the wire in, on a *different*,
+    // smaller, later mismatch than Day 6 found — `subject-reduction-redex`
+    // now fails on a literal `1` vs `0` `Nat` argument to a *second*,
+    // distinct `Acc.rec` application nested inside the same comparison
+    // (not proof-irrelevant: `Nat` isn't `Prop`), and
+    // `alg-conv-trans-acc-left`'s dump is unchanged from Day 6 — its
+    // "got" type has both sides of an `Eq` collapse to the *identical*
+    // `Acc.rec ... 1 #0`, which looks like a still-uncovered gap in how
+    // `infer_type_value`'s `App` case threads a proof-rewrite/cast through
+    // the value's type (a general completeness question, not specific to
+    // the recursor iota rule this pass targeted) rather than anything
+    // about the indexed/higher-order reduction itself.
+    //
+    // Per the instruction ("if they still reject, revert the wire only,
+    // dump the smallest disagreeing pair, and keep the iota work if tests
+    // prove it"): the wire is reverted again; `try_iota_value`'s new rule
+    // stays, proven by its own tests. See the PR update for both dumped
+    // pairs and the reasoning above in full.
     pub fn infer_type(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         crate::stats::infer_call();
         self.infer_type_cached(ctx, e)
@@ -7948,12 +7929,33 @@ impl<'e> Checker<'e> {
     }
 
     /// Reduce a recursor application whose major is a `Nat` literal or a
-    /// fully-applied constructor of a type in `all`, with zero indices and
-    /// only "simple" (zero-binder, directly-recursive) fields — exactly
-    /// `Nat.rec`/`List.rec`/`brecOn`-shaped structural recursion. Anything
-    /// wider (indices, higher-order recursive occurrences, K-like/structure
-    /// eta, nested-inductive recursion) is left neutral: `Ok(None)`, which
-    /// makes the whole comparison "uncertain" and defers to eager.
+    /// fully-applied constructor of a type in `all` — `Nat.rec`/`List.rec`/
+    /// `brecOn`-shaped structural recursion, indexed recursors (`Acc.rec`),
+    /// and higher-order (binder-introducing) recursive occurrences
+    /// (`Acc.intro`'s `∀ y, r y x → Acc r y` field) all included. Anything
+    /// this can't match eager's own rule on (K-like/structure eta, nested-
+    /// inductive recursion, an unresolvable major) is left neutral:
+    /// `Ok(None)`, which makes the whole comparison "uncertain" and defers
+    /// to eager — never a "close enough" wrong reduction.
+    ///
+    /// Indices are handled exactly like eager `try_iota`: skipped over
+    /// (folded into `major_pos`) and never separately inspected — the
+    /// checker doesn't re-validate them here any more than eager does.
+    /// The "apply minor to fields, interleave one rec-call per recursive
+    /// field" step (arbitrary binder count, indices threaded through a
+    /// field's own occurrence type) is *not* reimplemented here: it calls
+    /// eager's own `iota_from_first_principles`/`mk_rec_call` directly, on
+    /// quoted params/ctor_params/motives/minors/fields, to guarantee it
+    /// matches eager's rule by construction rather than by a second,
+    /// independently-written (and soundness-critical) copy of it. This
+    /// bridge is bounded, not accumulating: params/motives/minors are
+    /// fixed for the whole reduction (never grow with recursion depth),
+    /// and `fields` are this one constructor application's own (small)
+    /// arguments — never the "below"/accumulator value itself, which
+    /// never gets serialized: it stays purely in Value space, nested
+    /// inside the *lazy* argument thunks `eval`'s own `App` case already
+    /// creates for the rec-call embedded in `rhs`, so a minor that
+    /// ignores its `ih` still never forces it.
     fn try_iota_value(&self, spine: &nbe::Neutral, depth: u32) -> R<Option<Rc<nbe::Value>>> {
         let (root, args) = Self::unwind_neutral(spine);
         let (rname, us) = match root {
@@ -7977,10 +7979,7 @@ impl<'e> Checker<'e> {
             ),
             _ => return Ok(None),
         };
-        if num_indices != 0 {
-            return Ok(None);
-        }
-        let major_pos = (num_params + num_motives + num_minors) as usize;
+        let major_pos = (num_params + num_motives + num_minors + num_indices) as usize;
         if args.len() != major_pos + 1 {
             return Ok(None);
         }
@@ -7989,8 +7988,9 @@ impl<'e> Checker<'e> {
         }
         let params = &args[..num_params as usize];
         let motives = &args[num_params as usize..(num_params + num_motives) as usize];
-        let minors = &args[(num_params + num_motives) as usize..major_pos];
-        let major_v = args[major_pos].force(self)?;
+        let minors =
+            &args[(num_params + num_motives) as usize..(num_params + num_motives + num_minors) as usize];
+        let mut major_v = args[major_pos].force(self)?;
 
         let rec_owns_ctor = |cname: u32| -> bool {
             matches!(
@@ -7998,6 +7998,17 @@ impl<'e> Checker<'e> {
                 Some(ConstantInfo::Recursor { rules, .. }) if rules.iter().any(|r| r.ctor == cname)
             )
         };
+
+        // Theorem-wrapped major (`_proof := Acc.intro …`): eager unfolds
+        // this via `recursor_unfolds_thm_major` + `whnf_major` before iota
+        // ever sees it. Bridge to that exact mechanism — never a weaker
+        // reimplementation — when native forcing didn't already land on a
+        // ctor/`Nat`-literal head.
+        if self.recursor_unfolds_thm_major(rname) && !self.is_ctor_or_nat_lit_value(&major_v)? {
+            let major_q = self.quote(depth, &major_v)?;
+            let unfolded = self.whnf_major(&Self::dummy_ctx(depth), &major_q, rname)?;
+            major_v = self.eval(&nbe::generic_env(depth), &unfolded)?;
+        }
 
         let ctor: Option<(u32, u32, Vec<Rc<nbe::Thunk>>)> = match &*major_v {
             nbe::Value::Lit(Lit::Nat(n)) => {
@@ -8050,107 +8061,82 @@ impl<'e> Checker<'e> {
         if (ctor_args.len() as u32) < cnp {
             return Ok(None);
         }
+        let ctor_params = &ctor_args[..cnp as usize];
         let fields = &ctor_args[cnp as usize..];
         let minor_idx = self.ctor_minor_index(cname, rname, &all);
         if minor_idx >= minors.len() {
             return Ok(None);
         }
-        let Some(mask) = self.ctor_recursive_mask(cname, &all)? else {
-            return Ok(None);
-        };
-        if mask.len() != fields.len() {
-            return Ok(None);
-        }
 
-        let mut result = minors[minor_idx].force(self)?;
-        let mut rec_thunks: Vec<Rc<nbe::Thunk>> = Vec::new();
-        for (f, is_rec) in fields.iter().zip(mask.iter()) {
-            result = self.apply(result, f.clone(), depth)?;
-            if *is_rec {
-                rec_thunks.push(nbe::Thunk::rec_call(
-                    rname,
-                    us.clone(),
-                    params.to_vec(),
-                    motives.to_vec(),
-                    minors.to_vec(),
-                    f.clone(),
-                    depth,
-                ));
-            }
-        }
-        for rc in rec_thunks {
-            result = self.apply(result, rc, depth)?;
-        }
+        let dctx = Self::dummy_ctx(depth);
+        let params_q = self.quote_all(depth, params)?;
+        let ctor_params_q = self.quote_all(depth, ctor_params)?;
+        let motives_q = self.quote_all(depth, motives)?;
+        let minors_q = self.quote_all(depth, minors)?;
+        let fields_q = self.quote_all(depth, fields)?;
+        let rhs = self.iota_from_first_principles(
+            &dctx,
+            rname,
+            &us,
+            &[],
+            &all,
+            &params_q,
+            &ctor_params_q,
+            &motives_q,
+            &minors_q,
+            minors_q[minor_idx].clone(),
+            cname,
+            &fields_q,
+        )?;
+        let result = self.eval(&nbe::generic_env(depth), &rhs)?;
         self.iota_value_cache_insert(rname, &us, &args, result.clone());
         Ok(Some(result))
     }
 
-    /// Re-invoke the recursor on a strictly smaller field, entirely in
-    /// value space (no `Expr` is rebuilt): `rname us params motives minors
-    /// field`, applied via the same `apply` chain, which will immediately
-    /// re-enter `try_iota_value` for the smaller instance. This is the
-    /// "closures instead of substituted terms" step that keeps a `below`
-    /// accumulator from being re-serialized at every level.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn build_rec_call_value(
-        &self,
-        rname: u32,
-        us: &Rc<Vec<Level>>,
-        params: &[Rc<nbe::Thunk>],
-        motives: &[Rc<nbe::Thunk>],
-        minors: &[Rc<nbe::Thunk>],
-        field: &Rc<nbe::Thunk>,
-        depth: u32,
-    ) -> R<Rc<nbe::Value>> {
-        let mut v: Rc<nbe::Value> =
-            Rc::new(nbe::Value::Neutral(nbe::Neutral::Const(rname, us.clone())));
-        for p in params.iter().chain(motives.iter()).chain(minors.iter()) {
-            v = self.apply(v, p.clone(), depth)?;
+    /// `Ctx` of the given depth, entries of an arbitrary but valid
+    /// placeholder type (`Sort 0`) — used only to hand eager's
+    /// `iota_from_first_principles`/`mk_rec_call`/`whnf_major` a `Ctx` of
+    /// matching length for their own internal `ensure_pi`/`whnf`/
+    /// `is_def_eq` calls on the *quoted* (bounded, non-accumulating)
+    /// params/motives/minors/fields passed in alongside it. Those internal
+    /// checks (e.g. `mk_rec_call`'s param-match `is_def_eq`) only ever
+    /// gate whether a field counts as a recursive occurrence — a wrong
+    /// answer there can only make the bridge under- rather than over-
+    /// recognize a rec-call (`Ok(None)`, deferring to eager), never
+    /// produce an unsound accept.
+    fn dummy_ctx(depth: u32) -> Ctx {
+        let mut ctx = Ctx::new();
+        let placeholder = expr::sort(level::zero());
+        for _ in 0..depth {
+            ctx.push(placeholder.clone());
         }
-        self.apply(v, field.clone(), depth)
+        ctx
     }
 
-    /// Static (level-independent) shape of `cname`'s fields: `mask[i]` is
-    /// true when field `i`'s type, after whnf and consuming the ctor's own
-    /// params, is directly `T args..` for some `T` in `all` — a zero-binder
-    /// recursive occurrence (`Nat.succ`'s `Nat` field, `List.cons`'s tail,
-    /// `brecOn`-generated ctors, …). `None` bails the whole ctor (higher-
-    /// order recursion, e.g. `Acc.intro`, or anything else this spike does
-    /// not model) so the caller stays neutral and defers to eager.
-    fn ctor_recursive_mask(&self, cname: u32, all: &[u32]) -> R<Option<Vec<bool>>> {
-        let (ctor_typ, cnp) = match self.env.get(cname) {
-            Some(ConstantInfo::Constructor {
-                typ, num_params, ..
-            }) => (typ.clone(), *num_params),
-            _ => return Ok(None),
-        };
-        let mut ctx = Ctx::new();
-        let mut cur = ctor_typ;
-        for _ in 0..cnp {
-            match self.ensure_pi(&ctx, &cur) {
-                Ok((_, dom, body)) => {
-                    ctx.push(dom);
-                    cur = body;
-                }
-                Err(_) => return Ok(None),
+    fn quote_all(&self, depth: u32, thunks: &[Rc<nbe::Thunk>]) -> R<Vec<Expr>> {
+        thunks
+            .iter()
+            .map(|t| {
+                let v = t.force(self)?;
+                self.quote(depth, &v)
+            })
+            .collect()
+    }
+
+    /// `Value`-space analogue of `is_ctor_or_nat_lit_head`.
+    fn is_ctor_or_nat_lit_value(&self, v: &nbe::Value) -> R<bool> {
+        Ok(match v {
+            nbe::Value::Lit(Lit::Nat(_)) => true,
+            nbe::Value::Neutral(nv) => {
+                let (chead, _) = Self::unwind_neutral(nv);
+                matches!(
+                    chead,
+                    nbe::Neutral::Const(n, _)
+                        if matches!(self.env.get(*n), Some(ConstantInfo::Constructor { .. }))
+                )
             }
-        }
-        let mut mask = Vec::new();
-        loop {
-            let (dom, body) = match self.ensure_pi(&ctx, &cur) {
-                Ok((_, dom, body)) => (dom, body),
-                Err(_) => break,
-            };
-            let domw = self.whnf(&ctx, &dom).unwrap_or_else(|_| dom.clone());
-            let is_rec = !matches!(&**domw, ExprData::Pi(..)) && {
-                let (h, _) = expr::unfold_apps(&domw);
-                matches!(&**h, ExprData::Const(t, _) if all.contains(t))
-            };
-            mask.push(is_rec);
-            ctx.push(dom);
-            cur = body;
-        }
-        Ok(Some(mask))
+            _ => false,
+        })
     }
 
     fn iota_value_cache_key(
@@ -11211,28 +11197,32 @@ mod tests {
         assert!(Rc::ptr_eq(&t_q, &a), "first field of PSigma A B must infer to A, got {}", tc.pp(&t_q));
     }
 
-    // ---------------- NbE spike, Day 6: Acc-shape scope check ----------------
+    // ---------------- NbE spike, Day 7: indexed + higher-order iota ----------------
     //
-    // Day 5's ctx-quoting hypothesis for the two failing accept fixtures
-    // (`alg-conv-trans-acc-left`, `subject-reduction-redex`) turned out to
-    // be wrong once tested to a fix: threading the real `Ctx` end to end
-    // (see `infer_type_value`'s signature and the comment above
-    // `vctx_new`) did not clear them. `KIOTA_TRACE_DEFEQ_ARGS`, traced on
-    // `subject-reduction-redex`, and `KIOTA_DEBUG`, on
-    // `alg-conv-trans-acc-left`, both point at the same real cause: with
-    // `infer_type` wired, a theorem's inferred value type comes out with
-    // `Acc.rec` *fully iota-reduced* on both sides of an `Eq`, while the
-    // declared type keeps one side as `f 1 (Acc.intro r 1 g)` — literally
-    // constructor-headed, and eager reduces that via ordinary iota (as it
-    // always could). My Value-native path never gets that far: `Acc.intro`
-    // has one field of type `∀ y, r y x → Acc r y` — a `Pi`, not a bare
-    // recursive occurrence — so `ctor_recursive_mask` correctly refuses to
-    // call it "simple," and separately `Acc` itself has a nonzero index
-    // (`num_indices`), which `try_iota_value` bails on even earlier. Both
-    // are deliberate scope boundaries, not surprises; this locks in that
-    // they're both real and exercised, so a future attempt at higher-order
-    // (binder-introducing) recursive occurrences has a concrete pair of
-    // regression tests to keep green.
+    // Day 6 found the actual gap behind the two failing accept fixtures
+    // (`alg-conv-trans-acc-left`, `subject-reduction-redex`): eager reduces
+    // `Acc.rec motive minor x (Acc.intro x g)` via ordinary iota (a
+    // literal-constructor major), and the Value-native path couldn't —
+    // `Acc` has a nonzero index (`num_indices`), which `try_iota_value`
+    // bailed on immediately, and separately `Acc.intro`'s one field has
+    // type `∀ y, r y x → Acc r y` — a `Pi`, not a bare recursive
+    // occurrence, needing a binder-introducing rec-call `try_iota_value`
+    // didn't build.
+    //
+    // Day 7 implements both. `try_iota_value` no longer special-cases
+    // `num_indices` at all — indices are just extra major-position
+    // arguments, skipped exactly like eager `try_iota` skips them. Once a
+    // literal-constructor (or `Nat`-literal, or theorem-unfolds-to-one,
+    // via `recursor_unfolds_thm_major`/`whnf_major`) major is found, the
+    // "apply minor to fields, interleave one rec-call per recursive field"
+    // step is not reimplemented in Value space at all: it calls eager's
+    // own `iota_from_first_principles`/`mk_rec_call` directly on quoted
+    // (bounded, non-accumulating) params/motives/minors/fields, guaranteeing
+    // it matches eager's rule by construction — including indices threaded
+    // through a field's own occurrence type, and higher-order fields,
+    // which come back as a genuine `Value::Lam` (a real closure, not a
+    // quoted-and-reevaluated stand-in) ready to be applied to fresh
+    // arguments exactly like any other value.
     fn insert_mini_acc(env: &mut crate::env::Environment) {
         use crate::env::{ConstantInfo, RecRule};
         let sort0 = expr::sort(level::zero());
@@ -11308,21 +11298,13 @@ mod tests {
         env.rec_of.insert(1, 3);
     }
 
-    /// `MyAcc.rec motive minor x (MyAcc.intro x g)` — a literal-constructor
-    /// major, exactly like eager's `Acc.rec motive minor x (Acc.intro x g)`
-    /// — must stay a stuck `Neutral`, not silently (and wrongly) reduce.
-    /// `num_indices == 1` bails `try_iota_value` before it ever inspects
-    /// the constructor at all.
-    #[test]
-    fn try_iota_value_declines_indexed_recursor_major() {
-        use crate::env::Environment;
-        let mut env = Environment::default();
-        insert_mini_acc(&mut env);
-        let names = test_names(&["Nat0", "MyAcc", "MyAcc.intro", "MyAcc.rec"]);
-        let tc = Checker::new(&env, &names, None, None);
-
+    /// Shared plumbing for the Day 7 `MyAcc.rec` tests: `motive` and
+    /// `minor` (arity 3: the index field, the `g` field, and the "ih"
+    /// rec-call — matching `iota_from_first_principles`'s field-then-rec
+    /// ordering for `MyAcc.intro`'s two fields, one of which is
+    /// recursive).
+    fn mini_acc_motive_and_minor() -> (Expr, Expr) {
         let nat = expr::const_(0, vec![]);
-        let x = expr::lit_nat(num_bigint::BigUint::from(7u32));
         let motive = expr::lam(
             expr::BinderInfo::Default,
             nat.clone(),
@@ -11332,50 +11314,95 @@ mod tests {
                 nat.clone(),
             ),
         );
+        // `minor := fun (x:Nat) (g : Nat -> MyAcc) (ih : Nat -> Nat) => x`
+        // (`x` referenced as `#2`, three binders deep): discards `g` and
+        // `ih` entirely and returns the index field it was actually
+        // applied to. A minor that ignores `ih` must never force it —
+        // exactly the laziness `eval`'s `App` case already gives any
+        // argument thunk, now exercised through the bridge in
+        // `try_iota_value` instead of the old dedicated `Thunk::RecCall`.
         let minor = expr::lam(
             expr::BinderInfo::Default,
             nat.clone(),
             expr::lam(
                 expr::BinderInfo::Default,
-                expr::pi(expr::BinderInfo::Default, nat.clone(), expr::app(expr::const_(1, vec![]), expr::bvar(0))),
-                x.clone(),
+                expr::pi(
+                    expr::BinderInfo::Default,
+                    nat.clone(),
+                    expr::app(expr::const_(1, vec![]), expr::bvar(0)),
+                ),
+                expr::lam(
+                    expr::BinderInfo::Default,
+                    expr::pi(expr::BinderInfo::Default, nat.clone(), nat.clone()),
+                    expr::bvar(2),
+                ),
             ),
         );
-        let g = expr::lam(expr::BinderInfo::Default, nat.clone(), expr::app(expr::app(expr::const_(2, vec![]), expr::bvar(0)), expr::lam(expr::BinderInfo::Default, nat.clone(), expr::bvar(0))));
-        let intro = expr::apps(expr::const_(2, vec![]), &[x.clone(), g]);
-        let rec_app = expr::apps(expr::const_(3, vec![]), &[motive, minor, x, intro]);
-
-        let v = tc.eval(&crate::nbe::generic_env(0), &rec_app).unwrap();
-        assert!(
-            matches!(&*v, nbe::Value::Neutral(_)),
-            "indexed recursor major must stay neutral (declined, not reduced), got {}",
-            tc.pp(&tc.quote(0, &v).unwrap())
-        );
+        (motive, minor)
     }
 
-    /// Isolate the *other* half of the `Acc.intro` shape from the index:
-    /// even a zero-index recursor with a constructor field of `Pi` type
-    /// (a higher-order recursive occurrence, like `Acc.intro`'s `∀ y, ...`
-    /// field) must not be treated as a "simple" (zero-binder) recursive
-    /// field. `ctor_recursive_mask` must mark it `false` — not attempt a
-    /// (currently unimplemented) binder-introducing recursive call — and
-    /// the resulting iota must stay neutral (missing the extra `ih`
-    /// argument the minor's own Pi-arity implies), not silently produce a
-    /// wrong constructor-shaped value.
+    /// `MyAcc.rec motive minor x (MyAcc.intro x g)` — a literal-constructor
+    /// major over an *indexed* recursor whose recursive field is *higher-
+    /// order* (`Pi`-shaped), exactly `Acc.rec`/`Acc.intro`'s shape — must
+    /// now reduce, matching eager `try_iota`'s rule exactly (via the
+    /// `iota_from_first_principles`/`mk_rec_call` bridge), not decline.
+    /// `minor` discards both the field `g` and the rec-call `ih`, so the
+    /// correct answer is simply `x` — and since nothing ever forces `g`,
+    /// `g`'s own body doesn't need to be well-typed for this test (it
+    /// never gets evaluated).
     #[test]
-    fn ctor_recursive_mask_rejects_pi_shaped_field() {
+    fn try_iota_value_reduces_indexed_higher_order_ctor_major() {
         use crate::env::Environment;
         let mut env = Environment::default();
         insert_mini_acc(&mut env);
-        let names: Vec<std::rc::Rc<String>> = Vec::new();
+        let names = test_names(&["Nat0", "MyAcc", "MyAcc.intro", "MyAcc.rec"]);
         let tc = Checker::new(&env, &names, None, None);
-        let mask = tc.ctor_recursive_mask(2, &[1]).unwrap();
-        assert_eq!(
-            mask,
-            Some(vec![false, false]),
-            "MyAcc.intro's Nat field and its ∀y.MyAcc-y field must both be 'not a simple \
-             recursive occurrence' — the first genuinely isn't one, the second is one only \
-             in the higher-order (binder-introducing) sense this spike does not implement"
+
+        let nat = expr::const_(0, vec![]);
+        let x = expr::lit_nat(num_bigint::BigUint::from(7u32));
+        let (motive, minor) = mini_acc_motive_and_minor();
+        // `g`'s body is never forced by `minor` (which discards it), so a
+        // syntactically-closed placeholder is enough.
+        let g = expr::lam(expr::BinderInfo::Default, nat, x.clone());
+        let intro = expr::apps(expr::const_(2, vec![]), &[x.clone(), g]);
+        let rec_app = expr::apps(expr::const_(3, vec![]), &[motive, minor, x.clone(), intro]);
+
+        let v = tc.eval(&crate::nbe::generic_env(0), &rec_app).unwrap();
+        match &*v {
+            nbe::Value::Lit(Lit::Nat(n)) => {
+                assert_eq!(*n, num_bigint::BigUint::from(7u32));
+            }
+            other => panic!(
+                "MyAcc.rec on a literal MyAcc.intro major must reduce to the index (7), got {}",
+                tc.pp(&tc.quote(0, other).unwrap())
+            ),
+        }
+    }
+
+    /// The same recursor and minor, but the major is a bound variable —
+    /// not a constructor application at all. Must still correctly decline
+    /// (stay a stuck `Neutral`), the same as before Day 7: the indexed/
+    /// higher-order rule only ever fires once a real constructor (or
+    /// theorem-unfolds-to-one) major is found.
+    #[test]
+    fn try_iota_value_still_declines_when_major_is_not_a_ctor() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_acc(&mut env);
+        let names = test_names(&["Nat0", "MyAcc", "MyAcc.intro", "MyAcc.rec"]);
+        let tc = Checker::new(&env, &names, None, None);
+
+        let x = expr::lit_nat(num_bigint::BigUint::from(7u32));
+        let (motive, minor) = mini_acc_motive_and_minor();
+        let major_var = expr::bvar(0);
+        let rec_app = expr::apps(expr::const_(3, vec![]), &[motive, minor, x, major_var]);
+
+        let env1 = crate::nbe::generic_env(1);
+        let v = tc.eval(&env1, &rec_app).unwrap();
+        assert!(
+            matches!(&*v, nbe::Value::Neutral(_)),
+            "a non-constructor major must stay neutral (declined, not reduced), got {}",
+            tc.pp(&tc.quote(1, &v).unwrap())
         );
     }
 }
