@@ -8381,18 +8381,40 @@ impl<'e> Checker<'e> {
     }
 
     fn occurs_any(&self, e: &Expr, names: &[u32]) -> bool {
-        match &***e {
-            ExprData::Const(n, _) => names.contains(n),
-            ExprData::App(f, a) => self.occurs_any(f, names) || self.occurs_any(a, names),
-            ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
-                self.occurs_any(t, names) || self.occurs_any(b, names)
+        // Interned exprs are a DAG. A naive recursive walk re-visits every
+        // shared subterm once per path into it, which is exponential in the
+        // sharing depth — perf/app-lam's `dag_app_binder` never finished.
+        // Visit each node once by pointer identity instead.
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut stack: Vec<Expr> = vec![e.clone()];
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(Rc::as_ptr(&cur) as usize) {
+                continue;
             }
-            ExprData::Let(t, v, b) => {
-                self.occurs_any(t, names) || self.occurs_any(v, names) || self.occurs_any(b, names)
+            match &**cur {
+                ExprData::Const(n, _) => {
+                    if names.contains(n) {
+                        return true;
+                    }
+                }
+                ExprData::App(f, a) => {
+                    stack.push(f.clone());
+                    stack.push(a.clone());
+                }
+                ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
+                    stack.push(t.clone());
+                    stack.push(b.clone());
+                }
+                ExprData::Let(t, v, b) => {
+                    stack.push(t.clone());
+                    stack.push(v.clone());
+                    stack.push(b.clone());
+                }
+                ExprData::Proj(_, _, v) => stack.push(v.clone()),
+                _ => {}
             }
-            ExprData::Proj(_, _, v) => self.occurs_any(v, names),
-            _ => false,
         }
+        false
     }
 }
 

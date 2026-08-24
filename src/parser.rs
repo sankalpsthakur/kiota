@@ -1378,20 +1378,41 @@ fn ctor_field_tys(typ: &Expr, num_params: u32, inst: Option<&[Expr]>) -> Vec<Exp
 }
 
 fn expr_occurs_names(e: &Expr, names: &[u32]) -> bool {
-    match &***e {
-        ExprData::Const(n, _) => names.contains(n),
-        ExprData::App(f, a) => expr_occurs_names(f, names) || expr_occurs_names(a, names),
-        ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
-            expr_occurs_names(t, names) || expr_occurs_names(b, names)
+    // Interned exprs are a DAG. Recursing structurally re-visits every shared
+    // subterm once per path into it, which is exponential in the sharing
+    // depth: this is called on each declaration's whole value, and
+    // perf/app-lam's `dag_app_binder` never finished. Visit once by pointer
+    // identity.
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut stack: Vec<Expr> = vec![e.clone()];
+    while let Some(cur) = stack.pop() {
+        if !seen.insert(std::rc::Rc::as_ptr(&cur) as usize) {
+            continue;
         }
-        ExprData::Let(t, v, b) => {
-            expr_occurs_names(t, names)
-                || expr_occurs_names(v, names)
-                || expr_occurs_names(b, names)
+        match &**cur {
+            ExprData::Const(n, _) => {
+                if names.contains(n) {
+                    return true;
+                }
+            }
+            ExprData::App(f, a) => {
+                stack.push(f.clone());
+                stack.push(a.clone());
+            }
+            ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
+                stack.push(t.clone());
+                stack.push(b.clone());
+            }
+            ExprData::Let(t, v, b) => {
+                stack.push(t.clone());
+                stack.push(v.clone());
+                stack.push(b.clone());
+            }
+            ExprData::Proj(_, _, v) => stack.push(v.clone()),
+            _ => {}
         }
-        ExprData::Proj(_, _, v) => expr_occurs_names(v, names),
-        _ => false,
     }
+    false
 }
 
 /// The four quotient declarations are kernel primitives. Their canonical
