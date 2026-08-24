@@ -1,3 +1,8 @@
+/// Nested-inductive specializations are discovered by instantiating
+/// constructor fields, which strictly grows the term; bound the search so it
+/// terminates. Real Lean nesting depth is tiny (List/Array/Prod wrappers).
+const NESTED_EXPANSION_DEPTH: u32 = 16;
+
 use crate::env::{ConstantInfo, Environment, QuotKind, RecRule, ReducibilityHints};
 use crate::expr::{self, BinderInfo, Expr, ExprData};
 use crate::level::{self, Level};
@@ -1006,7 +1011,7 @@ impl Parser {
     /// inductive's constructors (Array T also yields List T).
     fn counted_nested(&self, type_names: &[u32]) -> usize {
         let mut seen: FxHashSet<usize> = FxHashSet::default();
-        let mut work: Vec<Expr> = Vec::new();
+        let mut work: Vec<(Expr, u32)> = Vec::new();
         for &tname in type_names {
             let (ctors, nparams) = match self.env.get(tname) {
                 Some(ConstantInfo::InductiveType {
@@ -1016,14 +1021,16 @@ impl Parser {
             };
             for cname in ctors {
                 if let Some(ConstantInfo::Constructor { typ, .. }) = self.env.get(cname) {
-                    work.extend(ctor_field_tys(typ, nparams, None));
+                    work.extend(ctor_field_tys(typ, nparams, None).into_iter().map(|f| (f, 0)));
                 }
             }
         }
+        // Interned exprs are a DAG, so visit each node at most once.
+        let mut visited: FxHashSet<usize> = FxHashSet::default();
         let mut i = 0;
         while i < work.len() {
-            let e = work[i].clone();
-            self.collect_nested_in(&e, type_names, &mut seen, &mut work);
+            let (e, d) = work[i].clone();
+            self.collect_nested_in(&e, d, type_names, &mut seen, &mut visited, &mut work);
             i += 1;
         }
         seen.len()
@@ -1032,33 +1039,38 @@ impl Parser {
     fn collect_nested_in(
         &self,
         e: &Expr,
+        depth: u32,
         group: &[u32],
         seen: &mut FxHashSet<usize>,
-        work: &mut Vec<Expr>,
+        visited: &mut FxHashSet<usize>,
+        work: &mut Vec<(Expr, u32)>,
     ) {
+        if !visited.insert(Rc::as_ptr(e) as usize) {
+            return;
+        }
         match &***e {
             ExprData::App(_, _) => {
                 let (h, args) = expr::unfold_apps(e);
                 if let ExprData::Const(n, us) = &**h {
-                    self.note_nested_app(*n, us.as_slice(), &args, group, seen, work);
+                    self.note_nested_app(*n, us.as_slice(), &args, depth, group, seen, work);
                 }
-                self.collect_nested_in(&h, group, seen, work);
+                self.collect_nested_in(&h, depth, group, seen, visited, work);
                 for a in &args {
-                    self.collect_nested_in(a, group, seen, work);
+                    self.collect_nested_in(a, depth, group, seen, visited, work);
                 }
             }
             ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
-                self.collect_nested_in(t, group, seen, work);
-                self.collect_nested_in(b, group, seen, work);
+                self.collect_nested_in(t, depth, group, seen, visited, work);
+                self.collect_nested_in(b, depth, group, seen, visited, work);
             }
             ExprData::Let(t, v, b) => {
-                self.collect_nested_in(t, group, seen, work);
-                self.collect_nested_in(v, group, seen, work);
-                self.collect_nested_in(b, group, seen, work);
+                self.collect_nested_in(t, depth, group, seen, visited, work);
+                self.collect_nested_in(v, depth, group, seen, visited, work);
+                self.collect_nested_in(b, depth, group, seen, visited, work);
             }
-            ExprData::Proj(_, _, v) => self.collect_nested_in(v, group, seen, work),
+            ExprData::Proj(_, _, v) => self.collect_nested_in(v, depth, group, seen, visited, work),
             ExprData::Const(n, us) => {
-                self.note_nested_app(*n, us.as_slice(), &[], group, seen, work)
+                self.note_nested_app(*n, us.as_slice(), &[], depth, group, seen, work)
             }
             _ => {}
         }
@@ -1069,10 +1081,21 @@ impl Parser {
         n: u32,
         us: &[Level],
         args: &[Expr],
+        depth: u32,
         group: &[u32],
         seen: &mut FxHashSet<usize>,
-        work: &mut Vec<Expr>,
+        work: &mut Vec<(Expr, u32)>,
     ) {
+        // Expanding a specialization instantiates a constructor field type,
+        // which yields a strictly larger term that can contain another nested
+        // application — so the fixpoint does not terminate. On cedar `seen`
+        // grew linearly past 10.4M specializations and never converged.
+        // `nested_n` is only an upper bound on how many recursors the block
+        // may declare, so stopping early can only under-count, which makes
+        // the extra-recursor check stricter. Bound the depth and fail closed.
+        if depth >= NESTED_EXPANSION_DEPTH {
+            return;
+        }
         if group.contains(&n) {
             return;
         }
@@ -1109,7 +1132,11 @@ impl Parser {
             for c in ctors {
                 if let Some(ConstantInfo::Constructor { typ, .. }) = self.env.get(c) {
                     let ty = expr::instantiate_level_params(typ, &subst);
-                    work.extend(ctor_field_tys(&ty, m_params, Some(params)));
+                    work.extend(
+                        ctor_field_tys(&ty, m_params, Some(params))
+                            .into_iter()
+                            .map(|f| (f, depth + 1)),
+                    );
                 }
             }
         }

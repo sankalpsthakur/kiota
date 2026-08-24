@@ -1102,6 +1102,10 @@ fn local_ty(ctx: &Ctx, i: u32) -> Option<Expr> {
     Some(expr::shift(raw, i as i32 + 1, 0))
 }
 
+/// Maximum nesting depth explored by the nested-positivity check before it
+/// declines. Real Lean nesting is shallow (List/Array/Prod wrappers).
+const NESTED_POSITIVITY_DEPTH: usize = 16;
+
 impl<'e> Checker<'e> {
     pub fn new(
         env: &'e Environment,
@@ -8236,6 +8240,13 @@ impl<'e> Checker<'e> {
     /// is checked on the specialized constructors. Export form still has
     /// `F Ds`, so instantiate F's constructors at `Ds` and require those
     /// fields to be strictly positive in `bound`.
+    /// Nested positivity recurses through instantiated constructor fields,
+    /// which strictly grows the term, so the `visiting` cycle check (a
+    /// structural compare of the argument vector) never matches and the
+    /// mutual recursion with `check_arg_positive_in` does not terminate —
+    /// cedar spun here indefinitely. Bound the nesting depth. Positivity is a
+    /// soundness check, so exceeding the bound must not accept: Decline says
+    /// "not verified" rather than claiming the type is positive.
     fn check_nested_functor(
         &self,
         ctx: &Ctx,
@@ -8246,6 +8257,9 @@ impl<'e> Checker<'e> {
         i_num_params: u32,
         visiting: &[(u32, Vec<Expr>)],
     ) -> R<()> {
+        if visiting.len() >= NESTED_POSITIVITY_DEPTH {
+            return decline("nested positivity nesting too deep to verify");
+        }
         let (f_np, f_all, f_lp) = match self.env.get(f_name) {
             Some(ConstantInfo::InductiveType {
                 num_params,
