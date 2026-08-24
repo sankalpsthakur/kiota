@@ -886,6 +886,22 @@ pub struct Checker<'e> {
     /// Holding the `Rc` here keeps the address live for as long as the
     /// cache entry does.
     iota_value_cache: RefCell<FxHashMap<(u32, Vec<Level>, Vec<ThunkPtrKey>), Rc<nbe::Value>>>,
+    /// Eager-path counterpart: `(rname, us, motive-ptrs, minor-ptrs, literal
+    /// n) → one iota-peel result`, independent of `KIOTA_NBE`. Safe by
+    /// construction (unlike the NbE cache above, the key clones the
+    /// `BigUint`/`Level`s by value rather than keying on the literal's own
+    /// address, and `motives`/`minors` are borrowed from `args`, which the
+    /// caller keeps alive for the whole call — no dangling-pointer-reuse
+    /// risk to replicate here).
+    iota_lit_memo: RefCell<FxHashMap<(u32, Vec<Level>, Vec<usize>, Vec<usize>, BigUint), Expr>>,
+    /// Test/diagnostic only: counts `iota_lit_memo` misses (i.e. actual
+    /// `iota_from_first_principles` derivations of a Nat-literal peel).
+    iota_lit_memo_misses: std::cell::Cell<u32>,
+    /// Test-only override for whether `iota_lit_memo` is consulted, so a
+    /// test can disable it on *this* `Checker` without mutating the
+    /// process-wide `KIOTA_NO_IOTA_MEMO` env var (which `cargo test`'s
+    /// parallel test threads would otherwise race on).
+    iota_memo_override: std::cell::Cell<Option<bool>>,
     /// Consecutive `Nat.rec` peels of one `bits() >= 20` literal countdown.
     fuel_nat_peels: std::cell::Cell<u32>,
     /// Last bits≥20 literal peeled; used to detect one hugeFuel countdown.
@@ -1143,6 +1159,9 @@ impl<'e> Checker<'e> {
             proof_arg_cache: RefCell::new(FxHashMap::default()),
             unfold_cache: RefCell::new(FxHashMap::default()),
             iota_value_cache: RefCell::new(FxHashMap::default()),
+            iota_lit_memo: RefCell::new(FxHashMap::default()),
+            iota_lit_memo_misses: std::cell::Cell::new(0),
+            iota_memo_override: std::cell::Cell::new(None),
             fuel_nat_peels: std::cell::Cell::new(0),
             fuel_nat_last: std::cell::RefCell::new(None),
             infer_only: std::cell::Cell::new(false),
@@ -3626,6 +3645,37 @@ impl<'e> Checker<'e> {
         let k_like = self.is_k_like(&all)?;
 
         let major_w = self.whnf_major(ctx, major, rname)?;
+
+        // Recursor-application memo: a `Nat.rec`/`brecOn` "below" step
+        // recurs with the *same* (motive, minors) pointers and a strictly
+        // decreasing literal major. Confirm that empirically first
+        // (`KIOTA_TRACE_IOTA_TRIPLES`), then skip re-deriving the ctor
+        // lookup / `ctor_minor_index` / `iota_from_first_principles` /
+        // `mk_rec_call` chain for a triple already seen.
+        let iota_memo_on = self
+            .iota_memo_override
+            .get()
+            .unwrap_or_else(|| std::env::var_os("KIOTA_NO_IOTA_MEMO").is_none());
+        if rest.is_empty() {
+            if let ExprData::Lit(Lit::Nat(n)) = &**major_w {
+                if std::env::var_os("KIOTA_TRACE_IOTA_TRIPLES").is_some() {
+                    eprintln!(
+                        "IOTA_TRIPLE rec={} motives={:?} minors={:?} n={}",
+                        self.name_str(rname),
+                        motives.iter().map(Self::ptr_key).collect::<Vec<_>>(),
+                        minors.iter().map(Self::ptr_key).collect::<Vec<_>>(),
+                        n
+                    );
+                }
+                if iota_memo_on {
+                    let key = Self::iota_lit_memo_key(rname, &us, motives, minors, n);
+                    if let Some(cached) = self.iota_lit_memo.borrow().get(&key) {
+                        crate::stats::n_nat();
+                        return Ok(Some(cached.clone()));
+                    }
+                }
+            }
+        }
         let (mhead, margs) = expr::unfold_apps(&major_w);
 
         if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
@@ -3709,6 +3759,9 @@ impl<'e> Checker<'e> {
         if minor_idx >= minors.len() {
             return Ok(None);
         }
+        if matches!(&**major_w, ExprData::Lit(Lit::Nat(_))) {
+            self.iota_lit_memo_misses.set(self.iota_lit_memo_misses.get() + 1);
+        }
         let rhs = self.iota_from_first_principles(
             ctx,
             rname,
@@ -3723,7 +3776,41 @@ impl<'e> Checker<'e> {
             cname,
             fields,
         )?;
+        if iota_memo_on && rest.is_empty() {
+            if let ExprData::Lit(Lit::Nat(n)) = &**major_w {
+                let key = Self::iota_lit_memo_key(rname, &us, motives, minors, n);
+                self.iota_lit_memo.borrow_mut().insert(key, rhs.clone());
+            }
+        }
         Ok(Some(expr::apps(rhs, rest)))
+    }
+
+    /// Test/diagnostic accessor for `iota_lit_memo_misses`.
+    pub(crate) fn iota_lit_memo_miss_count(&self) -> u32 {
+        self.iota_lit_memo_misses.get()
+    }
+
+    /// Test-only: force `iota_lit_memo` on/off for this `Checker` instance,
+    /// bypassing `KIOTA_NO_IOTA_MEMO` (see `iota_memo_override`).
+    #[cfg(test)]
+    pub(crate) fn set_iota_memo_enabled_for_test(&self, on: bool) {
+        self.iota_memo_override.set(Some(on));
+    }
+
+    fn iota_lit_memo_key(
+        rname: u32,
+        us: &[Level],
+        motives: &[Expr],
+        minors: &[Expr],
+        n: &BigUint,
+    ) -> (u32, Vec<Level>, Vec<usize>, Vec<usize>, BigUint) {
+        (
+            rname,
+            us.to_vec(),
+            motives.iter().map(Self::ptr_key).collect(),
+            minors.iter().map(Self::ptr_key).collect(),
+            n.clone(),
+        )
     }
 
     /// K-like iff: not mutual, result sort is Prop, one constructor, zero fields.
@@ -10414,5 +10501,139 @@ mod tests {
                 assert_eq!(nbe, eager, "nbe/eager disagree on Nat0 {i} vs {j}");
             }
         }
+    }
+
+    // ---------------- Eager recursor-application memo (Day 2 build order) ----------------
+
+    /// Same shape as `insert_mini_nat0`, but wired as the checker's `Nat`
+    /// (`nat_ref = Some(0)`) so a real `Lit::Nat` major exercises
+    /// `try_iota`'s literal-peel branch and `iota_lit_memo`, not the
+    /// constructor-tower path `insert_mini_nat0`'s own tests use.
+    fn insert_mini_natlit(env: &mut crate::env::Environment) {
+        insert_mini_nat0(env);
+    }
+
+    /// `add(n, 1) := Nat.rec 1 (fun _ ih => S ih) (lit n)`. Compared against
+    /// a `Nat0.Z`/`Nat0.S` ctor tower (`nat0_lit`), not a raw literal on the
+    /// RHS: `numeral_value`'s congruence shortcut inspects a term's shape
+    /// as-is rather than forcing it, so a stuck `Nat.rec` spine only gets
+    /// peeled level by level through `app_spines_congruent`'s recursive
+    /// `is_def_eq` on the `S`'s argument — which is exactly the recursion
+    /// this memo targets.
+    fn add_one_rec_app(motive: &Expr, step: &Expr, n: u32) -> Expr {
+        let rec_ = expr::const_(3, vec![]);
+        let base = expr::lit_nat(num_bigint::BigUint::from(1u32));
+        expr::apps(
+            rec_,
+            &[
+                motive.clone(),
+                base,
+                step.clone(),
+                expr::lit_nat(num_bigint::BigUint::from(n)),
+            ],
+        )
+    }
+
+    /// The operator's build order: (1) instrument to confirm the same
+    /// `(recursor, motive, minors)` triple recurs at overlapping literals,
+    /// (2) memoize it. This reproduces exactly that overlap: a first
+    /// `add(10, 1)` peels literals 10..=0 into `iota_lit_memo`; a second,
+    /// independent `add(7, 1)` — same motive/minor *pointers*, an entirely
+    /// separate top-level term, not reachable via the ordinary
+    /// `(ctx, ptr)` whnf cache — revisits literals 7..=0, all of which
+    /// should now be memo hits. `iota_lit_memo_miss_count` (real
+    /// `iota_from_first_principles` derivations) makes that observable
+    /// instead of only inferring it from wall-clock time.
+    #[test]
+    fn eager_iota_lit_memo_reuses_overlapping_countdown() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_natlit(&mut env);
+        let names = test_names(&["Nat0", "Nat0.Z", "Nat0.S", "Nat0.rec"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+
+        let nat0 = expr::const_(0, vec![]);
+        let motive = expr::lam(expr::BinderInfo::Default, nat0.clone(), nat0.clone());
+        let s = expr::const_(2, vec![]);
+        let step = expr::lam(
+            expr::BinderInfo::Default,
+            nat0.clone(),
+            expr::lam(expr::BinderInfo::Default, nat0, expr::app(s, expr::bvar(0))),
+        );
+
+        let ten = add_one_rec_app(&motive, &step, 10);
+        let eleven = nat0_lit(11);
+        assert!(tc.is_def_eq(&ctx, &ten, &eleven).unwrap(), "add 10 1 must convert to 11");
+        let misses_after_first = tc.iota_lit_memo_miss_count();
+        assert!(
+            misses_after_first >= 11,
+            "first countdown (11 levels, 10..=0) must derive each peel at least once, got {misses_after_first}"
+        );
+
+        // Independent term (fresh `expr::apps` spine, not reachable from
+        // `ten` via `(ctx, ptr)`), overlapping literals 7..=0.
+        let seven = add_one_rec_app(&motive, &step, 7);
+        let eight = nat0_lit(8);
+        assert!(tc.is_def_eq(&ctx, &seven, &eight).unwrap(), "add 7 1 must convert to 8");
+        let misses_after_second = tc.iota_lit_memo_miss_count();
+        assert_eq!(
+            misses_after_second, misses_after_first,
+            "every literal in the second (overlapping) countdown must hit iota_lit_memo, not re-derive"
+        );
+    }
+
+    /// Same overlap with the memo forced off on this `Checker` (test-only
+    /// override, not the process-wide `KIOTA_NO_IOTA_MEMO` env var — that
+    /// would race with other tests' `try_iota` calls under `cargo test`'s
+    /// parallel test threads): correctness must not depend on the memo.
+    ///
+    /// This also empirically confirms (rather than assumes) something the
+    /// build order didn't anticipate: with the memo off, the *first*
+    /// countdown still derives every peel (>= 11), but the *second*,
+    /// overlapping one derives **zero** more. That is not this memo at
+    /// work (it is disabled) — it is `whnf_cache`/`defeq_cache`, keyed on
+    /// `(ctx, ptr)`, already sharing the intermediate `Nat0.rec motive
+    /// base step (lit k)` terms for `k` in the overlap, because they are
+    /// pointer-identical (interned) across both countdowns. So on *this*
+    /// idealized reproduction — shared `motive`/`minors` pointers, an
+    /// interned literal — `iota_lit_memo` is redundant with caching kiota
+    /// already had; it can only add value where a (ctx, ptr) hit is not
+    /// available (e.g. across separate `Checker`s, or if two occurrences
+    /// of "the same" recursor call are ever *not* pointer-identical).
+    #[test]
+    fn eager_iota_lit_memo_disable_still_correct() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_natlit(&mut env);
+        let names = test_names(&["Nat0", "Nat0.Z", "Nat0.S", "Nat0.rec"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        tc.set_iota_memo_enabled_for_test(false);
+        let ctx = Ctx::new();
+        let nat0 = expr::const_(0, vec![]);
+        let motive = expr::lam(expr::BinderInfo::Default, nat0.clone(), nat0.clone());
+        let s = expr::const_(2, vec![]);
+        let step = expr::lam(
+            expr::BinderInfo::Default,
+            nat0.clone(),
+            expr::lam(expr::BinderInfo::Default, nat0, expr::app(s, expr::bvar(0))),
+        );
+        let ten = add_one_rec_app(&motive, &step, 10);
+        let eleven = nat0_lit(11);
+        assert!(tc.is_def_eq(&ctx, &ten, &eleven).unwrap());
+        let misses_after_first = tc.iota_lit_memo_miss_count();
+        assert!(
+            misses_after_first >= 11,
+            "memo disabled: first countdown must still fully re-derive (>= 11 peels), got {misses_after_first}"
+        );
+        let seven = add_one_rec_app(&motive, &step, 7);
+        let eight = nat0_lit(8);
+        assert!(tc.is_def_eq(&ctx, &seven, &eight).unwrap());
+        let misses_after_second = tc.iota_lit_memo_miss_count();
+        assert_eq!(
+            misses_after_second, misses_after_first,
+            "with the memo off, the overlap is still free — that's whnf_cache/defeq_cache \
+             (ctx, ptr) sharing the interned intermediate terms, not iota_lit_memo"
+        );
     }
 }
