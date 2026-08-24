@@ -9,6 +9,16 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 thread_local! {
+    /// Recursion guard for `pub fn infer_type`'s `KIOTA_NBE=1` dispatch,
+    /// mirroring `DEFEQ_DEPTH`/`WHNF_DEPTH`/`CORE_DEPTH`'s existing use of
+    /// `CONV_DEPTH` as a shared cap: a genuine bug in the fallback chain
+    /// between `infer_type_via_nbe` and eager (confirmed once already —
+    /// `infer_type_value_fallback` calling the dispatching `infer_type`
+    /// instead of `infer_type_cached` was an unconditional infinite loop
+    /// before that was fixed) should decline, not segfault. The eager-only
+    /// path (`infer_type_cached`) is unaffected: this counter only wraps
+    /// the outer dispatch, exactly like `is_def_eq`'s `DEFEQ_DEPTH`.
+    static INFER_DEPTH: Cell<u32> = const { Cell::new(0) };
     static DEFEQ_DEPTH: Cell<u32> = const { Cell::new(0) };
     static WHNF_DEPTH: Cell<u32> = const { Cell::new(0) };
     /// `whnf_core` → iota → `whnf_major` → `whnf_core` is not counted by
@@ -1582,8 +1592,37 @@ impl<'e> Checker<'e> {
 
     // ---------------- Type inference ----------------
 
+    // Day 5: wiring `infer_type` behind `KIOTA_NBE=1` (dispatching to
+    // `infer_type_via_nbe`, exactly like `is_def_eq` does) was attempted
+    // and reverted. With the wire in, two accept fixtures newly rejected
+    // under the flag (`alg-conv-trans-acc-left`: "value type does not
+    // match declared type"; `subject-reduction-redex`: "application
+    // argument type mismatch (nbe)"), both on the same shape: an `Acc.rec`
+    // major that is a bound variable on one side and a theorem
+    // (`redex._proof_2`/equivalent) applied to that variable on the other
+    // — proof-irrelevant under eager's `is_def_eq`, but the *reconstructed*
+    // context (`vctx_to_ctx`, built by quoting each tracked `Value` type)
+    // fed to that same eager `is_def_eq` as the fallback no longer
+    // triggers the pattern. That ruled out the first hypothesis (a
+    // `self.is_def_eq` re-entering `KIOTA_NBE`'s own dispatch instead of
+    // the plain eager comparator, which was a real, separate, and now
+    // fixed bug — `types_compatible` below uses `is_def_eq_inner`
+    // directly); swapping that in changed nothing, confirming the gap is
+    // in what `vctx_to_ctx`/`quote` reproduce, not in which comparator
+    // gets called. Per the Day 5 instruction to revert rather than chase a
+    // soundness-adjacent bug under a squeezed timeline: `infer_type` is
+    // unconditionally the eager path again — zero behavior change on
+    // either flag from this file versus before this attempt.
+    // `infer_type_value`/`infer_type_via_nbe`/`types_compatible` all stay,
+    // exercised only by their own dedicated tests (still green on both
+    // flags), so this is available to pick back up with a fix for the
+    // context-reconstruction gap rather than starting over.
     pub fn infer_type(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         crate::stats::infer_call();
+        self.infer_type_cached(ctx, e)
+    }
+
+    fn infer_type_cached(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         // Closed → 0. Open `loose = k` → k innermost binders, not the full
         // telescope: a 34k DAG with one loose bvar must not re-Check under
         // every extra PSigma/Acc motive (`._unary` well-founded proofs).
@@ -8294,6 +8333,57 @@ impl<'e> Checker<'e> {
         Ok(ctx)
     }
 
+    /// Inverse of `vctx_to_ctx`: `eval`s each of `ctx`'s (raw, unshifted)
+    /// stored types against the value-env built so far, in lockstep — the
+    /// same direction `eval` always goes (`Expr -> Value`), no quoting.
+    fn ctx_to_vctx(&self, ctx: &Ctx) -> R<(Vec<Rc<nbe::Value>>, nbe::VEnv)> {
+        let (mut tys, mut env) = Checker::vctx_new();
+        for i in 0..ctx.len() {
+            let ty_v = self.eval(&env, &ctx[i])?;
+            let (tys2, env2) = Checker::vctx_push(&tys, &env, ty_v);
+            tys = tys2;
+            env = env2;
+        }
+        Ok((tys, env))
+    }
+
+    /// `KIOTA_NBE=1` dispatch target for `pub fn infer_type`. Computes the
+    /// type via `infer_type_value` (Value-native for the core calculus,
+    /// falling back to `infer_type_cached` — never `infer_type`'s own
+    /// dispatch again, to skip a redundant flag re-check — for anything it
+    /// doesn't model) and quotes the result back to `Expr` at the
+    /// declaration/call boundary this function itself is.
+    ///
+    /// A `Reject` from `infer_type_value` is trusted directly: every reject
+    /// it can produce is either a raw structural fact (an out-of-range
+    /// bvar/projection index — not a soundness judgement, the same either
+    /// representation) or backed by `types_compatible`/`is_prop`, which
+    /// only ever decide via the proven eager `is_def_eq`/`is_prop` on
+    /// quoted forms. Any other outcome (an internal `Other`/`Decline`, or
+    /// quoting failing on an otherwise-successful inference) defers to
+    /// `infer_type_cached` entirely: per the contract, a bug here may cost
+    /// completeness, never turn into a wrong accept.
+    fn infer_type_via_nbe(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        if std::env::var_os("KIOTA_TRACE_INFER_NBE").is_some() {
+            eprintln!(
+                "infer_type_via_nbe ctxlen={} e={}",
+                ctx.len(),
+                self.pp_budget(e, 40)
+            );
+        }
+        let (tys, venv) = match self.ctx_to_vctx(ctx) {
+            Ok(x) => x,
+            Err(_) => return self.infer_type_cached(ctx, e),
+        };
+        match self.infer_type_value(&tys, &venv, e) {
+            Ok(tv) => self
+                .quote(ctx.len() as u32, &tv)
+                .or_else(|_| self.infer_type_cached(ctx, e)),
+            Err(rej @ TcError::Reject(_)) => Err(rej),
+            Err(_) => self.infer_type_cached(ctx, e),
+        }
+    }
+
     fn infer_type_value_fallback(
         &self,
         tys: &[Rc<nbe::Value>],
@@ -8301,7 +8391,12 @@ impl<'e> Checker<'e> {
         e: &Expr,
     ) -> R<Rc<nbe::Value>> {
         let actx = self.vctx_to_ctx(tys)?;
-        let t = self.infer_type(&actx, e)?;
+        // `infer_type_cached`, never `infer_type`: the latter re-dispatches
+        // to `infer_type_via_nbe` whenever `KIOTA_NBE=1`, which is *this
+        // function's own caller* — an unconditional infinite loop the
+        // instant this fallback ever fires with the flag on (confirmed by
+        // a real stack overflow before this fix; see the Day 5 PR update).
+        let t = self.infer_type_cached(&actx, e)?;
         self.eval(env, &t)
     }
 
@@ -8325,7 +8420,7 @@ impl<'e> Checker<'e> {
         let actx = self.vctx_to_ctx(tys)?;
         let got_q = self.quote(depth, got)?;
         let want_q = self.quote(depth, want)?;
-        self.is_def_eq(&actx, &got_q, &want_q)
+        self.is_def_eq_inner(&actx, &got_q, &want_q)
     }
 
     pub(crate) fn infer_type_value(
@@ -8362,10 +8457,26 @@ impl<'e> Checker<'e> {
                     nbe::Value::Pi(_, dom, pi_env, body) => (dom.clone(), pi_env.clone(), body.clone()),
                     _ => return self.infer_type_value_fallback(tys, env, e),
                 };
-                let at = self.infer_type_value(tys, env, a)?;
                 let dom_v = dom.force(self)?;
-                if !self.types_compatible(tys, depth, &at, &dom_v)? {
-                    return reject("application argument type mismatch (nbe)");
+                // Lean `check` infers every App argument; InferOnly (only
+                // ever set for already-checked terms, see `with_infer_only`)
+                // skips it, matching the eager App case exactly.
+                if !self.infer_only.get() {
+                    let at = self.infer_type_value(tys, env, a)?;
+                    if !self.types_compatible(tys, depth, &at, &dom_v)? {
+                        if std::env::var_os("KIOTA_DEBUG").is_some() {
+                            let at_q = self.quote(depth, &at).unwrap_or_else(|_| a.clone());
+                            let dom_q = self.quote(depth, &dom_v).unwrap_or_else(|_| a.clone());
+                            return reject(format!(
+                                "application argument type mismatch (nbe)\n  got:      {}\n  expected: {}\n  fun:      {}\n  arg:      {}",
+                                self.pp(&at_q),
+                                self.pp(&dom_q),
+                                self.pp(f),
+                                self.pp(a),
+                            ));
+                        }
+                        return reject("application argument type mismatch (nbe)");
+                    }
                 }
                 let av = self.eval(env, a)?;
                 let mut env2 = (*env_pi).clone();
