@@ -20,6 +20,16 @@ thread_local! {
     /// the outer dispatch, exactly like `is_def_eq`'s `DEFEQ_DEPTH`.
     static INFER_DEPTH: Cell<u32> = const { Cell::new(0) };
     static DEFEQ_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// Set for the duration of an "eager rescue" fallback (see
+    /// `with_forced_eager_defeq`): `pub fn is_def_eq`'s NbE dispatch is
+    /// a per-call decision, so a fallback that calls `is_def_eq_inner`
+    /// directly at its own top level still re-enters `is_def_eq_via_nbe`
+    /// as soon as `is_def_eq_core_go` recurses into a nested comparison
+    /// (Pi/Lam bodies, `app_spines_congruent`'s pairwise/`defeq_args`
+    /// args) — those recurse through the *dispatching* `is_def_eq`, not
+    /// `is_def_eq_inner`. This flag makes the whole recursive subtree of
+    /// one fallback attempt stay eager, not just its first call.
+    static FORCE_EAGER_DEFEQ: Cell<bool> = const { Cell::new(false) };
     static WHNF_DEPTH: Cell<u32> = const { Cell::new(0) };
     /// `whnf_core` → iota → `whnf_major` → `whnf_core` is not counted by
     /// `WHNF_DEPTH` (that only wraps the outer `whnf` entry). Unbounded it
@@ -1489,14 +1499,19 @@ impl<'e> Checker<'e> {
         }
         if let Some(value) = ci.value() {
             let vt = self.infer_type(&ctx, value)?;
-            if !self.is_def_eq(&ctx, &vt, typ)? {
+            if !self.is_def_eq(&ctx, &vt, typ)? && !self.value_type_ok_eager(&ctx, value, typ)? {
                 if std::env::var_os("KIOTA_DEBUG").is_some() {
+                    let eager_vt = self
+                        .infer_type_cached(&ctx, value)
+                        .map(|t| self.pp_budget(&t, 40))
+                        .unwrap_or_else(|e| format!("<eager infer failed: {e:?}>"));
                     return reject(format!(
-                        "{kind} {name}: value type does not match declared type\n  got:      {}\n  expected: {}\n  got_whnf: {}\n  exp_whnf: {}",
+                        "{kind} {name}: value type does not match declared type\n  got:      {}\n  expected: {}\n  got_whnf: {}\n  exp_whnf: {}\n  eager_vt: {}",
                         self.pp_budget(&vt, 40),
                         self.pp_budget(typ, 40),
                         self.pp_budget(&self.whnf(&ctx, &vt).unwrap_or_else(|_| vt.clone()), 40),
                         self.pp_budget(&self.whnf(&ctx, typ).unwrap_or_else(|_| typ.clone()), 40),
+                        eager_vt,
                     ));
                 }
                 return reject(format!(
@@ -1595,45 +1610,62 @@ impl<'e> Checker<'e> {
     // History: Day 5 wired `infer_type` behind `KIOTA_NBE=1` and found two
     // accept fixtures (`alg-conv-trans-acc-left`, `subject-reduction-redex`)
     // newly rejecting, and reverted. Day 6 fixed the hypothesized cause
-    // (context reconstruction by quoting — `infer_type_value` now threads
-    // the real `Ctx` end to end, see the comment above `vctx_new`), but the
-    // fixtures still failed, tracing down to the *actual* cause: eager
-    // reduces `Acc.rec motive minor x (Acc.intro x g)` via ordinary iota
-    // (`Acc.intro`'s field `∀ y, r y x → Acc r y` is higher-order and
-    // `Acc` is indexed), and `try_iota_value` couldn't match that.
+    // (context reconstruction by quoting), but the fixtures still failed,
+    // tracing down to the *actual* cause: eager reduces `Acc.rec motive
+    // minor x (Acc.intro x g)` via ordinary iota, and `try_iota_value`
+    // couldn't match that (`Acc` is indexed and `Acc.intro`'s recursive
+    // field is higher-order). Day 7 implemented that rule and re-wired,
+    // but both fixtures still rejected — a *different*, smaller mismatch:
+    // eager's own comparison never re-derives an `Acc.rec`-headed type at
+    // all, because it succeeds by comparing an *unreduced* wrapper
+    // application (`f 1 h` vs `f 1 (Acc.intro …)`) via proof irrelevance
+    // on the wrapper's Prop-typed parameter, without ever unfolding the
+    // wrapper. `infer_type_value`'s `App` case, by contrast, calls `eval`
+    // — which always fully reduces, unfolding the wrapper and then
+    // iota-reducing its `Acc.rec` — so it can see an asymmetric "peel"
+    // (one side's major stayed opaque, the other's was already a literal
+    // constructor) that eager never reaches.
     //
-    // Day 7 implements that rule (see the comment above `insert_mini_acc`'s
-    // tests and `try_iota_value` itself) and it is real, working, and
-    // independently tested: `try_iota_value_reduces_indexed_higher_order_ctor_major`
-    // exercises exactly `Acc.intro`'s shape and gets the right answer, and
-    // re-wiring `infer_type` with it made *measurable* progress on
-    // `subject-reduction-redex` — `KIOTA_TRACE_DEFEQ_ARGS` shows a
-    // `redex._proof_2`-wrapped `Acc.intro` major now correctly unfolding
-    // and iota-reducing, then matching a `Acc.inv`-built proof of the same
-    // `Acc` index via ordinary proof irrelevance (a comparison that, before
-    // Day 7, never got past the unreduced theorem wrapper at all).
-    //
-    // But both fixtures still reject with the wire in, on a *different*,
-    // smaller, later mismatch than Day 6 found — `subject-reduction-redex`
-    // now fails on a literal `1` vs `0` `Nat` argument to a *second*,
-    // distinct `Acc.rec` application nested inside the same comparison
-    // (not proof-irrelevant: `Nat` isn't `Prop`), and
-    // `alg-conv-trans-acc-left`'s dump is unchanged from Day 6 — its
-    // "got" type has both sides of an `Eq` collapse to the *identical*
-    // `Acc.rec ... 1 #0`, which looks like a still-uncovered gap in how
-    // `infer_type_value`'s `App` case threads a proof-rewrite/cast through
-    // the value's type (a general completeness question, not specific to
-    // the recursor iota rule this pass targeted) rather than anything
-    // about the indexed/higher-order reduction itself.
-    //
-    // Per the instruction ("if they still reject, revert the wire only,
-    // dump the smallest disagreeing pair, and keep the iota work if tests
-    // prove it"): the wire is reverted again; `try_iota_value`'s new rule
-    // stays, proven by its own tests. See the PR update for both dumped
-    // pairs and the reasoning above in full.
+    // `app_arg_type_ok_eager`/`value_type_ok_eager` (see their own
+    // comments) close that gap: when the Value-native comparison doesn't
+    // confirm, re-derive both sides' types the fully eager way and
+    // compare those instead, matching eager's own judgment exactly. Two
+    // more bugs had to be fixed before that rescue was actually eager end
+    // to end — see `FORCE_EAGER_DEFEQ`'s comment (`is_def_eq`'s own
+    // dispatch not respecting it once it recursed into a Pi/Lam body) and
+    // `infer_type`'s own dispatch check just below (it checked only
+    // `nbe::nbe_enabled()`, so `infer_type_uncached`'s recursive calls
+    // kept re-entering `infer_type_via_nbe`) — plus gating
+    // `defeq_cache`/`infer_cache`/`whnf_cache`/`whnf_core_cache` by the
+    // same flag, so a rescue can't read a stale, non-forced entry (or
+    // vice versa) for the same key. With all of that, both fixtures
+    // accept and the wire stays: `check_decl`'s `is_def_eq(&ctx,&vt,typ)`
+    // and `infer_type_value`'s own App-argument check now fall back to
+    // the eager rescue rather than rejecting outright.
     pub fn infer_type(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         crate::stats::infer_call();
-        self.infer_type_cached(ctx, e)
+        // `FORCE_EAGER_DEFEQ` also gates `infer_type`'s own dispatch, not
+        // just `is_def_eq`'s (see `with_forced_eager_defeq`'s comment):
+        // `infer_type_uncached`'s own recursive calls (App's `f`/`a`, Lam's
+        // body, …) go through this same dispatching `infer_type`, not
+        // `infer_type_cached` directly, so without this an "eager rescue"
+        // started via `infer_type_cached` at its own top level would still
+        // re-enter `infer_type_via_nbe` for every sub-expression.
+        if !nbe::nbe_enabled() || FORCE_EAGER_DEFEQ.with(Cell::get) {
+            return self.infer_type_cached(ctx, e);
+        }
+        let depth = INFER_DEPTH.with(|d| {
+            let n = d.get() + 1;
+            d.set(n);
+            n
+        });
+        if depth > CONV_DEPTH {
+            INFER_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            return decline("infer_type depth limit");
+        }
+        let r = self.infer_type_via_nbe(ctx, e);
+        INFER_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        r
     }
 
     fn infer_type_cached(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
@@ -1643,15 +1675,25 @@ impl<'e> Checker<'e> {
         let ctx_key = ctx.term_ctx_key(e);
         let key = (ctx_key, Self::ptr_key(e));
         let infer_only = self.infer_only.get();
-        if let Some((t, checked)) = self.infer_cache.borrow().get(&key) {
-            if infer_only || *checked {
-                crate::stats::infer_hit();
-                return Ok(t.clone());
+        // `FORCE_EAGER_DEFEQ` ("eager rescue", see `with_forced_eager_defeq`):
+        // a sub-expression's cached type here may have been computed while
+        // one of *its own* App-argument checks (line ~1693's `is_def_eq`)
+        // re-dispatched into NbE, which can reject where eager alone
+        // wouldn't (the same over-reduction `app_arg_type_ok_eager`'s own
+        // comment describes). A rescue must not reuse — or pollute — that
+        // entry; it needs its own, fully-eager-end-to-end recomputation.
+        let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
+        if !force_eager {
+            if let Some((t, checked)) = self.infer_cache.borrow().get(&key) {
+                if infer_only || *checked {
+                    crate::stats::infer_hit();
+                    return Ok(t.clone());
+                }
             }
         }
         let t = self.infer_type_uncached(ctx, e)?;
         let checked = !self.infer_only.get();
-        {
+        if !force_eager {
             let mut cache = self.infer_cache.borrow_mut();
             match cache.get_mut(&key) {
                 Some((old, was_checked)) if checked && !*was_checked => {
@@ -2450,8 +2492,16 @@ impl<'e> Checker<'e> {
             }
         }
         let k = Self::whnf_cache_key(ctx, e);
-        if let Some(r) = self.whnf_cache.borrow().get(&k) {
-            return Ok(r.clone());
+        // See `is_def_eq_inner`'s `force_eager` comment: `whnf_core` → iota
+        // → `mk_rec_call` calls the *dispatching* `is_def_eq`, so a WHNF
+        // computed while NOT forced-eager can differ from one computed
+        // while forced-eager. Don't read or write this cache across that
+        // boundary.
+        let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
+        if !force_eager {
+            if let Some(r) = self.whnf_cache.borrow().get(&k) {
+                return Ok(r.clone());
+            }
         }
         let mut cur = e.clone();
         let r = loop {
@@ -2486,7 +2536,9 @@ impl<'e> Checker<'e> {
             }
             return Ok(r);
         }
-        self.whnf_cache.borrow_mut().insert(k, r.clone());
+        if !force_eager {
+            self.whnf_cache.borrow_mut().insert(k, r.clone());
+        }
         Ok(r)
     }
 
@@ -2720,14 +2772,20 @@ impl<'e> Checker<'e> {
             return Ok(e);
         }
         let k = Self::whnf_cache_key(ctx, &e);
-        if let Some(r) = self.whnf_core_cache.borrow().get(&k) {
-            CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-            return Ok(r.clone());
+        // See `whnf`'s `force_eager` comment just above it.
+        let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
+        if !force_eager {
+            if let Some(r) = self.whnf_core_cache.borrow().get(&k) {
+                CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+                return Ok(r.clone());
+            }
         }
         let r = self.whnf_core_go(ctx, &e);
         CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         let r = r?;
-        self.whnf_core_cache.borrow_mut().insert(k, r.clone());
+        if !force_eager {
+            self.whnf_core_cache.borrow_mut().insert(k, r.clone());
+        }
         Ok(r)
     }
 
@@ -3262,12 +3320,24 @@ impl<'e> Checker<'e> {
             }
             return decline("defeq depth limit");
         }
-        let r = if nbe::nbe_enabled() {
+        let r = if nbe::nbe_enabled() && !FORCE_EAGER_DEFEQ.with(Cell::get) {
             self.is_def_eq_via_nbe(ctx, a, b)
         } else {
             self.is_def_eq_inner(ctx, a, b)
         };
         DEFEQ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        r
+    }
+
+    /// Run `f` with the whole recursive `is_def_eq` call tree forced onto
+    /// the eager path (see `FORCE_EAGER_DEFEQ`). Used only by
+    /// `app_arg_type_ok_eager`/`value_type_ok_eager` to make an "eager
+    /// rescue" attempt actually eager end to end, not just at its own
+    /// top-level call.
+    fn with_forced_eager_defeq<T>(&self, f: impl FnOnce() -> T) -> T {
+        let prev = FORCE_EAGER_DEFEQ.with(|c| c.replace(true));
+        let r = f();
+        FORCE_EAGER_DEFEQ.with(|c| c.set(prev));
         r
     }
 
@@ -3294,8 +3364,21 @@ impl<'e> Checker<'e> {
         // Closed pairs → 0. Open → k innermost binders (`pair_ctx_key`).
         let ctx_key = ctx.pair_ctx_key(a, b);
         let key = (ctx_key, min_k, max_k);
-        if let Some(&r) = self.defeq_cache.borrow().get(&key) {
-            return Ok(r);
+        // `FORCE_EAGER_DEFEQ` ("eager rescue", see `with_forced_eager_defeq`)
+        // must not read a cache entry that an earlier, *not* forced-eager
+        // call populated: `is_def_eq_via_nbe`'s own fallback can compute
+        // and cache `false` for a sub-pair that only looks unequal because
+        // `eval` over-reduced one side (see `app_arg_type_ok_eager`'s
+        // comment) — a rescue attempt reusing that stale entry would never
+        // get a chance to recompute it the eager way. Also skip writing
+        // the rescue's own result: nothing here is more "correct" than a
+        // normal computation, so don't let a rescue's answer for this
+        // exact pair silently poison ordinary (non-forced) lookups either.
+        let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
+        if !force_eager {
+            if let Some(&r) = self.defeq_cache.borrow().get(&key) {
+                return Ok(r);
+            }
         }
         // Proof irrelevance before app congruence. Typeclass instances are
         // proofs of a Prop (the class). Pairwise of `LawfulVecOperator.mk`
@@ -3303,11 +3386,15 @@ impl<'e> Checker<'e> {
         // class types instead. Acc `f 1 a` vs `f 1 (Acc.intro …)` is Bool,
         // so PI is false there and unreduced congruence still runs.
         if self.proofs_of_same_prop(ctx, a, b)? {
-            self.defeq_cache.borrow_mut().insert(key, true);
+            if !force_eager {
+                self.defeq_cache.borrow_mut().insert(key, true);
+            }
             return Ok(true);
         }
         if self.try_unreduced_const_congruence(ctx, a, b)? {
-            self.defeq_cache.borrow_mut().insert(key, true);
+            if !force_eager {
+                self.defeq_cache.borrow_mut().insert(key, true);
+            }
             return Ok(true);
         }
         let aw = self.whnf_for_defeq(ctx, a)?;
@@ -3346,15 +3433,18 @@ impl<'e> Checker<'e> {
         }
         if let (Ok(Some(x)), Ok(Some(y))) = (self.closed_int_value(ctx, &aw), self.closed_int_value(ctx, &bw)) {
             let r = x == y;
-            self.defeq_cache.borrow_mut().insert(key, r);
+            if !force_eager {
+                self.defeq_cache.borrow_mut().insert(key, r);
+            }
             return Ok(r);
         }
         let r = self.is_def_eq_core(ctx, &aw, &bw)?;
         // CONV_DEPTH / CORE_DEPTH abort as Decline, not Ok(false), so a stored
         // false is a completed answer. True-only left std `#18000` retrying the
         // same failing pair — 1e9 intern hits, intern size unchanged.
-        // Do not cache a result produced under a CORE_DEPTH stuck WHNF.
-        if !CORE_ABORTED.with(|a| a.get()) {
+        // Do not cache a result produced under a CORE_DEPTH stuck WHNF, or
+        // under a forced-eager rescue (see the cache-read comment above).
+        if !CORE_ABORTED.with(|a| a.get()) && !force_eager {
             self.defeq_cache.borrow_mut().insert(key, r);
         }
         Ok(r)
@@ -8446,6 +8536,75 @@ impl<'e> Checker<'e> {
         self.is_def_eq_inner(ctx, &got_q, &want_q)
     }
 
+    /// Last-resort fallback for an App argument-type check that
+    /// `types_compatible` couldn't confirm on the *evaluated* (`Value`)
+    /// forms. `eval` always fully reduces (unfolds every `Def` on the
+    /// spine, then tries iota) before anything gets compared, which can
+    /// turn `f x y` into a `Recursor`-headed spine — and
+    /// `try_unreduced_const_congruence` *deliberately* refuses to
+    /// proof-irrelevance-compare Recursor spines unreduced (its own
+    /// comment: "Recursor spines … must WHNF/δ/ι first"), while it
+    /// happily does so for an ordinary `Def` like `f` itself. So a check
+    /// that would succeed at the `f x y` level via proof irrelevance on a
+    /// `Prop`-typed argument, without ever needing to unfold `f`, can
+    /// still fail once `eval` has already unfolded `f` for us and only
+    /// one side's `Recursor` major happened to reduce further than the
+    /// other's (e.g. one side's major is a bound variable, the other a
+    /// theorem that unfolds to a constructor).
+    ///
+    /// Eager `infer_type`/`ensure_pi` never proactively reduces (it only
+    /// substitutes), so re-deriving both types the eager way and
+    /// comparing them with `is_def_eq_inner` (never `is_def_eq`, which
+    /// would re-dispatch into this same NbE path) reproduces exactly the
+    /// comparison eager itself would have made, at the same
+    /// (un-reduced) level. Only ever used to *rescue* a decline into an
+    /// accept that matches eager's own judgment; any error or eager
+    /// mismatch here still rejects.
+    fn app_arg_type_ok_eager(&self, ctx: &Ctx, f: &Expr, a: &Expr) -> R<bool> {
+        // The whole rescue — including re-deriving `f`'s and `a`'s types,
+        // not just the final comparison — must stay eager: `infer_type_cached`
+        // itself calls the *dispatching* `is_def_eq` for its own App-argument
+        // checks (inside `f`'s or `a`'s own structure), which would otherwise
+        // re-enter NbE (and risk the exact over-reduction this rescue exists
+        // to route around) before this function's own comparison ever runs.
+        self.with_forced_eager_defeq(|| {
+            let ft = match self.infer_type_cached(ctx, f) {
+                Ok(t) => t,
+                Err(_) => return Ok(false),
+            };
+            let dom = match self.ensure_pi(ctx, &ft) {
+                Ok((_, dom, _)) => dom,
+                Err(_) => return Ok(false),
+            };
+            let at = match self.infer_type_cached(ctx, a) {
+                Ok(t) => t,
+                Err(_) => return Ok(false),
+            };
+            self.is_def_eq_inner(ctx, &at, &dom)
+        })
+    }
+
+    /// `check_decl`'s counterpart to `app_arg_type_ok_eager`: when `vt`
+    /// (`infer_type`'s, possibly Value-native, answer for the whole
+    /// declaration value) doesn't convert with the declared `typ` under
+    /// `is_def_eq` (which itself may re-dispatch into NbE and re-reduce
+    /// both sides), re-derive the value's type the fully eager way —
+    /// `infer_type_cached` never proactively reduces — and compare that
+    /// against `typ` with `is_def_eq_inner` directly (never `is_def_eq`,
+    /// to avoid re-dispatching into the same NbE path). Only ever rescues
+    /// a decline into an accept that matches eager's own judgment.
+    fn value_type_ok_eager(&self, ctx: &Ctx, value: &Expr, typ: &Expr) -> R<bool> {
+        // See `app_arg_type_ok_eager`'s comment: re-deriving `value`'s type
+        // must also stay eager end to end, not just the final comparison.
+        self.with_forced_eager_defeq(|| {
+            let eager_vt = match self.infer_type_cached(ctx, value) {
+                Ok(t) => t,
+                Err(_) => return Ok(false),
+            };
+            self.is_def_eq_inner(ctx, &eager_vt, typ)
+        })
+    }
+
     pub(crate) fn infer_type_value(
         &self,
         ctx: &Ctx,
@@ -8487,14 +8646,19 @@ impl<'e> Checker<'e> {
                 // skips it, matching the eager App case exactly.
                 if !self.infer_only.get() {
                     let at = self.infer_type_value(ctx, tys, env, a)?;
-                    if !self.types_compatible(ctx, depth, &at, &dom_v)? {
+                    if !self.types_compatible(ctx, depth, &at, &dom_v)? && !self.app_arg_type_ok_eager(ctx, f, a)? {
                         if std::env::var_os("KIOTA_DEBUG").is_some() {
                             let at_q = self.quote(depth, &at).unwrap_or_else(|_| a.clone());
                             let dom_q = self.quote(depth, &dom_v).unwrap_or_else(|_| a.clone());
+                            let eager_at = self
+                                .infer_type_cached(ctx, a)
+                                .map(|t| self.pp(&t))
+                                .unwrap_or_else(|e| format!("<eager infer failed: {e:?}>"));
                             return reject(format!(
-                                "application argument type mismatch (nbe)\n  got:      {}\n  expected: {}\n  fun:      {}\n  arg:      {}",
+                                "application argument type mismatch (nbe)\n  got:      {}\n  expected: {}\n  eager_at: {}\n  fun:      {}\n  arg:      {}",
                                 self.pp(&at_q),
                                 self.pp(&dom_q),
+                                eager_at,
                                 self.pp(f),
                                 self.pp(a),
                             ));
@@ -11405,4 +11569,50 @@ mod tests {
             tc.pp(&tc.quote(1, &v).unwrap())
         );
     }
+
+    // ---------------- NbE spike, Day 7 continued: the eager-rescue wiring bug ----------------
+    //
+    // The two Acc-shape export fixtures still rejected with `infer_type`
+    // wired even after `try_iota_value` grew the indexed/higher-order
+    // rule: eager's own comparison never re-derives an `Acc.rec`-headed
+    // type at all — it succeeds by comparing an *unreduced* wrapper
+    // application (`f 1 h` vs `f 1 (Acc.intro …)`) via proof irrelevance
+    // on the wrapper's own Prop-typed parameter, never even unfolding the
+    // wrapper. `infer_type_value`'s `App` case, by contrast, always calls
+    // `eval` (which always fully reduces, unfolding the wrapper and then
+    // iota-reducing its `Acc.rec`), so the value-native path can see an
+    // asymmetric "peel" (one side's major stayed a bound variable, the
+    // other's — theorem-wrapped or not — was already a literal
+    // constructor) that never arises for eager because eager never
+    // reduces that far. `app_arg_type_ok_eager`/`value_type_ok_eager`
+    // exist to re-run that exact eager comparison as a rescue, but the
+    // rescue itself had two more bugs before it actually stayed eager
+    // end to end (both now covered by `alg_conv_trans_acc_left_accepts`/
+    // `subject_reduction_redex_accepts` in `tests/exports.rs`, which
+    // reject without either fix and accept with both — that pair of real,
+    // Lean-exported fixtures is the regression test for this section; a
+    // synthetic in-crate repro needs a fully Pi-typed stand-in recursor,
+    // which the existing `insert_mini_acc` test fixture deliberately
+    // isn't, to actually exercise the recursive dispatch path below):
+    //
+    // 1. `pub fn is_def_eq`'s `FORCE_EAGER_DEFEQ` gate stayed eager for
+    //    its own top-level call, but `is_def_eq_core_go`'s own recursion
+    //    (Pi/Lam bodies) calls the *dispatching* `is_def_eq`, not
+    //    `is_def_eq_inner` — so a rescue's comparison re-entered NbE (and
+    //    could re-hit the same over-reduction) as soon as it recursed
+    //    past the outermost node. Fixed by making `FORCE_EAGER_DEFEQ`
+    //    thread through `pub fn is_def_eq`'s own dispatch, not just the
+    //    rescue's initial call.
+    // 2. `pub fn infer_type`'s dispatch checked only `nbe::nbe_enabled()`,
+    //    never `FORCE_EAGER_DEFEQ` at all — so `infer_type_uncached`'s
+    //    own recursive calls (App's `f`/`a`, Lam's body, …), which go
+    //    through the *dispatching* `infer_type`, kept re-entering
+    //    `infer_type_via_nbe` for every sub-expression even while a
+    //    rescue's outermost call used `infer_type_cached` directly. This
+    //    was the one that actually mattered for both fixtures.
+    //
+    // Both `defeq_cache`/`infer_cache`/`whnf_cache`/`whnf_core_cache` also
+    // skip reading and writing while `FORCE_EAGER_DEFEQ` is set, so a
+    // rescue can't read a stale entry a non-forced call populated (or
+    // vice versa) for the same `(ctx, expr)` key.
 }
