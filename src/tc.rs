@@ -1769,7 +1769,7 @@ impl<'e> Checker<'e> {
             // projection of data out of a proof would already violate proof
             // irrelevance.  `body` is under the current field binder, so bvar
             // 0 records exactly that dependency.
-            if self.is_prop(ctx, &vtw)?
+            if self.is_prop_determinate(ctx, &vtw)?
                 && Self::occurs_bvar(&body, 0)
                 && !self.is_prop(ctx, &prior_dom)?
             {
@@ -1779,7 +1779,7 @@ impl<'e> Checker<'e> {
             ct2 = expr::instantiate1(&body, &proj_i);
         }
         let (_, dom, _body) = self.ensure_pi(ctx, &ct2)?;
-        if self.is_prop(ctx, &vtw)? {
+        if self.is_prop_determinate(ctx, &vtw)? {
             if !self.is_prop(ctx, &dom)? {
                 return reject("cannot project a Type field from a Prop structure");
             }
@@ -2197,6 +2197,20 @@ impl<'e> Checker<'e> {
     /// not identify `True` with `False`. Prop inductives, axioms `P : Prop`,
     /// and Pis into those count. Reads the constant's telescope, not `infer_type`
     /// of `ty` (that re-entered Check of huge type spines from PI).
+    /// `is_prop`, but "cannot decide" is an error rather than `false`.
+    ///
+    /// `is_prop` routes a Reject/Other through `decline_or_false`, yielding
+    /// `Ok(false)`. That is safe wherever a `true` answer merely *enables* a
+    /// shortcut (proof irrelevance, ι skips). At a **restrictive** gate the
+    /// polarity flips: a spurious `false` switches the restriction off. For
+    /// projections that would admit data out of a proof, so decline instead
+    /// of guessing.
+    fn is_prop_determinate(&self, ctx: &Ctx, ty: &Expr) -> R<bool> {
+        // Unlike `is_prop`, this propagates instead of swallowing.
+        let w = self.whnf(ctx, ty)?;
+        self.is_prop(ctx, &w)
+    }
+
     fn is_prop(&self, ctx: &Ctx, ty: &Expr) -> R<bool> {
         let w = match self.whnf(ctx, ty) {
             Ok(w) => w,
