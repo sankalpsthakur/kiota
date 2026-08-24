@@ -8216,6 +8216,316 @@ impl<'e> Checker<'e> {
             _ => Ok(false),
         }
     }
+
+    // ---------------- NbE spike, Day 4: infer_type on Values ----------------
+    //
+    // `pub fn infer_type` (the one every other part of the checker calls)
+    // is untouched: it still always returns `Expr`, exactly as before, so
+    // `check_decl`'s actual type-checking path has zero behavior change
+    // from anything in this section. `infer_type_value` is a new,
+    // additional, separately-tested entry point returning a `Value`
+    // instead, exercised directly by the tests below (and available for a
+    // future caller), not wired into the production dispatch.
+    //
+    // Rationale for not swapping the production dispatch: `infer_type` is
+    // the soundness boundary for every application in the checker (it's
+    // what verifies an argument's type matches a Pi's domain). Threading a
+    // second, less-tested implementation through every one of its many
+    // call sites this same pass, under a squeezed timeline, is a
+    // meaningfully different risk profile than accelerating `is_def_eq`
+    // (which only ever *shortcuts an accept it would reach anyway*).
+    // `infer_type_value` mitigates that by construction: any type
+    // *inferred* here that needs a *decisive* compatibility check (an
+    // application argument, a let value) is verified via the existing,
+    // proven `is_def_eq` on quoted forms, not by trusting a second,
+    // independent equality routine's `false`. On anything it does not
+    // model, it defers entirely to the eager `infer_type` and `eval`s the
+    // (quoted) result back into a Value — a `Value -> Expr -> Value`
+    // round trip only at those specific fallback points, which is real
+    // quoting outside "declaration boundaries" and is reported as such
+    // rather than glossed over.
+
+    /// Parallel to `Ctx`, but for Value-space inference: `tys[i]` is the
+    /// *type*, as a `Value`, of the variable at level `i`; `env` is the
+    /// matching value environment (same depth, in lockstep).
+    fn vctx_new() -> (Vec<Rc<nbe::Value>>, nbe::VEnv) {
+        (Vec::new(), nbe::empty_env())
+    }
+
+    /// Push a fresh (unknown-value) binder of type `ty`, as `infer_type`
+    /// does for `Lam`/`Pi`/binder-introducing forms.
+    fn vctx_push(tys: &[Rc<nbe::Value>], env: &nbe::VEnv, ty: Rc<nbe::Value>) -> (Vec<Rc<nbe::Value>>, nbe::VEnv) {
+        let level = env.len() as u32;
+        let mut tys2 = tys.to_vec();
+        tys2.push(ty);
+        let mut env2 = (**env).clone();
+        env2.push(nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(nbe::Neutral::Var(level)))));
+        (tys2, Rc::new(env2))
+    }
+
+    /// Push a *known* (`let`) binder: same type-tracking as `vctx_push`,
+    /// but the value environment gets the real (possibly still deferred)
+    /// value rather than a fresh neutral, so referencing it later zeta-
+    /// reduces for free — no explicit substitution step needed.
+    fn vctx_push_let(
+        tys: &[Rc<nbe::Value>],
+        env: &nbe::VEnv,
+        ty: Rc<nbe::Value>,
+        val: Rc<nbe::Thunk>,
+    ) -> (Vec<Rc<nbe::Value>>, nbe::VEnv) {
+        let mut tys2 = tys.to_vec();
+        tys2.push(ty);
+        let mut env2 = (**env).clone();
+        env2.push(val);
+        (tys2, Rc::new(env2))
+    }
+
+    /// Reconstruct an eager `Ctx` matching `tys`/`env`'s depth, for the
+    /// fallback points that need to hand a term to the proven eager
+    /// `is_def_eq`/`infer_type`/`is_prop`. Quotes each tracked type once,
+    /// at the depth it was introduced — bounded by binder depth, not by
+    /// any numeral a term happens to contain.
+    fn vctx_to_ctx(&self, tys: &[Rc<nbe::Value>]) -> R<Ctx> {
+        let mut ctx = Ctx::new();
+        for (i, ty) in tys.iter().enumerate() {
+            let q = self.quote(i as u32, ty)?;
+            ctx.push(q);
+        }
+        Ok(ctx)
+    }
+
+    fn infer_type_value_fallback(
+        &self,
+        tys: &[Rc<nbe::Value>],
+        env: &nbe::VEnv,
+        e: &Expr,
+    ) -> R<Rc<nbe::Value>> {
+        let actx = self.vctx_to_ctx(tys)?;
+        let t = self.infer_type(&actx, e)?;
+        self.eval(env, &t)
+    }
+
+    /// Definitive type-compatibility check: try the fast Value-native
+    /// comparison first (sound whenever it confirms `true`, per
+    /// `values_def_eq`'s contract), and only when it doesn't, fall back to
+    /// the existing `is_def_eq` on quoted forms for a decisive answer —
+    /// mirroring `is_def_eq_via_nbe`'s own accelerate-or-defer discipline,
+    /// so an incompleteness in the Value-native path can only cost a
+    /// quote/requote, never a wrong verdict.
+    fn types_compatible(
+        &self,
+        tys: &[Rc<nbe::Value>],
+        depth: u32,
+        got: &Rc<nbe::Value>,
+        want: &Rc<nbe::Value>,
+    ) -> R<bool> {
+        if self.values_def_eq(depth, got, want)? {
+            return Ok(true);
+        }
+        let actx = self.vctx_to_ctx(tys)?;
+        let got_q = self.quote(depth, got)?;
+        let want_q = self.quote(depth, want)?;
+        self.is_def_eq(&actx, &got_q, &want_q)
+    }
+
+    pub(crate) fn infer_type_value(
+        &self,
+        tys: &[Rc<nbe::Value>],
+        env: &nbe::VEnv,
+        e: &Expr,
+    ) -> R<Rc<nbe::Value>> {
+        let depth = env.len() as u32;
+        match &***e {
+            ExprData::BVar(i) => {
+                let idx = tys
+                    .len()
+                    .checked_sub(1 + *i as usize)
+                    .ok_or_else(|| TcError::Other("nbe infer: bvar out of range".into()))?;
+                Ok(tys[idx].clone())
+            }
+            ExprData::Sort(l) => Ok(Rc::new(nbe::Value::Sort(level::succ(l.clone())))),
+            ExprData::Const(n, us) => {
+                let t = self.infer_const(*n, us)?;
+                self.eval(&nbe::empty_env(), &t)
+            }
+            ExprData::Lit(Lit::Nat(_)) => {
+                let t = self.nat_type()?;
+                self.eval(&nbe::empty_env(), &t)
+            }
+            ExprData::Lit(Lit::Str(_)) => {
+                let t = self.string_type()?;
+                self.eval(&nbe::empty_env(), &t)
+            }
+            ExprData::App(f, a) => {
+                let ft = self.infer_type_value(tys, env, f)?;
+                let (dom, env_pi, body_pi) = match &*ft {
+                    nbe::Value::Pi(_, dom, pi_env, body) => (dom.clone(), pi_env.clone(), body.clone()),
+                    _ => return self.infer_type_value_fallback(tys, env, e),
+                };
+                let at = self.infer_type_value(tys, env, a)?;
+                let dom_v = dom.force(self)?;
+                if !self.types_compatible(tys, depth, &at, &dom_v)? {
+                    return reject("application argument type mismatch (nbe)");
+                }
+                let av = self.eval(env, a)?;
+                let mut env2 = (*env_pi).clone();
+                env2.push(nbe::Thunk::forced(av));
+                self.eval(&Rc::new(env2), &body_pi)
+            }
+            ExprData::Lam(bi, ty, body) => {
+                let tt = self.infer_type_value(tys, env, ty)?;
+                if !matches!(&*tt, nbe::Value::Sort(_)) {
+                    return self.infer_type_value_fallback(tys, env, e);
+                }
+                let dom_v = self.eval(env, ty)?;
+                let (tys2, env2) = Checker::vctx_push(tys, env, dom_v.clone());
+                let bt = self.infer_type_value(&tys2, &env2, body)?;
+                let bt_q = self.quote(depth + 1, &bt)?;
+                Ok(Rc::new(nbe::Value::Pi(
+                    *bi,
+                    nbe::Thunk::forced(dom_v),
+                    env.clone(),
+                    bt_q,
+                )))
+            }
+            ExprData::Pi(_bi, ty, body) => {
+                let tt = self.infer_type_value(tys, env, ty)?;
+                let l1 = match &*tt {
+                    nbe::Value::Sort(l) => l.clone(),
+                    _ => return self.infer_type_value_fallback(tys, env, e),
+                };
+                let dom_v = self.eval(env, ty)?;
+                let (tys2, env2) = Checker::vctx_push(tys, env, dom_v);
+                let bs = self.infer_type_value(&tys2, &env2, body)?;
+                let l2 = match &*bs {
+                    nbe::Value::Sort(l) => l.clone(),
+                    _ => return self.infer_type_value_fallback(tys, env, e),
+                };
+                Ok(Rc::new(nbe::Value::Sort(level::imax(l1, l2))))
+            }
+            ExprData::Let(ty, val, body) => {
+                let tt = self.infer_type_value(tys, env, ty)?;
+                if !matches!(&*tt, nbe::Value::Sort(_)) {
+                    return self.infer_type_value_fallback(tys, env, e);
+                }
+                let dom_v = self.eval(env, ty)?;
+                let vt = self.infer_type_value(tys, env, val)?;
+                if !self.types_compatible(tys, depth, &vt, &dom_v)? {
+                    return reject("let value type mismatch (nbe)");
+                }
+                let (tys2, env2) =
+                    Self::vctx_push_let(tys, env, dom_v, nbe::Thunk::deferred(env.clone(), val.clone()));
+                self.infer_type_value(&tys2, &env2, body)
+            }
+            ExprData::Proj(sname, idx, v) => self.infer_proj_value(tys, env, *sname, *idx, v),
+        }
+    }
+
+    /// Value-space counterpart of `infer_proj`: walks the constructor's
+    /// declared Pi telescope directly (as `Expr`, since it's a fixed,
+    /// closed declaration, not something evaluation ever grows), building
+    /// up a `VEnv` of the inductive's own params followed by
+    /// `proj(sname, i, v)` for each field before `idx` — so the target
+    /// field's domain, `eval`'d against that env, comes out already
+    /// substituted, no `instantiate1` needed.
+    fn infer_proj_value(
+        &self,
+        tys: &[Rc<nbe::Value>],
+        env: &nbe::VEnv,
+        sname: u32,
+        idx: u32,
+        v: &Expr,
+    ) -> R<Rc<nbe::Value>> {
+        let fallback = |tc: &Self| tc.infer_type_value_fallback_proj(tys, env, sname, idx, v);
+        let vt = self.infer_type_value(tys, env, v)?;
+        let nv = match &*vt {
+            nbe::Value::Neutral(nv) => nv,
+            _ => return fallback(self),
+        };
+        let (chead, targs) = Self::unwind_neutral(nv);
+        let (ind_name, us) = match chead {
+            nbe::Neutral::Const(n, us) => (*n, us.clone()),
+            _ => return fallback(self),
+        };
+        if ind_name != sname {
+            return fallback(self);
+        }
+        let (num_params, ctor_name) = match self.env.get(ind_name) {
+            Some(ConstantInfo::InductiveType {
+                num_params, ctors, ..
+            }) if ctors.len() == 1 => (*num_params, ctors[0]),
+            _ => return fallback(self),
+        };
+        let (ctor_lp, ctor_typ, num_fields) = match self.env.get(ctor_name) {
+            Some(ConstantInfo::Constructor {
+                level_params,
+                typ,
+                num_fields,
+                ..
+            }) => (level_params.clone(), typ.clone(), *num_fields),
+            _ => return fallback(self),
+        };
+        if idx >= num_fields {
+            return reject("projection index out of range (nbe)");
+        }
+        if (targs.len() as u32) < num_params {
+            return fallback(self);
+        }
+        let subst = level::subst_map(&ctor_lp, &us);
+        let mut cur = expr::instantiate_level_params(&ctor_typ, &subst);
+        let mut fenv: nbe::VEnv = nbe::empty_env();
+        for a in targs.iter().take(num_params as usize) {
+            let body = match &**cur {
+                ExprData::Pi(_, _, body) => body.clone(),
+                _ => return fallback(self),
+            };
+            let pv = a.force(self)?;
+            let mut fenv2 = (*fenv).clone();
+            fenv2.push(nbe::Thunk::forced(pv));
+            fenv = Rc::new(fenv2);
+            cur = body;
+        }
+        let v_value = self.eval(env, v)?;
+        for i in 0..idx {
+            let body = match &**cur {
+                ExprData::Pi(_, _, body) => body.clone(),
+                _ => return fallback(self),
+            };
+            let proj_i = self.eval_proj(sname, i, v_value.clone())?;
+            let mut fenv2 = (*fenv).clone();
+            fenv2.push(nbe::Thunk::forced(proj_i));
+            fenv = Rc::new(fenv2);
+            cur = body;
+        }
+        let dom = match &**cur {
+            ExprData::Pi(_, dom, _) => dom.clone(),
+            _ => return fallback(self),
+        };
+        let result = self.eval(&fenv, &dom)?;
+        let depth = env.len() as u32;
+        let actx = self.vctx_to_ctx(tys)?;
+        let vt_q = self.quote(depth, &vt)?;
+        if self.is_prop(&actx, &vt_q)? {
+            let dom_q = self.quote(depth, &result)?;
+            if !self.is_prop(&actx, &dom_q)? {
+                return reject("cannot project a Type field from a Prop structure (nbe)");
+            }
+        }
+        Ok(result)
+    }
+
+    fn infer_type_value_fallback_proj(
+        &self,
+        tys: &[Rc<nbe::Value>],
+        env: &nbe::VEnv,
+        sname: u32,
+        idx: u32,
+        v: &Expr,
+    ) -> R<Rc<nbe::Value>> {
+        let actx = self.vctx_to_ctx(tys)?;
+        let t = self.infer_proj(&actx, sname, idx, v)?;
+        self.eval(env, &t)
+    }
 }
 
 #[cfg(test)]
@@ -10635,5 +10945,115 @@ mod tests {
             "with the memo off, the overlap is still free — that's whnf_cache/defeq_cache \
              (ctx, ptr) sharing the interned intermediate terms, not iota_lit_memo"
         );
+    }
+
+    // ---------------- NbE spike, Day 4: infer_type_value vs eager ----------------
+
+    /// `A : Type`, `a : A`, `id := fun (_:A) => A` (so `App`'s codomain
+    /// exercises the beta step), `f := fun (x:A) => let (_:A) := a; x`.
+    /// Runs `infer_type_value` on `f`'s *body* — a `Lam` nested inside a
+    /// `Let` — and checks the quoted result agrees with eager `infer_type`
+    /// on the same term, at the same context depth.
+    #[test]
+    fn infer_type_value_matches_eager_on_lam_pi_app_let() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1,
+                is_unsafe: false,
+            },
+        );
+        let a_ty = expr::const_(0, vec![]);
+        env.insert(
+            1,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: a_ty.clone(),
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["A", "a"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let a_val = expr::const_(1, vec![]);
+
+        // `fun (x:A) => let (_:A) := a; x` : `A -> A`.
+        let inner_let = expr::let_(a_ty.clone(), a_val.clone(), expr::bvar(1));
+        let f = expr::lam(expr::BinderInfo::Default, a_ty.clone(), inner_let);
+
+        let (tys, venv) = Checker::vctx_new();
+        let ft_v = tc.infer_type_value(&tys, &venv, &f).unwrap();
+        let ft_q = tc.quote(0, &ft_v).unwrap();
+        let ctx = Ctx::new();
+        let ft_eager = tc.infer_type(&ctx, &f).unwrap();
+        assert!(
+            tc.is_def_eq(&ctx, &ft_q, &ft_eager).unwrap(),
+            "infer_type_value(f) = {} must eager-convert to infer_type(f) = {}",
+            tc.pp(&ft_q),
+            tc.pp(&ft_eager)
+        );
+        // `f`'s type must actually be `A -> A` (Pi, not stuck).
+        assert!(matches!(&*ft_v, nbe::Value::Pi(..)));
+
+        // Applying `f` to `a` must type-check (App's argument-type path)
+        // and infer `A`.
+        let app = expr::app(f, a_val);
+        let at_v = tc.infer_type_value(&tys, &venv, &app).unwrap();
+        let at_q = tc.quote(0, &at_v).unwrap();
+        assert!(
+            tc.is_def_eq(&ctx, &at_q, &a_ty).unwrap(),
+            "infer_type_value(f a) must be A, got {}",
+            tc.pp(&at_q)
+        );
+
+        // Ill-typed application (wrong argument type) must reject, not
+        // silently accept: `f` applied to `A` itself (a `Sort`, not an
+        // `A`) is not well-typed.
+        let bad_app = expr::app(
+            expr::lam(expr::BinderInfo::Default, a_ty.clone(), expr::bvar(0)),
+            a_ty,
+        );
+        assert!(tc.infer_type_value(&tys, &venv, &bad_app).is_err());
+    }
+
+    /// `PSigma.rec α β motive minor (mk α β x y)`'s projection form:
+    /// `infer_type_value` of `proj 0 0 #0` (first field of a bound
+    /// `PSigma A B`) must agree with eager `infer_proj`.
+    #[test]
+    fn infer_type_value_matches_eager_on_proj() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_psigma(&mut env);
+        let names = test_names(&["PSigma", "PSigma.mk", "PSigma.rec", "A", "B"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let a = expr::const_(3, vec![]);
+        let b = expr::const_(4, vec![]);
+        let psigma_ab = expr::apps(expr::const_(0, vec![]), &[a.clone(), b]);
+
+        let (tys0, venv0) = Checker::vctx_new();
+        let psigma_ty_v = tc.infer_type_value(&tys0, &venv0, &psigma_ab).unwrap();
+        // `Sort 1`, so the binder we push below matches the eager `ensure_sort`
+        // path that would've been used to introduce this same bvar.
+        assert!(matches!(&*psigma_ty_v, nbe::Value::Sort(_)));
+        let psigma_ty_val = tc.eval(&venv0, &psigma_ab).unwrap();
+        let (tys, venv) = Checker::vctx_push(&tys0, &venv0, psigma_ty_val);
+
+        let proj0 = expr::proj(0, 0, expr::bvar(0));
+        let t_v = tc.infer_type_value(&tys, &venv, &proj0).unwrap();
+        let t_q = tc.quote(1, &t_v).unwrap();
+
+        let mut ctx = Ctx::new();
+        ctx.push(psigma_ab);
+        let t_eager = tc.infer_proj(&ctx, 0, 0, &expr::bvar(0)).unwrap();
+        assert!(
+            tc.is_def_eq(&ctx, &t_q, &t_eager).unwrap(),
+            "infer_type_value(proj 0 0 #0) = {} must eager-convert to infer_proj = {}",
+            tc.pp(&t_q),
+            tc.pp(&t_eager)
+        );
+        assert!(Rc::ptr_eq(&t_q, &a), "first field of PSigma A B must infer to A, got {}", tc.pp(&t_q));
     }
 }

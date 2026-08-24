@@ -62,7 +62,7 @@ pub fn report() {
     }
     let g = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|x| x.get());
     eprintln!(
-        "STATS infer={} infer_hit={} whnf={} defeq={} inst_nodes={} shift_nodes={} ctx_clones={}",
+        "STATS infer={} infer_hit={} whnf={} defeq={} inst_nodes={} shift_nodes={} ctx_clones={} intern_calls={} live_nodes={}",
         g(&INFER_CALLS),
         g(&INFER_HITS),
         g(&WHNF_CALLS),
@@ -70,6 +70,8 @@ pub fn report() {
         g(&INST_NODES),
         g(&SHIFT_NODES),
         g(&CTX_CLONES),
+        crate::expr::intern_calls(),
+        crate::expr::intern_node_count(),
     );
 }
 
