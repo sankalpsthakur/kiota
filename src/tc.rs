@@ -2658,6 +2658,22 @@ impl<'e> Checker<'e> {
 
     /// Acc-shape: Prop inductive, recursive, one constructor. Theorem
     /// wrappers of the major (`_proof_2 := Acc.intro`) must unfold before iota.
+    ///
+    /// Day 9: `try_iota_value` (Day 7) now also drives this same gate
+    /// (both eager `whnf_major` and the Value-space bridge call it), and
+    /// its own ctor/iota handling is no longer restricted to Acc's exact
+    /// shape (indexed + higher-order recursion both work generically now).
+    /// So: is the `ctors.len() == 1` restriction *here* still needed, or
+    /// is it now redundant? Tried dropping it (any recursive Prop
+    /// inductive, any constructor count) and ran the full suite both
+    /// flags plus a callgrind comparison on the three Acc-shape export
+    /// fixtures: no regression, but also no newly-passing test and no
+    /// measurable instruction-count change — nothing in this repo has a
+    /// multi-constructor Prop-recursive inductive whose theorem-wrapped
+    /// major needs this to unfold. Widening a soundness-adjacent
+    /// unfold-and-retry rule with zero evidence of need is exactly the
+    /// kind of speculative lift this pass was told not to do. Reverted;
+    /// not lifted.
     fn recursor_unfolds_thm_major(&self, recursor: u32) -> bool {
         let Some(ConstantInfo::Recursor { all, .. }) = self.env.get(recursor) else {
             return false;
@@ -3041,6 +3057,16 @@ impl<'e> Checker<'e> {
     /// Same-head delta only helps unused parameters (`Function.const`).
     /// Instantiating a huge same-head body to discover that is wasted work.
     fn delta_body_is_small(&self, n: u32) -> bool {
+        // Day 9: checked whether infer/iota now living on the Value path
+        // (plus the `app_arg_type_ok_eager`/`value_type_ok_eager` rescue)
+        // made this cap redundant. Raised it to 1_000_000 and ran the full
+        // suite both flags: `large_regular_def_unfolds_in_whnf` fails
+        // (flag-independent — it directly pins `!delta_body_is_small(2)`
+        // for a ~large body at the *current* 512 boundary), everything
+        // else stays green. That's a test explicitly asserting today's
+        // threshold, not a case this cap wrongly declines/misses; no test
+        // exercises a body that *needs* a higher cap to succeed. Reverted;
+        // not lifted.
         const CAP: u32 = 512;
         self.def_body_under(n, CAP)
     }
@@ -3243,6 +3269,21 @@ impl<'e> Checker<'e> {
         // rule-ctor identity + specialization-order rec_group, not a size
         // band. Lazy delta (`is_delta_reducible`) still unfolds theorems
         // that pass the small-body cut.
+        //
+        // Day 9: this is used unconditionally by `eval_const` too (not
+        // just eager `whnf`), so "does NbE's own reduction make eagerly
+        // unfolding small theorems here safe now?" was worth asking.
+        // Tried widening to `Some(ConstantInfo::Theorem { .. }) =>
+        // self.delta_body_is_small(n)` and ran the full suite both flags:
+        // 77 lib + 35 export tests stayed green, and a real-fixture
+        // callgrind Ir comparison (`bench.sh` on
+        // `alg-conv-trans-acc-right.accept.ndjson`) was unchanged within
+        // noise (<1%). No test in this repo exercises the boundary either
+        // way — this only says the change is inert on what's here, not
+        // that it's safe against the large real Regular/theorem bodies
+        // the existing comments and `large_regular_def_unfolds_in_whnf`
+        // are calibrated against, which this sandbox has no access to.
+        // Reverted; no proving test, so not lifted.
         match self.env.get(n) {
             Some(ConstantInfo::Def {
                 hints: ReducibilityHints::Opaque,
@@ -7700,6 +7741,19 @@ impl<'e> Checker<'e> {
     /// is checked on the specialized constructors. Export form still has
     /// `F Ds`, so instantiate F's constructors at `Ds` and require those
     /// fields to be strictly positive in `bound`.
+    ///
+    /// Day 9: checked whether this repo has a "nested positivity depth
+    /// 16"-style cap that could now be replaced with a functor-identity
+    /// cycle check. It doesn't — there's no depth counter anywhere in the
+    /// positivity checker (`check_positivity`/`check_arg_positive_in`/
+    /// `check_specialized_ctor_positive` all take no depth parameter).
+    /// The only bound on nested-functor recursion is `visiting` below:
+    /// exact `(name, params)` identity, via `params_defeq`, which *is*
+    /// already the functor-identity check the candidate asked for, not a
+    /// raw depth cap standing in for one. Nothing to lift here; this is
+    /// inductive-declaration checking (`check_inductive_group`), not
+    /// `is_def_eq`/`infer_type`, so it was out of this pass's scope
+    /// either way.
     fn check_nested_functor(
         &self,
         ctx: &Ctx,
