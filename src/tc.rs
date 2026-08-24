@@ -30,6 +30,32 @@ thread_local! {
     /// `is_def_eq_inner`. This flag makes the whole recursive subtree of
     /// one fallback attempt stay eager, not just its first call.
     static FORCE_EAGER_DEFEQ: Cell<bool> = const { Cell::new(false) };
+    /// Set for the duration of `infer_type_via_nbe`'s own call tree (see
+    /// `infer_type`). Eager never proactively reduces a Prop-major
+    /// recursor application it doesn't have to: comparing `f 1 h` vs
+    /// `f 1 (Acc.intro …)` succeeds via proof irrelevance on `f`'s own
+    /// Prop-typed parameter *without ever unfolding `f`* (see
+    /// `try_unreduced_const_congruence`'s comment). `eval` has no such
+    /// laziness — it always fully reduces, so `infer_type_value`
+    /// evaluating two different Lambda's domains this way can see one
+    /// side's `Acc.rec` iota-reduce (major already a literal/theorem-
+    /// unfolds-to-a constructor) while the other's stays opaque, landing
+    /// on genuinely different normal forms (`Acc.rec … 1 …` vs
+    /// `Acc.rec … 0 …`) that eager never has to reconcile because it
+    /// never gets that far. `try_iota_value` checks this flag and departs
+    /// from `eval`'s "always fully reduce" default specifically for
+    /// Prop-major recursors (`recursor_unfolds_thm_major`'s Acc-shape
+    /// check) while it's set, staying neutral instead — the same
+    /// `app_arg_type_ok_eager`/`value_type_ok_eager` rescue this was
+    /// already falling back to still confirms it, now by comparing
+    /// *unreduced* forms that resolve via the same proof-irrelevance
+    /// shortcut eager uses, instead of two already-diverged reduced ones.
+    /// Never set during `is_def_eq_via_nbe`'s own comparison or plain
+    /// `eval`/`is_def_eq`: those still want full iota reduction, since
+    /// comparing two already-*Value*-space terms via `values_def_eq` is
+    /// exactly the case where reducing both sides to the same normal form
+    /// is the fast, legitimate confirmation.
+    static SUPPRESS_PROP_MAJOR_ITOA: Cell<bool> = const { Cell::new(false) };
     static WHNF_DEPTH: Cell<u32> = const { Cell::new(0) };
     /// `whnf_core` → iota → `whnf_major` → `whnf_core` is not counted by
     /// `WHNF_DEPTH` (that only wraps the outer `whnf` entry). Unbounded it
@@ -876,6 +902,27 @@ pub struct Checker<'e> {
     whnf_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
     whnf_core_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
     defeq_cache: RefCell<FxHashMap<(u64, usize, usize), bool>>,
+    /// `FORCE_EAGER_DEFEQ`-only namespace for the four caches directly
+    /// above (see `with_forced_eager_defeq`'s comment). `is_def_eq_inner`/
+    /// `infer_type_cached`/`whnf`/`whnf_core` are not invariant under
+    /// `FORCE_EAGER_DEFEQ`: their own recursive calls go through the
+    /// *dispatching* `is_def_eq`/`infer_type`, which take a different
+    /// path (eager vs NbE) depending on the flag, so a cached answer
+    /// computed one way is not generally safe to reuse computed the
+    /// other way (Day 8's stale-cache bug). Rather than skip caching
+    /// during a rescue entirely (Day 8; correct but wasteful — every
+    /// rescue re-did all its own work from scratch, 2.7x-3.8x more
+    /// `Ir` than eager on every fixture that needed one), give
+    /// `FORCE_EAGER_DEFEQ`-computed answers their own cache: still pure,
+    /// deterministic answers for a given `(ctx, expr)` key *as long as
+    /// they were computed under the same flag*, so this is exactly as
+    /// safe as the originals were before Day 8 ever introduced the
+    /// bypass, just kept in a separate map so a rescue's answer can
+    /// never leak into (or be leaked into by) a non-rescue lookup.
+    eager_whnf_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
+    eager_whnf_core_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
+    eager_defeq_cache: RefCell<FxHashMap<(u64, usize, usize), bool>>,
+    eager_infer_cache: RefCell<FxHashMap<(u64, usize), (Expr, bool)>>,
     /// `(const name, levels)` to unfolded value, memoized like the C++ kernel's
     /// `m_unfold`. The delta path can unfold the same def/theorem at the same
     /// levels over and over; re-instantiating a large body each time (O(size)
@@ -1175,6 +1222,10 @@ impl<'e> Checker<'e> {
             whnf_cache: RefCell::new(FxHashMap::default()),
             whnf_core_cache: RefCell::new(FxHashMap::default()),
             defeq_cache: RefCell::new(FxHashMap::default()),
+            eager_whnf_cache: RefCell::new(FxHashMap::default()),
+            eager_whnf_core_cache: RefCell::new(FxHashMap::default()),
+            eager_defeq_cache: RefCell::new(FxHashMap::default()),
+            eager_infer_cache: RefCell::new(FxHashMap::default()),
             infer_cache: RefCell::new(FxHashMap::default()),
             proof_arg_cache: RefCell::new(FxHashMap::default()),
             unfold_cache: RefCell::new(FxHashMap::default()),
@@ -1461,6 +1512,14 @@ impl<'e> Checker<'e> {
         self.whnf_core_cache.borrow_mut().clear();
         self.defeq_cache.borrow_mut().clear();
         self.infer_cache.borrow_mut().clear();
+        // `ctx_key`s (via `CTX_NEXT`, reset above) are reused across
+        // declarations, so a stale eager-namespace entry from the last
+        // declaration would be keyed identically but mean something
+        // different here.
+        self.eager_whnf_cache.borrow_mut().clear();
+        self.eager_whnf_core_cache.borrow_mut().clear();
+        self.eager_defeq_cache.borrow_mut().clear();
+        self.eager_infer_cache.borrow_mut().clear();
         if std::env::var_os("KIOTA_TRACE_DECL").is_some() {
             eprintln!("DECL {kind} {}", self.name_str(name));
         }
@@ -1675,26 +1734,31 @@ impl<'e> Checker<'e> {
         let ctx_key = ctx.term_ctx_key(e);
         let key = (ctx_key, Self::ptr_key(e));
         let infer_only = self.infer_only.get();
-        // `FORCE_EAGER_DEFEQ` ("eager rescue", see `with_forced_eager_defeq`):
-        // a sub-expression's cached type here may have been computed while
-        // one of *its own* App-argument checks (line ~1693's `is_def_eq`)
+        // `FORCE_EAGER_DEFEQ` ("eager rescue", see `with_forced_eager_defeq`)
+        // reads and writes its own namespaced cache (`eager_infer_cache`):
+        // a sub-expression's type here may differ depending on whether one
+        // of *its own* App-argument checks (line ~1693's `is_def_eq`)
         // re-dispatched into NbE, which can reject where eager alone
         // wouldn't (the same over-reduction `app_arg_type_ok_eager`'s own
-        // comment describes). A rescue must not reuse — or pollute — that
-        // entry; it needs its own, fully-eager-end-to-end recomputation.
+        // comment describes). Namespacing means a rescue still benefits
+        // from caching its own (and later rescues') repeated work, without
+        // ever reading or writing the non-forced cache.
         let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
-        if !force_eager {
-            if let Some((t, checked)) = self.infer_cache.borrow().get(&key) {
-                if infer_only || *checked {
-                    crate::stats::infer_hit();
-                    return Ok(t.clone());
-                }
+        let cache_ref = if force_eager {
+            &self.eager_infer_cache
+        } else {
+            &self.infer_cache
+        };
+        if let Some((t, checked)) = cache_ref.borrow().get(&key) {
+            if infer_only || *checked {
+                crate::stats::infer_hit();
+                return Ok(t.clone());
             }
         }
         let t = self.infer_type_uncached(ctx, e)?;
         let checked = !self.infer_only.get();
-        if !force_eager {
-            let mut cache = self.infer_cache.borrow_mut();
+        {
+            let mut cache = cache_ref.borrow_mut();
             match cache.get_mut(&key) {
                 Some((old, was_checked)) if checked && !*was_checked => {
                     *old = t.clone();
@@ -2495,13 +2559,11 @@ impl<'e> Checker<'e> {
         // See `is_def_eq_inner`'s `force_eager` comment: `whnf_core` → iota
         // → `mk_rec_call` calls the *dispatching* `is_def_eq`, so a WHNF
         // computed while NOT forced-eager can differ from one computed
-        // while forced-eager. Don't read or write this cache across that
-        // boundary.
+        // while forced-eager. Read/write the namespaced cache instead of
+        // the normal one so a rescue still benefits from memoization.
         let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
-        if !force_eager {
-            if let Some(r) = self.whnf_cache.borrow().get(&k) {
-                return Ok(r.clone());
-            }
+        if let Some(r) = self.whnf_cache_get(force_eager, &k) {
+            return Ok(r);
         }
         let mut cur = e.clone();
         let r = loop {
@@ -2536,9 +2598,7 @@ impl<'e> Checker<'e> {
             }
             return Ok(r);
         }
-        if !force_eager {
-            self.whnf_cache.borrow_mut().insert(k, r.clone());
-        }
+        self.whnf_cache_insert(force_eager, k, r.clone());
         Ok(r)
     }
 
@@ -2790,18 +2850,14 @@ impl<'e> Checker<'e> {
         let k = Self::whnf_cache_key(ctx, &e);
         // See `whnf`'s `force_eager` comment just above it.
         let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
-        if !force_eager {
-            if let Some(r) = self.whnf_core_cache.borrow().get(&k) {
-                CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-                return Ok(r.clone());
-            }
+        if let Some(r) = self.whnf_core_cache_get(force_eager, &k) {
+            CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            return Ok(r);
         }
         let r = self.whnf_core_go(ctx, &e);
         CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         let r = r?;
-        if !force_eager {
-            self.whnf_core_cache.borrow_mut().insert(k, r.clone());
-        }
+        self.whnf_core_cache_insert(force_eager, k, r.clone());
         Ok(r)
     }
 
@@ -3382,6 +3438,51 @@ impl<'e> Checker<'e> {
         r
     }
 
+    /// Route a cache read/write to the `FORCE_EAGER_DEFEQ`-namespaced map
+    /// or the normal one (see the field comment above `eager_whnf_cache`).
+    fn defeq_cache_get(&self, force_eager: bool, key: &(u64, usize, usize)) -> Option<bool> {
+        if force_eager {
+            self.eager_defeq_cache.borrow().get(key).copied()
+        } else {
+            self.defeq_cache.borrow().get(key).copied()
+        }
+    }
+    fn defeq_cache_insert(&self, force_eager: bool, key: (u64, usize, usize), v: bool) {
+        if force_eager {
+            self.eager_defeq_cache.borrow_mut().insert(key, v);
+        } else {
+            self.defeq_cache.borrow_mut().insert(key, v);
+        }
+    }
+    fn whnf_cache_get(&self, force_eager: bool, key: &(u64, usize)) -> Option<Expr> {
+        if force_eager {
+            self.eager_whnf_cache.borrow().get(key).cloned()
+        } else {
+            self.whnf_cache.borrow().get(key).cloned()
+        }
+    }
+    fn whnf_cache_insert(&self, force_eager: bool, key: (u64, usize), v: Expr) {
+        if force_eager {
+            self.eager_whnf_cache.borrow_mut().insert(key, v);
+        } else {
+            self.whnf_cache.borrow_mut().insert(key, v);
+        }
+    }
+    fn whnf_core_cache_get(&self, force_eager: bool, key: &(u64, usize)) -> Option<Expr> {
+        if force_eager {
+            self.eager_whnf_core_cache.borrow().get(key).cloned()
+        } else {
+            self.whnf_core_cache.borrow().get(key).cloned()
+        }
+    }
+    fn whnf_core_cache_insert(&self, force_eager: bool, key: (u64, usize), v: Expr) {
+        if force_eager {
+            self.eager_whnf_core_cache.borrow_mut().insert(key, v);
+        } else {
+            self.whnf_core_cache.borrow_mut().insert(key, v);
+        }
+    }
+
     fn is_def_eq_inner(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         crate::stats::defeq_call();
         if crate::stats::enabled() {
@@ -3406,20 +3507,21 @@ impl<'e> Checker<'e> {
         let ctx_key = ctx.pair_ctx_key(a, b);
         let key = (ctx_key, min_k, max_k);
         // `FORCE_EAGER_DEFEQ` ("eager rescue", see `with_forced_eager_defeq`)
-        // must not read a cache entry that an earlier, *not* forced-eager
-        // call populated: `is_def_eq_via_nbe`'s own fallback can compute
-        // and cache `false` for a sub-pair that only looks unequal because
-        // `eval` over-reduced one side (see `app_arg_type_ok_eager`'s
-        // comment) — a rescue attempt reusing that stale entry would never
-        // get a chance to recompute it the eager way. Also skip writing
-        // the rescue's own result: nothing here is more "correct" than a
-        // normal computation, so don't let a rescue's answer for this
-        // exact pair silently poison ordinary (non-forced) lookups either.
+        // reads and writes its own namespaced cache (`eager_defeq_cache`,
+        // see the field comment above it), never the normal one: a rescue
+        // computed under `FORCE_EAGER_DEFEQ` can legitimately disagree
+        // with a non-forced computation for the same `(ctx, a, b)` key,
+        // because `is_def_eq_via_nbe`'s own fallback can compute `false`
+        // for a sub-pair that only looks unequal because `eval`
+        // over-reduced one side (see `app_arg_type_ok_eager`'s comment).
+        // Namespacing (rather than Day 8's skip-caching-entirely fix)
+        // still lets one rescue's own repeated sub-comparisons — and later
+        // rescues on the same declaration — hit a cache, while keeping
+        // that answer from ever being read by, or overwritten by, a
+        // non-forced lookup.
         let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
-        if !force_eager {
-            if let Some(&r) = self.defeq_cache.borrow().get(&key) {
-                return Ok(r);
-            }
+        if let Some(r) = self.defeq_cache_get(force_eager, &key) {
+            return Ok(r);
         }
         // Proof irrelevance before app congruence. Typeclass instances are
         // proofs of a Prop (the class). Pairwise of `LawfulVecOperator.mk`
@@ -3427,15 +3529,11 @@ impl<'e> Checker<'e> {
         // class types instead. Acc `f 1 a` vs `f 1 (Acc.intro …)` is Bool,
         // so PI is false there and unreduced congruence still runs.
         if self.proofs_of_same_prop(ctx, a, b)? {
-            if !force_eager {
-                self.defeq_cache.borrow_mut().insert(key, true);
-            }
+            self.defeq_cache_insert(force_eager, key, true);
             return Ok(true);
         }
         if self.try_unreduced_const_congruence(ctx, a, b)? {
-            if !force_eager {
-                self.defeq_cache.borrow_mut().insert(key, true);
-            }
+            self.defeq_cache_insert(force_eager, key, true);
             return Ok(true);
         }
         let aw = self.whnf_for_defeq(ctx, a)?;
@@ -3474,19 +3572,17 @@ impl<'e> Checker<'e> {
         }
         if let (Ok(Some(x)), Ok(Some(y))) = (self.closed_int_value(ctx, &aw), self.closed_int_value(ctx, &bw)) {
             let r = x == y;
-            if !force_eager {
-                self.defeq_cache.borrow_mut().insert(key, r);
-            }
+            self.defeq_cache_insert(force_eager, key, r);
             return Ok(r);
         }
         let r = self.is_def_eq_core(ctx, &aw, &bw)?;
         // CONV_DEPTH / CORE_DEPTH abort as Decline, not Ok(false), so a stored
         // false is a completed answer. True-only left std `#18000` retrying the
         // same failing pair — 1e9 intern hits, intern size unchanged.
-        // Do not cache a result produced under a CORE_DEPTH stuck WHNF, or
-        // under a forced-eager rescue (see the cache-read comment above).
-        if !CORE_ABORTED.with(|a| a.get()) && !force_eager {
-            self.defeq_cache.borrow_mut().insert(key, r);
+        // Do not cache a result produced under a CORE_DEPTH stuck WHNF
+        // (still true regardless of the eager-rescue namespace).
+        if !CORE_ABORTED.with(|a| a.get()) {
+            self.defeq_cache_insert(force_eager, key, r);
         }
         Ok(r)
     }
@@ -8130,6 +8226,16 @@ impl<'e> Checker<'e> {
         if let Some(cached) = self.iota_value_cache(rname, &us, &args) {
             return Ok(Some(cached));
         }
+        // `SUPPRESS_PROP_MAJOR_ITOA` (see its own comment): inside
+        // `infer_type_via_nbe`'s call tree, a Prop-major recursor
+        // (Acc-shape) declines to iota-reduce even on a ctor/theorem-
+        // unfolds-to-ctor major, deferring to the eager rescue instead of
+        // risking an asymmetric reduction eager itself never performs.
+        // Nat.rec/List.rec/brecOn-shaped structural recursion (Nat's own
+        // major type isn't Prop) is entirely unaffected.
+        if SUPPRESS_PROP_MAJOR_ITOA.with(Cell::get) && self.recursor_unfolds_thm_major(rname) {
+            return Ok(None);
+        }
         let params = &args[..num_params as usize];
         let motives = &args[num_params as usize..(num_params + num_motives) as usize];
         let minors =
@@ -8527,6 +8633,25 @@ impl<'e> Checker<'e> {
                 self.pp_budget(e, 40)
             );
         }
+        // `SUPPRESS_PROP_MAJOR_ITOA` (see its own comment): scoped to this
+        // call's own recursive subtree, including any nested `infer_type`
+        // dispatch back into `infer_type_via_nbe` for a sub-expression.
+        let prev = SUPPRESS_PROP_MAJOR_ITOA.with(|c| c.replace(true));
+        let r = self.infer_type_via_nbe_inner(ctx, e);
+        SUPPRESS_PROP_MAJOR_ITOA.with(|c| c.set(prev));
+        r
+    }
+
+    fn infer_type_via_nbe_inner(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        // Day 10 (`KIOTA_TRACE_RESCUE=1`): confirms this function's own
+        // `ctx`-re-evaluation loop below is not the source of the Acc-shape
+        // `Ir` cost either — on `alg-conv-trans-acc-right.accept.ndjson`
+        // this runs 221 times with combined `ctx.len()` of 594, negligible
+        // next to `eval`'s ~55k total calls. See `types_compatible`'s
+        // comment for where the cost actually is.
+        if std::env::var_os("KIOTA_TRACE_RESCUE").is_some() {
+            eprintln!("INFER_VIA_NBE ctxlen={}", ctx.len());
+        }
         let mut tys = Vec::with_capacity(ctx.len());
         let mut env = nbe::empty_env();
         for i in 0..ctx.len() {
@@ -8587,7 +8712,48 @@ impl<'e> Checker<'e> {
         }
         let got_q = self.quote(depth, got)?;
         let want_q = self.quote(depth, want)?;
-        self.is_def_eq_inner(ctx, &got_q, &want_q)
+        // Day 10: this fallback was calling `is_def_eq_inner` directly,
+        // *not* wrapped in `with_forced_eager_defeq` — a real, separate
+        // gap from the two named rescues (`app_arg_type_ok_eager`/
+        // `value_type_ok_eager`), now closed the same way: as soon as its
+        // own recursion (Pi/Lam bodies, `app_spines_congruent`'s
+        // pairwise/`defeq_args` args) went through the *dispatching*
+        // `is_def_eq`, it re-entered `is_def_eq_via_nbe` for every nested
+        // sub-comparison regardless of whether either named rescue ever
+        // ran.
+        //
+        // Measured with `KIOTA_TRACE_RESCUE=1` on the three Acc-shape
+        // export fixtures: `app_arg_type_ok_eager`/`value_type_ok_eager`
+        // are invoked *zero* times on any of them, and forcing eager here
+        // (this fix) plus the cache-namespacing and `SUPPRESS_PROP_MAJOR_
+        // ITOA` fixes above changed the measured `callgrind` `Ir` by
+        // noise (<1%), not the 2.7x-3.8x this session's task expected to
+        // move. The actual cost, confirmed by instrumenting `eval` and
+        // `infer_type_via_nbe`'s own `ctx`-re-evaluation loop separately,
+        // is neither caches nor an asymmetric iota peel: it's that
+        // `infer_type_value` computes types by *evaluating* — `eval`
+        // always fully reduces every node it touches (Const unfolds,
+        // App applies, the final `motive`-substitution step calls `eval`
+        // again) — where eager's `infer_type_cached` computes the exact
+        // same types by *substituting* (`expr::instantiate1`, an O(1)
+        // pointer op via structural sharing/interning, no reduction at
+        // all). For a large proof term (the well-founded-recursion value
+        // these fixtures actually check), that is a real, structural
+        // difference in how much work each strategy does per node, not a
+        // missed cache or an avoidable reduction — `infer_type_via_nbe`
+        // itself only runs 221 times with 594 total `ctx` entries
+        // re-evaluated on the largest fixture (negligible), while `eval`
+        // alone accounts for essentially all ~55k reduction-counter hits.
+        // Closing this gap for real would mean `infer_type_value` (or a
+        // variant of it) computing types without evaluating through them
+        // — i.e. substitution-based, like eager — which is a materially
+        // different design for that function, not a bounded fix; out of
+        // scope for this pass. The three fixes above stay: each closes a
+        // real correctness/consistency gap in the eager-rescue mechanism
+        // ("a slower correct rescue is better than a wrong wire"), even
+        // though none of them, individually or together, move this
+        // fixture's `Ir` ratio.
+        self.with_forced_eager_defeq(|| self.is_def_eq_inner(ctx, &got_q, &want_q))
     }
 
     /// Last-resort fallback for an App argument-type check that
@@ -8615,6 +8781,18 @@ impl<'e> Checker<'e> {
     /// accept that matches eager's own judgment; any error or eager
     /// mismatch here still rejects.
     fn app_arg_type_ok_eager(&self, ctx: &Ctx, f: &Expr, a: &Expr) -> R<bool> {
+        // Day 10: `KIOTA_TRACE_RESCUE=1` logs every invocation of this and
+        // `value_type_ok_eager` with the term sizes involved. Used to
+        // confirm (not guess) that neither one is actually invoked on the
+        // Acc-shape export fixtures at all — see the comment above
+        // `types_compatible`.
+        if std::env::var_os("KIOTA_TRACE_RESCUE").is_some() {
+            eprintln!(
+                "RESCUE app f_size={} a_size={}",
+                expr_size_capped(f, 100_000),
+                expr_size_capped(a, 100_000)
+            );
+        }
         // The whole rescue — including re-deriving `f`'s and `a`'s types,
         // not just the final comparison — must stay eager: `infer_type_cached`
         // itself calls the *dispatching* `is_def_eq` for its own App-argument
@@ -8648,6 +8826,9 @@ impl<'e> Checker<'e> {
     /// to avoid re-dispatching into the same NbE path). Only ever rescues
     /// a decline into an accept that matches eager's own judgment.
     fn value_type_ok_eager(&self, ctx: &Ctx, value: &Expr, typ: &Expr) -> R<bool> {
+        if std::env::var_os("KIOTA_TRACE_RESCUE").is_some() {
+            eprintln!("RESCUE value value_size={}", expr_size_capped(value, 100_000));
+        }
         // See `app_arg_type_ok_eager`'s comment: re-deriving `value`'s type
         // must also stay eager end to end, not just the final comparison.
         self.with_forced_eager_defeq(|| {
