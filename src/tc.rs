@@ -8890,6 +8890,39 @@ impl<'e> Checker<'e> {
     /// redesign's actual point: a binder whose type is never looked up,
     /// or an argument whose codomain doesn't depend on it, now costs
     /// nothing instead of a full `eval`.
+    ///
+    /// Day 12 tried the same treatment for this function's own *return
+    /// value* — changing its signature to `R<Rc<nbe::Thunk>>` so `App`'s
+    /// own result (the substituted codomain, `body_pi` in an env extended
+    /// with the argument) could be `Thunk::deferred` instead of
+    /// `self.eval`'d immediately, i.e. eager's `instantiate1`-without-
+    /// normalizing, "the Value equivalent of a Closure applied without
+    /// forcing." Implemented, sound (`a` itself stayed forced, per Day
+    /// 10 — deferring it too reproduced that exact 3x
+    /// `080_RBTree.id_spec.accept.ndjson` regression again, even with
+    /// `body_pi` also deferred, confirming the two are the same
+    /// regression, not two independent ones), full suite green both
+    /// flags. Measured *zero* additional `Ir` improvement on all three
+    /// Acc-shape fixtures (identical to Day 10's numbers) and a small
+    /// (~1.5%) `Ir` regression on `080_RBTree.id_spec.accept.ndjson`
+    /// (reproduced across repeated runs, not noise): every caller that
+    /// needs to inspect an inferred type's shape — every enclosing `App`
+    /// checking `ft` is a `Pi`, every `Lam`/`Pi` checking its domain's
+    /// inferred type is a `Sort`, `types_compatible`'s own argument-type
+    /// check, and the final `quote` at the declaration boundary — forces
+    /// the thunk immediately anyway, via what would have been an
+    /// `infer_type_value_forced` helper. For these fixtures' own App
+    /// chains, that is *every* level, so the deferred `eval` just moved
+    /// from inside this function to the caller's forcing point a moment
+    /// later — same total work, plus one `Thunk` allocation's worth of
+    /// overhead and no case where the deferral actually paid off. Only a
+    /// caller using `infer_only` (skipping the argument-type check
+    /// entirely) or one that never inspects the result at all would ever
+    /// benefit, and neither pattern shows up enough in these fixtures'
+    /// own structure to matter. Reverted (this function still returns
+    /// `Rc<nbe::Value>`, `App`'s result is still built by evaluating
+    /// `body_pi` under the argument-extended env); Day 11's binder-`Thunk`
+    /// work above stays, since it measured as the real win.
     pub(crate) fn infer_type_value(
         &self,
         ctx: &Ctx,

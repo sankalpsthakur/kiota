@@ -65,6 +65,23 @@ fn rbtree_id_spec_accepts() {
     assert_accept("080_RBTree.id_spec.accept.ndjson");
 }
 
+/// Day 12: a from-scratch, hand-generated `Nat.rec`-on-a-literal-numeral
+/// countdown (`natVal: "5000"`, no declaration named after any real
+/// corpus's `assemble2`/`brecOn`-generated auxiliary) — the shape this
+/// whole NbE spike was originally motivated by (a recursor applied to a
+/// large `Nat` numeral major), so the eager-vs-NBE `Ir` comparison this
+/// fixture enables in `bench.sh` finally measures that original
+/// hypothesis directly instead of by proxy through the Acc-shape
+/// fixtures the spike ended up chasing correctness bugs on. `motive`
+/// is constant (`fun _ => Nat`) and the `succ` minor discards its `n`
+/// and returns `n_ih` unchanged, so the whole countdown reduces to
+/// `Nat.zero` — the point is the 5000-step iota chain getting there, not
+/// the answer.
+#[test]
+fn synthetic_nat_rec_countdown_accepts() {
+    assert_accept("synthetic-nat-rec-countdown.accept.ndjson");
+}
+
 #[test]
 fn bad_def_rejects() {
     assert_reject("002_badDef.reject.ndjson");
