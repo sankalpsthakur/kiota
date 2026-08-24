@@ -27,6 +27,25 @@ fn assert_accept(name: &str) {
     check_file(&path).unwrap_or_else(|e| panic!("{name} should accept, got {e:?}"));
 }
 
+/// Like `assert_accept`, but runs on a thread with a large stack, matching
+/// `main.rs`'s own `1024 * 1024 * 1024`-byte spawn for the release binary.
+/// A deep, non-tail-recursive fixture (e.g. `synthetic-below-brecon-
+/// countdown.accept.ndjson`'s 300-level `Below`/`Cons` chain) can overflow
+/// `cargo test`'s default ~2MB thread stack in an unoptimized debug build
+/// even though the same fixture is nowhere near the checker's own
+/// `CONV_DEPTH` limit and passes comfortably in a release build.
+fn assert_accept_deep(name: &str) {
+    let name = name.to_string();
+    let handle = std::thread::Builder::new()
+        .stack_size(1024 * 1024 * 1024)
+        .spawn(move || {
+            let path = fixture(&name);
+            check_file(&path).unwrap_or_else(|e| panic!("{name} should accept, got {e:?}"));
+        })
+        .expect("spawn deep-stack test thread");
+    handle.join().expect("deep-stack test thread panicked");
+}
+
 fn assert_reject(name: &str) {
     let path = fixture(name);
     match check_file(&path) {
@@ -77,9 +96,42 @@ fn rbtree_id_spec_accepts() {
 /// and returns `n_ih` unchanged, so the whole countdown reduces to
 /// `Nat.zero` — the point is the 5000-step iota chain getting there, not
 /// the answer.
+///
+/// Day 12 follow-up found this fixture's own declaration check never
+/// actually forces that chain: `Nat.rec`'s type-checking rule verifies
+/// the minors generically (in the bound `n`, not the literal), and the
+/// declared type here is the same *symbolic* `Nat`, so `KIOTA_STATS` is
+/// completely flat regardless of the literal's value — it measures fixed
+/// overhead, not a 5000-step reduction. Left as-is (still a valid,
+/// accepting fixture, just not informative about the countdown's own
+/// cost) rather than silently reinterpreted after the fact; see
+/// `synthetic_below_brecon_countdown_accepts` below for a fixture that
+/// verifiably does force the chain (`KIOTA_STATS` scales with depth).
 #[test]
 fn synthetic_nat_rec_countdown_accepts() {
     assert_accept("synthetic-nat-rec-countdown.accept.ndjson");
+}
+
+/// Day 12 (second pass): a "course-of-values"/`brecOn`-shaped fixture,
+/// not a plain `Nat.rec`-on-a-literal one. `Below : Nat -> Sort 1` is
+/// *itself* defined by `Nat.rec`, building a structurally new wrapper at
+/// every level (`Cons Nat (Cons Nat ( ... Nat))`, growing by one `Cons`
+/// layer per level — the synthetic stand-in for real Lean's
+/// `Nat.below`'s `PProd`-nested table), and `countdown`'s own minor reads
+/// the recursive occurrence `ih : Below n` directly to build the next
+/// level's value (`Cons.cons (Below n) n ih`). Depth 300 (in the 200-500
+/// range suggested as a lighter alternative to a 5000-step literal
+/// countdown): the declared type is deliberately the *explicit*
+/// hand-unfolded normal form (300 nested `Cons` applications, not
+/// `Below 300` symbolically) so `is_def_eq` cannot dispatch by matching
+/// `App(Below, _)` heads on both sides and must actually `whnf`/unfold
+/// `Below`'s recursive definition through all 300 levels to compare
+/// structurally — confirmed by `KIOTA_STATS` scaling with depth (unlike
+/// the plain-`Nat.rec` fixture above). Never named after `assemble2` or
+/// any real declaration; `Cons`/`Below`/`countdown` are generic.
+#[test]
+fn synthetic_below_brecon_countdown_accepts() {
+    assert_accept_deep("synthetic-below-brecon-countdown.accept.ndjson");
 }
 
 #[test]
