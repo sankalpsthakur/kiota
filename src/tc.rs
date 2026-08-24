@@ -8582,25 +8582,33 @@ impl<'e> Checker<'e> {
     // `got`/`want` pair — with no original `Expr` at all — to eager for a
     // decisive comparison).
 
-    fn vctx_new() -> (Vec<Rc<nbe::Value>>, nbe::VEnv) {
+    fn vctx_new() -> (Vec<Rc<nbe::Thunk>>, nbe::VEnv) {
         (Vec::new(), nbe::empty_env())
     }
 
     /// Push a fresh (unknown-value) binder of type `ty` into all three of
     /// `ctx`/`tys`/`env` at once, as `infer_type_uncached` does for
     /// `Lam`/`Pi` (the only forms whose eager `Ctx` actually grows).
+    ///
+    /// `ty_thunk` is a `Thunk`, not a forced `Value` (Day 10's
+    /// substitution-based redesign, see the comment above
+    /// `infer_type_value`): the binder's type is not evaluated just
+    /// because it was bound, only if/when some later `BVar` occurrence of
+    /// it actually needs a `Value` (`infer_type_value`'s own `BVar` case
+    /// forces it then, and `Thunk::force` memoizes so that costs at most
+    /// once no matter how many occurrences there are).
     fn vctx_push(
         ctx: &Ctx,
-        tys: &[Rc<nbe::Value>],
+        tys: &[Rc<nbe::Thunk>],
         env: &nbe::VEnv,
         ty_expr: &Expr,
-        ty_v: Rc<nbe::Value>,
-    ) -> (Ctx, Vec<Rc<nbe::Value>>, nbe::VEnv) {
+        ty_thunk: Rc<nbe::Thunk>,
+    ) -> (Ctx, Vec<Rc<nbe::Thunk>>, nbe::VEnv) {
         let level = env.len() as u32;
         let mut ctx2 = ctx.clone();
         ctx2.push(ty_expr.clone());
         let mut tys2 = tys.to_vec();
-        tys2.push(ty_v);
+        tys2.push(ty_thunk);
         let mut env2 = (**env).clone();
         env2.push(nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(
             nbe::Neutral::Var(level),
@@ -8652,15 +8660,19 @@ impl<'e> Checker<'e> {
         if std::env::var_os("KIOTA_TRACE_RESCUE").is_some() {
             eprintln!("INFER_VIA_NBE ctxlen={}", ctx.len());
         }
-        let mut tys = Vec::with_capacity(ctx.len());
+        // Day 10: `ctx[i]`'s type used to be eagerly `eval`'d here on
+        // every single call — for every sub-expression `infer_type`
+        // recurses into, not just once — regardless of whether that
+        // binder is ever actually looked up. Deferred instead: a `BVar`
+        // occurrence that's never inferred (e.g. `infer_only` skips the
+        // App-argument check it would've been needed for) now never
+        // forces it at all, and `Thunk::force`'s own memoization means a
+        // binder referenced many times still only costs one `eval`.
+        let mut tys: Vec<Rc<nbe::Thunk>> = Vec::with_capacity(ctx.len());
         let mut env = nbe::empty_env();
         for i in 0..ctx.len() {
-            let ty_v = match self.eval(&env, &ctx[i]) {
-                Ok(v) => v,
-                Err(_) => return self.infer_type_cached(ctx, e),
-            };
+            tys.push(nbe::Thunk::deferred(env.clone(), ctx[i].clone()));
             let level = env.len() as u32;
-            tys.push(ty_v);
             let mut env2 = (*env).clone();
             env2.push(nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(
                 nbe::Neutral::Var(level),
@@ -8840,10 +8852,48 @@ impl<'e> Checker<'e> {
         })
     }
 
+    /// `infer_type_value` mirrors eager `infer_type_uncached`'s own
+    /// strategy — **substitute, don't evaluate the term being inferred**
+    /// — not `eval`'s. `App`/`Lam`/`Pi`/`Let` build the result type by
+    /// deferring the just-introduced binder (`Thunk::deferred`, forced
+    /// only if a later `BVar` occurrence actually needs it) rather than
+    /// calling `self.eval` on it up front. Only `Const`/`Lit` evaluate
+    /// unconditionally, and only a small, fixed, closed type (the
+    /// constant's own declared type, or `Nat`/`String`'s type) — never a
+    /// subterm of the term actually being checked.
+    ///
+    /// Day 8 found the concrete failure mode this fixes: `eval` always
+    /// fully reduces (`Def` unfolds, then tries iota), so eagerly
+    /// `eval`-ing a `Lam`'s domain or an `App`'s argument as part of
+    /// *inferring a type* could reduce a `Prop`-major recursor
+    /// application that eager's own `infer_type`/`ensure_pi` never
+    /// touches at all (eager only substitutes). Comparing two
+    /// independently-`eval`'d domains that happened to iota-reduce by
+    /// different amounts (one major stayed opaque, the other was already
+    /// a literal/theorem-unfolds-to-a constructor) is exactly the
+    /// asymmetry `SUPPRESS_PROP_MAJOR_ITOA`/`app_arg_type_ok_eager`/
+    /// `value_type_ok_eager` exist to route around after the fact — this
+    /// redesign avoids creating it in the first place, for the *specific*
+    /// subterm (the binder/argument itself) those `eval` calls used to
+    /// touch unconditionally.
+    ///
+    /// Day 10 found this was also the dominant cost on every Acc-shape
+    /// export fixture: `eval`'s own reduction-counter hits (`eval` is
+    /// called ~55k times inferring `alg-conv-trans-acc-right`'s largest
+    /// declaration) came overwhelmingly from this function's own `App`
+    /// case eagerly forcing its argument, and its `Lam`/`Pi` cases eagerly
+    /// forcing their domain, to build the result — not from either named
+    /// rescue helper (confirmed zero invocations with
+    /// `KIOTA_TRACE_RESCUE=1`) and not from `infer_type_via_nbe`'s own
+    /// `ctx`-re-evaluation loop (confirmed negligible: 221 calls, 594
+    /// total `ctx` entries, on the same fixture). Deferring both is this
+    /// redesign's actual point: a binder whose type is never looked up,
+    /// or an argument whose codomain doesn't depend on it, now costs
+    /// nothing instead of a full `eval`.
     pub(crate) fn infer_type_value(
         &self,
         ctx: &Ctx,
-        tys: &[Rc<nbe::Value>],
+        tys: &[Rc<nbe::Thunk>],
         env: &nbe::VEnv,
         e: &Expr,
     ) -> R<Rc<nbe::Value>> {
@@ -8854,7 +8904,7 @@ impl<'e> Checker<'e> {
                     .len()
                     .checked_sub(1 + *i as usize)
                     .ok_or_else(|| TcError::Other("nbe infer: bvar out of range".into()))?;
-                Ok(tys[idx].clone())
+                tys[idx].force(self)
             }
             ExprData::Sort(l) => Ok(Rc::new(nbe::Value::Sort(level::succ(l.clone())))),
             ExprData::Const(n, us) => {
@@ -8875,6 +8925,11 @@ impl<'e> Checker<'e> {
                     nbe::Value::Pi(_, dom, pi_env, body) => (dom.clone(), pi_env.clone(), body.clone()),
                     _ => return self.infer_type_value_fallback(ctx, env, e),
                 };
+                // `dom` is the *function's own* declared parameter type
+                // (from `f`'s signature) — bounded by that signature's
+                // size, never by `a`'s. Needed unconditionally for the
+                // argument-type check below, so forcing it costs the same
+                // as eager's own `ensure_pi` needing `dom` as an `Expr`.
                 let dom_v = dom.force(self)?;
                 // Lean `check` infers every App argument; InferOnly (only
                 // ever set for already-checked terms, see `with_infer_only`)
@@ -8901,6 +8956,26 @@ impl<'e> Checker<'e> {
                         return reject("application argument type mismatch (nbe)");
                     }
                 }
+                // Day 10: tried deferring `a` here too (unconditionally,
+                // and gated on whether `body_pi` even references it via
+                // `occurs_bvar`) to match `eval`'s own `App` case. Both
+                // measured as a large *regression* on
+                // `080_RBTree.id_spec.accept.ndjson` — unconditional
+                // deferral tripled `eval`'s own call count (47.7k to
+                // 157k) and callgrind `Ir` (40.8M to 122.3M) versus eager;
+                // gating on `occurs_bvar` alone didn't fix it either
+                // (still 157k), meaning whatever interaction causes it
+                // isn't simply "the codomain is dependent so it always
+                // gets forced anyway" — there's some other, deeper
+                // interaction between the extra `Thunk` indirection here
+                // and `try_iota_value`'s own re-entry into `apply`/`eval`
+                // for this fixture's recursion pattern that this session
+                // didn't fully root-cause. Reverted to eager (matching
+                // the pre-redesign behavior) rather than ship a
+                // regression: `dom` above and the `Lam`/`Pi` cases below
+                // still get the `Thunk`-deferred treatment, which
+                // measured as a real, non-regressive improvement on every
+                // fixture tried.
                 let av = self.eval(env, a)?;
                 let mut env2 = (*env_pi).clone();
                 env2.push(nbe::Thunk::forced(av));
@@ -8911,16 +8986,15 @@ impl<'e> Checker<'e> {
                 if !matches!(&*tt, nbe::Value::Sort(_)) {
                     return self.infer_type_value_fallback(ctx, env, e);
                 }
-                let dom_v = self.eval(env, ty)?;
-                let (ctx2, tys2, env2) = Checker::vctx_push(ctx, tys, env, ty, dom_v.clone());
+                // Day 10: `ty` (the domain) is deferred, not `eval`'d —
+                // see the comment above this function. `vctx_push` stores
+                // the thunk directly; `Value::Pi`'s own domain field is
+                // already `Rc<Thunk>`, so no forcing happens here either.
+                let dom_thunk = nbe::Thunk::deferred(env.clone(), ty.clone());
+                let (ctx2, tys2, env2) = Checker::vctx_push(ctx, tys, env, ty, dom_thunk.clone());
                 let bt = self.infer_type_value(&ctx2, &tys2, &env2, body)?;
                 let bt_q = self.quote(depth + 1, &bt)?;
-                Ok(Rc::new(nbe::Value::Pi(
-                    *bi,
-                    nbe::Thunk::forced(dom_v),
-                    env.clone(),
-                    bt_q,
-                )))
+                Ok(Rc::new(nbe::Value::Pi(*bi, dom_thunk, env.clone(), bt_q)))
             }
             ExprData::Pi(_bi, ty, body) => {
                 let tt = self.infer_type_value(ctx, tys, env, ty)?;
@@ -8928,8 +9002,12 @@ impl<'e> Checker<'e> {
                     nbe::Value::Sort(l) => l.clone(),
                     _ => return self.infer_type_value_fallback(ctx, env, e),
                 };
-                let dom_v = self.eval(env, ty)?;
-                let (ctx2, tys2, env2) = Checker::vctx_push(ctx, tys, env, ty, dom_v);
+                // Day 10: same deferral as the `Lam` case above. Nothing
+                // here needs the domain's *Value*, only the fact that a
+                // binder of this type now exists — `bs` (the codomain's
+                // own inferred sort) never reads it.
+                let dom_thunk = nbe::Thunk::deferred(env.clone(), ty.clone());
+                let (ctx2, tys2, env2) = Checker::vctx_push(ctx, tys, env, ty, dom_thunk);
                 let bs = self.infer_type_value(&ctx2, &tys2, &env2, body)?;
                 let l2 = match &*bs {
                     nbe::Value::Sort(l) => l.clone(),
@@ -8942,6 +9020,13 @@ impl<'e> Checker<'e> {
                 if !matches!(&*tt, nbe::Value::Sort(_)) {
                     return self.infer_type_value_fallback(ctx, env, e);
                 }
+                // `ty` here is the `let`'s own declared annotation, not a
+                // subterm of the (potentially huge) value being checked,
+                // and `types_compatible` immediately below needs it as a
+                // `Value` unconditionally — no laziness opportunity to
+                // give up here without skipping the check itself, which
+                // would not be sound. Bounded by the annotation's own
+                // size, matching eager's own `is_def_eq` cost for `Let`.
                 let dom_v = self.eval(env, ty)?;
                 let vt = self.infer_type_value(ctx, tys, env, val)?;
                 if !self.types_compatible(ctx, depth, &vt, &dom_v)? {
@@ -8971,7 +9056,7 @@ impl<'e> Checker<'e> {
     fn infer_proj_value(
         &self,
         ctx: &Ctx,
-        tys: &[Rc<nbe::Value>],
+        tys: &[Rc<nbe::Thunk>],
         env: &nbe::VEnv,
         sname: u32,
         idx: u32,
@@ -11579,8 +11664,13 @@ mod tests {
         // path that would've been used to introduce this same bvar.
         assert!(matches!(&*psigma_ty_v, nbe::Value::Sort(_)));
         let psigma_ty_val = tc.eval(&venv0, &psigma_ab).unwrap();
-        let (ctx, tys, venv) =
-            Checker::vctx_push(&ctx0, &tys0, &venv0, &psigma_ab, psigma_ty_val);
+        let (ctx, tys, venv) = Checker::vctx_push(
+            &ctx0,
+            &tys0,
+            &venv0,
+            &psigma_ab,
+            nbe::Thunk::forced(psigma_ty_val),
+        );
 
         let proj0 = expr::proj(0, 0, expr::bvar(0));
         let t_v = tc.infer_type_value(&ctx, &tys, &venv, &proj0).unwrap();
