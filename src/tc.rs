@@ -28,7 +28,7 @@ thread_local! {
 /// Lean has no 2048 cap; `WellFounded.Nat.fix` / UTF-8 decode proofs nest
 /// `Nat.rec` conversion past that (Init `utf8DecodeChar?.assemble₃._proof_3`).
 /// Kept well under typical C-stack (~8MB) so this is a decline, not a segfault.
-const CONV_DEPTH: u32 = 8_192;
+const CONV_DEPTH: u32 = 131_072;
 
 #[derive(Debug)]
 pub enum TcError {
