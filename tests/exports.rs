@@ -134,6 +134,32 @@ fn synthetic_below_brecon_countdown_accepts() {
     assert_accept_deep("synthetic-below-brecon-countdown.accept.ndjson");
 }
 
+/// Day 14: the leftover hypothesis named at the end of the `Below`-as-
+/// named-`Def` fixture above -- "the growing structure must be an inline,
+/// non-shared subterm, not repeated calls to a named `Def`." `countdown`
+/// here is *not* a recursor application at all: it's 250 nested beta-
+/// redexes, `(fun (ih:Dom_249) => Cons.mk Dom_249 0 ih) ( ... (fun
+/// (ih:Dom_0) => Cons.mk Dom_0 0 ih) Nat.zero ...)`, where `Dom_k` (the
+/// k-`Cons`-layer-deep type at level `k`) is rebuilt from scratch --
+/// fresh `App(Cons, ...)` nodes, never referencing any earlier level's
+/// nodes -- at *every* occurrence (the lambda's own domain and `Cons.mk`'s
+/// own type parameter are separate rebuilds too), so neither structural
+/// interning nor `infer_cache`'s pointer-keyed memoization can short-
+/// circuit repeat work across levels. The declared type is likewise the
+/// explicit, independently-rebuilt 250-layer normal form, not a symbolic
+/// reference. Depth 250 (in the suggested 200-500 range). Never named
+/// after `assemble2`/`utf8DecodeChar?`; `Cons`/`countdown` are generic.
+///
+/// This is the fixture that actually reproduces superlinear eager cost:
+/// callgrind `Ir` at N=40/80/160 grows ~3.6x-3.8x per doubling of N (not
+/// ~2x, i.e. not linear) -- but NBE grows the same way and is *slower*,
+/// not faster, at every depth tried (~1.4x-1.46x). See the PR for the
+/// full numbers and the resulting decision.
+#[test]
+fn synthetic_below_inline_unshared_accepts() {
+    assert_accept_deep("synthetic-below-inline-unshared.accept.ndjson");
+}
+
 #[test]
 fn bad_def_rejects() {
     assert_reject("002_badDef.reject.ndjson");
