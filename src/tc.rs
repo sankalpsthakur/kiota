@@ -3007,10 +3007,7 @@ impl<'e> Checker<'e> {
                                 }
                             }
                             if let ExprData::Lit(Lit::Str(s)) = &**vw {
-                                if std::env::var_os("KIOTA_TRUST_STRING_REPR").is_some()
-                                    && self.name_str(*sname) == "String"
-                                    && *idx == 0
-                                {
+                                if *idx == 0 && self.authenticated_native_string(*sname) {
                                     if let Some(ba) = self.string_to_byte_array(s) {
                                         cur = expr::apps(ba, &args);
                                         continue;
@@ -3134,10 +3131,7 @@ impl<'e> Checker<'e> {
                         }
                     }
                     if let ExprData::Lit(Lit::Str(s)) = &**vw {
-                        if std::env::var_os("KIOTA_TRUST_STRING_REPR").is_some()
-                            && self.name_str(*sname) == "String"
-                            && *idx == 0
-                        {
+                        if *idx == 0 && self.authenticated_native_string(*sname) {
                             if let Some(ba) = self.string_to_byte_array(s) {
                                 cur = ba;
                                 continue;
@@ -7700,6 +7694,63 @@ impl<'e> Checker<'e> {
             return Ok(Some(expr::apps(mked, &args[2..])));
         }
         Ok(None)
+    }
+
+    /// Is `sname` Lean's native `String`, in the exact shape whose literal
+    /// representation the kernel may assume?
+    ///
+    /// Reducing `Proj(String, 0, "abc")` to `ByteArray.mk (Array.mk UInt8 …)`
+    /// asserts a representation the export never wrote down. That is only
+    /// justified if the declared `String` really is Lean's: a non-unsafe,
+    /// parameterless, index-free `Sort 1` inductive named `String`, alone in
+    /// its mutual group, with exactly one constructor taking exactly one
+    /// first field of type `ByteArray`. A name check alone is forgeable — an export
+    /// can declare its own `String` with a different field and inherit the
+    /// native semantics.
+    fn authenticated_native_string(&self, sname: u32) -> bool {
+        let Some(ConstantInfo::InductiveType {
+            level_params,
+            typ,
+            num_params: 0,
+            num_indices: 0,
+            all,
+            ctors,
+            is_unsafe: false,
+            ..
+        }) = self.env.get(sname)
+        else {
+            return false;
+        };
+        if self.name_str(sname) != "String"
+            || !level_params.is_empty()
+            || **typ != *expr::sort(level::succ(level::zero()))
+            || all.as_slice() != [sname]
+            || ctors.len() != 1
+        {
+            return false;
+        }
+        let Some(ConstantInfo::Constructor {
+            typ: ctyp,
+            num_params: 0,
+            num_fields,
+            level_params: clp,
+            ..
+        }) = self.env.get(ctors[0])
+        else {
+            return false;
+        };
+        // Lean's String is `String.ofByteArray (data : ByteArray) (valid : …)`
+        // — two fields, the second a validity proof. Only field 0 determines
+        // the representation this reduction produces, so require field 0 to
+        // be the ByteArray and leave the rest to ordinary checking.
+        if !clp.is_empty() || *num_fields < 1 {
+            return false;
+        }
+        let ExprData::Pi(_, dom, _) = &***ctyp else {
+            return false;
+        };
+        matches!(&***dom, ExprData::Const(b, us)
+            if us.is_empty() && self.name_str(*b) == "ByteArray")
     }
 
     fn string_to_byte_array(&self, s: &str) -> Option<Expr> {
