@@ -2,6 +2,7 @@ use crate::env::{ConstantInfo, Environment, QuotKind, ReducibilityHints};
 use crate::expr::{self, BinderInfo, Expr, ExprData, Lit};
 use crate::level::{self, Level};
 use crate::nat;
+use crate::nbe;
 use num_bigint::{BigInt, BigUint, Sign};
 use rustc_hash::FxHashMap;
 use std::cell::{Cell, RefCell};
@@ -828,6 +829,24 @@ fn decline<T>(msg: impl Into<String>) -> R<T> {
     Err(TcError::Decline(msg.into()))
 }
 
+/// Pointer-identity `Rc<nbe::Thunk>` wrapper for `iota_value_cache`'s key.
+/// Unlike a bare `usize`, holding the `Rc` here keeps the thunk allocation
+/// alive for as long as the cache entry does, so a later, unrelated thunk
+/// can never be allocated at the same address and collide with this key.
+#[derive(Clone)]
+struct ThunkPtrKey(Rc<nbe::Thunk>);
+impl PartialEq for ThunkPtrKey {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for ThunkPtrKey {}
+impl std::hash::Hash for ThunkPtrKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (Rc::as_ptr(&self.0) as usize).hash(state)
+    }
+}
+
 pub struct Checker<'e> {
     pub env: &'e Environment,
     pub names: &'e [std::rc::Rc<String>],
@@ -852,6 +871,21 @@ pub struct Checker<'e> {
     /// Consts whose telescope has a Prop-inductive binder (`USquash`, `Eq`).
     /// Only those spines need `defeq_args`; everything else stays pairwise.
     proof_arg_cache: RefCell<FxHashMap<u32, bool>>,
+    /// `(rname, us, pointer-identity of params+motives+minors+major)` to
+    /// the already-reduced NbE `Value` (`KIOTA_NBE=1` only). This is what
+    /// lets two independently-evaluated sides that bottom out in "the same"
+    /// recursor call (same closures, same literal) collapse to one shared
+    /// `Rc`, so the later `Rc::ptr_eq` fast path in `values_def_eq` fires
+    /// instead of re-walking a `below`-sized structure.
+    ///
+    /// The key holds the actual `Rc<Thunk>` clones (via `ThunkPtrKey`), not
+    /// bare `usize` addresses: keying on a dropped thunk's address would
+    /// let an unrelated, later thunk that the allocator reuses that address
+    /// for collide with a stale entry and return a wrong (and, for a
+    /// self-referential `Nat.rec` chain, non-terminating) cached value.
+    /// Holding the `Rc` here keeps the address live for as long as the
+    /// cache entry does.
+    iota_value_cache: RefCell<FxHashMap<(u32, Vec<Level>, Vec<ThunkPtrKey>), Rc<nbe::Value>>>,
     /// Consecutive `Nat.rec` peels of one `bits() >= 20` literal countdown.
     fuel_nat_peels: std::cell::Cell<u32>,
     /// Last bits≥20 literal peeled; used to detect one hugeFuel countdown.
@@ -1108,6 +1142,7 @@ impl<'e> Checker<'e> {
             infer_cache: RefCell::new(FxHashMap::default()),
             proof_arg_cache: RefCell::new(FxHashMap::default()),
             unfold_cache: RefCell::new(FxHashMap::default()),
+            iota_value_cache: RefCell::new(FxHashMap::default()),
             fuel_nat_peels: std::cell::Cell::new(0),
             fuel_nat_last: std::cell::RefCell::new(None),
             infer_only: std::cell::Cell::new(false),
@@ -3139,7 +3174,11 @@ impl<'e> Checker<'e> {
             }
             return decline("defeq depth limit");
         }
-        let r = self.is_def_eq_inner(ctx, a, b);
+        let r = if nbe::nbe_enabled() {
+            self.is_def_eq_via_nbe(ctx, a, b)
+        } else {
+            self.is_def_eq_inner(ctx, a, b)
+        };
         DEFEQ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         r
     }
@@ -7573,6 +7612,523 @@ impl<'e> Checker<'e> {
             _ => false,
         }
     }
+
+    // ---------------- NbE spike (`KIOTA_NBE=1`, `is_def_eq` only) ----------------
+    //
+    // See `nbe.rs` for the design rationale. Everything below only ever
+    // asserts `Ok(true)` when it can justify it structurally (two values
+    // reduced, via legitimate reduction steps, to a matching canonical or
+    // neutral shape); anything else — mismatch, or a construct this spike
+    // does not model — is surfaced as `Ok(false)`/`Err` and the caller
+    // (`is_def_eq_via_nbe`) falls back to the eager comparator for a
+    // definitive answer. NbE can only accelerate a `true` it would reach
+    // anyway; it never overrides the eager verdict.
+
+    pub(crate) fn is_def_eq_via_nbe(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        let depth = ctx.len() as u32;
+        let attempt: R<bool> = (|| {
+            let env = crate::nbe::generic_env(depth);
+            let va = self.eval(&env, a)?;
+            let vb = self.eval(&env, b)?;
+            self.values_def_eq(depth, &va, &vb)
+        })();
+        match attempt {
+            Ok(true) => Ok(true),
+            _ => self.is_def_eq_inner(ctx, a, b),
+        }
+    }
+
+    pub(crate) fn eval(&self, env: &nbe::VEnv, e: &Expr) -> R<Rc<nbe::Value>> {
+        crate::stats::whnf_call();
+        match &***e {
+            ExprData::BVar(i) => {
+                let idx = env
+                    .len()
+                    .checked_sub(1 + *i as usize)
+                    .ok_or_else(|| TcError::Other("nbe: bvar out of range".into()))?;
+                env[idx].force(self)
+            }
+            ExprData::Sort(l) => Ok(Rc::new(nbe::Value::Sort(l.clone()))),
+            ExprData::Lit(l) => Ok(Rc::new(nbe::Value::Lit(l.clone()))),
+            ExprData::Lam(bi, ty, body) => {
+                let dom = nbe::Thunk::deferred(env.clone(), ty.clone());
+                Ok(Rc::new(nbe::Value::Lam(*bi, dom, env.clone(), body.clone())))
+            }
+            ExprData::Pi(bi, ty, body) => {
+                let dom = nbe::Thunk::deferred(env.clone(), ty.clone());
+                Ok(Rc::new(nbe::Value::Pi(*bi, dom, env.clone(), body.clone())))
+            }
+            ExprData::Let(_ty, val, body) => {
+                let mut env2 = (**env).clone();
+                env2.push(nbe::Thunk::deferred(env.clone(), val.clone()));
+                self.eval(&Rc::new(env2), body)
+            }
+            ExprData::Proj(s, i, v) => {
+                let vv = self.eval(env, v)?;
+                self.eval_proj(*s, *i, vv)
+            }
+            ExprData::Const(n, us) => self.eval_const(*n, us),
+            ExprData::App(f, a) => {
+                let vf = self.eval(env, f)?;
+                let arg = nbe::Thunk::deferred(env.clone(), a.clone());
+                self.apply(vf, arg, env.len() as u32)
+            }
+        }
+    }
+
+    fn eval_const(&self, n: u32, us: &Rc<Vec<Level>>) -> R<Rc<nbe::Value>> {
+        if self.eager_whnf_unfolds(n) {
+            if let Some(body) = self.unfold_def(n, us)? {
+                return self.eval(&nbe::empty_env(), &body);
+            }
+        }
+        Ok(Rc::new(nbe::Value::Neutral(nbe::Neutral::Const(n, us.clone()))))
+    }
+
+    fn eval_proj(&self, sname: u32, idx: u32, v: Rc<nbe::Value>) -> R<Rc<nbe::Value>> {
+        if let nbe::Value::Neutral(nv) = &*v {
+            let (chead, cargs) = Self::unwind_neutral(nv);
+            if let nbe::Neutral::Const(cname, _) = chead {
+                if let Some(ConstantInfo::Constructor {
+                    num_params,
+                    induct,
+                    ..
+                }) = self.env.get(*cname)
+                {
+                    if *induct == sname {
+                        let fi = (*num_params + idx) as usize;
+                        if let Some(f) = cargs.get(fi) {
+                            return f.force(self);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Rc::new(nbe::Value::Neutral(nbe::Neutral::Proj(
+            sname,
+            idx,
+            Rc::new(match &*v {
+                nbe::Value::Neutral(nv) => Self::clone_neutral(nv),
+                _ => return decline("nbe: proj of a non-structure value"),
+            }),
+        ))))
+    }
+
+    fn clone_neutral(n: &nbe::Neutral) -> nbe::Neutral {
+        match n {
+            nbe::Neutral::Var(l) => nbe::Neutral::Var(*l),
+            nbe::Neutral::Const(a, us) => nbe::Neutral::Const(*a, us.clone()),
+            nbe::Neutral::App(f, a) => nbe::Neutral::App(Rc::new(Self::clone_neutral(f)), a.clone()),
+            nbe::Neutral::Proj(s, i, v) => nbe::Neutral::Proj(*s, *i, Rc::new(Self::clone_neutral(v))),
+        }
+    }
+
+    /// Unwind a `Neutral` spine into `(root, args)`, args in application
+    /// order (first-applied first) — the `Value`-space analogue of
+    /// `expr::unfold_apps`.
+    fn unwind_neutral(n: &nbe::Neutral) -> (&nbe::Neutral, Vec<Rc<nbe::Thunk>>) {
+        let mut args = Vec::new();
+        let mut cur = n;
+        loop {
+            match cur {
+                nbe::Neutral::App(f, a) => {
+                    args.push(a.clone());
+                    cur = f;
+                }
+                _ => break,
+            }
+        }
+        args.reverse();
+        (cur, args)
+    }
+
+    pub(crate) fn apply(
+        &self,
+        vf: Rc<nbe::Value>,
+        arg: Rc<nbe::Thunk>,
+        depth: u32,
+    ) -> R<Rc<nbe::Value>> {
+        match &*vf {
+            nbe::Value::Lam(_, _, env, body) => {
+                let mut env2 = (**env).clone();
+                env2.push(arg);
+                self.eval(&Rc::new(env2), body)
+            }
+            nbe::Value::Neutral(n) => self.apply_neutral(n, arg, depth),
+            _ => decline("nbe: apply to a non-function value"),
+        }
+    }
+
+    fn apply_neutral(
+        &self,
+        n: &nbe::Neutral,
+        arg: Rc<nbe::Thunk>,
+        depth: u32,
+    ) -> R<Rc<nbe::Value>> {
+        let spine = nbe::Neutral::App(Rc::new(Self::clone_neutral(n)), arg);
+        if let Some(v) = self.try_iota_value(&spine, depth)? {
+            return Ok(v);
+        }
+        Ok(Rc::new(nbe::Value::Neutral(spine)))
+    }
+
+    /// Reduce a recursor application whose major is a `Nat` literal or a
+    /// fully-applied constructor of a type in `all`, with zero indices and
+    /// only "simple" (zero-binder, directly-recursive) fields — exactly
+    /// `Nat.rec`/`List.rec`/`brecOn`-shaped structural recursion. Anything
+    /// wider (indices, higher-order recursive occurrences, K-like/structure
+    /// eta, nested-inductive recursion) is left neutral: `Ok(None)`, which
+    /// makes the whole comparison "uncertain" and defers to eager.
+    fn try_iota_value(&self, spine: &nbe::Neutral, depth: u32) -> R<Option<Rc<nbe::Value>>> {
+        let (root, args) = Self::unwind_neutral(spine);
+        let (rname, us) = match root {
+            nbe::Neutral::Const(n, us) => (*n, us.clone()),
+            _ => return Ok(None),
+        };
+        let (all, num_params, num_motives, num_minors, num_indices) = match self.env.get(rname) {
+            Some(ConstantInfo::Recursor {
+                all,
+                num_params,
+                num_motives,
+                num_minors,
+                num_indices,
+                ..
+            }) => (
+                all.clone(),
+                *num_params,
+                *num_motives,
+                *num_minors,
+                *num_indices,
+            ),
+            _ => return Ok(None),
+        };
+        if num_indices != 0 {
+            return Ok(None);
+        }
+        let major_pos = (num_params + num_motives + num_minors) as usize;
+        if args.len() != major_pos + 1 {
+            return Ok(None);
+        }
+        if let Some(cached) = self.iota_value_cache(rname, &us, &args) {
+            return Ok(Some(cached));
+        }
+        let params = &args[..num_params as usize];
+        let motives = &args[num_params as usize..(num_params + num_motives) as usize];
+        let minors = &args[(num_params + num_motives) as usize..major_pos];
+        let major_v = args[major_pos].force(self)?;
+
+        let rec_owns_ctor = |cname: u32| -> bool {
+            matches!(
+                self.env.get(rname),
+                Some(ConstantInfo::Recursor { rules, .. }) if rules.iter().any(|r| r.ctor == cname)
+            )
+        };
+
+        let ctor: Option<(u32, u32, Vec<Rc<nbe::Thunk>>)> = match &*major_v {
+            nbe::Value::Lit(Lit::Nat(n)) => {
+                let Some((zero, succ)) = self.nat_ctors() else {
+                    return Ok(None);
+                };
+                let nat_induct = match self.env.get(zero) {
+                    Some(ConstantInfo::Constructor { induct, .. }) => Some(*induct),
+                    _ => None,
+                };
+                if !(nat_induct.map(|i| all.contains(&i)).unwrap_or(false) || rec_owns_ctor(zero)) {
+                    return Ok(None);
+                }
+                if *n == BigUint::from(0u32) {
+                    Some((zero, 0, Vec::new()))
+                } else if n.bits() > 256 {
+                    // Same byte cap as the eager path (`nat.rs`); stays
+                    // neutral so the fallback keeps the eager decline.
+                    return Ok(None);
+                } else {
+                    let pred = n - 1u32;
+                    Some((
+                        succ,
+                        0,
+                        vec![nbe::Thunk::forced(Rc::new(nbe::Value::Lit(Lit::Nat(pred))))],
+                    ))
+                }
+            }
+            nbe::Value::Neutral(nv) => {
+                let (chead, cargs) = Self::unwind_neutral(nv);
+                match chead {
+                    nbe::Neutral::Const(cname, _) => match self.env.get(*cname) {
+                        Some(ConstantInfo::Constructor {
+                            induct,
+                            num_params: cnp,
+                            ..
+                        }) if all.contains(induct) || rec_owns_ctor(*cname) => {
+                            Some((*cname, *cnp, cargs))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((cname, cnp, ctor_args)) = ctor else {
+            return Ok(None);
+        };
+        if (ctor_args.len() as u32) < cnp {
+            return Ok(None);
+        }
+        let fields = &ctor_args[cnp as usize..];
+        let minor_idx = self.ctor_minor_index(cname, rname, &all);
+        if minor_idx >= minors.len() {
+            return Ok(None);
+        }
+        let Some(mask) = self.ctor_recursive_mask(cname, &all)? else {
+            return Ok(None);
+        };
+        if mask.len() != fields.len() {
+            return Ok(None);
+        }
+
+        let mut result = minors[minor_idx].force(self)?;
+        let mut rec_thunks: Vec<Rc<nbe::Thunk>> = Vec::new();
+        for (f, is_rec) in fields.iter().zip(mask.iter()) {
+            result = self.apply(result, f.clone(), depth)?;
+            if *is_rec {
+                rec_thunks.push(nbe::Thunk::rec_call(
+                    rname,
+                    us.clone(),
+                    params.to_vec(),
+                    motives.to_vec(),
+                    minors.to_vec(),
+                    f.clone(),
+                    depth,
+                ));
+            }
+        }
+        for rc in rec_thunks {
+            result = self.apply(result, rc, depth)?;
+        }
+        self.iota_value_cache_insert(rname, &us, &args, result.clone());
+        Ok(Some(result))
+    }
+
+    /// Re-invoke the recursor on a strictly smaller field, entirely in
+    /// value space (no `Expr` is rebuilt): `rname us params motives minors
+    /// field`, applied via the same `apply` chain, which will immediately
+    /// re-enter `try_iota_value` for the smaller instance. This is the
+    /// "closures instead of substituted terms" step that keeps a `below`
+    /// accumulator from being re-serialized at every level.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_rec_call_value(
+        &self,
+        rname: u32,
+        us: &Rc<Vec<Level>>,
+        params: &[Rc<nbe::Thunk>],
+        motives: &[Rc<nbe::Thunk>],
+        minors: &[Rc<nbe::Thunk>],
+        field: &Rc<nbe::Thunk>,
+        depth: u32,
+    ) -> R<Rc<nbe::Value>> {
+        let mut v: Rc<nbe::Value> =
+            Rc::new(nbe::Value::Neutral(nbe::Neutral::Const(rname, us.clone())));
+        for p in params.iter().chain(motives.iter()).chain(minors.iter()) {
+            v = self.apply(v, p.clone(), depth)?;
+        }
+        self.apply(v, field.clone(), depth)
+    }
+
+    /// Static (level-independent) shape of `cname`'s fields: `mask[i]` is
+    /// true when field `i`'s type, after whnf and consuming the ctor's own
+    /// params, is directly `T args..` for some `T` in `all` — a zero-binder
+    /// recursive occurrence (`Nat.succ`'s `Nat` field, `List.cons`'s tail,
+    /// `brecOn`-generated ctors, …). `None` bails the whole ctor (higher-
+    /// order recursion, e.g. `Acc.intro`, or anything else this spike does
+    /// not model) so the caller stays neutral and defers to eager.
+    fn ctor_recursive_mask(&self, cname: u32, all: &[u32]) -> R<Option<Vec<bool>>> {
+        let (ctor_typ, cnp) = match self.env.get(cname) {
+            Some(ConstantInfo::Constructor {
+                typ, num_params, ..
+            }) => (typ.clone(), *num_params),
+            _ => return Ok(None),
+        };
+        let mut ctx = Ctx::new();
+        let mut cur = ctor_typ;
+        for _ in 0..cnp {
+            match self.ensure_pi(&ctx, &cur) {
+                Ok((_, dom, body)) => {
+                    ctx.push(dom);
+                    cur = body;
+                }
+                Err(_) => return Ok(None),
+            }
+        }
+        let mut mask = Vec::new();
+        loop {
+            let (dom, body) = match self.ensure_pi(&ctx, &cur) {
+                Ok((_, dom, body)) => (dom, body),
+                Err(_) => break,
+            };
+            let domw = self.whnf(&ctx, &dom).unwrap_or_else(|_| dom.clone());
+            let is_rec = !matches!(&**domw, ExprData::Pi(..)) && {
+                let (h, _) = expr::unfold_apps(&domw);
+                matches!(&**h, ExprData::Const(t, _) if all.contains(t))
+            };
+            mask.push(is_rec);
+            ctx.push(dom);
+            cur = body;
+        }
+        Ok(Some(mask))
+    }
+
+    fn iota_value_cache_key(
+        &self,
+        rname: u32,
+        us: &Rc<Vec<Level>>,
+        args: &[Rc<nbe::Thunk>],
+    ) -> (u32, Vec<Level>, Vec<ThunkPtrKey>) {
+        let ptrs = args.iter().cloned().map(ThunkPtrKey).collect();
+        (rname, (**us).clone(), ptrs)
+    }
+
+    fn iota_value_cache(
+        &self,
+        rname: u32,
+        us: &Rc<Vec<Level>>,
+        args: &[Rc<nbe::Thunk>],
+    ) -> Option<Rc<nbe::Value>> {
+        let key = self.iota_value_cache_key(rname, us, args);
+        self.iota_value_cache.borrow().get(&key).cloned()
+    }
+
+    fn iota_value_cache_insert(
+        &self,
+        rname: u32,
+        us: &Rc<Vec<Level>>,
+        args: &[Rc<nbe::Thunk>],
+        v: Rc<nbe::Value>,
+    ) {
+        let key = self.iota_value_cache_key(rname, us, args);
+        self.iota_value_cache.borrow_mut().insert(key, v);
+    }
+
+    /// Convert a `Value` back to an `Expr`, for tests and error paths only —
+    /// the hot `values_def_eq` comparison never needs to quote.
+    pub(crate) fn quote(&self, depth: u32, v: &nbe::Value) -> R<Expr> {
+        match v {
+            nbe::Value::Sort(l) => Ok(expr::sort(l.clone())),
+            nbe::Value::Lit(Lit::Nat(n)) => Ok(expr::lit_nat(n.clone())),
+            nbe::Value::Lit(Lit::Str(s)) => Ok(expr::lit_str((**s).clone())),
+            nbe::Value::Lam(bi, dom, env, body) => {
+                let domv = dom.force(self)?;
+                let domq = self.quote(depth, &domv)?;
+                let fresh = nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(nbe::Neutral::Var(depth))));
+                let mut env2 = (**env).clone();
+                env2.push(fresh);
+                let bodyv = self.eval(&Rc::new(env2), body)?;
+                let bodyq = self.quote(depth + 1, &bodyv)?;
+                Ok(expr::lam(*bi, domq, bodyq))
+            }
+            nbe::Value::Pi(bi, dom, env, body) => {
+                let domv = dom.force(self)?;
+                let domq = self.quote(depth, &domv)?;
+                let fresh = nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(nbe::Neutral::Var(depth))));
+                let mut env2 = (**env).clone();
+                env2.push(fresh);
+                let bodyv = self.eval(&Rc::new(env2), body)?;
+                let bodyq = self.quote(depth + 1, &bodyv)?;
+                Ok(expr::pi(*bi, domq, bodyq))
+            }
+            nbe::Value::Neutral(n) => self.quote_neutral(depth, n),
+        }
+    }
+
+    fn quote_neutral(&self, depth: u32, n: &nbe::Neutral) -> R<Expr> {
+        match n {
+            nbe::Neutral::Var(level) => {
+                if *level >= depth {
+                    return Err(TcError::Other("nbe: level out of range during quote".into()));
+                }
+                Ok(expr::bvar(depth - level - 1))
+            }
+            nbe::Neutral::Const(name, us) => Ok(expr::const_(*name, (**us).clone())),
+            nbe::Neutral::App(f, a) => {
+                let fq = self.quote_neutral(depth, f)?;
+                let av = a.force(self)?;
+                let aq = self.quote(depth, &av)?;
+                Ok(expr::app(fq, aq))
+            }
+            nbe::Neutral::Proj(s, i, v) => {
+                let vq = self.quote_neutral(depth, v)?;
+                Ok(expr::proj(*s, *i, vq))
+            }
+        }
+    }
+
+    /// Structural equality of two `Value`s. `Ok(true)` is a sound, final
+    /// answer (matching canonical/neutral shapes are definitionally equal
+    /// by construction of `eval`). `Ok(false)` means "not confirmed" —
+    /// mismatch *or* an unsupported shape — and the caller must treat that
+    /// as "ask eager", never as a confirmed inequality.
+    pub(crate) fn values_def_eq(&self, depth: u32, va: &Rc<nbe::Value>, vb: &Rc<nbe::Value>) -> R<bool> {
+        if Rc::ptr_eq(va, vb) {
+            return Ok(true);
+        }
+        match (&**va, &**vb) {
+            (nbe::Value::Sort(l1), nbe::Value::Sort(l2)) => Ok(level::is_def_eq(l1, l2)),
+            (nbe::Value::Lit(x), nbe::Value::Lit(y)) => Ok(x == y),
+            (nbe::Value::Neutral(n1), nbe::Value::Neutral(n2)) => self.neutral_def_eq(depth, n1, n2),
+            (nbe::Value::Pi(_, d1, e1, b1), nbe::Value::Pi(_, d2, e2, b2)) => {
+                let dv1 = d1.force(self)?;
+                let dv2 = d2.force(self)?;
+                if !self.values_def_eq(depth, &dv1, &dv2)? {
+                    return Ok(false);
+                }
+                let fresh = nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(nbe::Neutral::Var(depth))));
+                let mut env1 = (**e1).clone();
+                env1.push(fresh.clone());
+                let mut env2 = (**e2).clone();
+                env2.push(fresh);
+                let bv1 = self.eval(&Rc::new(env1), b1)?;
+                let bv2 = self.eval(&Rc::new(env2), b2)?;
+                self.values_def_eq(depth + 1, &bv1, &bv2)
+            }
+            (nbe::Value::Lam(_, d1, e1, b1), nbe::Value::Lam(_, d2, e2, b2)) => {
+                let dv1 = d1.force(self)?;
+                let dv2 = d2.force(self)?;
+                if !self.values_def_eq(depth, &dv1, &dv2)? {
+                    return Ok(false);
+                }
+                let fresh = nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(nbe::Neutral::Var(depth))));
+                let mut env1 = (**e1).clone();
+                env1.push(fresh.clone());
+                let mut env2 = (**e2).clone();
+                env2.push(fresh);
+                let bv1 = self.eval(&Rc::new(env1), b1)?;
+                let bv2 = self.eval(&Rc::new(env2), b2)?;
+                self.values_def_eq(depth + 1, &bv1, &bv2)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn neutral_def_eq(&self, depth: u32, n1: &nbe::Neutral, n2: &nbe::Neutral) -> R<bool> {
+        match (n1, n2) {
+            (nbe::Neutral::Var(l1), nbe::Neutral::Var(l2)) => Ok(l1 == l2),
+            (nbe::Neutral::Const(a, ua), nbe::Neutral::Const(b, ub)) => Ok(a == b
+                && ua.len() == ub.len()
+                && ua.iter().zip(ub.iter()).all(|(x, y)| level::is_def_eq(x, y))),
+            (nbe::Neutral::App(f1, a1), nbe::Neutral::App(f2, a2)) => {
+                if !self.neutral_def_eq(depth, f1, f2)? {
+                    return Ok(false);
+                }
+                let v1 = a1.force(self)?;
+                let v2 = a2.force(self)?;
+                self.values_def_eq(depth, &v1, &v2)
+            }
+            (nbe::Neutral::Proj(s1, i1, v1), nbe::Neutral::Proj(s2, i2, v2)) => {
+                Ok(s1 == s2 && i1 == i2 && self.neutral_def_eq(depth, v1, v2)?)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -9099,6 +9655,13 @@ mod tests {
     /// WHNF makes `id a ≡ a` Ok(false) at the cap (stuck term as normal form).
     #[test]
     fn core_depth_abort_declines_not_stuck_whnf() {
+        // `CORE_DEPTH`/`WHNF_DEPTH` are eager-path recursion guards; the NbE
+        // spike (`KIOTA_NBE=1`) doesn't share them (`id a` reduces to `a` in
+        // O(1) via a closure, no counted recursion to abort), so this
+        // eager-internals test has nothing to assert there.
+        if crate::nbe::nbe_enabled() {
+            return;
+        }
         use crate::env::{ConstantInfo, Environment, ReducibilityHints};
         let mut env = Environment::default();
         let sort1 = expr::sort(level::succ(level::zero()));
@@ -9623,5 +10186,233 @@ mod tests {
             tc.pp(&lhs),
             tc.pp(&arg)
         );
+    }
+
+    // ---------------- NbE spike: eval/quote and is_def_eq_via_nbe vs eager ----------------
+
+    /// `Nat0 : Type`, `Z`/`S` ctors, `Nat0.rec` with the standard two rules —
+    /// enough to exercise `try_iota_value`'s "simple" (zero-index,
+    /// directly-recursive) path without pulling in the real `Nat` literal
+    /// fast path.
+    fn insert_mini_nat0(env: &mut crate::env::Environment) {
+        use crate::env::{ConstantInfo, RecRule};
+        let sort1 = expr::sort(level::succ(level::zero()));
+        let nat0 = expr::const_(0, vec![]);
+        env.insert(
+            0,
+            ConstantInfo::InductiveType {
+                level_params: vec![],
+                typ: sort1.clone(),
+                num_params: 0,
+                num_indices: 0,
+                all: vec![0],
+                ctors: vec![1, 2],
+                is_rec: true,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            1,
+            ConstantInfo::Constructor {
+                level_params: vec![],
+                typ: nat0.clone(),
+                induct: 0,
+                cidx: 0,
+                num_params: 0,
+                num_fields: 0,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            2,
+            ConstantInfo::Constructor {
+                level_params: vec![],
+                typ: expr::pi(expr::BinderInfo::Default, nat0.clone(), nat0.clone()),
+                induct: 0,
+                cidx: 1,
+                num_params: 0,
+                num_fields: 1,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            3,
+            ConstantInfo::Recursor {
+                level_params: vec![],
+                typ: sort1,
+                all: vec![0],
+                num_params: 0,
+                num_indices: 0,
+                num_motives: 1,
+                num_minors: 2,
+                rules: vec![
+                    RecRule {
+                        ctor: 1,
+                        nfields: 0,
+                        rhs: expr::bvar(0),
+                    },
+                    RecRule {
+                        ctor: 2,
+                        nfields: 1,
+                        rhs: expr::bvar(0),
+                    },
+                ],
+                k: false,
+                is_unsafe: false,
+            },
+        );
+        env.rec_of.insert(0, 3);
+    }
+
+    fn nat0_lit(n: u32) -> Expr {
+        let z = expr::const_(1, vec![]);
+        let s = expr::const_(2, vec![]);
+        let mut cur = z;
+        for _ in 0..n {
+            cur = expr::app(s.clone(), cur);
+        }
+        cur
+    }
+
+    /// `Nat0.rec motive 1 (fun _ ih => S ih) 2` (i.e. `add 2 1`) must NbE-
+    /// evaluate, quote, and `is_def_eq_via_nbe` all agree with eager on `3`,
+    /// and must not agree on `2` — the closure-based iota path in
+    /// `try_iota_value`/`build_rec_call_value` has to reduce a real
+    /// `brecOn`-shaped recursive call (one rec-call per level, via a
+    /// `Thunk::RecCall`, not a re-quoted term) to the right answer.
+    #[test]
+    fn nbe_nat0_rec_add_matches_eager() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_nat0(&mut env);
+        let names = test_names(&["Nat0", "Nat0.Z", "Nat0.S", "Nat0.rec"]);
+        let tc = Checker::new(&env, &names, None, None);
+
+        let nat0 = expr::const_(0, vec![]);
+        let s = expr::const_(2, vec![]);
+        let rec_ = expr::const_(3, vec![]);
+        let motive = expr::lam(expr::BinderInfo::Default, nat0.clone(), nat0.clone());
+        let base = nat0_lit(1); // add's `m`
+        let step = expr::lam(
+            expr::BinderInfo::Default,
+            nat0.clone(),
+            expr::lam(
+                expr::BinderInfo::Default,
+                nat0,
+                expr::app(s, expr::bvar(0)),
+            ),
+        );
+        let two = nat0_lit(2);
+        let rec_app = expr::apps(rec_, &[motive, base, step, two.clone()]);
+        let three = nat0_lit(3);
+
+        let ctx = Ctx::new();
+        assert!(
+            tc.is_def_eq(&ctx, &rec_app, &three).unwrap(),
+            "eager: add 2 1 must convert to 3"
+        );
+        assert!(
+            tc.is_def_eq_via_nbe(&ctx, &rec_app, &three).unwrap(),
+            "nbe: add 2 1 must convert to 3"
+        );
+        assert!(
+            !tc.is_def_eq(&ctx, &rec_app, &two).unwrap(),
+            "eager: add 2 1 must not convert to 2"
+        );
+        assert!(
+            !tc.is_def_eq_via_nbe(&ctx, &rec_app, &two).unwrap(),
+            "nbe: add 2 1 must not convert to 2"
+        );
+
+        // eval/quote round-trip: the quoted normal form must itself be
+        // eager-defeq to `3` (and NOT to `2`).
+        let v = tc.eval(&crate::nbe::generic_env(0), &rec_app).unwrap();
+        let q = tc.quote(0, &v).unwrap();
+        assert!(
+            tc.is_def_eq(&ctx, &q, &three).unwrap(),
+            "quoted NbE normal form must eager-convert to 3, got {}",
+            tc.pp(&q)
+        );
+        assert!(!tc.is_def_eq(&ctx, &q, &two).unwrap());
+    }
+
+    /// Closed beta/eta-free lambda application: `(fun _:A => a) star` vs
+    /// `a`. Smallest possible eval/quote + `is_def_eq_via_nbe` sanity check,
+    /// independent of any inductive/iota machinery.
+    #[test]
+    fn nbe_beta_matches_eager_on_axioms() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            1,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::const_(0, vec![]),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            2,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::const_(0, vec![]),
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["A", "a", "star"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let a_ty = expr::const_(0, vec![]);
+        let a = expr::const_(1, vec![]);
+        let star = expr::const_(2, vec![]);
+        let redex = expr::app(
+            expr::lam(expr::BinderInfo::Default, a_ty, a.clone()),
+            star,
+        );
+        let ctx = Ctx::new();
+        assert!(tc.is_def_eq(&ctx, &redex, &a).unwrap());
+        assert!(tc.is_def_eq_via_nbe(&ctx, &redex, &a).unwrap());
+        assert!(!tc.is_def_eq(&ctx, &redex, &expr::const_(2, vec![])).unwrap());
+        assert!(!tc
+            .is_def_eq_via_nbe(&ctx, &redex, &expr::const_(2, vec![]))
+            .unwrap());
+
+        let v = tc.eval(&crate::nbe::generic_env(0), &redex).unwrap();
+        let q = tc.quote(0, &v).unwrap();
+        assert!(Rc::ptr_eq(&q, &a), "quoted beta-redex must be `a` itself, got {}", tc.pp(&q));
+    }
+
+    /// The `KIOTA_NBE=1` dispatch in `is_def_eq` must be a pure accelerator:
+    /// running the whole exports suite through it must not change any
+    /// accept/reject/decline verdict. `run_all_flag_combinations.sh`/CI sets
+    /// the env var; here we call `is_def_eq_via_nbe` directly so the test is
+    /// deterministic regardless of how the test binary itself was launched.
+    #[test]
+    fn nbe_never_confirms_true_when_eager_says_false() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_nat0(&mut env);
+        let names = test_names(&["Nat0", "Nat0.Z", "Nat0.S", "Nat0.rec"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let ctx = Ctx::new();
+        // Two unrelated numerals: NbE must not spuriously confirm equality.
+        for i in 0..5u32 {
+            for j in 0..5u32 {
+                let a = nat0_lit(i);
+                let b = nat0_lit(j);
+                let eager = tc.is_def_eq(&ctx, &a, &b).unwrap();
+                let nbe = tc.is_def_eq_via_nbe(&ctx, &a, &b).unwrap();
+                assert_eq!(eager, i == j);
+                assert_eq!(nbe, eager, "nbe/eager disagree on Nat0 {i} vs {j}");
+            }
+        }
     }
 }
