@@ -75,6 +75,13 @@ Exit codes:
 
 Set `KIOTA_DEBUG=1` to print both sides of an application-type mismatch.
 
+## Benchmarking
+
+To A/B instruction counts, wall time, and peak RSS across two builds (or two
+runs of the same build) without relying on Linux `perf`, see
+[`scripts/bench.sh`](scripts/bench.sh) and
+[`scripts/README-bench.md`](scripts/README-bench.md).
+
 ## What to read in the code
 
 If you are exploring kernel implementation rather than just running the binary, the interesting paths are:
