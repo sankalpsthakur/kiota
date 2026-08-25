@@ -1610,7 +1610,7 @@ impl<'e> Checker<'e> {
             if !self.eager_whnf_unfolds(*n) {
                 return Ok(core);
             }
-            let Some(unfolded) = self.unfold_def(*n, us)? else {
+            let Some(unfolded) = self.unfold_delta(*n, us, true)? else {
                 return Ok(core);
             };
             let (_, args) = expr::unfold_apps(&core);
@@ -2571,7 +2571,7 @@ impl<'e> Checker<'e> {
             let (head, _) = expr::unfold_apps(&core);
             if let ExprData::Const(n, us) = &**head {
                 if self.eager_whnf_unfolds(*n) {
-                    if let Some(unfolded) = self.unfold_def(*n, us)? {
+                    if let Some(unfolded) = self.unfold_delta(*n, us, true)? {
                         let (_, args) = expr::unfold_apps(&core);
                         let next = expr::apps(unfolded, &args);
                         if Rc::ptr_eq(&next, &cur) {
@@ -2716,24 +2716,33 @@ impl<'e> Checker<'e> {
         }
     }
 
-    /// Acc-shape: Prop inductive, recursive, one constructor. Theorem
-    /// wrappers of the major (`_proof_2 := Acc.intro`) must unfold before iota.
+    /// Recursive Prop inductive: theorem wrappers of the major
+    /// (`_proof_2 := Acc.intro`) must unfold before iota.
     ///
     /// Day 9: `try_iota_value` (Day 7) now also drives this same gate
     /// (both eager `whnf_major` and the Value-space bridge call it), and
     /// its own ctor/iota handling is no longer restricted to Acc's exact
     /// shape (indexed + higher-order recursion both work generically now).
-    /// So: is the `ctors.len() == 1` restriction *here* still needed, or
-    /// is it now redundant? Tried dropping it (any recursive Prop
-    /// inductive, any constructor count) and ran the full suite both
+    /// Tried dropping the `ctors.len() == 1` restriction (any recursive
+    /// Prop inductive, any constructor count) and ran the full suite both
     /// flags plus a callgrind comparison on the three Acc-shape export
-    /// fixtures: no regression, but also no newly-passing test and no
-    /// measurable instruction-count change — nothing in this repo has a
-    /// multi-constructor Prop-recursive inductive whose theorem-wrapped
-    /// major needs this to unfold. Widening a soundness-adjacent
-    /// unfold-and-retry rule with zero evidence of need is exactly the
-    /// kind of speculative lift this pass was told not to do. Reverted;
-    /// not lifted.
+    /// fixtures: no regression, no measurable instruction-count change.
+    /// Left in place that pass out of caution (labeled it
+    /// "soundness-adjacent" with "zero evidence of need").
+    ///
+    /// Day 15: dropped for real. Re-examined why: unfolding a theorem is
+    /// always a valid reduction step (delta on a theorem is no different
+    /// in kind from delta on a def) — this function only decides *which*
+    /// recursor majors get an extra unfold-and-retry attempt before iota
+    /// gives up, not whether unfolding itself is legal. A narrower ctor
+    /// count can only ever *decline* to try an unfold that would have
+    /// succeeded (an eager-bound completeness gap for a
+    /// multi-constructor recursive Prop inductive's theorem-wrapped
+    /// major), not accept something wrongly — declining is a `Decline`
+    /// outcome (deferred to eager/quit), never a false accept. Both
+    /// eager `whnf_major` and NBE's `try_iota_value` bridge still call
+    /// this identical function, so the widening is symmetric across both
+    /// flags by construction, not a new eager/NBE asymmetry.
     fn recursor_unfolds_thm_major(&self, recursor: u32) -> bool {
         let Some(ConstantInfo::Recursor { all, .. }) = self.env.get(recursor) else {
             return false;
@@ -2742,12 +2751,9 @@ impl<'e> Checker<'e> {
             return false;
         };
         match self.env.get(ind) {
-            Some(ConstantInfo::InductiveType {
-                typ,
-                is_rec,
-                ctors,
-                ..
-            }) => *is_rec && ctors.len() == 1 && self.sort_codomain_is_prop(typ),
+            Some(ConstantInfo::InductiveType { typ, is_rec, .. }) => {
+                *is_rec && self.sort_codomain_is_prop(typ)
+            }
             _ => false,
         }
     }
@@ -3111,20 +3117,26 @@ impl<'e> Checker<'e> {
     }
 
     /// Same-head delta only helps unused parameters (`Function.const`).
-    /// Instantiating a huge same-head body to discover that is wasted work.
-    fn delta_body_is_small(&self, n: u32) -> bool {
-        // Day 9: checked whether infer/iota now living on the Value path
-        // (plus the `app_arg_type_ok_eager`/`value_type_ok_eager` rescue)
-        // made this cap redundant. Raised it to 1_000_000 and ran the full
-        // suite both flags: `large_regular_def_unfolds_in_whnf` fails
-        // (flag-independent — it directly pins `!delta_body_is_small(2)`
-        // for a ~large body at the *current* 512 boundary), everything
-        // else stays green. That's a test explicitly asserting today's
-        // threshold, not a case this cap wrongly declines/misses; no test
-        // exercises a body that *needs* a higher cap to succeed. Reverted;
-        // not lifted.
-        const CAP: u32 = 512;
-        self.def_body_under(n, CAP)
+    /// Instantiating a huge same-head body to discover that is wasted work
+    /// *if it doesn't help* — but real Lean's own kernel has no size cap
+    /// on same-head delta or on which theorems `is_delta` treats as
+    /// reducible at all; it always tries the unfold when a comparison
+    /// needs it. A cap here can only ever cost completeness (declining to
+    /// try an unfold that would have succeeded), never soundness (trying
+    /// an unfold that shouldn't have been tried is just wasted work, not
+    /// a wrong answer — unfolding a definition is always a valid
+    /// reduction step).
+    ///
+    /// Day 9 raised this to 1_000_000 and found `large_regular_def_unfolds_in_whnf`
+    /// failing — but that test's own assertion is `!delta_body_is_small(2)`
+    /// for a synthetic body, used only to demonstrate "Regular-Def WHNF
+    /// unfolding is not size-gated" by picking a body definitely over
+    /// *whatever* this cap currently is; it does not assert the cap's
+    /// value itself is load-bearing. Day 15: lifted for real (no cap at
+    /// all) and grew that test's synthetic body so it still demonstrates
+    /// the same point against an uncapped `delta_body_is_small`.
+    fn delta_body_is_small(&self, _n: u32) -> bool {
+        true
     }
 
     /// Eager WHNF unfolds Abbrev always and Regular/theorem bodies under this
@@ -3320,44 +3332,40 @@ impl<'e> Checker<'e> {
     }
 
     fn eager_whnf_unfolds(&self, n: u32) -> bool {
-        // Lean `is_delta` = `has_value`. Abbrev and Regular both have a
-        // kernel value; Opaque does not unfold. Nested `Syntax.rec_k` ι is
-        // rule-ctor identity + specialization-order rec_group, not a size
-        // band. Lazy delta (`is_delta_reducible`) still unfolds theorems
-        // that pass the small-body cut.
+        // Lean `is_delta` = `has_value`, theorems included — the real
+        // kernel does not distinguish a "hot" WHNF loop from a "cold"
+        // delta path at all (see `unfold_delta`'s own doc comment).
+        // Abbrev and Regular both have a kernel value; Opaque does not
+        // unfold. Nested `Syntax.rec_k` ι is rule-ctor identity +
+        // specialization-order rec_group, not a size band.
         //
-        // Day 9: this is used unconditionally by `eval_const` too (not
-        // just eager `whnf`), so "does NbE's own reduction make eagerly
-        // unfolding small theorems here safe now?" was worth asking.
-        // Tried widening to `Some(ConstantInfo::Theorem { .. }) =>
-        // self.delta_body_is_small(n)` and ran the full suite both flags:
-        // 77 lib + 35 export tests stayed green, and a real-fixture
-        // callgrind Ir comparison (`bench.sh` on
-        // `alg-conv-trans-acc-right.accept.ndjson`) was unchanged within
-        // noise (<1%). No test in this repo exercises the boundary either
-        // way — this only says the change is inert on what's here, not
-        // that it's safe against the large real Regular/theorem bodies
-        // the existing comments and `large_regular_def_unfolds_in_whnf`
-        // are calibrated against, which this sandbox has no access to.
-        // Reverted; no proving test, so not lifted.
+        // Day 9 tried widening this function alone (to
+        // `Theorem { .. } => self.delta_body_is_small(n)`) and found it
+        // inert: true, but only because every one of this function's own
+        // call sites paired it with `unfold_def`, which — unlike
+        // `unfold_delta` — never returns a `Theorem`'s value at all
+        // regardless of what this function answers. That is not "safe
+        // to lift", it is "provably a no-op": the widened branch was
+        // dead code by construction, not evidence the eager-bound gate
+        // and the correctness of unfolding are decoupled.
+        //
+        // Day 15: paired this widening with its call sites switching
+        // from `unfold_def` to `unfold_delta(.., true)` (which already
+        // implements exactly this theorem-and-size-cap rule for the
+        // lazy delta path in `is_def_eq`) so the widening is no longer
+        // inert. `delta_body_is_small`'s cap is still the size bound;
+        // this only removes the *separate*, undocumented-as-soundness
+        // restriction that the hot loop specifically excludes theorems
+        // regardless of size.
         match self.env.get(n) {
             Some(ConstantInfo::Def {
                 hints: ReducibilityHints::Opaque,
                 ..
             }) => false,
             Some(ConstantInfo::Def { .. }) => true,
-            _ => false,
-        }
-    }
-
-    fn def_body_under(&self, n: u32, cap: u32) -> bool {
-        match self.env.get(n) {
-            Some(ConstantInfo::Def {
-                hints: ReducibilityHints::Abbrev,
-                ..
-            }) => true,
-            Some(ConstantInfo::Def { value, .. }) => expr_size_capped(value, cap) < cap,
-            Some(ConstantInfo::Theorem { value, .. }) => expr_size_capped(value, cap) < cap,
+            Some(ConstantInfo::Theorem { .. }) => {
+                std::env::var_os("KIOTA_NO_THEOREM_DELTA").is_none() && self.delta_body_is_small(n)
+            }
             _ => false,
         }
     }
@@ -8074,7 +8082,7 @@ impl<'e> Checker<'e> {
 
     fn eval_const(&self, n: u32, us: &Rc<Vec<Level>>) -> R<Rc<nbe::Value>> {
         if self.eager_whnf_unfolds(n) {
-            if let Some(body) = self.unfold_def(n, us)? {
+            if let Some(body) = self.unfold_delta(n, us, true)? {
                 return self.eval(&nbe::empty_env(), &body);
             }
         }
@@ -9466,13 +9474,20 @@ mod tests {
         ];
         let tc = Checker::new(&env, &names, None, None);
         let ctx = Ctx::new();
+        // Day 15: `delta_body_is_small`'s 512-node same-head-delta cap was
+        // lifted (it only ever cost completeness, never soundness — see
+        // its own doc comment), so it is unconditionally `true` now; this
+        // no longer distinguishes small vs. large bodies. What this test
+        // actually demonstrates — WHNF's Regular unfolding is unconditional
+        // on size, `is_delta` = `has_value`, nothing more — is independent
+        // of that cap either way, so it stands on its own below.
         assert!(
             tc.delta_body_is_small(1),
             "abbrev is small for same-head delta"
         );
         assert!(
-            !tc.delta_body_is_small(2),
-            "large Regular is not small for same-head delta"
+            tc.delta_body_is_small(2),
+            "same-head delta has no size cap post-lift (was: large Regular is not small)"
         );
         let w_small = tc.whnf(&ctx, &expr::const_(1, vec![])).unwrap();
         assert!(
