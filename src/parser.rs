@@ -232,6 +232,10 @@ impl Parser {
         }
     }
 
+    fn name_str(&self, n: u32) -> &str {
+        self.names.get(n as usize).map(|s| s.as_str()).unwrap_or("")
+    }
+
     fn reject_if_dup(&self, name: u32) -> Result<(), TcError> {
         if self.env.get(name).is_some() {
             return Err(TcError::Reject(format!(
@@ -519,6 +523,33 @@ impl Parser {
                 "extra recursor in inductive group ({} recs, expected {expected_recs})",
                 recs.len()
             )));
+        }
+        // `I.rec` is the name Lean reserves for `I`'s recursor, and it is the
+        // name every user of the recursor is compiled against. An export that
+        // supplies `I.not_rec` instead is not offering a constant the kernel
+        // would ever have built, so no amount of checking its *type* makes it
+        // legitimate — and a checker that regenerates `I.rec` from the
+        // inductive would leave `I.not_rec` dangling for its callers. Nested
+        // auxiliaries are `I.rec_1`, `I.rec_2`, …; identity below is still
+        // rule constructors, this only fixes what the constant may be called.
+        for r in &recs {
+            let rname = Self::get_u32(r, "name");
+            let rstr = self.name_str(rname);
+            let named_for_group = type_names.iter().any(|t| {
+                let tstr = self.name_str(*t);
+                match rstr.strip_prefix(tstr) {
+                    Some(".rec") => true,
+                    Some(suf) => suf
+                        .strip_prefix(".rec_")
+                        .is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit())),
+                    None => false,
+                }
+            });
+            if !named_for_group {
+                return Err(TcError::Reject(format!(
+                    "recursor `{rstr}` is not named `I.rec` for an inductive in this group"
+                )));
+            }
         }
         let mut seen_rec_for: FxHashSet<u32> = FxHashSet::default();
         for r in &recs {

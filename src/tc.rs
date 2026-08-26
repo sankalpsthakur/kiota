@@ -1699,37 +1699,29 @@ impl<'e> Checker<'e> {
             let (_, _dom, body) = self.ensure_pi(ctx, &ct)?;
             ct = expr::instantiate1(&body, p);
         }
-        // walk `idx` fields, substituting earlier fields with proj v i
-        let mut field_types = Vec::new();
-        let mut cur = ct;
-        for _ in 0..num_fields {
-            let (_, dom, body) = self.ensure_pi(ctx, &cur)?;
-            field_types.push(dom.clone());
-            cur = body;
-            // note body still has a dangling bvar 0 representing this field;
-            // we substitute concretely below once we know which projections to build.
-            break;
-        }
-        // Re-derive properly: substitute proj(v,0)..proj(v,idx-1) into the telescope.
-        let mut ct2 = {
-            let subst2 = level::subst_map(&ctor_lp, &us);
-            let mut t = expr::instantiate_level_params(&ctor_typ, &subst2);
-            for p in args.iter().take(num_params as usize) {
-                let (_, _d, body) = self.ensure_pi(ctx, &t)?;
-                t = expr::instantiate1(&body, p);
-            }
-            t
-        };
+        // Walk the field telescope, replacing field `i` by `proj v i` only
+        // where a later field actually mentions it. On a `Prop` structure that
+        // substitution is where data would leak: proof irrelevance says any
+        // two inhabitants are equal, so nothing a proof depends on may be
+        // data. Fields that nothing depends on are irrelevant — which is why
+        // projecting *past* plain data is fine and projecting past a
+        // depended-on data field is not, whatever the requested field's own
+        // type is.
+        let is_prop_struct = self.is_prop(ctx, &vtw)?;
         for i in 0..idx {
-            let (_, _dom, body) = self.ensure_pi(ctx, &ct2)?;
-            let proj_i = expr::proj(sname, i, v.clone());
-            ct2 = expr::instantiate1(&body, &proj_i);
+            let (_, dom_i, body) = self.ensure_pi(ctx, &ct)?;
+            ct = if expr::loose_bvar_range(&body) > 0 {
+                if is_prop_struct && !self.is_prop(ctx, &dom_i)? {
+                    return reject("projection reaches past a data field a later field depends on, in a Prop structure");
+                }
+                expr::instantiate1(&body, &expr::proj(sname, i, v.clone()))
+            } else {
+                body
+            };
         }
-        let (_, dom, _body) = self.ensure_pi(ctx, &ct2)?;
-        if self.is_prop(ctx, &vtw)? {
-            if !self.is_prop(ctx, &dom)? {
-                return reject("cannot project a Type field from a Prop structure");
-            }
+        let (_, dom, _body) = self.ensure_pi(ctx, &ct)?;
+        if is_prop_struct && !self.is_prop(ctx, &dom)? {
+            return reject("cannot project a Type field from a Prop structure");
         }
         Ok(dom)
     }
@@ -1925,15 +1917,29 @@ impl<'e> Checker<'e> {
             }
             _ => {
                 let (h, args) = expr::unfold_apps(&w);
-                let ExprData::Const(n, _) = &**h else {
+                let ExprData::Const(n, us) = &**h else {
                     return self.is_prop_by_infer(ctx, &w);
                 };
+                // The sort of `I.{us} a₁ … aₙ` is what `I`'s telescope ends in
+                // *after* substituting `us`. Reading `Sort u` straight off the
+                // declaration answers for the parameter, not the instance, and
+                // says `PUnit.{0}` is not a proposition. `MaybeProp.{u}` still
+                // answers "not a proposition", which is the intended reading:
+                // the field-universe bound and the projection rule have to
+                // agree on that, or a data field enters a `Prop`.
                 if let Some(ConstantInfo::InductiveType {
-                    typ, num_params, ..
+                    level_params,
+                    typ,
+                    num_params,
+                    ..
                 }) = self.env.get(*n)
                 {
                     if (args.len() as u32) >= *num_params {
-                        return Ok(self.sort_codomain_is_prop(typ));
+                        let subst = level::subst_map(level_params, us);
+                        let ity = expr::instantiate_level_params(typ, &subst);
+                        if let Some(is_p) = Self::codomain_sort_is_prop(&ity, args.len()) {
+                            return Ok(is_p);
+                        }
                     }
                 }
                 let Some(cty) = self.const_typ(*n) else {
@@ -1962,14 +1968,24 @@ impl<'e> Checker<'e> {
     }
 
     fn telescope_codomain_is_prop(&self, typ: &Expr, args: usize) -> bool {
+        Self::codomain_sort_is_prop(typ, args).unwrap_or(false)
+    }
+
+    /// `Some(is_prop)` when peeling exactly `args` binders off `typ` lands on a
+    /// sort, so the answer is exact; `None` when it does not and the caller has
+    /// to fall back to inference.
+    fn codomain_sort_is_prop(typ: &Expr, args: usize) -> Option<bool> {
         let mut t = typ.clone();
         for _ in 0..args {
             match &**t {
                 ExprData::Pi(_, _, b) => t = b.clone(),
-                _ => return false,
+                _ => return None,
             }
         }
-        matches!(&**t, ExprData::Sort(l) if level::is_def_eq(l, &level::zero()))
+        match &**t {
+            ExprData::Sort(l) => Some(level::is_def_eq(l, &level::zero())),
+            _ => None,
+        }
     }
 
     fn sort_codomain_is_prop(&self, ty: &Expr) -> bool {
@@ -3057,19 +3073,16 @@ impl<'e> Checker<'e> {
     }
 
     fn eager_whnf_unfolds(&self, n: u32) -> bool {
-        // Lean `is_delta` = `has_value`. Abbrev and Regular both have a
-        // kernel value; Opaque does not unfold. Nested `Syntax.rec_k` ι is
+        // Lean `is_delta` = `has_value`, and `has_value` is a property of the
+        // *constant kind*, not of `ReducibilityHints`. `ReducibilityHints`
+        // only orders lazy delta (`def_height`); `.opaque` is the hint Lean
+        // puts on well-founded definitions and on every `defnInfo` built by
+        // hand, and the kernel unfolds those. Only `ConstantInfo::Opaque`
+        // (the `opaque` keyword) has no value. Nested `Syntax.rec_k` ι is
         // rule-ctor identity + specialization-order rec_group, not a size
         // band. Lazy delta (`is_delta_reducible`) still unfolds theorems
         // that pass the small-body cut.
-        match self.env.get(n) {
-            Some(ConstantInfo::Def {
-                hints: ReducibilityHints::Opaque,
-                ..
-            }) => false,
-            Some(ConstantInfo::Def { .. }) => true,
-            _ => false,
-        }
+        matches!(self.env.get(n), Some(ConstantInfo::Def { .. }))
     }
 
     fn def_body_under(&self, n: u32, cap: u32) -> bool {
@@ -3106,17 +3119,11 @@ impl<'e> Checker<'e> {
             && std::env::var_os("KIOTA_NO_THEOREM_DELTA").is_none()
             && crate::stats::theorem_delta_in_scope()
             && self.delta_body_is_small(n);
-        // Lean `is_delta` = `has_value`. WHNF unfolds Abbrev and Regular
-        // (`eager_whnf_unfolds`). Lazy delta still unfolds theorems that
-        // pass the small-body cut so `Bind.bind inst.1` can reach
-        // `StateT.bind` / `match_1`.
-        let is_def = matches!(
-            self.env.get(n),
-            Some(ConstantInfo::Def {
-                hints: ReducibilityHints::Abbrev | ReducibilityHints::Regular(_),
-                ..
-            })
-        );
+        // Lean `is_delta` = `has_value`, which every `Def` has whatever its
+        // hints say (`.opaque` included — it only lowers `def_height`). Lazy
+        // delta still unfolds theorems that pass the small-body cut so
+        // `Bind.bind inst.1` can reach `StateT.bind` / `match_1`.
+        let is_def = matches!(self.env.get(n), Some(ConstantInfo::Def { .. }));
         is_def || is_thm
     }
 

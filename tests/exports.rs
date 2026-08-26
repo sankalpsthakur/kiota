@@ -80,11 +80,15 @@ fn extra_rec_rejects() {
     assert_reject("extra-rec.reject.ndjson");
 }
 
-/// Recursor identity is rule constructors / `all ∩ group`, not `I.rec`.
-/// `elim` is a well-typed recursor for `False`; a pretty-name gate used to reject it.
+/// `elim` is a well-typed recursor for `False`, and still not a constant the
+/// kernel would have built: Lean names `I`'s recursor `I.rec` (nested
+/// auxiliaries `I.rec_1`, `I.rec_2`, …), and everything compiled against it
+/// refers to that name. Identity for ι is rule constructors, but the name is
+/// still checked — see the arena's `misnamed_rec_user`, which imports
+/// `misnamed_rec.not_rec` and must be rejected.
 #[test]
-fn extra_rec_all_field_not_pretty_name_accepts() {
-    assert_accept("extra-rec-alt-name.accept.ndjson");
+fn extra_rec_alt_name_rejects() {
+    assert_reject("extra-rec-alt-name.reject.ndjson");
 }
 
 #[test]
