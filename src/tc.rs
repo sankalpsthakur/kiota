@@ -27,8 +27,14 @@ thread_local! {
 /// Recursion guard for `whnf` / `is_def_eq`, not a completeness fingerprint.
 /// Lean has no 2048 cap; `WellFounded.Nat.fix` / UTF-8 decode proofs nest
 /// `Nat.rec` conversion past that (Init `utf8DecodeChar?.assemble₃._proof_3`).
-/// Kept well under typical C-stack (~8MB) so this is a decline, not a segfault.
-const CONV_DEPTH: u32 = 8_192;
+///
+/// The budget is the worker stack `main` allocates, which is 1 GB, not the
+/// 8 MB default this was once sized against. `perf/church-numerals` needs a
+/// reduction depth of 14520 by construction, so 8192 declined a test whose
+/// whole point is that the beta reduction is Θ(n²) but finite. Measured
+/// worst-case usage over the arena suite is well under a tenth of the stack
+/// at this cap, so it stays a decline rather than a segfault.
+const CONV_DEPTH: u32 = 32_768;
 
 #[derive(Debug)]
 pub enum TcError {
