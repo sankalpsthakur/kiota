@@ -7305,7 +7305,135 @@ impl<'e> Checker<'e> {
                 }
             }
         }
+
+        // Lean derives the recursor's motive universe rather than reading it
+        // off the export. Proof irrelevance makes any two inhabitants of a
+        // `Prop` equal, so a recursor that eliminates into a larger universe
+        // could tell apart things the theory says are the same. The exception
+        // is a subsingleton, where there is nothing to tell apart: an empty
+        // `Prop`, or one with a single constructor whose every field is
+        // itself a proof or is already exposed by the conclusion. Trusting
+        // the exported motive instead is `large-elim-prop-bool`, which
+        // relabels a two-constructor `Type` as a `Prop` and keeps the
+        // recursor: `pick .tt` and `pick .ff` then reduce to `true` and
+        // `false` while `.tt = .ff`.
+        let result_level = all.first().and_then(|t| infos.get(t)).map(|i| i.sort.clone());
+        if let Some(result_level) = result_level {
+            if self.elim_only_at_universe_zero(&param_ctx, &all, &result_level, num_params)? {
+                for tname in &all {
+                    let Some(rname) = self.env.rec_of.get(tname) else {
+                        continue;
+                    };
+                    if let Some(l) = self.recursor_motive_level(*rname) {
+                        if !level::is_def_eq(&l, &level::zero()) {
+                            return reject(
+                                "recursor of a Prop eliminates into a larger universe than Prop",
+                            );
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Lean's `elim_only_at_universe_zero`, over the group being declared.
+    fn elim_only_at_universe_zero(
+        &self,
+        param_ctx: &Ctx,
+        all: &[u32],
+        result_level: &Level,
+        num_params: u32,
+    ) -> R<bool> {
+        if level::is_not_zero(result_level) {
+            return Ok(false);
+        }
+        if all.len() > 1 {
+            return Ok(true);
+        }
+        let ctors = match self.env.get(all[0]) {
+            Some(ConstantInfo::InductiveType { ctors, .. }) => ctors.clone(),
+            _ => return Ok(false),
+        };
+        match ctors.len() {
+            0 => Ok(false),
+            1 => Ok(!self.ctor_is_subsingleton(param_ctx, ctors[0], num_params)?),
+            _ => Ok(true),
+        }
+    }
+
+    /// Every non-parameter field is a proof, or is one of the arguments the
+    /// conclusion already applies the type to — eliminating such a field
+    /// reveals nothing the type did not already say.
+    fn ctor_is_subsingleton(&self, param_ctx: &Ctx, cname: u32, num_params: u32) -> R<bool> {
+        let mut cur = match self.env.get(cname) {
+            Some(ConstantInfo::Constructor { typ, .. }) => typ.clone(),
+            _ => return Ok(false),
+        };
+        for _ in 0..num_params {
+            match &**cur {
+                ExprData::Pi(_, _, b) => cur = b.clone(),
+                _ => return Ok(false),
+            }
+        }
+        let mut ctx = param_ctx.clone();
+        let mut nbinders = num_params;
+        let mut data_fields: Vec<u32> = Vec::new();
+        loop {
+            let (dom, body) = match &**cur {
+                ExprData::Pi(_, d, b) => (d.clone(), b.clone()),
+                _ => break,
+            };
+            let ds = self.infer_type(&ctx, &dom)?;
+            let is_proof = matches!(
+                self.ensure_sort(&ctx, &ds),
+                Ok(l) if level::is_def_eq(&l, &level::zero())
+            );
+            if !is_proof {
+                data_fields.push(nbinders);
+            }
+            ctx.push(dom);
+            nbinders += 1;
+            cur = body;
+        }
+        if data_fields.is_empty() {
+            return Ok(true);
+        }
+        let (_, args) = expr::unfold_apps(&cur);
+        Ok(data_fields.into_iter().all(|depth| {
+            let bv = nbinders - 1 - depth;
+            args.iter()
+                .any(|a| matches!(&***a, ExprData::BVar(k) if *k == bv))
+        }))
+    }
+
+    /// The sort a recursor's first motive lands in, read off its type:
+    /// `Π params, Π (motive : Π indices, I … → Sort ℓ), …`.
+    fn recursor_motive_level(&self, rname: u32) -> Option<Level> {
+        let (typ, num_params) = match self.env.get(rname) {
+            Some(ConstantInfo::Recursor {
+                typ, num_params, ..
+            }) => (typ.clone(), *num_params),
+            _ => return None,
+        };
+        let mut cur = typ;
+        for _ in 0..num_params {
+            match &**cur {
+                ExprData::Pi(_, _, b) => cur = b.clone(),
+                _ => return None,
+            }
+        }
+        let mut m = match &**cur {
+            ExprData::Pi(_, motive, _) => motive.clone(),
+            _ => return None,
+        };
+        loop {
+            match &**m {
+                ExprData::Pi(_, _, b) => m = b.clone(),
+                ExprData::Sort(l) => return Some(l.clone()),
+                _ => return None,
+            }
+        }
     }
 
     /// Walk a constructor's argument telescope; each argument type must be
