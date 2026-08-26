@@ -371,10 +371,20 @@ fn tutorial_014_self_proof_rejects() {
     assert_reject("tutorial-014-selfProof.reject.ndjson");
 }
 
-/// Projecting a `Type`-sorted field of a structure reached only through
-/// a genuine `Prop`-valued value along the way. Already rejected on this
-/// branch before this pass (`cannot project a Type field from a Prop
-/// structure`); added here as a permanent regression fixture.
+/// `PropStructure.{0,1}`'s field 5 (`aFinalProof : PUnit.{0}`), itself a
+/// genuine Prop field — but field 3 (`someMoreData : PUnit.{1}`, data)
+/// is referenced by field 4's own type, making it a "dependent data
+/// field"; Lean's kernel rejects any projection at or after one, even
+/// one whose own type never mentions it. Already rejected on this branch
+/// before the day-16 pass that added this fixture, but only because
+/// `is_prop`'s level-substitution bug (fixed in the day-17 pass, see
+/// `tutorial-089-projProp1.accept.ndjson`'s own comment) happened to
+/// also misclassify field 5 itself as "not Prop" — an accidental reject
+/// for the wrong reason. Fixing that bug made this fixture start
+/// *accepting* until `infer_proj` (tc.rs) also gained the actual
+/// "dependent data field" check this fixture is named for, in the same
+/// pass — both fixes landed together specifically so this fixture never
+/// regressed to a false accept.
 #[test]
 fn tutorial_094_proj_prop6_rejects() {
     assert_reject("tutorial-094-projProp6.reject.ndjson");
@@ -398,4 +408,88 @@ fn tutorial_144_false_from_unsafe_rejects() {
 #[test]
 fn tutorial_145_false_from_partial_rejects() {
     assert_reject("tutorial-145-falseFromPartial.reject.ndjson");
+}
+
+// ---- lean-kernel-arena pre-existing false rejects on `good/`, fixed
+// this pass (results.json, 2026-08-26 11:02:30 UTC run's `good/`
+// tarball entries; all seven shared one root cause) ----
+//
+// `constType`/`id` in these fixtures are exported with `hints: "opaque"`
+// — the arena's own `good_def`/`bad_def` test-case generator
+// (Tutorial/Meta.lean) unconditionally sets this on every declaration it
+// emits, then runs `good` outcomes through the *real* Lean kernel, which
+// accepts them (they only exist in this tarball because they do). This
+// checker's `eager_whnf_unfolds` treated `hints: Opaque` as "no kernel
+// value to unfold", conflating a `def`'s *reducibility hint* (elaborator-
+// only; the kernel's own `is_delta` never consults it) with the entirely
+// separate `ConstantInfo::Opaque` declaration kind (the export's
+// `"opaqueDecl"`, an axiom-with-a-witness that genuinely has no value).
+// Fixed in `eager_whnf_unfolds` (tc.rs): every `ConstantInfo::Def`
+// unfolds regardless of `hints`, matching the real kernel.
+
+/// `def betaReduction : constType Prop (Prop → Prop) := ∀ (p : Prop), p`
+/// — the declared type only reduces to `Prop` (matching the value's own
+/// inferred type) if `constType`, hinted `opaque`, still unfolds.
+#[test]
+fn tutorial_006_beta_reduction_accepts() {
+    assert_accept("tutorial-006-betaReduction.accept.ndjson");
+}
+
+/// Same shape as `006_betaReduction`, reducing under a binder.
+#[test]
+fn tutorial_007_beta_reduction2_accepts() {
+    assert_accept("tutorial-007-betaReduction2.accept.ndjson");
+}
+
+/// `inductive reduceCtorParam (a : Type) : Type` with a constructor field
+/// typed `constType (reduceCtorParam α) (reduceCtorParam α)` — the
+/// positivity checker must reduce this (opaque-hinted `constType`, whose
+/// body discards its second argument) to see the field *is* the
+/// recursive occurrence itself, not a negative one hidden behind an
+/// unreduced application.
+#[test]
+fn tutorial_055_reduce_ctor_param_accepts() {
+    assert_accept("tutorial-055-reduceCtorParam-mk.accept.ndjson");
+}
+
+/// Projecting `PropStructure.{0,1}`'s field 0 (`aProof : PUnit.{0}`) out
+/// of the (genuinely Prop-valued) structure. Needs the projected field's
+/// own type, `PUnit.{u}` instantiated at `u := 0`, correctly recognized
+/// as Prop — `is_prop`'s fast path checked `PUnit`'s *generic*,
+/// uninstantiated kind (`Sort u`, a bare level *parameter*, never
+/// literally `Sort 0`) instead of substituting the actual `us = [0]` at
+/// this use, so it always answered "not Prop" for any level-polymorphic
+/// codomain regardless of instantiation. Fixed in `is_prop` (tc.rs):
+/// that fast path now only ever short-circuits on a confirmed `true`;
+/// a `false` falls through to `is_prop_by_infer`, which substitutes
+/// levels correctly via `infer_const`.
+#[test]
+fn tutorial_089_proj_prop1_accepts() {
+    assert_accept("tutorial-089-projProp1.accept.ndjson");
+}
+
+/// Projecting field 2 (`aSecondProof : PUnit.{0}`) — same `is_prop` fix
+/// as `089_projProp1`; also exercises that an earlier *non-dependent*
+/// data field (field 1, `someData : PUnit.{1}`, referenced by nothing
+/// later) does not block a later Prop field's projection — only a data
+/// field some later field's type actually mentions does (see
+/// `tutorial-094-projProp6.reject.ndjson`'s own comment for the other
+/// half of this rule, fixed in the same `infer_proj` pass).
+#[test]
+fn tutorial_091_proj_prop3_accepts() {
+    assert_accept("tutorial-091-projProp3.accept.ndjson");
+}
+
+/// Same shape as `055_reduceCtorParam.mk`, with the recursive occurrence
+/// reached through one more `constType`-style reduction step.
+#[test]
+fn tutorial_123_reduce_ctor_param_refl_accepts() {
+    assert_accept("tutorial-123-reduceCtorParamRefl-mk.accept.ndjson");
+}
+
+/// Same shape again, with the recursive occurrence as a higher-order
+/// field (`(x : α) → constType (..) α`).
+#[test]
+fn tutorial_124_reduce_ctor_param_refl2_accepts() {
+    assert_accept("tutorial-124-reduceCtorParamRefl2-mk.accept.ndjson");
 }

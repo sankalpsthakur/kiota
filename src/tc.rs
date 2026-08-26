@@ -1928,39 +1928,85 @@ impl<'e> Checker<'e> {
             let (_, _dom, body) = self.ensure_pi(ctx, &ct)?;
             ct = expr::instantiate1(&body, p);
         }
-        // walk `idx` fields, substituting earlier fields with proj v i
-        let mut field_types = Vec::new();
+        // Every field's own type, substituting each earlier field with
+        // its own `proj sname i v` term as we walk the telescope — needed
+        // for *every* field (not only up to `idx`) to check the
+        // "dependent data field" rule below across the whole structure.
+        let mut doms: Vec<Expr> = Vec::with_capacity(num_fields as usize);
         let mut cur = ct;
-        for _ in 0..num_fields {
+        for i in 0..num_fields {
             let (_, dom, body) = self.ensure_pi(ctx, &cur)?;
-            field_types.push(dom.clone());
-            cur = body;
-            // note body still has a dangling bvar 0 representing this field;
-            // we substitute concretely below once we know which projections to build.
-            break;
-        }
-        // Re-derive properly: substitute proj(v,0)..proj(v,idx-1) into the telescope.
-        let mut ct2 = {
-            let subst2 = level::subst_map(&ctor_lp, &us);
-            let mut t = expr::instantiate_level_params(&ctor_typ, &subst2);
-            for p in args.iter().take(num_params as usize) {
-                let (_, _d, body) = self.ensure_pi(ctx, &t)?;
-                t = expr::instantiate1(&body, p);
-            }
-            t
-        };
-        for i in 0..idx {
-            let (_, _dom, body) = self.ensure_pi(ctx, &ct2)?;
+            doms.push(dom.clone());
             let proj_i = expr::proj(sname, i, v.clone());
-            ct2 = expr::instantiate1(&body, &proj_i);
+            cur = expr::instantiate1(&body, &proj_i);
         }
-        let (_, dom, _body) = self.ensure_pi(ctx, &ct2)?;
         if self.is_prop(ctx, &vtw)? {
-            if !self.is_prop(ctx, &dom)? {
+            // Lean's kernel rejects a projection out of a Prop-valued,
+            // single-constructor structure unless (a) the projected
+            // field is itself provably Prop at this instantiation, and
+            // (b) no *earlier* field is a "dependent data field": a
+            // field that is itself data (not Prop) and is referenced by
+            // some field's own type, anywhere in the telescope — not
+            // only by fields up to `idx`. Once such a field exists,
+            // extracting anything after it in the telescope is unsound
+            // (proof irrelevance forbids recovering that data field's
+            // value), even for a later field whose own type never
+            // mentions it (`094_projProp6`/`097_projMaybePropPast`:
+            // rejected purely for coming after `someMoreData`/`field`,
+            // not for using it). `091_projProp3`/`096_projMaybeProp`:
+            // a data field that *isn't* referenced by anything later is
+            // "non-dependent" and does not block subsequent projections.
+            if !self.is_prop(ctx, &doms[idx as usize])? {
                 return reject("cannot project a Type field from a Prop structure");
             }
+            let mut referenced = Vec::new();
+            for dom_k in &doms {
+                Self::collect_proj_indices(dom_k, sname, v, &mut referenced);
+            }
+            let mut dependent_data_bound: Option<u32> = None;
+            for j in referenced {
+                if (j as usize) < doms.len()
+                    && !self.is_prop(ctx, &doms[j as usize])?
+                    && dependent_data_bound.is_none_or(|m| j < m)
+                {
+                    dependent_data_bound = Some(j);
+                }
+            }
+            if let Some(m) = dependent_data_bound {
+                if idx >= m {
+                    return reject(
+                        "cannot project a Prop field that comes after a dependent data field",
+                    );
+                }
+            }
         }
-        Ok(dom)
+        Ok(doms[idx as usize].clone())
+    }
+
+    /// Collects every `i` such that `proj sname i v` occurs as a subterm
+    /// of `e` (matching `v` by pointer identity, since every occurrence
+    /// built by `infer_proj`'s own substitution loop clones the same
+    /// `Rc`). Used to find which earlier fields a later field's type
+    /// actually mentions.
+    fn collect_proj_indices(e: &Expr, sname: u32, v: &Expr, out: &mut Vec<u32>) {
+        match &***e {
+            ExprData::Proj(s, i, inner) if *s == sname && Rc::ptr_eq(inner, v) => out.push(*i),
+            ExprData::Proj(_, _, inner) => Self::collect_proj_indices(inner, sname, v, out),
+            ExprData::App(f, a) => {
+                Self::collect_proj_indices(f, sname, v, out);
+                Self::collect_proj_indices(a, sname, v, out);
+            }
+            ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
+                Self::collect_proj_indices(t, sname, v, out);
+                Self::collect_proj_indices(b, sname, v, out);
+            }
+            ExprData::Let(t, val, b) => {
+                Self::collect_proj_indices(t, sname, v, out);
+                Self::collect_proj_indices(val, sname, v, out);
+                Self::collect_proj_indices(b, sname, v, out);
+            }
+            _ => {}
+        }
     }
 
     fn occurs_bvar(e: &Expr, i: u32) -> bool {
@@ -2157,12 +2203,32 @@ impl<'e> Checker<'e> {
                 let ExprData::Const(n, _) = &**h else {
                     return self.is_prop_by_infer(ctx, &w);
                 };
+                // Fast paths below check the *generic*, uninstantiated
+                // declared kind (`InductiveType.typ`/`const_typ`), not the
+                // one with `us` (this specific use's universe arguments)
+                // substituted in. That is only ever safe as a *positive*
+                // test: a codomain that is *literally* `Sort 0` in the
+                // generic kind (e.g. `Eq`/`False`, whose own sort never
+                // depends on their level params at all) really is Prop at
+                // every instantiation. A codomain that's a bare level
+                // *parameter* (`PUnit.{u} : Sort u`) is not "not Prop" —
+                // it's simply not decided by this untouched check; whether
+                // it's Prop depends on what `u` is at *this* use
+                // (`PUnit.{0}` is Prop, `PUnit.{1}` is not), which only
+                // `is_prop_by_infer` (via `infer_const`'s real level
+                // substitution) can answer. Treating the generic check's
+                // `false` as the final answer produced a false reject on
+                // *every* Prop-valued instantiation of a level-polymorphic
+                // codomain (`089_projProp1`/`091_projProp3`: projecting a
+                // `PUnit.{0}` field out of a Prop structure, rejected as
+                // "not Prop" because the *un*instantiated `PUnit.{u}`
+                // isn't literally `Sort 0`).
                 if let Some(ConstantInfo::InductiveType {
                     typ, num_params, ..
                 }) = self.env.get(*n)
                 {
-                    if (args.len() as u32) >= *num_params {
-                        return Ok(self.sort_codomain_is_prop(typ));
+                    if (args.len() as u32) >= *num_params && self.sort_codomain_is_prop(typ) {
+                        return Ok(true);
                     }
                 }
                 let Some(cty) = self.const_typ(*n) else {
@@ -3351,8 +3417,7 @@ impl<'e> Checker<'e> {
         // Lean `is_delta` = `has_value`, theorems included — the real
         // kernel does not distinguish a "hot" WHNF loop from a "cold"
         // delta path at all (see `unfold_delta`'s own doc comment).
-        // Abbrev and Regular both have a kernel value; Opaque does not
-        // unfold. Nested `Syntax.rec_k` ι is rule-ctor identity +
+        // Nested `Syntax.rec_k` ι is rule-ctor identity +
         // specialization-order rec_group, not a size band.
         //
         // Day 9 tried widening this function alone (to
@@ -3373,11 +3438,34 @@ impl<'e> Checker<'e> {
         // this only removes the *separate*, undocumented-as-soundness
         // restriction that the hot loop specifically excludes theorems
         // regardless of size.
+        //
+        // Day 17: `ConstantInfo::Def { hints: Opaque, .. }` also
+        // unconditionally unfolds now, for the same reason. This variant
+        // is a `def` with a `hints` *reducibility* annotation of
+        // `opaque` — it still has a real, checked value (the export's
+        // `"defnDecl"`/`"def"` kind) — and is a completely different
+        // thing from `ConstantInfo::Opaque` (the export's separate
+        // `"opaqueDecl"`/`"opaque"` kind, an axiom-with-a-witness that
+        // genuinely has no kernel value to unfold). `hints` only ever
+        // affects the *elaborator*'s unification/transparency strategy
+        // (which definition to try first, or not to try at all when
+        // `@[irreducible]`); the kernel's own `is_delta`/`whnf` do not
+        // consult it at all — confirmed against the arena's own test
+        // generator (`good_def`/`bad_def` in Tutorial/Meta.lean
+        // unconditionally sets `hints := .opaque` on every generated
+        // `def`, then runs `good` outcomes through the *real* Lean
+        // kernel; `006_betaReduction`, `007_betaReduction2`, and
+        // `055_reduceCtorParam.mk`/`123_reduceCtorParamRefl.mk`/
+        // `124_reduceCtorParamRefl2.mk` all only type-check because the
+        // kernel unfolds an opaque-*hinted* `constType`/`id`). Excluding
+        // it here made every one of those `good_def`s reject with "value
+        // type does not match declared type" (the `def`/`theorem`
+        // couldn't be beta/delta-reduced enough to see the two sides
+        // matched) or, for the positivity-checked inductives, "occurrence
+        // of inductive type in unsupported position" (`positivity_whnf`
+        // couldn't unfold `constType (...)` far enough to see the
+        // recursive occurrence was the whole field, not a negative one).
         match self.env.get(n) {
-            Some(ConstantInfo::Def {
-                hints: ReducibilityHints::Opaque,
-                ..
-            }) => false,
             Some(ConstantInfo::Def { .. }) => true,
             Some(ConstantInfo::Theorem { .. }) => {
                 std::env::var_os("KIOTA_NO_THEOREM_DELTA").is_none() && self.delta_body_is_small(n)
@@ -9188,10 +9276,19 @@ impl<'e> Checker<'e> {
         let depth = env.len() as u32;
         let vt_q = self.quote(depth, &vt)?;
         if self.is_prop(ctx, &vt_q)? {
-            let dom_q = self.quote(depth, &result)?;
-            if !self.is_prop(ctx, &dom_q)? {
-                return reject("cannot project a Type field from a Prop structure (nbe)");
-            }
+            // Projecting out of a genuinely Prop-valued structure needs
+            // the full "does an earlier field's own type get referenced
+            // by a later field, and is that earlier field itself data"
+            // analysis (see `infer_proj`'s own comment) — not just "is
+            // this one field itself Prop", which alone accepts unsound
+            // cases like projecting a field that comes after (but does
+            // not itself use) a dependent data field
+            // (`094_projProp6`/`097_projMaybePropPast`). Rather than
+            // reimplement that analysis in Value space for what is an
+            // inherently rare, non-hot-path shape, defer to the eager
+            // path, which already does it and is kept in sync with any
+            // future change to that rule.
+            return fallback(self);
         }
         Ok(result)
     }
