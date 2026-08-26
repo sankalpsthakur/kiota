@@ -880,6 +880,14 @@ pub struct Checker<'e> {
     /// Eq/HEq argument heads only (not nested / value-scan). `f.eq_def`
     /// must unfold `f` even when `f` is circuit-like.
     eq_arg_heads: RefCell<Vec<u32>>,
+    /// The constant whose own declaration is being checked. Lean adds a
+    /// declaration to the environment only once the kernel has accepted it,
+    /// so its type and value are checked against an environment that does not
+    /// contain it and a self-reference is an unknown constant. The export
+    /// format has no way to express recursion (Lean compiles it to recursors
+    /// or well-founded fixpoints), so a constant that does refer to itself is
+    /// asserting itself: `theorem selfProof : ∀ p : Prop, p := selfProof`.
+    declaring: std::cell::Cell<Option<u32>>,
 }
 
 thread_local! {
@@ -1117,6 +1125,7 @@ impl<'e> Checker<'e> {
             checking_simple_prop_inductive: std::cell::Cell::new(false),
             eq_related_defs: RefCell::new(Vec::new()),
             eq_arg_heads: RefCell::new(Vec::new()),
+            declaring: std::cell::Cell::new(None),
         }
     }
 
@@ -1404,6 +1413,10 @@ impl<'e> Checker<'e> {
                 seen.push(*p);
             }
         }
+        // Only reached for axiom/def/theorem/opaque, none of which Lean lets
+        // mention themselves; the parser has already inserted this one so the
+        // rest of the block can be built, so hide it again for its own check.
+        self.declaring.set(Some(name));
         let typ = ci.typ();
         let ctx: Ctx = Ctx::new();
         let sort = self.infer_type(&ctx, typ)?;
@@ -1634,6 +1647,12 @@ impl<'e> Checker<'e> {
     }
 
     fn infer_const(&self, n: u32, us: &[Level]) -> R<Expr> {
+        if self.declaring.get() == Some(n) {
+            return reject(format!(
+                "`{}` refers to itself; it is not in the environment until it is checked",
+                self.name_str(n)
+            ));
+        }
         let ci = self
             .env
             .get(n)
@@ -2810,6 +2829,9 @@ impl<'e> Checker<'e> {
     }
 
     fn unfold_def(&self, n: u32, us: &[Level]) -> R<Option<Expr>> {
+        if self.declaring.get() == Some(n) {
+            return Ok(None);
+        }
         match self.env.get(n) {
             Some(ConstantInfo::Def {
                 level_params,

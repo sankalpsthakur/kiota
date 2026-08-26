@@ -427,6 +427,25 @@ impl Parser {
                         .unwrap_or("?")
                 )));
             }
+            // A constructor exists because an inductive in this block lists it,
+            // at the index it lists it at. Taking the exported `induct`/`cidx`
+            // on trust lets a constructor ride along that no declared type
+            // claims: `rogue : False` beside the real, empty `False` is an
+            // inhabitant of the empty type, and `cidx` is what iota uses to
+            // pick a minor premise. `induct` must also name a type in *this*
+            // block, since that is the group being declared and checked.
+            let claimed_here = types.iter().any(|t| Self::get_u32(t, "name") == induct)
+                && matches!(
+                    self.env.get(induct),
+                    Some(ConstantInfo::InductiveType { ctors, .. })
+                        if ctors.get(cidx as usize) == Some(&name)
+                );
+            if !claimed_here {
+                return Err(TcError::Reject(format!(
+                    "constructor `{}` is not the constructor at index {cidx} of any inductive in this block",
+                    self.name_str(name)
+                )));
+            }
             self.env.insert(
                 name,
                 ConstantInfo::Constructor {
