@@ -1557,6 +1557,22 @@ impl<'e> Checker<'e> {
             }
         }
         if let Some(value) = ci.value() {
+            // A declaration's own value cannot reference the declaration's
+            // own name: real Lean's kernel type-checks a declaration
+            // *before* adding it to the environment, so at that point the
+            // name being defined does not exist yet and any reference to
+            // it is an unresolved identifier. This checker instead
+            // inserts each declaration into `self.env` (in `handle_def_like`)
+            // before `check_decl` runs, which — without this check — lets
+            // `infer_type` resolve a self-reference to the declaration's
+            // own (still being verified) type and match it trivially,
+            // regardless of whether the "proof" means anything
+            // (`theorem selfProof : ∀ p, p := selfProof`). This is not a
+            // name-specific patch: it rejects any declaration whose value
+            // mentions its own name, for any name.
+            if self.occurs_any(value, &[name]) {
+                return reject(format!("{kind} {name}: value references its own declaration"));
+            }
             let vt = self.infer_type(&ctx, value)?;
             if !self.is_def_eq(&ctx, &vt, typ)? && !self.value_type_ok_eager(&ctx, value, typ)? {
                 if std::env::var_os("KIOTA_DEBUG").is_some() {

@@ -315,3 +315,87 @@ fn nested_neg_functor_rejects() {
 fn nested_list_tree_accepts() {
     assert_accept("nested-list-tree.accept.ndjson");
 }
+
+// ---- lean-kernel-arena live false accepts (fetched from
+// leanprover/lean-kernel-arena @ 1df91b3909dfbf85de17c23190b5059e74d5c60c's
+// `lean-arena-tests.tar.gz`, verbatim, not hand-written) ----
+//
+// The live arena board (results.json, 2026-08-26 11:02:30 UTC, run
+// 32952787023) had `kiota` accepting all six of these on `main 0.1.0 @
+// 58e8636`. On this branch, three already rejected before this pass
+// (`tutorial-094-projProp6`, `tutorial-144-falseFromUnsafe`,
+// `tutorial-145-falseFromPartial` — added here to lock that in against
+// regression); the other three were genuine, fixed bugs in this pass.
+
+/// A `Prop`-valued inductive (`NewBool`) with two constructors whose
+/// recursor is universe-polymorphic in the motive's own sort, i.e.
+/// allows "large elimination" — computing a real `Bool` from a proof.
+/// Combined with proof irrelevance (any two proofs of a `Prop` are
+/// equal), this proves `False`. Real Lean's kernel restricts a
+/// multi-constructor Prop inductive's recursor to `Sort 0` motives only;
+/// this checker previously never validated that at all. Fixed in
+/// `handle_inductive_block` (parser.rs): a Prop-valued inductive with
+/// two or more constructors must have its recursor's motive fixed at
+/// `Sort 0`, checked structurally (peeling the recursor's own Pi
+/// telescope to the motive parameter's codomain sort), not by name.
+#[test]
+fn large_elim_prop_bool_rejects() {
+    assert_reject("large-elim-prop-bool.reject.ndjson");
+}
+
+/// A constructor named `rogue`, typed `False`, whose `induct` field
+/// names `Orphan` — an inductive this export never declares anywhere.
+/// This checker previously registered every entry in an `inductive`
+/// block's `ctors` array unconditionally, without checking that
+/// `induct` names a real inductive declared in the same block, or that
+/// the named inductive's own `ctors` list actually includes this
+/// constructor at the claimed index. Fixed in `handle_inductive_block`:
+/// every constructor is now cross-checked against its claimed owner's
+/// own declared `ctors` list before being registered.
+#[test]
+fn orphan_ctor_rejects() {
+    assert_reject("orphan-ctor.reject.ndjson");
+}
+
+/// `theorem selfProof : ∀ (p : Prop), p := selfProof` — a declaration
+/// whose own value references its own (not yet defined) name. Real
+/// Lean's kernel type-checks a declaration before adding it to the
+/// environment, so a self-reference is an unresolved identifier. This
+/// checker instead inserts each declaration before checking it
+/// (`handle_def_like` then `check_decl`), which let a self-reference
+/// resolve to the declaration's own declared type and match trivially.
+/// Fixed in `check_decl` (tc.rs): a declaration's value may not mention
+/// its own name, checked structurally for any name, not this one.
+#[test]
+fn tutorial_014_self_proof_rejects() {
+    assert_reject("tutorial-014-selfProof.reject.ndjson");
+}
+
+/// Projecting a `Type`-sorted field of a structure reached only through
+/// a genuine `Prop`-valued value along the way. Already rejected on this
+/// branch before this pass (`cannot project a Type field from a Prop
+/// structure`); added here as a permanent regression fixture.
+#[test]
+fn tutorial_094_proj_prop6_rejects() {
+    assert_reject("tutorial-094-projProp6.reject.ndjson");
+}
+
+/// `def unsafeLoop : False := unsafeLoop` (self-referential, but marked
+/// `unsafe`, so self-reference is legitimate) followed by
+/// `theorem falseFromUnsafe : False := unsafeLoop` — a safe theorem
+/// depending on an unsafe definition's value. Already rejected on this
+/// branch before this pass (the parser refuses any `unsafe`-marked
+/// `def`/`opaque` outright, so `unsafeLoop` itself never reaches the
+/// environment); added here as a permanent regression fixture.
+#[test]
+fn tutorial_144_false_from_unsafe_rejects() {
+    assert_reject("tutorial-144-falseFromUnsafe.reject.ndjson");
+}
+
+/// Same shape as `144_falseFromUnsafe` with `partial` in place of
+/// `unsafe`. Already rejected on this branch before this pass; added
+/// here as a permanent regression fixture.
+#[test]
+fn tutorial_145_false_from_partial_rejects() {
+    assert_reject("tutorial-145-falseFromPartial.reject.ndjson");
+}
