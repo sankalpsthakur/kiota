@@ -90,9 +90,9 @@ else
     fi
 fi
 
-RUN_ENV=()
+RUN_COMMAND=(env)
 if [ -n "$PREFIX" ]; then
-    RUN_ENV+=("KIOTA_MAX_DECL=$PREFIX")
+    RUN_COMMAND+=("KIOTA_MAX_DECL=$PREFIX")
 fi
 
 # --- Plain run: wall_ms + peak_rss_kb (no valgrind overhead) ---------------
@@ -100,30 +100,42 @@ fi
 WALL_MS=""
 PEAK_RSS_KB=""
 
-if command -v /usr/bin/time >/dev/null 2>&1; then
+if [ -x /usr/bin/time ]; then
     TIME_OUT="$(mktemp)"
-    trap 'rm -f "$TIME_OUT"' RETURN 2>/dev/null || true
-    if env "${RUN_ENV[@]}" /usr/bin/time -v "$BIN" "$CORPUS" >/dev/null 2>"$TIME_OUT"; then :; else :; fi
-    WALL_CLOCK="$(grep -E 'Elapsed \(wall clock\) time' "$TIME_OUT" | sed -E 's/.*: *//')"
-    if [ -n "${WALL_CLOCK:-}" ]; then
-        # Formats: [h:]mm:ss.ss or m:ss.ss
-        IFS=: read -ra PARTS <<<"$WALL_CLOCK"
-        if [ "${#PARTS[@]}" -eq 3 ]; then
-            WALL_MS=$(awk -v h="${PARTS[0]}" -v m="${PARTS[1]}" -v s="${PARTS[2]}" \
-                'BEGIN { printf "%d", (h*3600 + m*60 + s) * 1000 }')
-        else
-            WALL_MS=$(awk -v m="${PARTS[0]}" -v s="${PARTS[1]}" \
-                'BEGIN { printf "%d", (m*60 + s) * 1000 }')
+    TIME_PROBE="$(mktemp)"
+    if /usr/bin/time -v true >/dev/null 2>"$TIME_PROBE" \
+        && grep -q 'Elapsed (wall clock) time' "$TIME_PROBE"; then
+        if "${RUN_COMMAND[@]}" /usr/bin/time -v "$BIN" "$CORPUS" \
+            >/dev/null 2>"$TIME_OUT"; then :; else :; fi
+        # Split on the label/value separator (`: `), not the colons inside
+        # GNU time's `[h:]mm:ss` value.
+        WALL_CLOCK="$(awk -F ': ' '/Elapsed \(wall clock\) time/ { print $NF; exit }' "$TIME_OUT")"
+        if [ -n "${WALL_CLOCK:-}" ]; then
+            IFS=: read -ra PARTS <<<"$WALL_CLOCK"
+            if [ "${#PARTS[@]}" -eq 3 ]; then
+                WALL_MS=$(awk -v h="${PARTS[0]}" -v m="${PARTS[1]}" -v s="${PARTS[2]}" \
+                    'BEGIN { printf "%d", (h*3600 + m*60 + s) * 1000 }')
+            elif [ "${#PARTS[@]}" -eq 2 ]; then
+                WALL_MS=$(awk -v m="${PARTS[0]}" -v s="${PARTS[1]}" \
+                    'BEGIN { printf "%d", (m*60 + s) * 1000 }')
+            fi
         fi
+        PEAK_RSS_KB="$(awk -F ': ' '/Maximum resident set size/ { print $NF; exit }' "$TIME_OUT")"
+    else
+        # POSIX `-p` works with GNU, macOS, and BSD time. It reports wall time
+        # but not peak RSS in a portable unit.
+        if "${RUN_COMMAND[@]}" /usr/bin/time -p "$BIN" "$CORPUS" \
+            >/dev/null 2>"$TIME_OUT"; then :; else :; fi
+        WALL_SECONDS="$(awk '$1 == "real" { print $2; exit }' "$TIME_OUT")"
+        if [ -n "${WALL_SECONDS:-}" ]; then
+            WALL_MS=$(awk -v s="$WALL_SECONDS" 'BEGIN { printf "%d", s * 1000 }')
+        fi
+        echo "bench.sh: GNU time -v unavailable; peak_rss_kb will be null" >&2
     fi
-    PEAK_RSS_KB="$(grep -E 'Maximum resident set size' "$TIME_OUT" | sed -E 's/.*: *//')"
-    rm -f "$TIME_OUT"
+    rm -f "$TIME_OUT" "$TIME_PROBE"
 else
-    echo "bench.sh: /usr/bin/time not found; timing wall clock manually, peak_rss_kb will be null" >&2
-    START_NS=$(date +%s%N)
-    env "${RUN_ENV[@]}" "$BIN" "$CORPUS" >/dev/null 2>&1 || true
-    END_NS=$(date +%s%N)
-    WALL_MS=$(( (END_NS - START_NS) / 1000000 ))
+    echo "bench.sh: /usr/bin/time not found; wall_ms and peak_rss_kb will be null" >&2
+    "${RUN_COMMAND[@]}" "$BIN" "$CORPUS" >/dev/null 2>&1 || true
 fi
 
 # --- Valgrind/callgrind run: instructions -----------------------------------
@@ -132,7 +144,7 @@ INSTRUCTIONS=""
 
 if command -v valgrind >/dev/null 2>&1; then
     CALLGRIND_OUT="$(mktemp)"
-    if env "${RUN_ENV[@]}" valgrind --tool=callgrind --callgrind-out-file="$CALLGRIND_OUT" \
+    if "${RUN_COMMAND[@]}" valgrind --tool=callgrind --callgrind-out-file="$CALLGRIND_OUT" \
         --quiet -- "$BIN" "$CORPUS" >/dev/null 2>&1; then :; else :; fi
     # The callgrind output file's "summary:" line is the total cost for the
     # collected events; with default settings the sole event is Ir
