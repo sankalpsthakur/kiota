@@ -525,6 +525,34 @@ impl Parser {
                         .unwrap_or("?")
                 )));
             }
+            // A recursor is only genuine if it was actually derived from
+            // an inductive declaration; nothing here re-derives it from
+            // one, so at minimum require that `all` isn't empty and that
+            // every name in it is a real inductive type declared in this
+            // same block. Without this, an `all: []` (or an `all`
+            // pointing at an undeclared name — the recursor-side twin of
+            // `orphan-ctor`'s constructor-side hole) recursor is added to
+            // the environment as a callable constant with no inductive
+            // ever associated with it, and nothing that only checks the
+            // recursors an inductive *does* claim ever looks at it again
+            // (`orphan-rec`: `all: []` on a `False`-typed `rogue`
+            // recursor with no motives/minors/rules, added anyway, then
+            // used directly as a "proof" of `False`).
+            if all.is_empty() {
+                return Err(TcError::Reject(format!(
+                    "recursor `{}` has an empty `all` (not derived from any inductive)",
+                    self.names.get(name as usize).map(|s| s.as_str()).unwrap_or("?")
+                )));
+            }
+            for ind in &all {
+                if !declared_ctors.contains_key(ind) {
+                    return Err(TcError::Reject(format!(
+                        "recursor `{}` claims inductive `{}`, which this block does not declare",
+                        self.names.get(name as usize).map(|s| s.as_str()).unwrap_or("?"),
+                        self.names.get(*ind as usize).map(|s| s.as_str()).unwrap_or("?"),
+                    )));
+                }
+            }
             // Large elimination check (non-mutual, single-motive case,
             // which is what every hand-crafted or Lean-generated exploit
             // of this rule looks like): a Prop-valued inductive with two

@@ -2466,6 +2466,80 @@ impl<'e> Checker<'e> {
         r
     }
 
+    /// `App(f, App(f, App(f, ..., base)))`-shaped comparison (e.g. a
+    /// Church-numeral-style repeated application of a fixed function `f`
+    /// nested in argument position, not spine position — `unfold_apps`'s
+    /// own flattening only helps when several arguments are applied to
+    /// *one* function call; it does nothing when the nesting is one
+    /// single-argument application inside the next one's argument).
+    /// Peels one application layer at a time from `a` and `b`
+    /// simultaneously and compares each layer's own `f` with a single,
+    /// immediately-completed `is_def_eq` call, so `DEFEQ_DEPTH` never
+    /// accumulates past whatever depth this function's own caller is
+    /// already at, no matter how many layers there are — as opposed to
+    /// the normal recursive comparison, which nests one more `is_def_eq`
+    /// frame (and one more `DEFEQ_DEPTH` count) per layer and hits
+    /// `CONV_DEPTH` on a long enough chain even though every layer
+    /// genuinely does match.
+    ///
+    /// Returns `None` (not applicable, caller falls back to the normal
+    /// recursive path) when there is nothing to peel, or the two sides'
+    /// chains disagree (different length or a mismatched `f`) partway
+    /// through — in the disagreement case the fallback is exactly as
+    /// correct as this fast path (every layer's `f` is checked with the
+    /// same `is_def_eq` either way), just potentially depth-limited,
+    /// which only affects a very long *rejecting* comparison, not an
+    /// accepting one: this function only ever *confirms* `Some(true)`
+    /// after verifying every single layer, never `Some(true)` on a
+    /// mismatch it didn't check.
+    fn iterated_app_congruent(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<Option<bool>> {
+        let mut cur_a = a.clone();
+        let mut cur_b = b.clone();
+        let mut peeled = 0u32;
+        loop {
+            let (fa, aa) = match &**cur_a {
+                ExprData::App(f, arg) => (f.clone(), arg.clone()),
+                _ => break,
+            };
+            let (fb, ab) = match &**cur_b {
+                ExprData::App(f, arg) => (f.clone(), arg.clone()),
+                _ => break,
+            };
+            if !self.is_def_eq(ctx, &fa, &fb)? {
+                // `fa`/`fb` themselves disagree — but `cur_a`/`cur_b`
+                // (the *whole*, not-yet-peeled current layer) may still
+                // be equal for a reason this per-layer `f`-vs-`f`
+                // comparison can't see: `fa` might be a partial
+                // application (e.g. one Church numeral partially
+                // applied to another, `(n X s)`) that itself needs
+                // *whnf*, not structural comparison, to reach the same
+                // shape as `fb`. If we've already peeled at least one
+                // matching layer, recurse into `is_def_eq(cur_a, cur_b)`
+                // for the remainder: that re-enters the normal
+                // dispatch, which `whnf`s both sides again (expanding
+                // `fa` further) before retrying — genuinely making
+                // progress (`cur_a`/`cur_b` are strictly smaller than
+                // the original `a`/`b`), not re-asking the same
+                // question. If nothing has been peeled yet, `cur_a`
+                // *is* `a` — recursing here would ask the identical
+                // question and loop forever, so fall back to the
+                // caller's own (recursive, but not infinite)
+                // `app_spines_congruent` instead.
+                if peeled == 0 {
+                    return Ok(None);
+                }
+                return Ok(Some(self.is_def_eq(ctx, &cur_a, &cur_b)?));
+            }
+            cur_a = aa;
+            cur_b = ab;
+            peeled += 1;
+        }
+        if peeled == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.is_def_eq(ctx, &cur_a, &cur_b)?))
+    }
+
     fn app_spines_congruent(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         let (h1, a1) = expr::unfold_apps(a);
         let (h2, a2) = expr::unfold_apps(b);
@@ -3783,6 +3857,9 @@ impl<'e> Checker<'e> {
                 return self.with_fresh_app_cong(|| self.is_def_eq(&ctx2, b1, b2));
             }
             (ExprData::App(_, _), ExprData::App(_, _)) => {
+                if let Some(r) = self.iterated_app_congruent(ctx, a, b)? {
+                    return Ok(r);
+                }
                 if self.app_spines_congruent(ctx, a, b)? {
                     return Ok(true);
                 }

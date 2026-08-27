@@ -175,6 +175,26 @@ fn extra_rec_rejects() {
     assert_reject("extra-rec.reject.ndjson");
 }
 
+/// The recursor-side sibling of `extra-rec`/`orphan-ctor`: a second
+/// recursor named `rogue`, typed `False` directly, with no motives,
+/// minors, or rules, and — the part that distinguishes it from
+/// `extra-rec` — an *empty* `all` field, so it is not associated with
+/// any inductive at all. `inconsistent : False := rogue` then "proves"
+/// `False`. lean4export itself cannot produce this shape (it derives an
+/// inductive's own recursors by scanning `all`, so a recursor with an
+/// empty `all` is silently dropped from a real export); this file is
+/// hand-modified from `extra-rec.ndjson`. Rejected on this branch by two
+/// independent checks: the arity check on `rogue`'s own malformed type
+/// telescope, and (verified separately with a minimal synthetic export
+/// that fixes the arity so only this fires) `handle_inductive_block`'s
+/// own `all`-must-be-non-empty-and-declared-in-this-block check, added
+/// alongside `orphan-ctor`'s existing constructor-side version of the
+/// same validation.
+#[test]
+fn orphan_rec_rejects() {
+    assert_reject("orphan-rec.reject.ndjson");
+}
+
 /// Recursor identity is rule constructors / `all ∩ group`, not `I.rec`.
 /// `elim` is a well-typed recursor for `False`; a pretty-name gate used to reject it.
 #[test]
@@ -492,4 +512,31 @@ fn tutorial_123_reduce_ctor_param_refl_accepts() {
 #[test]
 fn tutorial_124_reduce_ctor_param_refl2_accepts() {
     assert_accept("tutorial-124-reduceCtorParamRefl2-mk.accept.ndjson");
+}
+
+/// `kernel_church_numerals`: `@Eq CNat (cmul m n) (explicit numeral for
+/// m*n) := rfl`, `CNat := {X} → (X → X) → X → X`, `cmul a b := fun X s z
+/// => a X (b X s) z`, both `m`/`n` large enough that a naive comparison
+/// needs thousands of recursive `is_def_eq` calls to walk the fully
+/// expanded product. `is_def_eq_core_go`'s own `App`-vs-`App` case
+/// recursed one call (and one `DEFEQ_DEPTH` count) per nested
+/// application layer regardless of shape, which for this
+/// `App(f, App(f, App(f, ..., base)))`-shaped comparison hit
+/// `CONV_DEPTH` even though every layer genuinely matched. Fixed with
+/// `iterated_app_congruent` (tc.rs): peels one application layer at a
+/// time from both sides in an iterative loop, so comparing each layer's
+/// own head never nests more than one `is_def_eq` frame deep no matter
+/// how many layers there are; when a layer's own heads still disagree
+/// after some have matched, it recurses once into the *remainder*
+/// (letting the normal dispatch `whnf` that partial application
+/// further — e.g. `cmul`'s multiplication groups its expansion in
+/// batches of `n`'s size, not one `s` at a time, so the two sides'
+/// "layers" don't line up until re-`whnf`'d), rather than falling back
+/// to the old, fully recursive comparison for the whole remaining
+/// chain. Does not change the answer for any case the old recursive
+/// comparison could already reach within `CONV_DEPTH` — only how many
+/// stack/`DEFEQ_DEPTH` frames a *matching* chain costs to confirm.
+#[test]
+fn church_numerals_accepts() {
+    assert_accept_deep("church-numerals.accept.ndjson");
 }
