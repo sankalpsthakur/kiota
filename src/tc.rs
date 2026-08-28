@@ -4310,7 +4310,9 @@ impl<'e> Checker<'e> {
         let ctor_params = &ctor_args[..cnp as usize];
         let fields = &ctor_args[cnp as usize..];
 
-        let minor_idx = self.ctor_minor_index(cname, rname, &all);
+        let minor_idx = self
+            .minor_index_from_type(rname, &us, &level_params, params, cname, ctor_params)
+            .unwrap_or_else(|| self.ctor_minor_index(cname, rname, &all));
         if minor_idx >= minors.len() {
             return Ok(None);
         }
@@ -4518,6 +4520,105 @@ impl<'e> Checker<'e> {
             if let Some(rec) = self.rec_for_ctor_in_group(*c, rname) {
                 return Some(rec);
             }
+        }
+        None
+    }
+
+    /// Find `cname`'s minor-premise slot directly from `rname`'s own type
+    /// signature, instead of a heuristic count over the group's sort
+    /// order (`ctor_minor_index`). A nested-recursor group shares one
+    /// global minor numbering across every member (`minors.len()` is the
+    /// same for `rec`, `rec_1`, …), and each minor's own declared type is
+    /// `Π (fields/IHs...), motive_j (C params.. fields..)` — a shape that
+    /// names its constructor `C` and that constructor's own params
+    /// directly, with no ambiguity, regardless of how many *other*
+    /// specializations in the group happen to reuse the same constructor
+    /// name for a different element type (`List.cons` is one constant
+    /// shared by every `List _` instantiation, so a six-way mutual group
+    /// with two different `List` specializations has two separate
+    /// `List.nil`/`List.cons`-shaped minors at two different slots).
+    /// Matching on the constructor's own params (not just its name) is
+    /// what tells those two slots apart, and does so from the type
+    /// signature alone — no dependence on `self.rec_group`'s own sort
+    /// order at all. Returns `None` (falls back to the heuristic) for any
+    /// shape this doesn't handle cleanly, e.g. an indexed recursor whose
+    /// conclusion isn't a single-argument `motive major`, or if the type
+    /// doesn't parse as expected — never a wrong answer, just a decline
+    /// to the existing behavior.
+    ///
+    /// On `Cedar.Spec.Value._sizeOf_5_eq`'s own two-same-shaped-`List`
+    /// group, this independently derives the same slot `ctor_minor_index`
+    /// already did post-fix: the group's sort order was not, in fact, the
+    /// source of that reject (verified, not assumed — both approaches
+    /// agree here). The remaining gap there is a different one: the
+    /// generated `head_ih` for a nested-recursor field mutually typed
+    /// with the group (e.g. `Prod`) is a *specialized* recursor
+    /// application (`rec_5` here), while the proof compares it against a
+    /// *generic* typeclass-instance application for the same field
+    /// (`SizeOf.sizeOf` routed through `Prod`'s own, non-specialized
+    /// recursor) — both stuck on the same neutral variable, needing
+    /// "these are two different recursors for the same type, with
+    /// pointwise-equal motives/minors" as its own defeq principle, which
+    /// this checker does not implement. Out of scope for this pass.
+    fn minor_index_from_type(
+        &self,
+        rname: u32,
+        us: &[Level],
+        rec_level_params: &[u32],
+        params: &[Expr],
+        cname: u32,
+        ctor_params: &[Expr],
+    ) -> Option<usize> {
+        let (typ, rec_num_params, num_motives, num_minors) = match self.env.get(rname) {
+            Some(ConstantInfo::Recursor {
+                typ,
+                num_params,
+                num_motives,
+                num_minors,
+                ..
+            }) => (typ.clone(), *num_params, *num_motives, *num_minors),
+            _ => return None,
+        };
+        if rec_level_params.len() != us.len() || rec_num_params as usize != params.len() {
+            return None;
+        }
+        let subst = level::subst_map(rec_level_params, us);
+        let typ = expr::instantiate_level_params(&typ, &subst);
+        // `params` is in application order (outermost/first-bound first);
+        // `instantiate` substitutes bvar 0 (innermost) with `args[0]`, so
+        // reverse before threading them through the leading `Pi`s.
+        let params_rev: Vec<Expr> = params.iter().rev().cloned().collect();
+        let mut cur = expr::instantiate(&typ, &params_rev);
+        for _ in 0..(rec_num_params + num_motives) {
+            match &**cur {
+                ExprData::Pi(_, _, body) => cur = body.clone(),
+                _ => return None,
+            }
+        }
+        for p in 0..num_minors {
+            let (mut inner, next) = match &**cur {
+                ExprData::Pi(_, dom, body) => (dom.clone(), body.clone()),
+                _ => return None,
+            };
+            loop {
+                match &**inner {
+                    ExprData::Pi(_, _, body) => inner = body.clone(),
+                    _ => break,
+                }
+            }
+            let (_motive, concl_args) = expr::unfold_apps(&inner);
+            if let Some(major_shape) = concl_args.last() {
+                let (chead, cargs) = expr::unfold_apps(major_shape);
+                if let ExprData::Const(c, _) = &**chead {
+                    if *c == cname
+                        && cargs.len() >= ctor_params.len()
+                        && cargs[..ctor_params.len()] == *ctor_params
+                    {
+                        return Some(p as usize);
+                    }
+                }
+            }
+            cur = next;
         }
         None
     }
@@ -8529,23 +8630,26 @@ impl<'e> Checker<'e> {
             nbe::Neutral::Const(n, us) => (*n, us.clone()),
             _ => return Ok(None),
         };
-        let (all, num_params, num_motives, num_minors, num_indices) = match self.env.get(rname) {
-            Some(ConstantInfo::Recursor {
-                all,
-                num_params,
-                num_motives,
-                num_minors,
-                num_indices,
-                ..
-            }) => (
-                all.clone(),
-                *num_params,
-                *num_motives,
-                *num_minors,
-                *num_indices,
-            ),
-            _ => return Ok(None),
-        };
+        let (level_params, all, num_params, num_motives, num_minors, num_indices) =
+            match self.env.get(rname) {
+                Some(ConstantInfo::Recursor {
+                    level_params,
+                    all,
+                    num_params,
+                    num_motives,
+                    num_minors,
+                    num_indices,
+                    ..
+                }) => (
+                    level_params.clone(),
+                    all.clone(),
+                    *num_params,
+                    *num_motives,
+                    *num_minors,
+                    *num_indices,
+                ),
+                _ => return Ok(None),
+            };
         let major_pos = (num_params + num_motives + num_minors + num_indices) as usize;
         if args.len() != major_pos + 1 {
             return Ok(None);
@@ -8640,10 +8744,6 @@ impl<'e> Checker<'e> {
         }
         let ctor_params = &ctor_args[..cnp as usize];
         let fields = &ctor_args[cnp as usize..];
-        let minor_idx = self.ctor_minor_index(cname, rname, &all);
-        if minor_idx >= minors.len() {
-            return Ok(None);
-        }
 
         let dctx = Self::dummy_ctx(depth);
         let params_q = self.quote_all(depth, params)?;
@@ -8651,6 +8751,13 @@ impl<'e> Checker<'e> {
         let motives_q = self.quote_all(depth, motives)?;
         let minors_q = self.quote_all(depth, minors)?;
         let fields_q = self.quote_all(depth, fields)?;
+
+        let minor_idx = self
+            .minor_index_from_type(rname, &us, &level_params, &params_q, cname, &ctor_params_q)
+            .unwrap_or_else(|| self.ctor_minor_index(cname, rname, &all));
+        if minor_idx >= minors.len() {
+            return Ok(None);
+        }
         let rhs = self.iota_from_first_principles(
             &dctx,
             rname,
