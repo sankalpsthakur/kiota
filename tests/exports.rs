@@ -195,11 +195,19 @@ fn orphan_rec_rejects() {
     assert_reject("orphan-rec.reject.ndjson");
 }
 
-/// Recursor identity is rule constructors / `all ∩ group`, not `I.rec`.
-/// `elim` is a well-typed recursor for `False`; a pretty-name gate used to reject it.
+/// `I.rec` is the name Lean reserves for `I`'s recursor and the name every
+/// caller of it is compiled against (nested auxiliaries are `I.rec_1`,
+/// `I.rec_2`, …). Identity for iota still comes from rule constructors /
+/// `all ∩ group`, not the pretty name — that is what orders nested
+/// `rec_k` and lets `Value.rec_3`/`rec_4` share a container — but the name
+/// is checked too, separately: an export offering a well-typed recursor
+/// for `False` under any other name (`elim`) is not a constant Lean's own
+/// kernel would ever have produced, and arena tests 140
+/// (`misnamed_rec_user`) / 141 (`dup_rec_def2`) both exploit exactly this.
+/// This fixture used to be (incorrectly) an accept fixture.
 #[test]
-fn extra_rec_all_field_not_pretty_name_accepts() {
-    assert_accept("extra-rec-alt-name.accept.ndjson");
+fn extra_rec_alt_name_rejects() {
+    assert_reject("extra-rec-alt-name.reject.ndjson");
 }
 
 #[test]

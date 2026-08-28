@@ -997,6 +997,23 @@ pub struct Checker<'e> {
     /// Eq/HEq argument heads only (not nested / value-scan). `f.eq_def`
     /// must unfold `f` even when `f` is circuit-like.
     eq_arg_heads: RefCell<Vec<u32>>,
+    /// The constant whose own declaration is being checked right now. Real
+    /// Lean's kernel adds a declaration to the environment only once it has
+    /// accepted it, so a declaration's type and value are checked against an
+    /// environment that does not yet contain it, and a reference to the
+    /// declaration's own name inside either is an unresolved identifier. The
+    /// export format cannot express recursion anyway (Lean compiles it to
+    /// recursors or well-founded fixpoints), so a value that does refer to
+    /// its own name is asserting itself: `theorem selfProof : ∀ p, p :=
+    /// selfProof`. This checker instead inserts each declaration into
+    /// `self.env` before `check_decl` runs (so the rest of a mutual block
+    /// can be built), so `infer_const`/`unfold_def` hide the one constant
+    /// under check for the duration of its own check — an O(1) check on
+    /// every constant lookup, in contrast to a one-shot recursive scan of
+    /// the whole declaration value for the name, which revisits every
+    /// shared subterm of a hash-consed DAG and can blow up on a proof term
+    /// with heavy sharing.
+    declaring: std::cell::Cell<Option<u32>>,
 }
 
 thread_local! {
@@ -1242,6 +1259,7 @@ impl<'e> Checker<'e> {
             checking_simple_prop_inductive: std::cell::Cell::new(false),
             eq_related_defs: RefCell::new(Vec::new()),
             eq_arg_heads: RefCell::new(Vec::new()),
+            declaring: std::cell::Cell::new(None),
         }
     }
 
@@ -1537,6 +1555,12 @@ impl<'e> Checker<'e> {
                 seen.push(*p);
             }
         }
+        // Only reached for axiom/def/theorem/opaque (see `check_last`'s
+        // callers), none of which Lean lets mention themselves; the parser
+        // has already inserted this one into `self.env` so the rest of a
+        // mutual block can be built, so hide it again for the duration of
+        // its own check (`infer_const`/`unfold_def`).
+        self.declaring.set(Some(name));
         let typ = ci.typ();
         let ctx: Ctx = Ctx::new();
         let sort = self.infer_type(&ctx, typ)?;
@@ -1557,22 +1581,6 @@ impl<'e> Checker<'e> {
             }
         }
         if let Some(value) = ci.value() {
-            // A declaration's own value cannot reference the declaration's
-            // own name: real Lean's kernel type-checks a declaration
-            // *before* adding it to the environment, so at that point the
-            // name being defined does not exist yet and any reference to
-            // it is an unresolved identifier. This checker instead
-            // inserts each declaration into `self.env` (in `handle_def_like`)
-            // before `check_decl` runs, which — without this check — lets
-            // `infer_type` resolve a self-reference to the declaration's
-            // own (still being verified) type and match it trivially,
-            // regardless of whether the "proof" means anything
-            // (`theorem selfProof : ∀ p, p := selfProof`). This is not a
-            // name-specific patch: it rejects any declaration whose value
-            // mentions its own name, for any name.
-            if self.occurs_any(value, &[name]) {
-                return reject(format!("{kind} {name}: value references its own declaration"));
-            }
             let vt = self.infer_type(&ctx, value)?;
             if !self.is_def_eq(&ctx, &vt, typ)? && !self.value_type_ok_eager(&ctx, value, typ)? {
                 if std::env::var_os("KIOTA_DEBUG").is_some() {
@@ -1863,6 +1871,12 @@ impl<'e> Checker<'e> {
     }
 
     fn infer_const(&self, n: u32, us: &[Level]) -> R<Expr> {
+        if self.declaring.get() == Some(n) {
+            return reject(format!(
+                "`{}` refers to itself; it is not in the environment until it is checked",
+                self.name_str(n)
+            ));
+        }
         let ci = self
             .env
             .get(n)
@@ -3236,6 +3250,9 @@ impl<'e> Checker<'e> {
     }
 
     fn unfold_def(&self, n: u32, us: &[Level]) -> R<Option<Expr>> {
+        if self.declaring.get() == Some(n) {
+            return Ok(None);
+        }
         match self.env.get(n) {
             Some(ConstantInfo::Def {
                 level_params,
