@@ -695,3 +695,35 @@ fn lean_persistent_hashmap_node_accepts() {
 fn lean_value_two_list_specializations_accepts() {
     assert_accept("lean-value-two-list-specializations.accept.ndjson");
 }
+
+/// Lean's own `elim_only_at_universe_zero` (`src/kernel/inductive.cpp`)
+/// restricts a Prop-valued inductive's recursor to `Sort 0` motives
+/// unless the type is a syntactic "subsingleton": at most one
+/// constructor, every non-Prop field of which occurs in the
+/// constructor's own conclusion. `large-elim-prop-bool` above already
+/// covers "more than one constructor"; this covers the other live
+/// route: exactly *one* constructor whose field is data (not a proof)
+/// and not exposed anywhere in the conclusion.
+///
+/// ```
+/// inductive Bad : Prop | mk (x : Sort 1)
+/// Bad.rec.{u} : (motive : Bad → Sort u) → ((x : Sort 1) → motive (Bad.mk x)) → (t : Bad) → motive t
+/// ```
+///
+/// `x`'s own type is `Sort 1` (not Prop — `level::is_not_zero`), and
+/// `Bad` has no indices at all for `x` to occur in, so nothing in the
+/// conclusion exposes it. A checker that only rejects on `ctors.len() >=
+/// 2` (this branch's old, narrower rule) waves this recursor's `Sort u`
+/// motive straight through: `pick : Bad → Sort 1 := fun b => Bad.rec.{2}
+/// (fun _ => Sort 1) (fun x => x) b` would pull `x`'s own type back out
+/// of an opaque `Bad` proof, and proof irrelevance (any two `Bad.mk`
+/// proofs are equal) would make that type-unsound. Hand-written (not
+/// arena-sourced): Lean's own elaborator never emits a `Bad.rec` shaped
+/// like this for ordinary `inductive Bad : Prop | mk (x : Sort 1)`
+/// source (it would fix the elim level at `0` itself), so the exploit
+/// has to be fed to the checker directly, the same way `orphan-ctor`/
+/// `orphan-rec` do for their own kernel invariants.
+#[test]
+fn prop_subsingleton_elim_data_field_rejects() {
+    assert_reject("prop-subsingleton-elim-data-field.reject.ndjson");
+}

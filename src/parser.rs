@@ -388,16 +388,6 @@ impl Parser {
         // never declares).
         let mut declared_ctors: std::collections::HashMap<u32, Vec<u32>> =
             std::collections::HashMap::new();
-        // Whether each inductive type declared in this block is
-        // Prop-valued (its own kind's Pi telescope ends in `Sort 0`).
-        // Used below to enforce "large elimination": a Prop-valued
-        // inductive with more than one constructor may only be
-        // eliminated into `Prop`, never into a larger `Sort` — allowing
-        // it is how `large-elim-prop-bool` proves `False` (proof
-        // irrelevance says any two proofs of a `Prop` are equal, but a
-        // recursor whose motive can target `Bool` distinguishes them).
-        let mut type_is_prop: std::collections::HashMap<u32, bool> =
-            std::collections::HashMap::new();
         for t in &types {
             let name = Self::require_u32(t, "name")?;
             self.reject_if_dup(name)?;
@@ -419,11 +409,6 @@ impl Parser {
                 )));
             }
             declared_ctors.insert(name, ctor_names.clone());
-            type_is_prop.insert(
-                name,
-                telescope_codomain_sort(&typ)
-                    .is_some_and(|l| level::is_def_eq(&l, &level::zero())),
-            );
             self.env.insert(
                 name,
                 ConstantInfo::InductiveType {
@@ -557,35 +542,13 @@ impl Parser {
                     )));
                 }
             }
-            // Large elimination check (non-mutual, single-motive case,
-            // which is what every hand-crafted or Lean-generated exploit
-            // of this rule looks like): a Prop-valued inductive with two
-            // or more constructors must have its motive's own codomain
-            // sort fixed at `Sort 0`, not a free universe parameter —
-            // otherwise the recursor lets a proof of the Prop compute a
-            // genuine `Bool`/`Type`-valued result, which combined with
-            // proof irrelevance (any two proofs of the same Prop are
-            // equal) proves `False`. Mutual/multi-motive recursors are
-            // left unvalidated here, same as before this check existed —
-            // narrower than getting a multi-motive case wrong.
-            if all.len() == 1 && num_motives == 1 {
-                if let (Some(true), Some(owner_ctors)) =
-                    (type_is_prop.get(&all[0]).copied(), declared_ctors.get(&all[0]))
-                {
-                    if owner_ctors.len() >= 2 {
-                        let motive_ok = nth_pi_domain(&typ, num_params)
-                            .and_then(|mt| telescope_codomain_sort(&mt))
-                            .is_some_and(|l| level::is_def_eq(&l, &level::zero()));
-                        if !motive_ok {
-                            return Err(TcError::Reject(format!(
-                                "recursor `{}` allows large elimination out of Prop-valued, multi-constructor inductive `{}`",
-                                self.names.get(name as usize).map(|s| s.as_str()).unwrap_or("?"),
-                                self.names.get(all[0] as usize).map(|s| s.as_str()).unwrap_or("?"),
-                            )));
-                        }
-                    }
-                }
-            }
+            // Large-elimination check: see `Checker::elim_only_at_universe_zero`
+            // (`tc.rs`), run from `check_inductive_group` once this whole
+            // block's constants are in `self.env` and full type inference
+            // is available (needed for the "does a field live in Prop"
+            // part of Lean's own rule — not decidable from bare syntax
+            // the way the old, narrower `ctors.len() >= 2`-only check
+            // here used to approximate it).
             let rules = if let Some(arr) = r.get("rules").and_then(|x| x.as_array()) {
                 let mut out = Vec::with_capacity(arr.len());
                 for rule in arr {
@@ -1070,36 +1033,6 @@ fn pi_telescope_len(typ: &Expr) -> u32 {
     }
 }
 
-/// The `Sort` at the end of a Pi telescope, ignoring every binder along
-/// the way (e.g. an inductive's own kind, or a motive parameter's own
-/// type `(t : Ind params idxs) -> Sort u`).
-fn telescope_codomain_sort(e: &Expr) -> Option<Level> {
-    let mut cur = e.clone();
-    loop {
-        match &**cur {
-            ExprData::Pi(_, _, body) => cur = body.clone(),
-            ExprData::Sort(l) => return Some(l.clone()),
-            _ => return None,
-        }
-    }
-}
-
-/// The domain (binder type) of the `n`-th Pi in `e`'s own telescope
-/// (0-indexed), i.e. the type of a recursor's motive parameter once the
-/// leading `n` uniform-parameter binders are skipped.
-fn nth_pi_domain(e: &Expr, n: u32) -> Option<Expr> {
-    let mut cur = e.clone();
-    for _ in 0..n {
-        match &**cur {
-            ExprData::Pi(_, _, body) => cur = body.clone(),
-            _ => return None,
-        }
-    }
-    match &**cur {
-        ExprData::Pi(_, dom, _) => Some(dom.clone()),
-        _ => None,
-    }
-}
 
 fn ctor_field_tys(typ: &Expr, num_params: u32, inst: Option<&[Expr]>) -> Vec<Expr> {
     let mut cur = typ.clone();

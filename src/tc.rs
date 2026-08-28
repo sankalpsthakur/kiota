@@ -2115,24 +2115,6 @@ impl<'e> Checker<'e> {
         params: &[Expr],
         major: &Expr,
     ) -> R<Option<(u32, u32, Vec<Expr>)>> {
-        if all.len() != 1 {
-            return Ok(None);
-        }
-        let tname = all[0];
-        if !self.is_non_rec_structure(tname) {
-            return Ok(None);
-        }
-        let (ctors, num_params) = match self.env.get(tname) {
-            Some(ConstantInfo::InductiveType {
-                ctors, num_params, ..
-            }) => (ctors.clone(), *num_params),
-            _ => return Ok(None),
-        };
-        let cname = ctors[0];
-        let nfields = match self.env.get(cname) {
-            Some(ConstantInfo::Constructor { num_fields, .. }) => *num_fields,
-            _ => return Ok(None),
-        };
         let mt = match self.infer_type(ctx, major) {
             Ok(t) => t,
             Err(e) => {
@@ -2150,50 +2132,62 @@ impl<'e> Checker<'e> {
         if self.is_prop(ctx, &mtw)? {
             if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
                 eprintln!(
-                    "IOTA to_ctor skip Prop structure {} ty={}",
-                    self.name_str(tname),
+                    "IOTA to_ctor skip Prop structure ty={}",
                     self.pp_budget(&mtw, 10)
                 );
             }
             return Ok(None);
         }
         let (thead, targs) = expr::unfold_apps(&mtw);
-        match &**thead {
-            ExprData::Const(n, _) if *n == tname => {
-                if targs.len() < num_params as usize {
-                    if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
-                        eprintln!(
-                            "IOTA to_ctor underapplied {} targs={} nparams={}",
-                            self.name_str(tname),
-                            targs.len(),
-                            num_params
-                        );
-                    }
-                    return Ok(None);
-                }
-                let mut ctor_args: Vec<Expr> = targs[..num_params as usize].to_vec();
-                for i in 0..nfields {
-                    ctor_args.push(expr::proj(tname, i, major.clone()));
-                }
-                let _ = params;
-                Ok(Some((cname, num_params, ctor_args)))
-            }
-            other => {
-                if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
-                    eprintln!(
-                        "IOTA to_ctor head mismatch want={} got={} ty={}",
-                        self.name_str(tname),
-                        match other {
-                            ExprData::Const(n, _) => self.name_str(*n).to_string(),
-                            ExprData::BVar(i) => format!("#{i}"),
-                            _ => format!("{other:?}"),
-                        },
-                        self.pp_budget(&mtw, 12)
-                    );
-                }
-                Ok(None)
-            }
+        // `all[0]` is only the right structure name for a non-mutual
+        // recursor (`all.len() == 1`): a nested-recursor group member
+        // stuck on a neutral major of some *other* group member's type
+        // (e.g. `Cedar.Spec.Value.rec_5`'s major typed `Prod Attr Value`,
+        // inside a `Value`/`List Value`/… six-way group) is a real,
+        // reachable case — `Cedar.Spec.Value._sizeOf_5_eq`'s "cons" proof
+        // supplies exactly this: a `head_ih` computed via the specialized
+        // recursor applied to an abstract `head : Prod Attr Value`, which
+        // needs struct eta on `head` itself (not on `all[0]`, `Value`)
+        // before ι can fire on it at all. Reading `tname` off the major's
+        // own inferred type — rather than assuming it's `all[0]` — makes
+        // this work the same way for every group member, mutual or not,
+        // and for a group member that is only *nested inside* `all`, not
+        // one of `all`'s own listed types.
+        let tname = match &**thead {
+            ExprData::Const(n, _) => *n,
+            _ => return Ok(None),
+        };
+        if !self.is_non_rec_structure(tname) {
+            return Ok(None);
         }
+        let (ctors, num_params) = match self.env.get(tname) {
+            Some(ConstantInfo::InductiveType {
+                ctors, num_params, ..
+            }) => (ctors.clone(), *num_params),
+            _ => return Ok(None),
+        };
+        let cname = ctors[0];
+        let nfields = match self.env.get(cname) {
+            Some(ConstantInfo::Constructor { num_fields, .. }) => *num_fields,
+            _ => return Ok(None),
+        };
+        if targs.len() < num_params as usize {
+            if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
+                eprintln!(
+                    "IOTA to_ctor underapplied {} targs={} nparams={}",
+                    self.name_str(tname),
+                    targs.len(),
+                    num_params
+                );
+            }
+            return Ok(None);
+        }
+        let mut ctor_args: Vec<Expr> = targs[..num_params as usize].to_vec();
+        for i in 0..nfields {
+            ctor_args.push(expr::proj(tname, i, major.clone()));
+        }
+        let _ = (params, all);
+        Ok(Some((cname, num_params, ctor_args)))
     }
 
     /// Whether `ty` is a proposition (`ty : Prop`), not whether `ty` *is* Prop.
@@ -7997,6 +7991,127 @@ impl<'e> Checker<'e> {
         n > 0 && level::is_def_eq(&cur, lo)
     }
 
+    /// Lean kernel `elim_only_at_universe_zero` (`src/kernel/inductive.cpp`):
+    /// whether the recursor(s) for the (mutual) inductive group `all` may
+    /// only eliminate into `Prop` (motive codomain fixed at `Sort 0`),
+    /// rather than an arbitrary `Sort u`. This is Lean's own,
+    /// syntax-approximated "is this Prop a subsingleton" check — the
+    /// justification for the exception is that a subsingleton has at
+    /// most one proof, so a motive that can see into `Sort u` still
+    /// cannot distinguish two different proofs (there's only one).
+    ///
+    /// Sort-u inductives are entirely unaffected — the whole notion of
+    /// "elim only at 0" only makes sense for a type that could actually
+    /// *be* `Prop` for some universe assignment. Checked via
+    /// `level::is_not_zero` on the type's own declared sort, matching
+    /// the kernel's own `m_is_not_zero` exactly (not `is_def_eq` against
+    /// literal `zero`, which only catches an unconditionally-Prop type
+    /// and would let a level-polymorphic predicate like `Sort u` through
+    /// unrestricted for every `u`, including `u := 0`).
+    ///
+    /// For a possibly-Prop, non-mutual, single-constructor type, Lean's
+    /// own two-part field check (case 3 below) is why a `Sort u`-valued
+    /// field is only safe to expose through the motive when it already
+    /// occurs literally in the constructor's own conclusion (its own
+    /// index arguments): that information was never hidden — it's part
+    /// of the term's declared type, not something the recursor would be
+    /// leaking out of an opaque proof.
+    ///
+    /// Restricted (Prop-only) when any of:
+    ///   1. `all.len() > 1`: mutually recursive predicates.
+    ///   2. the type has more than one constructor.
+    ///   3. the type has exactly one constructor with a field that is
+    ///      not itself Prop-valued (case 1 below fails) *and* does not
+    ///      occur in the constructor's own conclusion (case 2 fails) —
+    ///      e.g. `inductive Bad : Prop | mk (x : Sort 1)`: `x`'s own
+    ///      type is `Sort 1` (not Prop, `is_not_zero`), and `Bad` has no
+    ///      indices at all for `x` to occur in, so a `Bad.rec` motive
+    ///      that reaches `Sort 1` could pull `x` itself out of an opaque
+    ///      `Bad` proof — combined with proof irrelevance (any two
+    ///      `Bad.mk` proofs are equal), that proves `False`.
+    /// Not restricted (large elim OK) when the type has zero
+    /// constructors (e.g. `False`: vacuously fine, nothing to leak) or
+    /// its one constructor's every non-Prop field occurs in the
+    /// conclusion (e.g. `Eq.refl`'s `a` occurs as both of `Eq`'s own
+    /// indices).
+    fn elim_only_at_universe_zero(&self, all: &[u32]) -> R<bool> {
+        let tname0 = all[0];
+        let (num_params0, num_indices0, typ0) = match self.env.get(tname0) {
+            Some(ConstantInfo::InductiveType {
+                num_params,
+                num_indices,
+                typ,
+                ..
+            }) => (*num_params, *num_indices, typ.clone()),
+            _ => return Ok(false),
+        };
+        let mut ctx0 = Ctx::new();
+        let mut cur0 = typ0;
+        for _ in 0..(num_params0 + num_indices0) {
+            let (_, dom, body) = self.ensure_pi(&ctx0, &cur0)?;
+            ctx0.push(dom);
+            cur0 = body;
+        }
+        let result_level = self.ensure_sort(&ctx0, &cur0)?;
+        if level::is_not_zero(&result_level) {
+            // For every universe assignment the type is not Prop, so
+            // it's not an inductive predicate at all.
+            return Ok(false);
+        }
+        if all.len() > 1 {
+            return Ok(true);
+        }
+        let ctors = match self.env.get(tname0) {
+            Some(ConstantInfo::InductiveType { ctors, .. }) => ctors.clone(),
+            _ => return Ok(false),
+        };
+        if ctors.len() > 1 {
+            return Ok(true);
+        }
+        let Some(&cname) = ctors.first() else {
+            // Zero constructors (`False`): vacuously large-elim OK.
+            return Ok(false);
+        };
+        let (c_typ, c_np) = match self.env.get(cname) {
+            Some(ConstantInfo::Constructor {
+                typ, num_params, ..
+            }) => (typ.clone(), *num_params),
+            _ => return Ok(false),
+        };
+        let mut cctx = Ctx::new();
+        let mut cur = c_typ;
+        let mut pos: u32 = 0;
+        // bvar-depth positions of fields that are not themselves Prop.
+        let mut to_check: Vec<u32> = Vec::new();
+        loop {
+            match &**cur {
+                ExprData::Pi(_, dom, body) => {
+                    if pos >= c_np {
+                        if let Ok(ds) = self.infer_type(&cctx, dom) {
+                            if let Ok(field_lvl) = self.ensure_sort(&cctx, &ds) {
+                                if level::is_not_zero(&field_lvl) {
+                                    to_check.push(pos);
+                                }
+                            }
+                        }
+                    }
+                    cctx.push(dom.clone());
+                    cur = body.clone();
+                    pos += 1;
+                }
+                _ => break,
+            }
+        }
+        let (_, args) = expr::unfold_apps(&cur);
+        for p in &to_check {
+            let expected = expr::bvar(pos - 1 - p);
+            if !args.iter().any(|a| **a == *expected) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn check_inductive_group(&self, first_name: u32) -> R<()> {
         let ci = self
             .env
@@ -8178,6 +8293,62 @@ impl<'e> Checker<'e> {
                     if self.occurs_any(idx_arg, &all) {
                         return reject("constructor index expression refers to the inductive type being defined");
                     }
+                }
+            }
+        }
+        // Large-elimination check, once per group (not once per member —
+        // `check_inductive_group` runs once per type name in the block,
+        // all sharing the same `all`). See `elim_only_at_universe_zero`'s
+        // own comment for the exact rule being enforced.
+        if all.first() == Some(&first_name) && self.elim_only_at_universe_zero(&all)? {
+            let mut recs: Vec<u32> = all
+                .iter()
+                .filter_map(|t| self.env.rec_of.get(t).copied())
+                .collect();
+            recs.sort_unstable();
+            recs.dedup();
+            for rname in recs {
+                let (r_typ, r_np, r_nm) = match self.env.get(rname) {
+                    Some(ConstantInfo::Recursor {
+                        typ,
+                        num_params,
+                        num_motives,
+                        ..
+                    }) => (typ.clone(), *num_params, *num_motives),
+                    _ => continue,
+                };
+                let mut mctx = Ctx::new();
+                let mut cur = r_typ;
+                for _ in 0..r_np {
+                    let (_, dom, body) = self.ensure_pi(&mctx, &cur)?;
+                    mctx.push(dom);
+                    cur = body;
+                }
+                for _ in 0..r_nm {
+                    let (_, dom, body) = self.ensure_pi(&mctx, &cur)?;
+                    let motive_ok = {
+                        let mut mtctx = mctx.clone();
+                        let mut mt = dom.clone();
+                        loop {
+                            match self.ensure_pi(&mtctx, &mt) {
+                                Ok((_, d, b)) => {
+                                    mtctx.push(d);
+                                    mt = b;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        self.ensure_sort(&mtctx, &mt)
+                            .is_ok_and(|l| level::is_def_eq(&l, &level::zero()))
+                    };
+                    if !motive_ok {
+                        return reject(format!(
+                            "recursor `{}` allows large elimination out of a Prop-valued inductive that is not a subsingleton",
+                            self.name_str(rname)
+                        ));
+                    }
+                    mctx.push(dom);
+                    cur = body;
                 }
             }
         }
