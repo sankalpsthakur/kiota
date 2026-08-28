@@ -727,3 +727,37 @@ fn lean_value_two_list_specializations_accepts() {
 fn prop_subsingleton_elim_data_field_rejects() {
     assert_reject("prop-subsingleton-elim-data-field.reject.ndjson");
 }
+
+/// Minimal dependency-closure slice, cut directly from a real
+/// `cedar-spec` export (not hand-assembled), of
+/// `Cedar.Spec.Value._sizeOf_3_eq` — the equation lemma bridging
+/// `Cedar.Data.Map`'s generic `SizeOf` instance to `Value`'s own
+/// specialized nested recursor for a `Map`-typed field. Traced back to
+/// a real, general bug in `iota_from_first_principles`: it substituted
+/// a constructor's own declared universe parameters using the *outer*
+/// recursor's universe args (`us`) instead of the constructor's own
+/// application-site universe args. For a nested, independently-declared
+/// constructor whose own level-parameter list differs in length or
+/// identity from the enclosing recursor's shared levels (`Cedar.Data.
+/// Map.mk`'s own `{u1, u2}` inside a group whose own recursors share
+/// just one level), this left part of the constructor's declared type
+/// permanently uninstantiated (a free `u60`-style leftover universe
+/// parameter). That, in turn, made `nested_rec_for_type`'s own
+/// major-premise-type match against the *correctly* instantiated form
+/// fail, silently falling back to the ambiguous, name-only
+/// `nested_rec_for` search — which then picked the wrong group member
+/// for a recursive field's own IH (`Cedar.Spec.Value.rec_3`, for `List
+/// Value`, instead of `rec_4`, for `List (Prod Attr Value)` — both
+/// still owning `List.cons`/`List.nil`).
+///
+/// Fixed by threading the constructor's own application-site universe
+/// args through `try_iota`/`try_iota_value` into
+/// `iota_from_first_principles`, instead of reusing the outer
+/// recursor's. Also fixes `Cedar.Spec.Value._sizeOf_5_eq` (the
+/// equation lemma this one's own proof depends on) under `KIOTA_NBE=1`,
+/// which the eager-only `to_ctor_when_structure` fix (struct eta on a
+/// stuck neutral major) did not reach.
+#[test]
+fn cedar_value_sizeof3_nested_map_accepts() {
+    assert_accept("cedar-value-sizeOf3-nested-map.accept.ndjson");
+}

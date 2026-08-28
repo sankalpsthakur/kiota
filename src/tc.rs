@@ -4236,13 +4236,13 @@ impl<'e> Checker<'e> {
             );
         }
         let ctor = match &**mhead {
-            ExprData::Const(cname, _) => match self.env.get(*cname) {
+            ExprData::Const(cname, ctor_us) => match self.env.get(*cname) {
                 Some(ConstantInfo::Constructor {
                     induct,
                     num_params: cnp,
                     ..
                 }) if all.contains(induct) || rec_owns_ctor(*cname) => {
-                    Some((*cname, *cnp, margs.clone()))
+                    Some((*cname, *cnp, margs.clone(), Some((**ctor_us).clone())))
                 }
                 _ => None,
             },
@@ -4254,7 +4254,7 @@ impl<'e> Checker<'e> {
                     };
                     if nat_induct.map(|ind| all.contains(&ind)).unwrap_or(false) || rec_owns_ctor(zero) {
                         if n == &num_bigint::BigUint::from(0u32) {
-                            Some((zero, 0, vec![]))
+                            Some((zero, 0, vec![], None))
                         } else if n.bits() > 256 {
                             // Lean `LEAN_NAT_MAX_SIZE`-style byte cap, not a
                             // bits∈[20,24] fingerprint of hugeFuel vs 2^32.
@@ -4263,7 +4263,7 @@ impl<'e> Checker<'e> {
                             // One succ peel per iota (C++ natLit). WHNF-core
                             // may continue; uniform WHNF_DEPTH declines.
                             let pred = n - 1u32;
-                            Some((succ, 0, vec![expr::lit_nat(pred)]))
+                            Some((succ, 0, vec![expr::lit_nat(pred)], None))
                         }
                     } else {
                         None
@@ -4275,7 +4275,7 @@ impl<'e> Checker<'e> {
             _ => None,
         };
 
-        let (cname, cnp, ctor_args) = if let Some(x) = ctor {
+        let (cname, cnp, ctor_args, ctor_us) = if let Some(x) = ctor {
             x
         } else if let Some(x) = self.to_ctor_when_structure(ctx, &all, params, &major_w)? {
             if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
@@ -4288,10 +4288,10 @@ impl<'e> Checker<'e> {
                     x.2.len()
                 );
             }
-            x
+            (x.0, x.1, x.2, None)
         } else if k_like {
             match self.k_like_ctor(ctx, &all, params, major)? {
-                Some(x) => x,
+                Some(x) => (x.0, x.1, x.2, None),
                 None => return Ok(None),
             }
         } else {
@@ -4313,10 +4313,30 @@ impl<'e> Checker<'e> {
         if matches!(&**major_w, ExprData::Lit(Lit::Nat(_))) {
             self.iota_lit_memo_misses.set(self.iota_lit_memo_misses.get() + 1);
         }
+        // The constructor's own universe args at the application site
+        // (`ctor_us`) — not `us` (the *outer* recursor's own levels).
+        // For a nested/reused type (`Cedar.Data.Map.mk`'s `{u1, u2}`
+        // inside a group whose own shared levels are just `{u2'}`, say),
+        // substituting the ctor's declared level params with `us`
+        // mismatches in length/identity, leaving some of the ctor's own
+        // level params entirely unsubstituted — a free `u60`-style
+        // leftover that then compares unequal to the same nested type's
+        // properly-instantiated form elsewhere in the same proof
+        // (`Cedar.Spec.Value._sizeOf_3_eq`: this left the "cons" case's
+        // generated IH pointing at the *wrong* group member, since the
+        // wrong-leveled major type no longer matched any candidate's own
+        // declared major and fell through to the name-only fallback).
+        // Falls back to `us` only when the ctor's own application-site
+        // levels aren't available (the literal-major and structure/K
+        // shortcuts above, none of which build a group member's own
+        // multi-level-param constructor the way a literal `Const` major
+        // does).
+        let ctor_us_owned = ctor_us.unwrap_or_else(|| us.to_vec());
         let rhs = self.iota_from_first_principles(
             ctx,
             rname,
             &us,
+            &ctor_us_owned,
             &level_params,
             &all,
             params,
@@ -4533,6 +4553,7 @@ impl<'e> Checker<'e> {
     /// `nested_rec_for`) for any shape this doesn't handle cleanly.
     fn nested_rec_for_type(
         &self,
+        ctx: &Ctx,
         rname: u32,
         us: &[Level],
         params: &[Expr],
@@ -4586,11 +4607,27 @@ impl<'e> Checker<'e> {
             };
             let (mh, margs) = expr::unfold_apps(&major_dom);
             if let ExprData::Const(c, _) = &**mh {
-                if *c == target
-                    && margs.len() >= target_args.len()
-                    && margs[..target_args.len()] == *target_args
-                {
-                    return Some(rec);
+                if *c == target && margs.len() >= target_args.len() {
+                    // Structural `==` is too strict here: two occurrences
+                    // of the *same* nested type can carry differently
+                    // *named* (but defeq) universe level arguments —
+                    // e.g. one path substitutes a group's own concrete
+                    // levels, another leaves a generic level parameter
+                    // from a shared instance's own declaration in place.
+                    // A false decline here (from `!=` on an otherwise-
+                    // identical type) is what let `nested_rec_for`'s
+                    // ambiguous, name-only fallback silently pick the
+                    // wrong group member (`Cedar.Spec.Value._sizeOf_3_eq`:
+                    // `List Value`'s `rec_3`, sorted first, instead of
+                    // `List (Prod Attr Value)`'s `rec_4`, both owning
+                    // `List.cons`/`List.nil`).
+                    let matches = margs[..target_args.len()]
+                        .iter()
+                        .zip(target_args)
+                        .all(|(a, b)| a == b || self.is_def_eq(ctx, a, b).unwrap_or(false));
+                    if matches {
+                        return Some(rec);
+                    }
                 }
             }
         }
@@ -4771,6 +4808,7 @@ impl<'e> Checker<'e> {
         ctx: &Ctx,
         rname: u32,
         us: &[Level],
+        ctor_us: &[Level],
         level_params: &[u32],
         all: &[u32],
         params: &[Expr],
@@ -4787,7 +4825,9 @@ impl<'e> Checker<'e> {
             }) => (level_params.clone(), typ.clone()),
             _ => return Ok(minor),
         };
-        let subst = level::subst_map(&ctor_lp, us);
+        // `ctor_us`, the constructor's own universe args at its
+        // application site — not `us` (see the call site's own comment).
+        let subst = level::subst_map(&ctor_lp, ctor_us);
         let mut ct = expr::instantiate_level_params(&ctor_typ, &subst);
         // Nested ctors (Array.mk, List.cons) carry their own params on the
         // major; the outer recursor's params may be empty (Syntax).
@@ -4895,7 +4935,7 @@ impl<'e> Checker<'e> {
         } else if self.occurs_any(&ty, all) {
             // Only `F … I …` (e.g. `Array Syntax`), not `List Preresolved`.
             let nrec = self
-                .nested_rec_for_type(rname, us, params, target, &iargs)
+                .nested_rec_for_type(&tctx, rname, us, params, target, &iargs)
                 .or_else(|| self.nested_rec_for(target, rname));
             if let Some(nrec) = nrec {
                 (nrec, params.iter().map(|p| expr::shift(p, shift_by, 0)).collect(), &[][..])
@@ -8944,7 +8984,7 @@ impl<'e> Checker<'e> {
             major_v = self.eval(&nbe::generic_env(depth), &unfolded)?;
         }
 
-        let ctor: Option<(u32, u32, Vec<Rc<nbe::Thunk>>)> = match &*major_v {
+        let ctor: Option<(u32, u32, Vec<Rc<nbe::Thunk>>, Option<Vec<Level>>)> = match &*major_v {
             nbe::Value::Lit(Lit::Nat(n)) => {
                 let Some((zero, succ)) = self.nat_ctors() else {
                     return Ok(None);
@@ -8957,7 +8997,7 @@ impl<'e> Checker<'e> {
                     return Ok(None);
                 }
                 if *n == BigUint::from(0u32) {
-                    Some((zero, 0, Vec::new()))
+                    Some((zero, 0, Vec::new(), None))
                 } else if n.bits() > 256 {
                     // Same byte cap as the eager path (`nat.rs`); stays
                     // neutral so the fallback keeps the eager decline.
@@ -8968,19 +9008,20 @@ impl<'e> Checker<'e> {
                         succ,
                         0,
                         vec![nbe::Thunk::forced(Rc::new(nbe::Value::Lit(Lit::Nat(pred))))],
+                        None,
                     ))
                 }
             }
             nbe::Value::Neutral(nv) => {
                 let (chead, cargs) = Self::unwind_neutral(nv);
                 match chead {
-                    nbe::Neutral::Const(cname, _) => match self.env.get(*cname) {
+                    nbe::Neutral::Const(cname, ctor_us) => match self.env.get(*cname) {
                         Some(ConstantInfo::Constructor {
                             induct,
                             num_params: cnp,
                             ..
                         }) if all.contains(induct) || rec_owns_ctor(*cname) => {
-                            Some((*cname, *cnp, cargs))
+                            Some((*cname, *cnp, cargs, Some((**ctor_us).clone())))
                         }
                         _ => None,
                     },
@@ -8989,7 +9030,7 @@ impl<'e> Checker<'e> {
             }
             _ => None,
         };
-        let Some((cname, cnp, ctor_args)) = ctor else {
+        let Some((cname, cnp, ctor_args, ctor_us)) = ctor else {
             return Ok(None);
         };
         if (ctor_args.len() as u32) < cnp {
@@ -9011,11 +9052,17 @@ impl<'e> Checker<'e> {
         if minor_idx >= minors.len() {
             return Ok(None);
         }
+        // See eager's own call site comment: the ctor's own
+        // application-site universe args, not `us` (the outer
+        // recursor's), or a nested type's own multi-level-param
+        // constructor is left partly unsubstituted.
+        let ctor_us_owned = ctor_us.unwrap_or_else(|| us.to_vec());
         let rhs = self.iota_from_first_principles(
             &dctx,
             rname,
             &us,
-            &[],
+            &ctor_us_owned,
+            &level_params,
             &all,
             &params_q,
             &ctor_params_q,
