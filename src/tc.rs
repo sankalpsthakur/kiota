@@ -4523,7 +4523,48 @@ impl<'e> Checker<'e> {
     }
 
     fn ctor_minor_index(&self, cname: u32, rname: u32, all: &[u32]) -> usize {
+        // `rname`'s own position for `cname` first: a nested group's own
+        // constructor can be *polymorphic* (`List.cons` is the same
+        // constant regardless of its element type), so two different
+        // specializations in the same group (`List Value`'s recursor and
+        // `List (Prod Attr Value)`'s, say) can each list a rule for the
+        // exact same `cname`. Matching the first occurrence across the
+        // *whole* group, regardless of which recursor is actually being
+        // reduced, silently picked whichever specialization's rule (and
+        // RHS) happened to come first in the group's order — the wrong
+        // one whenever `rname` itself isn't that first specialization.
+        // This fixes that misattribution (never uses a *different*
+        // recursor's rule for the constructor being reduced), but the
+        // offset added below still assumes `self.rec_group`'s own sort
+        // order lines up with the actual, shared minor-slot layout the
+        // group's individual definitions (e.g. a mutual `sizeOf` helper)
+        // were built against; a group with more than one same-shaped
+        // nested specialization (two `List.nil`/`List.cons` pairs, for
+        // distinct element types, both in one group) can still combine
+        // with the wrong minor if that assumption doesn't hold for a
+        // given export. Confirmed independently correct — and needed —
+        // for every existing fixture (the `Acc`/`PersistentHashMap.Node`
+        // nested-recursor cases): only known to be incomplete on a case
+        // pulled from the live `cedar` export with two same-shaped `List`
+        // specializations in one six-way mutual group.
         let mut idx = 0usize;
+        for rec in self.rec_group(rname) {
+            let rules = match self.env.get(rec) {
+                Some(ConstantInfo::Recursor { rules, .. }) => rules,
+                _ => continue,
+            };
+            if rec == rname {
+                if let Some(local) = rules.iter().position(|r| r.ctor == cname) {
+                    return idx + local;
+                }
+            }
+            idx += rules.len();
+        }
+        // Fallback for a `cname` `rname` doesn't own directly (shouldn't
+        // normally happen: `try_iota`'s own ctor detection already
+        // requires `rec_owns_ctor(cname)` or `all.contains(induct)` before
+        // calling here) — first match by ctor name anywhere in the group.
+        idx = 0;
         for rec in self.rec_group(rname) {
             if let Some(ConstantInfo::Recursor { rules, .. }) = self.env.get(rec) {
                 for rule in rules {
