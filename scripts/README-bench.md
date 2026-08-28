@@ -30,12 +30,32 @@ Output is one line of JSON on stdout:
 {"instructions": 123456789, "wall_ms": 842, "peak_rss_kb": 51200, "sha": "<sha>", "prefix": null}
 ```
 
-- `instructions` is `null` if `valgrind` is not on `PATH` (a clear skip
-  notice is printed to stderr in that case).
-- `wall_ms` / `peak_rss_kb` come from a separate, plain (no-valgrind) run,
-  since valgrind's own overhead makes its wall time and memory numbers
-  meaningless for comparison. `peak_rss_kb` is `null` if `/usr/bin/time` is
-  not available.
+- `instructions` is callgrind **Ir** (instructions retired). It is `null`
+  if `valgrind` is not on `PATH` (a clear skip notice is printed to stderr
+  in that case). It is never invented from wall time, RSS, or the arena's
+  ⏱️ column.
+- `wall_ms` is elapsed real time for a separate, plain (no-valgrind) run,
+  measured with bash `$EPOCHREALTIME` (bash 5+) or `date +%s%N`. It does
+  not require GNU `time`.
+- `peak_rss_kb` is that same plain run's peak RSS from
+  `/proc/<pid>/status` `VmHWM` (kB), sampled while the child is alive.
+  It does not require GNU `time`. `/usr/bin/time -v` is an optional
+  cross-check and is used only if `/proc` sampling produced nothing.
+- Valgrind's own wall time and RSS are ignored: they include instrumentation
+  overhead and are not comparable.
+
+## How this relates to the arena sort key
+
+The Lean Kernel Arena's ⏱️ column is **not** wall-clock time. It is virtual
+CPU time derived from instruction counts at a fixed **6.0 Ginstr/s**. Field
+3 of the arena sort key is the **raw mathlib instruction count** (Ir), not
+that derived ⏱️ value.
+
+So `instructions` (callgrind Ir) is the number this harness exists to
+produce. Do not treat `wall_ms` as ⏱️, and do not compute a fake Ir as
+`wall_ms * 6.0e6`. If valgrind is missing, `instructions` stays `null`.
+
+`wall_ms` and `peak_rss_kb` are diagnostics for local A/B runs.
 
 ## Comparing two runs of the same SHA
 
@@ -73,8 +93,9 @@ less noisy than wall-clock time.
 - `valgrind` (optional, for instruction counts). If missing, the script
   still runs and reports `wall_ms`/`peak_rss_kb`, with `instructions: null`
   and a skip notice on stderr.
-- `/usr/bin/time` (optional, for `peak_rss_kb`). If missing, `wall_ms` is
-  still measured by the script directly, and `peak_rss_kb` is `null`.
+- `/proc` (Linux) for `peak_rss_kb`. `/usr/bin/time` is optional: wall
+  time is always measured by the script, and `peak_rss_kb` comes from
+  `VmHWM` when `/proc` is available.
 
 ## Cache
 

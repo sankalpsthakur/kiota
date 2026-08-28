@@ -17,11 +17,16 @@
 #    "peak_rss_kb": <int|null>, "sha": "<string>", "prefix": <int|null>}
 #
 # Instruction counts come from `valgrind --tool=callgrind` when valgrind is
-# on PATH. Wall time and peak RSS come from a separate, unaltered (no
-# valgrind) run, since valgrind's own overhead makes its wall time and RSS
-# meaningless for comparison. If valgrind is missing, instructions is null
-# and a clear skip notice is printed to stderr; wall_ms/peak_rss_kb are
-# still measured.
+# on PATH (callgrind Ir). That field is never derived from wall time or from
+# the arena's ⏱️ column (virtual CPU at a fixed 6.0 Ginstr/s). If valgrind is
+# missing, instructions is null and a clear skip notice is printed to stderr.
+#
+# Wall time and peak RSS come from a separate, unaltered (no valgrind) run,
+# since valgrind's own overhead makes its wall time and RSS meaningless for
+# comparison. wall_ms is elapsed real time via $EPOCHREALTIME (bash 5+) or
+# date +%s%N; peak_rss_kb is /proc/<pid>/status VmHWM (kB). Neither field
+# requires GNU time or valgrind. /usr/bin/time, if present, is an optional
+# cross-check / last-resort RSS fallback only.
 #
 # See scripts/README-bench.md for how to compare two runs of the same SHA.
 
@@ -96,46 +101,137 @@ if [ -n "$PREFIX" ]; then
 fi
 
 # --- Plain run: wall_ms + peak_rss_kb (no valgrind overhead) ---------------
+# Wall and RSS are measured directly. /usr/bin/time is never required.
+
+# Integer microseconds from $EPOCHREALTIME (sec.usec) or date +%s%N.
+realtime_to_us() {
+    local t="$1" sec frac
+    sec="${t%%.*}"
+    frac="${t#*.}"
+    if [ "$sec" = "$t" ]; then
+        frac="0"
+    fi
+    frac="${frac}000000"
+    frac="${frac:0:6}"
+    printf '%s' "$((10#$sec * 1000000 + 10#$frac))"
+}
+
+now_us() {
+    if [ -n "${EPOCHREALTIME:-}" ]; then
+        realtime_to_us "$EPOCHREALTIME"
+    else
+        local ns
+        ns="$(date +%s%N 2>/dev/null || true)"
+        case "$ns" in
+            ''|*[!0-9]*)
+                ns="$(date +%s)000000000"
+                ;;
+        esac
+        printf '%s' "$((10#$ns / 1000))"
+    fi
+}
+
+# VmHWM is kB. Empty output if /proc is missing or the pid is already gone.
+# Parse with bash builtins so we can poll without forking awk on every sample.
+read_proc_vmhwm_state() {
+    # Sets PROC_VMHWM and PROC_STATE. Both empty if /proc/<pid>/status
+    # cannot be read (process already reaped).
+    PROC_VMHWM=""
+    PROC_STATE=""
+    local status="/proc/${1}/status" key rest
+    [ -r "$status" ] || return 0
+    while IFS=$' \t' read -r key rest; do
+        case "$key" in
+            State:)
+                PROC_STATE="${rest#"${rest%%[![:space:]]*}"}"
+                PROC_STATE="${PROC_STATE%%[[:space:]]*}"
+                ;;
+            VmHWM:)
+                PROC_VMHWM="${rest#"${rest%%[![:space:]]*}"}"
+                PROC_VMHWM="${PROC_VMHWM%%[[:space:]]*}"
+                ;;
+        esac
+    done < "$status" 2>/dev/null || true
+}
+
+# Sample the child's VmHWM until it exits. Bash may reap background children
+# on SIGCHLD, so a post-wait /proc/<pid> read is unreliable; stop on zombie
+# (State Z), a failed read, or once /proc/<pid>/status is gone. VmHWM is a
+# kernel high-water mark, so the last successful read is the peak up to
+# that point. Busy-poll at first so tiny fixtures are not missed, then
+# back off so a long run does not pin a core.
+# Sets PEAK_RSS_KB in this shell (not via command substitution).
+sample_peak_rss_kb() {
+    local pid="$1" last="" polls=0
+    while :; do
+        read_proc_vmhwm_state "$pid"
+        if [ -n "$PROC_VMHWM" ]; then
+            last="$PROC_VMHWM"
+        fi
+        case "$PROC_STATE" in
+            Z*) break ;;
+        esac
+        if [ -z "$PROC_VMHWM" ] && [ -z "$PROC_STATE" ]; then
+            break
+        fi
+        polls=$((polls + 1))
+        if [ "$polls" -gt 200 ]; then
+            sleep 0.01 2>/dev/null || true
+        fi
+    done
+    PEAK_RSS_KB="$last"
+}
+
+parse_gnu_time_rss_kb() {
+    awk -F ': ' '/Maximum resident set size/ { print $NF; exit }' "$1"
+}
 
 WALL_MS=""
 PEAK_RSS_KB=""
 
-if [ -x /usr/bin/time ]; then
+if [ -n "${EPOCHREALTIME:-}" ]; then
+    START_US="$(realtime_to_us "$EPOCHREALTIME")"
+else
+    START_US="$(now_us)"
+fi
+"${RUN_COMMAND[@]}" "$BIN" "$CORPUS" >/dev/null 2>&1 &
+CHILD_PID=$!
+# Sample in this shell (not a command substitution) so the first /proc
+# read is not delayed by an extra fork.
+sample_peak_rss_kb "$CHILD_PID"
+# Child may already be a zombie; one more /proc/<pid> read before wait.
+read_proc_vmhwm_state "$CHILD_PID"
+if [ -n "$PROC_VMHWM" ]; then
+    PEAK_RSS_KB="$PROC_VMHWM"
+fi
+wait "$CHILD_PID" || true
+if [ -n "${EPOCHREALTIME:-}" ]; then
+    END_US="$(realtime_to_us "$EPOCHREALTIME")"
+else
+    END_US="$(now_us)"
+fi
+WALL_MS=$(( (END_US - START_US) / 1000 ))
+
+# After wait, bash has reaped the child so /proc/<pid> is gone.
+# /proc/self/status would be this shell, not kiota — do not substitute it.
+
+# Optional GNU time cross-check: fill peak_rss_kb only if /proc sampling
+# produced nothing (no /proc, or the child exited before the first read).
+if [ -z "${PEAK_RSS_KB:-}" ] && [ -x /usr/bin/time ]; then
     TIME_OUT="$(mktemp)"
     TIME_PROBE="$(mktemp)"
     if /usr/bin/time -v true >/dev/null 2>"$TIME_PROBE" \
         && grep -q 'Elapsed (wall clock) time' "$TIME_PROBE"; then
+        echo "bench.sh: /proc VmHWM unavailable; GNU time -v fallback for peak_rss_kb" >&2
         if "${RUN_COMMAND[@]}" /usr/bin/time -v "$BIN" "$CORPUS" \
             >/dev/null 2>"$TIME_OUT"; then :; else :; fi
-        # Split on the label/value separator (`: `), not the colons inside
-        # GNU time's `[h:]mm:ss` value.
-        WALL_CLOCK="$(awk -F ': ' '/Elapsed \(wall clock\) time/ { print $NF; exit }' "$TIME_OUT")"
-        if [ -n "${WALL_CLOCK:-}" ]; then
-            IFS=: read -ra PARTS <<<"$WALL_CLOCK"
-            if [ "${#PARTS[@]}" -eq 3 ]; then
-                WALL_MS=$(awk -v h="${PARTS[0]}" -v m="${PARTS[1]}" -v s="${PARTS[2]}" \
-                    'BEGIN { printf "%d", (h*3600 + m*60 + s) * 1000 }')
-            elif [ "${#PARTS[@]}" -eq 2 ]; then
-                WALL_MS=$(awk -v m="${PARTS[0]}" -v s="${PARTS[1]}" \
-                    'BEGIN { printf "%d", (m*60 + s) * 1000 }')
-            fi
-        fi
-        PEAK_RSS_KB="$(awk -F ': ' '/Maximum resident set size/ { print $NF; exit }' "$TIME_OUT")"
+        PEAK_RSS_KB="$(parse_gnu_time_rss_kb "$TIME_OUT")"
     else
-        # POSIX `-p` works with GNU, macOS, and BSD time. It reports wall time
-        # but not peak RSS in a portable unit.
-        if "${RUN_COMMAND[@]}" /usr/bin/time -p "$BIN" "$CORPUS" \
-            >/dev/null 2>"$TIME_OUT"; then :; else :; fi
-        WALL_SECONDS="$(awk '$1 == "real" { print $2; exit }' "$TIME_OUT")"
-        if [ -n "${WALL_SECONDS:-}" ]; then
-            WALL_MS=$(awk -v s="$WALL_SECONDS" 'BEGIN { printf "%d", s * 1000 }')
-        fi
-        echo "bench.sh: GNU time -v unavailable; peak_rss_kb will be null" >&2
+        echo "bench.sh: /proc VmHWM unavailable and GNU time -v missing; peak_rss_kb will be null" >&2
     fi
     rm -f "$TIME_OUT" "$TIME_PROBE"
-else
-    echo "bench.sh: /usr/bin/time not found; wall_ms and peak_rss_kb will be null" >&2
-    "${RUN_COMMAND[@]}" "$BIN" "$CORPUS" >/dev/null 2>&1 || true
+elif [ -z "${PEAK_RSS_KB:-}" ]; then
+    echo "bench.sh: /proc VmHWM unavailable; peak_rss_kb will be null" >&2
 fi
 
 # --- Valgrind/callgrind run: instructions -----------------------------------
