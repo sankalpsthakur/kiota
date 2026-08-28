@@ -2831,6 +2831,32 @@ impl<'e> Checker<'e> {
     /// iota-peels intern-distinct `s.i` / `Nat.rec` spines (`#3495`, `#4000`).
     /// `false` means "not proved this way", never "not defeq".
     fn try_unreduced_const_congruence(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        self.try_unreduced_const_congruence_ex(ctx, a, b, false)
+    }
+
+    /// `allow_recursor`: see the call site after the cheap (β/ι/proj, no
+    /// δ) `whnf_core` pass in `is_def_eq_inner`. Lean's own
+    /// `is_def_eq_core` runs its `whnf_core(t, false, true)` (no δ, no
+    /// normalizer extensions) and *then* tries `is_def_eq_app` — plain
+    /// argument-wise congruence — with no exclusion for a recursor head
+    /// at all (`type_checker.cpp`). Two stuck, same-arity applications of
+    /// the *same* recursor (major included, as just another argument)
+    /// are defeq iff every argument pairwise is, regardless of whether
+    /// the recursor itself could ever be further reduced — proving that
+    /// never needs the recursor's own δ/ι behavior, only that both sides
+    /// agree argument-by-argument. Kept `false` (the pre-existing,
+    /// unreduced-in-the-raw-term call) to leave that path's own behavior
+    /// untouched; `true` only for the new cheap-whnf_core retry, which
+    /// only ever seeks this shape after the same-shape-revealing β/ι/proj
+    /// step, not on two arbitrary, possibly-intern-distinct raw spines
+    /// (the `#18041`-style concern the `false` path still guards against).
+    fn try_unreduced_const_congruence_ex(
+        &self,
+        ctx: &Ctx,
+        a: &Expr,
+        b: &Expr,
+        allow_recursor: bool,
+    ) -> R<bool> {
         match (&***a, &***b) {
             (ExprData::Proj(s1, i1, v1), ExprData::Proj(s2, i2, v2)) if s1 == s2 && i1 == i2 => {
                 if self.is_def_eq(ctx, v1, v2)? {
@@ -2869,7 +2895,7 @@ impl<'e> Checker<'e> {
         // Recursor spines and *large* Regulars must WHNF/δ/ι first.
         // Unreduced pairwise of `mkGateCached` walks AIG `BinaryInput.mk`
         // as a tree (`#18041`). Abbrev Acc wrappers still congruence.
-        if matches!(self.env.get(*n1), Some(ConstantInfo::Recursor { .. })) {
+        if !allow_recursor && matches!(self.env.get(*n1), Some(ConstantInfo::Recursor { .. })) {
             return Ok(false);
         }
         // Type-structure ctors (`BinaryInput.mk`): unreduced field-pairwise
@@ -3784,6 +3810,24 @@ impl<'e> Checker<'e> {
             return Ok(true);
         }
         if self.try_unreduced_const_congruence(ctx, a, b)? {
+            self.defeq_cache_insert(force_eager, key, true);
+            return Ok(true);
+        }
+        // Lean's own `is_def_eq_core`: a cheap `whnf_core(t, false, true)`
+        // pass (β/ι/proj, no δ, no normalizer extensions) before trying
+        // congruence again — see `try_unreduced_const_congruence_ex`'s own
+        // comment. `a`/`b` here can be β-redexes (`(fun h => Nat.rec …) v`)
+        // whose *bodies* are the same-shape, same-arity recursor spine
+        // `try_unreduced_const_congruence` above never got to see (its own
+        // `unfold_apps` saw the outer `Lam`, not `Nat.rec`). `whnf_core`
+        // (unlike `whnf`) never δ-unfolds a named constant, so this cannot
+        // itself force the full, depth-capped recursor unfold this exists
+        // to avoid.
+        let a_core = self.whnf_core(ctx, a)?;
+        let b_core = self.whnf_core(ctx, b)?;
+        if (!Rc::ptr_eq(&a_core, a) || !Rc::ptr_eq(&b_core, b))
+            && self.try_unreduced_const_congruence_ex(ctx, &a_core, &b_core, true)?
+        {
             self.defeq_cache_insert(force_eager, key, true);
             return Ok(true);
         }
