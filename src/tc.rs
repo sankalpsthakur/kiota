@@ -1154,6 +1154,20 @@ impl std::ops::Index<usize> for Ctx {
     }
 }
 
+/// Shift every parameter expression recorded in the positivity checker's
+/// nested-functor `visiting` list by `by`, so entries captured at one de
+/// Bruijn context depth stay meaningful after more binders are pushed (see
+/// `check_arg_positive_in` / `check_specialized_ctor_positive`).
+fn shift_visiting(visiting: &[(u32, Vec<Expr>)], by: i32) -> Vec<(u32, Vec<Expr>)> {
+    if by == 0 {
+        return visiting.to_vec();
+    }
+    visiting
+        .iter()
+        .map(|(n, ps)| (*n, ps.iter().map(|p| expr::shift(p, by, 0)).collect()))
+        .collect()
+}
+
 pub(crate) fn expr_size_capped(e: &Expr, cap: u32) -> u32 {
     let mut n = 0u32;
     let mut stack = vec![e.clone()];
@@ -7999,6 +8013,7 @@ impl<'e> Checker<'e> {
             crate::stats::ctx_clone();
             ctx.clone()
         };
+        let mut peeled = 0i32;
         loop {
             match &**cur {
                 ExprData::Pi(_, dom, body) => {
@@ -8009,11 +8024,29 @@ impl<'e> Checker<'e> {
                     }
                     ctx2.push(dom.clone());
                     cur = self.positivity_whnf(&ctx2, body)?;
+                    peeled += 1;
                 }
                 _ => break,
             }
         }
-        self.check_positive_spine(&ctx2, &cur, bound, num_params, visiting)
+        // `visiting` records, per outer nested-functor call, the parameter
+        // expressions the cycle check (`params_defeq`, called from
+        // `check_nested_functor`) later compares fresh occurrences against
+        // — but those recorded expressions are only meaningful relative to
+        // the de Bruijn context depth they were captured at. Every `Pi`
+        // peeled above pushes one more binder onto `ctx2` without this
+        // constructor argument's own binders being reflected in
+        // `visiting`'s stored expressions, so a later occurrence found
+        // under those same binders is compared, via `is_def_eq` at the
+        // *new*, deeper `ctx2`, against params that still sit at the
+        // *old*, shallower depth: never equal, no matter how many times
+        // the exact same nested type/params pair recurs. Shifting
+        // `visiting`'s contents by the same amount keeps them meaningful
+        // at `ctx2`'s depth, so a genuine repeat is recognized and the
+        // cycle check (which is the only thing bounding this recursion)
+        // actually bounds it.
+        let visiting_shifted = shift_visiting(visiting, peeled);
+        self.check_positive_spine(&ctx2, &cur, bound, num_params, &visiting_shifted)
     }
 
     fn expected_param_args(&self, ctx: &Ctx, num_params: u32) -> Vec<Expr> {
@@ -8212,11 +8245,19 @@ impl<'e> Checker<'e> {
             crate::stats::ctx_clone();
             ctx.clone()
         };
+        // Each field after the first sits one more binder deep than the
+        // last (`ctx2.push(dom)` below, once per preceding field), same
+        // reasoning as `check_arg_positive_in`'s own shift: `visiting`'s
+        // recorded params are only meaningful at the context depth they
+        // were captured at, so they need to be shifted to stay meaningful
+        // for a later field's own occurrence check.
+        let mut visiting_cur = visiting.to_vec();
         loop {
             match &**cur {
                 ExprData::Pi(_, dom, body) => {
-                    self.check_arg_positive_in(&ctx2, dom, bound, i_num_params, visiting)?;
+                    self.check_arg_positive_in(&ctx2, dom, bound, i_num_params, &visiting_cur)?;
                     ctx2.push(dom.clone());
+                    visiting_cur = shift_visiting(&visiting_cur, 1);
                     cur = body.clone();
                 }
                 _ => break,

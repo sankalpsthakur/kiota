@@ -614,3 +614,51 @@ fn int_neg_succ_mul_sub_nat_nat_accepts() {
 fn std_iterm_allm_pure_accepts() {
     assert_accept("std-iterm-allm-pure.accept.ndjson");
 }
+
+/// Minimal dependency-closure slice of the inductive
+/// `Lean.PersistentHashMap.Node` (a real, doubly-nested inductive pulled in
+/// transitively by some importers of `Lean`, e.g. a Cedar-policy export
+/// bundling `Lean`/`Batteries`/`Std`): `Node`'s `entries` constructor field
+/// is `Array (Entry .. .. Node)`, `Entry` in turn has a `ref` field that is
+/// `Node` again, cycling `Node -> Array -> List -> Entry -> Node`. Two
+/// independent, compounding bugs made checking (not just parsing) this
+/// declaration diverge instead of terminating quickly:
+///
+/// 1. `ctor_field_tys` (parser.rs, used to reconstruct nested-inductive
+///    specializations for the recursor-count sanity check) returned each
+///    constructor field's domain type as-is, without correcting for the
+///    fact that a *later* field sits one binder deeper than the first in
+///    the constructor's own `Pi` telescope. A free variable referring to
+///    something outside the telescope (e.g. the outer inductive's own
+///    already-substituted params) therefore drifted one bvar index higher
+///    per field position, and further with every nesting level recursed
+///    into, so the same logical `Array`/`List`/`Entry` specialization never
+///    compared equal to itself on a repeat visit — an unbounded BFS instead
+///    of the small, finite one intended. Fixed by shifting each field's
+///    domain back to a consistent depth-0 frame of reference.
+/// 2. `note_nested_app`'s own dedup set was keyed by `Rc::as_ptr` on a
+///    freshly built expression rather than by structural equality, an
+///    independent latent bug (masked by (1) always producing "new" values
+///    anyway): even once (1)'s drift is fixed, repeat visits still need a
+///    key stable across separately-constructed-but-equal expressions.
+///    Fixed by keying `seen` on the expression's own derived structural
+///    `Hash`/`Eq` instead.
+/// 3. The positivity checker's `check_arg_positive_in` /
+///    `check_specialized_ctor_positive` (tc.rs) maintain a `visiting` list
+///    of `(name, params)` pairs to detect and cut off exactly this kind of
+///    nested-functor recursion cycle (`params_defeq`, an `is_def_eq`-based
+///    check), but never adjusted `visiting`'s recorded parameter
+///    expressions when pushing additional binders onto the context for
+///    later constructor fields or peeled `Pi`s. A later occurrence was then
+///    compared, at the new, deeper context, against params still expressed
+///    at the shallower depth they were recorded at: never equal, so the one
+///    mechanism meant to bound this recursion never fired. Fixed by
+///    shifting `visiting`'s contents by the same amount as the context
+///    grows, in both call sites.
+///
+/// All three are real, sound-but-incomplete bugs on real Lean library code,
+/// not anything specific to this one type name.
+#[test]
+fn lean_persistent_hashmap_node_accepts() {
+    assert_accept("lean-persistent-hashmap-node.accept.ndjson");
+}

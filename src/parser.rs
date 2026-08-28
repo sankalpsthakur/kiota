@@ -778,7 +778,7 @@ impl Parser {
     /// `type_names`, including those found by instantiating a previous
     /// inductive's constructors (Array T also yields List T).
     fn counted_nested(&self, type_names: &[u32]) -> usize {
-        let mut seen: FxHashSet<usize> = FxHashSet::default();
+        let mut seen: FxHashSet<Expr> = FxHashSet::default();
         let mut work: Vec<Expr> = Vec::new();
         for &tname in type_names {
             let (ctors, nparams) = match self.env.get(tname) {
@@ -806,7 +806,7 @@ impl Parser {
         &self,
         e: &Expr,
         group: &[u32],
-        seen: &mut FxHashSet<usize>,
+        seen: &mut FxHashSet<Expr>,
         work: &mut Vec<Expr>,
     ) {
         match &***e {
@@ -843,7 +843,7 @@ impl Parser {
         us: &[Level],
         args: &[Expr],
         group: &[u32],
-        seen: &mut FxHashSet<usize>,
+        seen: &mut FxHashSet<Expr>,
         work: &mut Vec<Expr>,
     ) {
         if group.contains(&n) {
@@ -865,9 +865,21 @@ impl Parser {
         }
         let all = all.clone();
         for m in all {
+            // Keyed by the expression's own *structural* `Hash`/`Eq`
+            // (`ExprData` derives both, and `Rc<T>`'s in turn delegate to
+            // `T`'s), not by `Rc::as_ptr`: `expr::apps`/`expr::const_` both
+            // go through the global intern table, which already
+            // deduplicates by structural hash — `Const`'s own `us: Rc<Vec
+            // <Level>>` field hashes/compares structurally too, so
+            // `us.to_vec()` reallocating a fresh `Vec` each call is not
+            // itself the problem. The pointer was still unstable because
+            // `ctor_field_tys` (below) fed this call subtly different
+            // *values* for `params` on repeat visits to the same nested
+            // specialization (see its own doc comment), not merely
+            // different pointers to the same value; fixing that is what
+            // makes this structural key actually converge.
             let key_e = expr::apps(expr::const_(m, us.to_vec()), params);
-            let k = Rc::as_ptr(&key_e) as usize;
-            if !seen.insert(k) {
+            if !seen.insert(key_e) {
                 continue;
             }
             let (ctors, m_params, subst) = match self.env.get(m) {
@@ -1105,12 +1117,39 @@ fn ctor_field_tys(typ: &Expr, num_params: u32, inst: Option<&[Expr]>) -> Vec<Exp
         let rev: Vec<Expr> = args.iter().rev().cloned().collect();
         cur = expr::instantiate(&cur, &rev);
     }
+    // Each successive field's domain lives one binder deeper than the
+    // last (`Pi(f0, Pi(f1, Pi(f2, ...)))`): a free variable referring to
+    // something *outside* this constructor's own telescope (e.g. the
+    // already-substituted outer params from `inst` above) sits at index
+    // `k` higher in the `k`-th field than in the first. Returning
+    // `dom.clone()` as-is silently left every field at its own,
+    // uncorrected depth. Callers that treat every entry of the returned
+    // `Vec` as living at the same (depth-0) frame of reference —
+    // `note_nested_app` does exactly this, scanning each field for
+    // occurrences of an outer group's own names and reusing the result as
+    // `params` for the *next* recursion level — then saw the outer
+    // params' bvar index drift upward by one per field position, and by
+    // one more with every additional nesting level recursed into. That is
+    // a genuine change in *value*, not just a fresh, unstable pointer to
+    // an unchanged value, so no amount of re-keying `note_nested_app`'s
+    // own dedup set fixes it on its own: each "repeat" visit to the same
+    // logical nested specialization (e.g. `Lean.PersistentHashMap.Node`'s
+    // `Array (Entry .. (Node ..))` cycling back through `List`/`Entry`)
+    // was really a *different* term one bvar index further out, so it
+    // never converged — turning what should be a small, finite BFS into
+    // one that never terminates. Shifting each field's domain down by its
+    // own position renormalizes it back to the same frame of reference as
+    // field 0; the shift's cutoff leaves any (rare) reference to a
+    // *sibling* field itself (index below the field's own position)
+    // untouched.
     let mut fields = Vec::new();
+    let mut k: u32 = 0;
     loop {
         match &**cur {
             ExprData::Pi(_, dom, body) => {
-                fields.push(dom.clone());
+                fields.push(expr::shift(dom, -(k as i32), k));
                 cur = body.clone();
+                k += 1;
             }
             _ => break,
         }
