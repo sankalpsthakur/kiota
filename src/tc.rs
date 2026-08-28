@@ -2466,12 +2466,14 @@ impl<'e> Checker<'e> {
         r
     }
 
-    /// `App(f, App(f, App(f, ..., base)))`-shaped comparison (e.g. a
-    /// Church-numeral-style repeated application of a fixed function `f`
-    /// nested in argument position, not spine position — `unfold_apps`'s
-    /// own flattening only helps when several arguments are applied to
-    /// *one* function call; it does nothing when the nesting is one
-    /// single-argument application inside the next one's argument).
+    /// `App(f, App(f, App(f, ..., base)))`-shaped comparison where `f` is
+    /// a *bound variable* repeated at every layer (e.g. a Church-numeral-
+    /// style repeated application of a `fun`'s own parameter, nested in
+    /// argument position, not spine position — `unfold_apps`'s own
+    /// flattening only helps when several arguments are applied to *one*
+    /// function call; it does nothing when the nesting is one single-
+    /// argument application inside the next one's argument).
+    ///
     /// Peels one application layer at a time from `a` and `b`
     /// simultaneously and compares each layer's own `f` with a single,
     /// immediately-completed `is_def_eq` call, so `DEFEQ_DEPTH` never
@@ -2482,16 +2484,33 @@ impl<'e> Checker<'e> {
     /// `CONV_DEPTH` on a long enough chain even though every layer
     /// genuinely does match.
     ///
+    /// Deliberately restricted to a bound-variable `f`: this peeling is
+    /// only sound when "`f x` defeq `f y`" is exactly equivalent to
+    /// "`x` defeq `y`", which holds for a neutral, uninterpreted
+    /// variable (there is no reduction rule to invoke on it, so
+    /// congruence is the *only* way two applications of it can ever be
+    /// equal) but not in general for a concrete, defined function —
+    /// `Int.natAbs (Int.negSucc n)` and `Int.natAbs (Int.ofNat (n+1))`
+    /// are both defeq to `n+1` (`Int.natAbs` is not injective) even
+    /// though `Int.negSucc n` and `Int.ofNat (n+1)` are themselves not
+    /// defeq at all. An earlier version of this function recursed on
+    /// the *arguments* of any matched `f`, defined constants included,
+    /// once at least one layer had matched; for `Int.natAbs_neg` in
+    /// Lean's own `Init` that produced exactly this false reject,
+    /// comparing `Int.negSucc n` against `Int.ofNat (n+1)` directly
+    /// instead of comparing `Int.natAbs` applied to each and letting the
+    /// normal delta-unfold retry (below, in the caller) resolve it.
+    ///
     /// Returns `None` (not applicable, caller falls back to the normal
-    /// recursive path) when there is nothing to peel, or the two sides'
-    /// chains disagree (different length or a mismatched `f`) partway
-    /// through — in the disagreement case the fallback is exactly as
-    /// correct as this fast path (every layer's `f` is checked with the
-    /// same `is_def_eq` either way), just potentially depth-limited,
-    /// which only affects a very long *rejecting* comparison, not an
-    /// accepting one: this function only ever *confirms* `Some(true)`
-    /// after verifying every single layer, never `Some(true)` on a
-    /// mismatch it didn't check.
+    /// recursive path) when there is nothing to peel, the peeled `f` is
+    /// not a bound variable, or the two sides' chains disagree (different
+    /// length or a mismatched `f`) partway through — in the disagreement
+    /// case the fallback is exactly as correct as this fast path (every
+    /// layer's `f` is checked with the same `is_def_eq` either way), just
+    /// potentially depth-limited, which only affects a very long
+    /// *rejecting* comparison, not an accepting one: this function only
+    /// ever *confirms* `Some(true)` after verifying every single layer,
+    /// never `Some(true)` on a mismatch it didn't check.
     fn iterated_app_congruent(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<Option<bool>> {
         let mut cur_a = a.clone();
         let mut cur_b = b.clone();
@@ -2505,6 +2524,9 @@ impl<'e> Checker<'e> {
                 ExprData::App(f, arg) => (f.clone(), arg.clone()),
                 _ => break,
             };
+            if !matches!(&**fa, ExprData::BVar(_)) {
+                break;
+            }
             if !self.is_def_eq(ctx, &fa, &fb)? {
                 // `fa`/`fb` themselves disagree — but `cur_a`/`cur_b`
                 // (the *whole*, not-yet-peeled current layer) may still
@@ -2514,13 +2536,18 @@ impl<'e> Checker<'e> {
                 // applied to another, `(n X s)`) that itself needs
                 // *whnf*, not structural comparison, to reach the same
                 // shape as `fb`. If we've already peeled at least one
-                // matching layer, recurse into `is_def_eq(cur_a, cur_b)`
-                // for the remainder: that re-enters the normal
-                // dispatch, which `whnf`s both sides again (expanding
-                // `fa` further) before retrying — genuinely making
-                // progress (`cur_a`/`cur_b` are strictly smaller than
-                // the original `a`/`b`), not re-asking the same
-                // question. If nothing has been peeled yet, `cur_a`
+                // matching (bound-variable) layer, recurse into
+                // `is_def_eq(cur_a, cur_b)` for the remainder: that
+                // re-enters the normal dispatch, which `whnf`s both
+                // sides again (expanding `fa` further) before retrying —
+                // genuinely making progress (`cur_a`/`cur_b` are
+                // strictly smaller than the original `a`/`b`), not
+                // re-asking the same question. Sound here specifically
+                // because every already-peeled layer's own `f` was a
+                // bound variable (see the doc comment above): congruence
+                // on those was the only way they could ever be equal, so
+                // reducing to "is the remainder equal" loses no
+                // information. If nothing has been peeled yet, `cur_a`
                 // *is* `a` — recursing here would ask the identical
                 // question and loop forever, so fall back to the
                 // caller's own (recursive, but not infinite)

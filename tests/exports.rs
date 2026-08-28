@@ -540,3 +540,39 @@ fn tutorial_124_reduce_ctor_param_refl2_accepts() {
 fn church_numerals_accepts() {
     assert_accept_deep("church-numerals.accept.ndjson");
 }
+
+/// Minimal dependency-closure slice of `theorem Int.natAbs_neg` from
+/// Lean's own `Init` export (decl #795 of the full `init.ndjson`, which
+/// `KIOTA_NBE` unset rejected before the fix below). The proof matches
+/// on a `Nat.succ n` and needs `Int.natAbs (Neg.neg .. (Int.ofNat
+/// (Nat.succ n)))` to reduce all the way through the `Neg` typeclass
+/// projection, `Int.neg`'s own `casesOn`-compiled match, and
+/// `Int.negOfNat`'s match, down to `Int.negSucc n` — and then needs that
+/// compared, as an *argument to `Int.natAbs`*, against the differently-
+/// shaped `Int.ofNat (Nat.succ n)`. `Int.natAbs` is not injective
+/// (`natAbs (negSucc n) = natAbs (ofNat (n+1)) = n+1`), so this defeq
+/// holds even though the two `Int` values themselves do not. This was
+/// exactly the shape `iterated_app_congruent` mishandled (see
+/// `church_numerals_accepts` above and the fix in `tc.rs`): once it had
+/// peeled the shared `Int.natAbs` layer, it compared `Int.negSucc n`
+/// against `Int.ofNat (Nat.succ n)` directly instead of letting the
+/// normal delta-unfold retry decide the whole `Int.natAbs _` comparison,
+/// producing a false reject. Fixed by restricting that peeling to a
+/// bound-variable head only, where congruence really is the only way
+/// two applications can be equal.
+#[test]
+fn int_nat_abs_neg_accepts() {
+    assert_accept("int-natAbs-neg.accept.ndjson");
+}
+
+/// Minimal dependency-closure slice of `theorem
+/// Int.negSucc_mul_subNatNat` from the full `init.ndjson` (decl #823,
+/// the point `KIOTA_NBE=1` reached and rejected before the same fix as
+/// `int_nat_abs_neg_accepts` above — `KIOTA_NBE` unset had already
+/// rejected earlier, at `Int.natAbs_neg`, so never reached this decl).
+/// Same root cause: a non-injective `Int`/`Nat` arithmetic identity
+/// compared through a shared, congruence-unsafe outer application.
+#[test]
+fn int_neg_succ_mul_sub_nat_nat_accepts() {
+    assert_accept("int-negSucc-mul-subNatNat.accept.ndjson");
+}
