@@ -224,3 +224,17 @@ fn nested_neg_functor_rejects() {
 fn nested_list_tree_accepts() {
     assert_accept("nested-list-tree.accept.ndjson");
 }
+
+/// `inductive Bad : Prop | mk (x : Sort 1)`, given the recursor a `Type` of
+/// that shape would have. One constructor, so a rule that only looks at
+/// multi-constructor Props waves it through — but the field is data and the
+/// conclusion `Bad` does not expose it, which is exactly the clause that
+/// makes Lean fix the motive at `Sort 0`. The export goes on to define
+/// `pick : Bad → Sort 1`, pulling the field back out of a proof; proof
+/// irrelevance then equates `Bad.mk A` with `Bad.mk B` for any two types and
+/// `pick` disagrees, which is `large-elim-prop-bool` again without the second
+/// constructor.
+#[test]
+fn single_ctor_prop_large_elim_rejects() {
+    assert_reject("single-ctor-prop-large-elim.reject.ndjson");
+}
