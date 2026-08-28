@@ -761,3 +761,37 @@ fn prop_subsingleton_elim_data_field_rejects() {
 fn cedar_value_sizeof3_nested_map_accepts() {
     assert_accept("cedar-value-sizeOf3-nested-map.accept.ndjson");
 }
+
+/// Minimal dependency-closure slice, cut directly from a real
+/// `cedar-spec` export (not hand-assembled), of
+/// `Cedar.SymCC.TermType.ofType`. Traced back to a real, general bug in
+/// `mk_rec_call`'s own recursive-field detection: it only generated an
+/// induction hypothesis for a constructor field when `occurs_any` (a
+/// purely *syntactic* check for the group's own type name appearing
+/// literally in the field's type) found the group's type name inside
+/// the field's own type expression. That correctly catches *direct*
+/// nesting (`List Value` inside `Value`'s own mutual group, since
+/// `Value` appears literally) but misses *indirect* nesting through an
+/// independently-named intermediate type: `Cedar.Validation.CedarType`'s
+/// own `List (Prod Attr QualifiedType)` field. `QualifiedType` itself
+/// wraps `CedarType` in its own definition, but the literal name
+/// `CedarType` never appears inside `List (Prod Attr QualifiedType)`,
+/// so `occurs_any` reported "not recursive" and this field's own
+/// induction hypothesis was silently dropped. That under-applied a
+/// `below`-shaped minor by exactly that missing argument slot, leaving
+/// it stuck as a bare, unapplied constructor-minor lambda instead of a
+/// fully-reduced value — which is what `TermType.ofType`'s own
+/// `.fst`/`.snd`-style projections out of that stuck lambda then
+/// rejected on ("projection of non-inductive value": the lambda's own
+/// head is not an inductive type application at all).
+///
+/// Fixed by trying `nested_rec_for_type`'s own, precise major-type
+/// match first — it matches directly against a candidate's *actual
+/// declared* major-premise type, so it is sound and complete for this
+/// case regardless of whether `occurs_any`'s syntactic name search can
+/// see the recursion — falling back to the old `occurs_any`-then-
+/// `nested_rec_for` path only when that declines.
+#[test]
+fn cedar_symcc_termtype_oftype_indirect_nesting_accepts() {
+    assert_accept("cedar-symcc-termtype-oftype-indirect-nesting.accept.ndjson");
+}

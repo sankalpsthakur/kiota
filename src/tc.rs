@@ -4932,12 +4932,31 @@ impl<'e> Checker<'e> {
                 iargs[..nparams].to_vec(),
                 &iargs[nparams..],
             )
+        } else if let Some(nrec) = self.nested_rec_for_type(&tctx, rname, us, params, target, &iargs) {
+            // `nested_rec_for_type` matches on `ty`'s own head and args
+            // against each candidate's *actual declared major-premise
+            // type* — sound regardless of whether `occurs_any` (below)
+            // can see the recursion at all. `occurs_any` is a purely
+            // syntactic check for the group's own type *name* appearing
+            // literally inside `ty`; it correctly catches direct nesting
+            // (`List Value` inside `Value`'s own group) but misses
+            // *indirect* nesting through some other, independently-named
+            // type in between (`Cedar.Validation.CedarType`'s own
+            // `List (Prod Attr QualifiedType)` field: `QualifiedType`
+            // itself wraps `CedarType`, but the literal name `CedarType`
+            // never appears in `List (Prod Attr QualifiedType)`, so
+            // `occurs_any` said "not recursive" and this field's own
+            // induction hypothesis was silently dropped — under-applying
+            // a `below`-shaped minor by exactly that many argument slots
+            // and leaving it stuck as a bare, unapplied `Ctor.mk`-minor
+            // lambda instead of a fully-reduced value, which is what
+            // `Cedar.SymCC.TermType.ofType`'s own `.fst`/`.snd`
+            // projections out of that stuck lambda then reject on).
+            (nrec, params.iter().map(|p| expr::shift(p, shift_by, 0)).collect(), &[][..])
         } else if self.occurs_any(&ty, all) {
-            // Only `F … I …` (e.g. `Array Syntax`), not `List Preresolved`.
-            let nrec = self
-                .nested_rec_for_type(&tctx, rname, us, params, target, &iargs)
-                .or_else(|| self.nested_rec_for(target, rname));
-            if let Some(nrec) = nrec {
+            // Fallback for a shape `nested_rec_for_type` doesn't parse
+            // cleanly: the older, name-only search, unchanged.
+            if let Some(nrec) = self.nested_rec_for(target, rname) {
                 (nrec, params.iter().map(|p| expr::shift(p, shift_by, 0)).collect(), &[][..])
             } else {
                 return Ok(None);
