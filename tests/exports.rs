@@ -662,3 +662,36 @@ fn std_iterm_allm_pure_accepts() {
 fn lean_persistent_hashmap_node_accepts() {
     assert_accept("lean-persistent-hashmap-node.accept.ndjson");
 }
+
+/// Minimal dependency-closure slice of a small, hand-written inductive
+/// (built and exported with a real local Lean 4.29.1 toolchain, not
+/// hand-assembled ndjson) chosen specifically to reproduce the
+/// `List.cons`-name-collision shape that broke
+/// `Lean.PersistentHashMap.Node` and (partially) `Cedar.Spec.Value`,
+/// with the smallest possible mutual/nested group that still has *two*
+/// separate `List` specializations:
+///
+/// ```
+/// inductive Value where
+///   | prim : Nat → Value
+///   | set : List Value → Value
+///   | record : List (String × Value) → Value
+/// ```
+///
+/// This four-way mutual group (`Value`, `List Value`, `List (String ×
+/// Value)`, `Prod String Value`) gets four recursors (`rec`, `rec_1`,
+/// `rec_2`, `rec_3`), and `rec_1`/`rec_2` both list rules for
+/// `List.nil`/`List.cons` — verified directly against the real, official
+/// kernel's own export (not assumed): both recursors' own declared type
+/// signatures share one identical minor-premise telescope in the same
+/// order (main type's constructors, then each nested type's own, in
+/// discovery order, deepest last), and `rec_1`'s own major premise is
+/// declared as `List Value` while `rec_2`'s is `List (Prod String
+/// Value)` — confirming the group's `rec_N` naming order does track the
+/// type-signature layout for this shape, and giving
+/// `minor_index_from_type` something to independently agree with
+/// `ctor_minor_index` on.
+#[test]
+fn lean_value_two_list_specializations_accepts() {
+    assert_accept("lean-value-two-list-specializations.accept.ndjson");
+}

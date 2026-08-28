@@ -4524,6 +4524,85 @@ impl<'e> Checker<'e> {
         None
     }
 
+    /// Find the group member specialized for the exact nested type
+    /// `target target_args..` (e.g. `List Value` vs `List (Prod String
+    /// Value)`), by checking each candidate's own declared major-premise
+    /// type — not `nested_rec_for`'s constructor-name search, which
+    /// cannot tell two specializations of the same polymorphic type
+    /// apart (`List.nil`/`List.cons` are the same constants regardless of
+    /// element type, so a group with two different `List` specializations
+    /// has two members whose rules both name them; the first-match search
+    /// always picks whichever is sorted first, not the one whose own
+    /// major premise is actually `target target_args..`). Same shape and
+    /// same reasoning as `minor_index_from_type`, for recursor identity
+    /// instead of minor-slot identity. Returns `None` (falls back to
+    /// `nested_rec_for`) for any shape this doesn't handle cleanly.
+    fn nested_rec_for_type(
+        &self,
+        rname: u32,
+        us: &[Level],
+        params: &[Expr],
+        target: u32,
+        target_args: &[Expr],
+    ) -> Option<u32> {
+        for rec in self.rec_group(rname) {
+            let (typ, rec_level_params, rec_num_params, num_motives, num_minors, num_indices) =
+                match self.env.get(rec) {
+                    Some(ConstantInfo::Recursor {
+                        typ,
+                        level_params,
+                        num_params,
+                        num_motives,
+                        num_minors,
+                        num_indices,
+                        ..
+                    }) => (
+                        typ.clone(),
+                        level_params.clone(),
+                        *num_params,
+                        *num_motives,
+                        *num_minors,
+                        *num_indices,
+                    ),
+                    _ => continue,
+                };
+            if rec_level_params.len() != us.len() || rec_num_params as usize != params.len() {
+                continue;
+            }
+            let subst = level::subst_map(&rec_level_params, us);
+            let typ = expr::instantiate_level_params(&typ, &subst);
+            let params_rev: Vec<Expr> = params.iter().rev().cloned().collect();
+            let mut cur = expr::instantiate(&typ, &params_rev);
+            let mut ok = true;
+            for _ in 0..(rec_num_params + num_motives + num_minors + num_indices) {
+                match &**cur {
+                    ExprData::Pi(_, _, body) => cur = body.clone(),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let major_dom = match &**cur {
+                ExprData::Pi(_, dom, _) => dom.clone(),
+                _ => continue,
+            };
+            let (mh, margs) = expr::unfold_apps(&major_dom);
+            if let ExprData::Const(c, _) = &**mh {
+                if *c == target
+                    && margs.len() >= target_args.len()
+                    && margs[..target_args.len()] == *target_args
+                {
+                    return Some(rec);
+                }
+            }
+        }
+        None
+    }
+
     /// Find `cname`'s minor-premise slot directly from `rname`'s own type
     /// signature, instead of a heuristic count over the group's sort
     /// order (`ctor_minor_index`). A nested-recursor group shares one
@@ -4821,7 +4900,10 @@ impl<'e> Checker<'e> {
             )
         } else if self.occurs_any(&ty, all) {
             // Only `F … I …` (e.g. `Array Syntax`), not `List Preresolved`.
-            if let Some(nrec) = self.nested_rec_for(target, rname) {
+            let nrec = self
+                .nested_rec_for_type(rname, us, params, target, &iargs)
+                .or_else(|| self.nested_rec_for(target, rname));
+            if let Some(nrec) = nrec {
                 (nrec, params.iter().map(|p| expr::shift(p, shift_by, 0)).collect(), &[][..])
             } else {
                 return Ok(None);
