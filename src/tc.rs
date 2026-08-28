@@ -4078,11 +4078,14 @@ impl<'e> Checker<'e> {
         // and we compare each field of a against `proj(b, i)`, plus check
         // b's type matches.
         let (ha, argsa) = expr::unfold_apps(a);
-        let (cname, num_params) = match &**ha {
+        let (cname, num_params, num_fields) = match &**ha {
             ExprData::Const(n, _) => match self.env.get(*n) {
                 Some(ConstantInfo::Constructor {
-                    induct, num_params, ..
-                }) => (*induct, *num_params),
+                    induct,
+                    num_params,
+                    num_fields,
+                    ..
+                }) => (*induct, *num_params, *num_fields),
                 _ => return Ok(None),
             },
             _ => return Ok(None),
@@ -4095,8 +4098,17 @@ impl<'e> Checker<'e> {
         if !is_struct {
             return Ok(None);
         }
-        let num_fields = argsa.len().saturating_sub(num_params as usize);
-        if num_fields == 0 && argsa.len() < num_params as usize {
+        // `a` must be the *fully* applied constructor (params and all
+        // fields) — a partial application like `ULift.up Bool` (still
+        // missing its `down` field) has function type, not the structure
+        // type, and eta for structures does not apply to it at all: an
+        // earlier version of this check derived the field count as
+        // `argsa.len() - num_params` instead of reading the constructor's
+        // own declared field count, so an under-applied `a` was silently
+        // treated as if it had zero fields (vacuously "equal" to any `b`
+        // of the same inductive head), which is unsound.
+        let total_arity = num_params as usize + num_fields as usize;
+        if argsa.len() != total_arity {
             return Ok(None);
         }
         let fields = &argsa[num_params as usize..];

@@ -576,3 +576,33 @@ fn int_nat_abs_neg_accepts() {
 fn int_neg_succ_mul_sub_nat_nat_accepts() {
     assert_accept("int-negSucc-mul-subNatNat.accept.ndjson");
 }
+
+/// Minimal dependency-closure slice of `theorem Std.IterM.allM_pure`
+/// from the full `init.ndjson` (decl #32282, the next point `KIOTA_NBE`
+/// unset reached and rejected after the `Int.natAbs_neg` fix above).
+/// Needs Lean's *eta for structures* rule: a term `t : ULift.{r,s} A` is
+/// defeq to `ULift.up A (ULift.down A t)` (the constructor applied to
+/// its own single field's projection) even when `t` itself is neutral
+/// (here, an applied bound variable), not literally a `ULift.up`
+/// application. `try_struct_eta` (tc.rs) already implemented this rule
+/// in general, but derived a fully-applied constructor's own field
+/// count as `argsa.len() - num_params` instead of reading the
+/// constructor's declared field count: for an *under*-applied
+/// constructor like the partial application `ULift.up Bool` (still
+/// missing its `down` argument, so of function type `Bool → ULift.{r,s}
+/// Bool`, not the structure type itself), that formula silently
+/// computed zero fields and returned "equal" vacuously, without
+/// checking any field, whenever `Std.IterM.allM_pure`'s proof compared
+/// such a partial application against another term — sound as long as
+/// nothing relies on it being *false*, but a source of missed
+/// comparisons this checker should have deferred to the normal
+/// eta/delta path instead. Fixed by requiring the constructor be
+/// applied to exactly `num_params + num_fields` arguments (its full
+/// arity) before treating the comparison as a structure-eta candidate
+/// at all; an under- or over-applied constructor now falls through to
+/// the ordinary structural/delta comparison, which resolves this proof
+/// correctly.
+#[test]
+fn std_iterm_allm_pure_accepts() {
+    assert_accept("std-iterm-allm-pure.accept.ndjson");
+}
