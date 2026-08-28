@@ -2114,7 +2114,7 @@ impl<'e> Checker<'e> {
         all: &[u32],
         params: &[Expr],
         major: &Expr,
-    ) -> R<Option<(u32, u32, Vec<Expr>)>> {
+    ) -> R<Option<(u32, u32, Vec<Expr>, Vec<Level>)>> {
         let mt = match self.infer_type(ctx, major) {
             Ok(t) => t,
             Err(e) => {
@@ -2153,8 +2153,8 @@ impl<'e> Checker<'e> {
         // this work the same way for every group member, mutual or not,
         // and for a group member that is only *nested inside* `all`, not
         // one of `all`'s own listed types.
-        let tname = match &**thead {
-            ExprData::Const(n, _) => *n,
+        let (tname, tus) = match &**thead {
+            ExprData::Const(n, us) => (*n, (**us).clone()),
             _ => return Ok(None),
         };
         if !self.is_non_rec_structure(tname) {
@@ -2187,7 +2187,20 @@ impl<'e> Checker<'e> {
             ctor_args.push(expr::proj(tname, i, major.clone()));
         }
         let _ = (params, all);
-        Ok(Some((cname, num_params, ctor_args)))
+        // `tus` — the struct's own universe args, read off `major`'s own
+        // (already correctly-typed) WHNF'd type head — not the *outer*
+        // recursor's `us`. A nested/reused structure (`Cedar.Data.Map`'s
+        // own `{u, v}`) can have a different level-parameter arity than
+        // whatever recursor is eta-expanding it here (`CedarType.rec_1`'s
+        // own single motive-universe `us`); zipping the constructor's
+        // `level_params` against the wrong-arity `us` (the caller's
+        // previous default) leaves every level past `us.len()`
+        // unsubstituted — silently keeping the constructor's own raw,
+        // never-instantiated declared parameter name in the eta-expanded
+        // major's type, which then fails to `is_def_eq` against any
+        // properly-instantiated occurrence of that same nested type
+        // elsewhere in the same proof.
+        Ok(Some((cname, num_params, ctor_args, tus)))
     }
 
     /// Whether `ty` is a proposition (`ty : Prop`), not whether `ty` *is* Prop.
@@ -4288,7 +4301,7 @@ impl<'e> Checker<'e> {
                     x.2.len()
                 );
             }
-            (x.0, x.1, x.2, None)
+            (x.0, x.1, x.2, Some(x.3))
         } else if k_like {
             match self.k_like_ctor(ctx, &all, params, major)? {
                 Some(x) => (x.0, x.1, x.2, None),

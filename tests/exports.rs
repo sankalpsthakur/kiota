@@ -795,3 +795,42 @@ fn cedar_value_sizeof3_nested_map_accepts() {
 fn cedar_symcc_termtype_oftype_indirect_nesting_accepts() {
     assert_accept("cedar-symcc-termtype-oftype-indirect-nesting.accept.ndjson");
 }
+
+/// Synthetic (hand-written Lean, real `lean4export`, minimal dependency-
+/// closure slice — not hand-assembled ndjson) reproduction of the
+/// `to_ctor_when_structure` level-arity bug found via
+/// `Cedar.Thm.well_typed_implies_wf_type._unary`.
+///
+/// `to_ctor_when_structure` struct-eta-expands a neutral major of a
+/// single-constructor, non-recursive structure type (`Pair`, standing in
+/// for `Cedar.Data.Map`) so a recursor group's own "below"-style member
+/// (`Wrap.rec_1`, standing in for `CedarType.rec_1`) can be applied to
+/// it. Before this fix, the eta-expanded constructor's own universe
+/// arguments (`ctor_us`) were never computed from the struct's own type —
+/// they silently defaulted to the *outer* recursor's own `us` (here, one
+/// slot: just the motive's universe). Zipping `Pair`'s own two
+/// level-parameters (`u`, `v`) against that one-element `us` left the
+/// second slot unmapped, so `instantiate_level_params` fell back to
+/// `Pair`'s raw, never-instantiated declared parameter name instead of
+/// its real, correctly-inferred level — corrupting the type of `Pair`'s
+/// own nested field (`List (PProd Nat Wrap)`, standing in for
+/// `Cedar.Data.Map`'s own `List (Prod Attr Qualified CedarType)`).
+///
+/// `Outer.field`'s own declared type spells its `Wrap` type argument via
+/// a zero-arity alias (`WrapAlias := Wrap`, standing in for
+/// `QualifiedType := Qualified CedarType`), so `occurs_any`'s purely
+/// syntactic name search can't see the recursion either (same shape as
+/// the `ofType` fixture above, one level removed) — `mk_rec_call` is
+/// left comparing the corrupted, wrongly-leveled major against a
+/// sibling recursor's correctly `us`-substituted major type, which
+/// `is_def_eq` (correctly) refuses, rejecting the proof outright
+/// ("theorem 228580: value type does not match declared type").
+///
+/// Fixed by having `to_ctor_when_structure` read the struct's own
+/// universe arguments directly off the major's own (already
+/// correctly-typed) inferred type, instead of leaving the caller to
+/// default to the wrong-arity outer `us`.
+#[test]
+fn struct_eta_nested_level_arity_accepts() {
+    assert_accept("struct-eta-nested-level-arity.accept.ndjson");
+}
