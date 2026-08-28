@@ -46,14 +46,57 @@ use crate::tc::{Checker, R};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// `KIOTA_NBE`'s value, not just its presence: only `1`/`true`/`yes`
+/// (case-insensitive, surrounding whitespace ignored) mean "on". A pure
+/// function of the string so it can be unit-tested directly, since
+/// `nbe_enabled`'s own `thread_local` caches its result for the whole
+/// thread's lifetime (across every `#[test]` that thread happens to run),
+/// making the env-var-reading function itself unreliable to test directly.
+fn parse_nbe_flag(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+}
+
 /// `KIOTA_NBE=1` routes `is_def_eq` through this module. Default (unset) is
 /// the untouched eager path, so existing behavior is bit-for-bit unchanged
-/// unless the flag is set.
+/// unless the flag is set to a truthy value.
+///
+/// Previously checked `var_os(..).is_some()`, so *any* value — including
+/// `KIOTA_NBE=0` — enabled NBE; only leaving the variable completely unset
+/// selected eager. `KIOTA_NBE=0` reads as "eager" to a human (and to every
+/// other `KIOTA_*` on/off flag in this checker that's spelled with a value,
+/// e.g. none of them treat `=0` as "on"), so an external harness setting it
+/// to disable NBE was silently getting NBE instead. Now `0`/empty/unset all
+/// mean eager; `1`/`true`/`yes` mean NBE.
 pub fn nbe_enabled() -> bool {
     thread_local! {
-        static ON: bool = std::env::var_os("KIOTA_NBE").is_some();
+        static ON: bool = std::env::var("KIOTA_NBE")
+            .map(|v| parse_nbe_flag(&v))
+            .unwrap_or(false);
     }
     ON.with(|b| *b)
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::parse_nbe_flag;
+
+    #[test]
+    fn nbe_flag_treats_zero_and_empty_as_eager() {
+        assert!(!parse_nbe_flag("0"));
+        assert!(!parse_nbe_flag(""));
+        assert!(!parse_nbe_flag("false"));
+        assert!(!parse_nbe_flag("2"));
+        assert!(!parse_nbe_flag("no"));
+    }
+
+    #[test]
+    fn nbe_flag_treats_truthy_values_as_nbe() {
+        assert!(parse_nbe_flag("1"));
+        assert!(parse_nbe_flag("true"));
+        assert!(parse_nbe_flag("TRUE"));
+        assert!(parse_nbe_flag("yes"));
+        assert!(parse_nbe_flag(" 1 "));
+    }
 }
 
 /// `env[i]` is the thunk bound for de Bruijn index `i` counted from the
