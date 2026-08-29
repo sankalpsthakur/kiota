@@ -1544,6 +1544,26 @@ impl<'e> Checker<'e> {
         self.whnf_core_cache.borrow_mut().clear();
         self.defeq_cache.borrow_mut().clear();
         self.infer_cache.borrow_mut().clear();
+        // The hash-cons table itself is the one node-lifetime root the
+        // above never bounded: it holds a strong `Rc` to every distinct
+        // `Expr` ever built, for the life of the process, regardless of
+        // whether any later declaration can still reach it. On a
+        // cedar.ndjson-scale export (tens of thousands of declarations)
+        // that table's own size — not any one recursive term — grows
+        // into a single doubling allocation (~24M nodes → next resize
+        // ~3.3 GB) too large for the process to satisfy, aborting
+        // outright instead of continuing to the next declaration.
+        // Clearing it here is exactly as safe as the pointer-keyed
+        // clears just above: the lookup key is a structural hash of the
+        // node's own content, not an address, so a post-clear "miss"
+        // only re-allocates an equal node — it can never return a wrong
+        // one — and every pointer-keyed cache that could otherwise see
+        // a stale address is cleared in this same reset, so there is no
+        // window for a freed-and-reused address to collide with one.
+        // The threshold is far above anything Init, Std, or any existing
+        // fixture reaches, so ordinary runs never call `Interner::
+        // default()` here at all.
+        expr::intern_clear_if_large(4_000_000);
         // `ctx_key`s (via `CTX_NEXT`, reset above) are reused across
         // declarations, so a stale eager-namespace entry from the last
         // declaration would be keyed identically but mean something

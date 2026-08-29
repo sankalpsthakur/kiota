@@ -326,6 +326,39 @@ pub fn intern_node_count() -> usize {
     INTERN.with(|t| t.borrow().len())
 }
 
+/// Drop the hash-cons table's own lookup structure if it has grown past
+/// `threshold` nodes, returning whether it did. Every *other* per-decl
+/// reset (`clear_subst_memos`, and the pointer-keyed `whnf`/`defeq`/
+/// `infer` caches in `tc.rs`, cleared right alongside this call — see
+/// their own `#3491`-`#3495` comment) already treats "pointer identity
+/// only means something for the declaration that minted it" as the
+/// scoping rule; this is the one node-lifetime root that comment's own
+/// fix left unbounded, since dropping a hash-cons entry never needs the
+/// caution a *pointer-keyed* cache does — the lookup key here is a
+/// structural hash of the node's own content, not an address, so a
+/// "miss" after clearing just re-allocates an equal node instead of
+/// ever returning a wrong one. A large finite value (well above what
+/// checking Init, Std, or any existing fixture ever reaches) keeps
+/// ordinary runs byte-for-byte unaffected; it only fires on inputs
+/// whose own total distinct-node count crosses it — cedar.ndjson-scale
+/// exports whose ~30k-declaration global hash-cons table is what grows
+/// unboundedly (as itself, not any recursive term) into needing a
+/// single doubling allocation the sizes seen (~24M nodes → next resize
+/// ~3.3 GB) larger than a checker process's own affordable single
+/// allocation, aborting with `memory allocation of N bytes failed`
+/// rather than continuing to the next declaration.
+pub fn intern_clear_if_large(threshold: usize) -> bool {
+    INTERN.with(|t| {
+        let mut t = t.borrow_mut();
+        if t.len() > threshold {
+            *t = Interner::default();
+            true
+        } else {
+            false
+        }
+    })
+}
+
 pub fn intern_calls() -> u64 {
     INTERN_CALLS.with(|c| c.get())
 }
