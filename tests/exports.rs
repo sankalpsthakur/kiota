@@ -834,3 +834,49 @@ fn cedar_symcc_termtype_oftype_indirect_nesting_accepts() {
 fn struct_eta_nested_level_arity_accepts() {
     assert_accept("struct-eta-nested-level-arity.accept.ndjson");
 }
+
+/// Minimal dependency-closure slice, cut directly from a real
+/// `Lean.Doc.Block` export (not hand-assembled), of
+/// `Lean.Doc.Block.brecOn_6.go`. `Lean.Doc.Block` is a parametric,
+/// nine-member mutual/nested recursor group (`Lean`'s own documentation
+/// AST) — the first target `nested_rec_for_type` has ever searched with
+/// `rec_num_params > 0` (every earlier user, Cedar's own nested types,
+/// is non-parametric, `rec_num_params == 0`).
+///
+/// `nested_rec_for_type` computed a candidate sibling's own declared
+/// major-premise type by calling `expr::instantiate(&typ, &params_rev)`
+/// directly on `typ` — the candidate's whole closed, still-`Π`-headed
+/// declared type — then peeling `rec_num_params + num_motives +
+/// num_minors + num_indices` `Pi` layers off the result via a bare
+/// `body.clone()` per layer (never pushing a matching binder onto any
+/// context). Two bugs, only one of them visible while
+/// `rec_num_params == 0`:
+///
+/// 1. `instantiate` substitutes *loose* bvars in a term already living
+///    under that many binders; called on `typ` itself (still `Π`-headed,
+///    no loose bvars at all) it is a silent no-op, so `params` was never
+///    actually substituted into the params' own `Pi`s. Invisible when
+///    there is nothing to substitute either way (`rec_num_params == 0`).
+/// 2. Peeling any `Pi` layer via `body.clone()` — motives and minors
+///    included, since a major premise never references them — without
+///    pushing a corresponding binder leaves any surviving bvar (an
+///    already-substituted parameter reference) indexed as if all those
+///    layers were still present. Also invisible when there is nothing
+///    parametric to survive.
+///
+/// Both together left every candidate's own computed major type
+/// referring to the outer type parameters at the wrong de Bruijn depth,
+/// so `is_def_eq` correctly reported every candidate's major as *not*
+/// matching the field's real type, and `mk_rec_call` fell through to the
+/// ambiguous, unchecked, name-only `nested_rec_for` — same general
+/// "wrong sibling in a nested/mutual recursor group" failure mode as the
+/// earlier `_sizeOf`/`ofType`/struct-eta fixes, from a different root
+/// cause. Fixed by peeling the params' own `Pi`s first (so `instantiate`
+/// actually has loose bvars to replace) and shifting the extracted major
+/// type down by the motive/minor/index count peeled afterward, undoing
+/// exactly the nesting those `body.clone()` calls introduced without a
+/// matching context push.
+#[test]
+fn lean_doc_block_nested_rec_param_shift_accepts() {
+    assert_accept("lean-doc-block-nested-rec-param-shift.accept.ndjson");
+}

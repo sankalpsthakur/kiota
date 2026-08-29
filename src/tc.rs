@@ -4663,10 +4663,36 @@ impl<'e> Checker<'e> {
             }
             let subst = level::subst_map(&rec_level_params, us);
             let typ = expr::instantiate_level_params(&typ, &subst);
-            let params_rev: Vec<Expr> = params.iter().rev().cloned().collect();
-            let mut cur = expr::instantiate(&typ, &params_rev);
+            // `typ` is `rec`'s own closed declared type — still `Π`-headed
+            // over its params, not yet a term "under" any loose bvars —
+            // so `instantiate` (which substitutes loose bvars, not `Pi`
+            // binders) must run *after* the params' own `Pi`s are peeled,
+            // not on `typ` directly. Peeling all of
+            // `rec_num_params + num_motives + num_minors + num_indices`
+            // in one pass first (the previous shape here) made that
+            // instantiate call a no-op — invisible whenever
+            // `rec_num_params == 0` (nothing to substitute either way,
+            // true of every prior nested type this ran on), but wrong
+            // for a genuinely parametric target whose own major premise
+            // depends on those params (`Lean.Doc.Block`'s own two type
+            // arguments).
+            let mut cur = typ;
             let mut ok = true;
-            for _ in 0..(rec_num_params + num_motives + num_minors + num_indices) {
+            for _ in 0..rec_num_params {
+                match &**cur {
+                    ExprData::Pi(_, _, body) => cur = body.clone(),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let params_rev: Vec<Expr> = params.iter().rev().cloned().collect();
+            let mut cur = expr::instantiate(&cur, &params_rev);
+            for _ in 0..(num_motives + num_minors + num_indices) {
                 match &**cur {
                     ExprData::Pi(_, _, body) => cur = body.clone(),
                     _ => {
@@ -4682,6 +4708,20 @@ impl<'e> Checker<'e> {
                 ExprData::Pi(_, dom, _) => dom.clone(),
                 _ => continue,
             };
+            // The `num_motives + num_minors + num_indices` layers just
+            // peeled above are taken via a bare `body.clone()` on each
+            // `Pi`, never pushing a matching dummy binder onto any
+            // context — so any bvar in `major_dom` that actually names
+            // something *outside* all of them (an already-substituted
+            // parameter from the stage just above) is still indexed as
+            // if those layers were still there. Shifting down by exactly
+            // that count re-expresses it relative to the true, unpeeled
+            // depth `params`/`target_args` already live at: motives and
+            // minors are never referenced by a well-formed major
+            // premise's own type, so there is nothing here to
+            // substitute, only to un-nest.
+            let peeled = (num_motives + num_minors + num_indices) as i32;
+            let major_dom = expr::shift(&major_dom, -peeled, 0);
             let (mh, margs) = expr::unfold_apps(&major_dom);
             if let ExprData::Const(c, _) = &**mh {
                 if *c == target && margs.len() >= target_args.len() {
@@ -5009,7 +5049,27 @@ impl<'e> Checker<'e> {
                 iargs[..nparams].to_vec(),
                 &iargs[nparams..],
             )
-        } else if let Some(nrec) = self.nested_rec_for_type(&tctx, rname, us, params, target, &iargs) {
+        } else if let Some(nrec) = {
+            // `params` is at `ctx`'s own depth; `target_args` (`iargs`,
+            // built from `ty`) is at `tctx`'s — `ctx` plus the `binders`
+            // this function's own `field_ty`-unfold loop just pushed.
+            // The direct-recursion branch just above already shifts
+            // `params` by `shift_by` before comparing it against
+            // anything `iargs`-derived (`p_rec_shifted`); this branch
+            // compared un-shifted `params` against `tctx`-depth
+            // `target_args` instead, so a candidate's own major type —
+            // wherever it embeds one of the outer recursor's own
+            // parameters, as any genuinely parametric nested type's
+            // major premise does — carried the wrong de Bruijn index
+            // whenever `shift_by > 0`. Invisible for a non-parametric
+            // target (nothing to embed), which is every prior nested
+            // type this ran on.
+            let shifted_params: Vec<Expr> = params
+                .iter()
+                .map(|p| expr::shift(p, shift_by, 0))
+                .collect();
+            self.nested_rec_for_type(&tctx, rname, us, &shifted_params, target, &iargs)
+        } {
             // `nested_rec_for_type` matches on `ty`'s own head and args
             // against each candidate's *actual declared major-premise
             // type* — sound regardless of whether `occurs_any` (below)
