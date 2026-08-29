@@ -4811,16 +4811,87 @@ impl<'e> Checker<'e> {
         }
         let subst = level::subst_map(rec_level_params, us);
         let typ = expr::instantiate_level_params(&typ, &subst);
-        // `params` is in application order (outermost/first-bound first);
-        // `instantiate` substitutes bvar 0 (innermost) with `args[0]`, so
-        // reverse before threading them through the leading `Pi`s.
-        let params_rev: Vec<Expr> = params.iter().rev().cloned().collect();
-        let mut cur = expr::instantiate(&typ, &params_rev);
-        for _ in 0..(rec_num_params + num_motives) {
+        // `instantiate` substitutes *loose* bvars — a no-op on `typ` as a
+        // whole, since it's the recursor's own closed, Pi-wrapped declared
+        // type (`loose_bvar_range(typ) == 0`). The params (e.g. LCNF
+        // `Code`'s own `purity` index, threaded through as an explicit
+        // leading parameter rather than a plain non-indexed one) must be
+        // substituted into the *body*, after peeling their own binding
+        // `Pi`s first — exactly the same class of bug already fixed in
+        // `nested_rec_for_type` (`Lean.Doc.Block.brecOn_6.go`). Calling
+        // `instantiate` on the still-Pi-wrapped type left every reference
+        // to a param inside a minor's own conclusion as an unresolved,
+        // dangling bvar that could never match `ctor_params` — not "off
+        // by a shift", genuinely two different things being compared — so
+        // this always returned `None` for any recursor with
+        // `rec_num_params > 0`, falling through to `ctor_minor_index`'s
+        // name-only positional fallback (wrong here: `Lean.Compiler.LCNF.
+        // Code.rec`'s six-motive mutual group interleaves `Code`'s own
+        // constructors with `Alt`/`FunDecl`/`Cases`'s, so `Code.let`/
+        // `Code.fun`'s minors sit at positions 5/6, not the fallback's
+        // assumed 0/1).
+        let mut cur = typ;
+        for _ in 0..rec_num_params {
             match &**cur {
                 ExprData::Pi(_, _, body) => cur = body.clone(),
                 _ => return None,
             }
+        }
+        // `params` is in application order (outermost/first-bound first);
+        // `instantiate` substitutes bvar 0 (innermost) with `args[0]`, so
+        // reverse before substituting into the now-loose body.
+        let params_rev: Vec<Expr> = params.iter().rev().cloned().collect();
+        let mut cur = expr::instantiate(&cur, &params_rev);
+        for _ in 0..num_motives {
+            match &**cur {
+                ExprData::Pi(_, _, body) => cur = body.clone(),
+                _ => return None,
+            }
+        }
+        // Two passes over the same minor telescope. First, find every
+        // position whose conclusion's constructor head is `cname` by name
+        // alone (cheap, no de Bruijn bookkeeping). Most constructors are
+        // unique within their own recursor's minor list — `Code.let`/
+        // `Code.fun` never recur for any other type in the mutual group —
+        // so a unique name match already unambiguously answers "which
+        // minor", without needing `ctor_params` at all. Only a name that
+        // repeats (the documented `ctor_minor_index` case: two same-shaped
+        // nested specializations, e.g. two `List.cons` rules for distinct
+        // element types in one group) needs the second, params-based pass
+        // to disambiguate — that pass's own bookkeeping (comparing
+        // `ctor_params`, captured at the caller's scope, against `cargs`
+        // found by walking `num_motives + p` outer binders plus this
+        // minor's own inner ones) only has to get the shift right when
+        // there's more than one candidate, not for every recursor.
+        let mut by_name: Vec<usize> = Vec::new();
+        {
+            let mut probe = cur.clone();
+            for p in 0..num_minors {
+                let (mut inner, next) = match &**probe {
+                    ExprData::Pi(_, dom, body) => (dom.clone(), body.clone()),
+                    _ => return None,
+                };
+                loop {
+                    match &**inner {
+                        ExprData::Pi(_, _, body) => inner = body.clone(),
+                        _ => break,
+                    }
+                }
+                let (_motive, concl_args) = expr::unfold_apps(&inner);
+                if let Some(major_shape) = concl_args.last() {
+                    let (chead, _) = expr::unfold_apps(major_shape);
+                    if matches!(&**chead, ExprData::Const(c, _) if *c == cname) {
+                        by_name.push(p as usize);
+                    }
+                }
+                probe = next;
+            }
+        }
+        if by_name.len() == 1 {
+            return Some(by_name[0]);
+        }
+        if by_name.is_empty() {
+            return None;
         }
         for p in 0..num_minors {
             let (mut inner, next) = match &**cur {

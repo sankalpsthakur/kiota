@@ -880,3 +880,32 @@ fn struct_eta_nested_level_arity_accepts() {
 fn lean_doc_block_nested_rec_param_shift_accepts() {
     assert_accept("lean-doc-block-nested-rec-param-shift.accept.ndjson");
 }
+
+/// `Lean.Compiler.LCNF.Code.ctorElim` — same `instantiate`-on-a-still-Π
+/// no-op class of bug as `lean_doc_block_nested_rec_param_shift_accepts`
+/// above, this time in `minor_index_from_type` rather than
+/// `nested_rec_for_type`. `Code` is one member of a six-motive mutual
+/// group (with `Alt`/`FunDecl`/`Cases`/two nested `Array`/`List`
+/// specializations) and carries an explicit parameter (`Purity`) threaded
+/// through every constructor. `minor_index_from_type` called
+/// `instantiate` on the recursor's own closed, still-`Π`-headed declared
+/// type (a no-op, since a closed term has no loose bvars) instead of on
+/// the body after peeling the parameter's own binding `Π`s first, so
+/// every reference to `Purity` inside a minor's own conclusion stayed an
+/// unresolved, dangling bvar that could never match the caller's actual
+/// parameter — not "off by a shift", genuinely two different things being
+/// compared. That silently failed for every minor of any recursor with
+/// `rec_num_params > 0`, falling through to `ctor_minor_index`'s
+/// name-only positional fallback, which assumes each group member's own
+/// constructors start contiguously from index 0 — wrong here, since
+/// `Code`'s own constructors (`let`, `fun`, ...) are interleaved after
+/// `Alt`/`FunDecl`/`Cases`'s and start at position 5, not 0. Fixed by
+/// peeling the leading parameter `Π`s before instantiating, then matching
+/// a minor by its constructor name alone whenever that name is unique
+/// within the recursor's own minor list (the common case, sidestepping
+/// the de Bruijn bookkeeping entirely), falling back to the existing
+/// params-based comparison only to disambiguate a name that repeats.
+#[test]
+fn lean_compiler_lcnf_code_ctorelim_accepts() {
+    assert_accept("lean-compiler-lcnf-code-ctorelim.accept.ndjson");
+}
