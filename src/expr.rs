@@ -327,26 +327,18 @@ pub fn intern_node_count() -> usize {
 }
 
 /// Drop the hash-cons table's own lookup structure if it has grown past
-/// `threshold` nodes, returning whether it did. Every *other* per-decl
-/// reset (`clear_subst_memos`, and the pointer-keyed `whnf`/`defeq`/
-/// `infer` caches in `tc.rs`, cleared right alongside this call — see
-/// their own `#3491`-`#3495` comment) already treats "pointer identity
-/// only means something for the declaration that minted it" as the
-/// scoping rule; this is the one node-lifetime root that comment's own
-/// fix left unbounded, since dropping a hash-cons entry never needs the
-/// caution a *pointer-keyed* cache does — the lookup key here is a
-/// structural hash of the node's own content, not an address, so a
-/// "miss" after clearing just re-allocates an equal node instead of
-/// ever returning a wrong one. A large finite value (well above what
-/// checking Init, Std, or any existing fixture ever reaches) keeps
-/// ordinary runs byte-for-byte unaffected; it only fires on inputs
-/// whose own total distinct-node count crosses it — cedar.ndjson-scale
-/// exports whose ~30k-declaration global hash-cons table is what grows
-/// unboundedly (as itself, not any recursive term) into needing a
-/// single doubling allocation the sizes seen (~24M nodes → next resize
-/// ~3.3 GB) larger than a checker process's own affordable single
-/// allocation, aborting with `memory allocation of N bytes failed`
-/// rather than continuing to the next declaration.
+/// `threshold` nodes, returning whether it did. The lookup key is a
+/// structural hash of the node's content, not an address, so a miss
+/// after clearing just re-allocates an equal node — it cannot return a
+/// wrong one. Callers must drop every pointer-keyed cache *and* every
+/// map that holds a strong `Rc` into interned terms (`unfold_cache`,
+/// `iota_value_cache`, `iota_lit_memo`) *before* this runs: those maps
+/// otherwise pin the pre-clear generation, and `iota_lit_memo` keys on
+/// raw `usize` addresses that the allocator may reuse. A large finite
+/// threshold (well above Init, Std, or any existing fixture) keeps
+/// ordinary runs byte-for-byte unaffected. Cedar-scale exports hit it
+/// when the table's next capacity-doubling (~24M nodes → ~3.3 GB) is
+/// larger than one affordable allocation.
 pub fn intern_clear_if_large(threshold: usize) -> bool {
     INTERN.with(|t| {
         let mut t = t.borrow_mut();
@@ -667,6 +659,33 @@ mod tests {
             Rc::ptr_eq(&acc, &acc2),
             "primary intern map must still hash-cons after thousands of unique nodes"
         );
+    }
+
+    #[test]
+    fn intern_clear_if_large_is_a_noop_under_threshold() {
+        let _ = const_(1, vec![]);
+        let n = intern_node_count();
+        assert!(!intern_clear_if_large(n.saturating_add(1)));
+        assert_eq!(intern_node_count(), n);
+    }
+
+    #[test]
+    fn intern_clear_if_large_resets_table_and_still_hash_conses() {
+        let mut acc = bvar(0);
+        for i in 0..200u32 {
+            acc = app(acc, lit_nat(BigUint::from(i)));
+        }
+        let n = intern_node_count();
+        assert!(n > 50, "setup interned {n} nodes");
+        assert!(intern_clear_if_large(50));
+        assert_eq!(intern_node_count(), 0, "table itself is empty after reset");
+        let a = bvar(0);
+        let b = bvar(0);
+        assert!(
+            Rc::ptr_eq(&a, &b),
+            "post-clear intern must still hash-cons"
+        );
+        let _ = acc;
     }
 
     #[test]

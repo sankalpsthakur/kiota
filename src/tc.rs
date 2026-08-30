@@ -927,7 +927,9 @@ pub struct Checker<'e> {
     /// `(const name, levels)` to unfolded value, memoized like the C++ kernel's
     /// `m_unfold`. The delta path can unfold the same def/theorem at the same
     /// levels over and over; re-instantiating a large body each time (O(size)
-    /// `instantiate_level_params`) is what made `_proof_1_1` blow up.
+    /// `instantiate_level_params`) is what made `_proof_1_1` blow up. Kept
+    /// across declarations until the intern table is reset: after that the
+    /// entries pin a pre-clear generation and must go in the same reset.
     unfold_cache: RefCell<FxHashMap<(u32, Vec<Level>), Expr>>,
     /// `(context id, term)` to inferred type. Unlike the caches above this one
     /// works under binders, which is where the redundancy actually is: a term
@@ -1537,7 +1539,6 @@ impl<'e> Checker<'e> {
         // Pointer-keyed WHNF/defeq/infer caches are only useful inside one
         // declaration. Keeping them across decls is how `#3491`–`#3495`
         // grew from ~0.9 GB to multi-GB before the next omega proof.
-        // `unfold_cache` is keyed by (const, levels) and is reused.
         expr::clear_subst_memos();
         CTX_IDS.with(|m| m.borrow_mut().clear());
         CTX_NEXT.with(|c| c.set(1));
@@ -1545,6 +1546,18 @@ impl<'e> Checker<'e> {
         self.whnf_core_cache.borrow_mut().clear();
         self.defeq_cache.borrow_mut().clear();
         self.infer_cache.borrow_mut().clear();
+        // `ctx_key`s (via `CTX_NEXT`, reset above) are reused across
+        // declarations, so a stale eager-namespace entry from the last
+        // declaration would be keyed identically but mean something
+        // different here. These must land *before* `intern_clear_if_large`:
+        // they are pointer-keyed, and dropping the intern table can free
+        // an `Expr` whose address the allocator then reuses. Clearing them
+        // in the same reset is not enough if the intern drop happens first
+        // and anything in between allocates.
+        self.eager_whnf_cache.borrow_mut().clear();
+        self.eager_whnf_core_cache.borrow_mut().clear();
+        self.eager_defeq_cache.borrow_mut().clear();
+        self.eager_infer_cache.borrow_mut().clear();
         // The hash-cons table itself is the one node-lifetime root the
         // above never bounded: it holds a strong `Rc` to every distinct
         // `Expr` ever built, for the life of the process, regardless of
@@ -1554,25 +1567,34 @@ impl<'e> Checker<'e> {
         // into a single doubling allocation (~24M nodes → next resize
         // ~3.3 GB) too large for the process to satisfy, aborting
         // outright instead of continuing to the next declaration.
-        // Clearing it here is exactly as safe as the pointer-keyed
-        // clears just above: the lookup key is a structural hash of the
-        // node's own content, not an address, so a post-clear "miss"
-        // only re-allocates an equal node — it can never return a wrong
-        // one — and every pointer-keyed cache that could otherwise see
-        // a stale address is cleared in this same reset, so there is no
-        // window for a freed-and-reused address to collide with one.
-        // The threshold is far above anything Init, Std, or any existing
-        // fixture reaches, so ordinary runs never call `Interner::
-        // default()` here at all.
-        expr::intern_clear_if_large(4_000_000);
-        // `ctx_key`s (via `CTX_NEXT`, reset above) are reused across
-        // declarations, so a stale eager-namespace entry from the last
-        // declaration would be keyed identically but mean something
-        // different here.
-        self.eager_whnf_cache.borrow_mut().clear();
-        self.eager_whnf_core_cache.borrow_mut().clear();
-        self.eager_defeq_cache.borrow_mut().clear();
-        self.eager_infer_cache.borrow_mut().clear();
+        //
+        // `unfold_cache` is keyed by (const, levels), not an address, so
+        // it is safe to keep across declarations *until* the intern table
+        // is dropped. After that its entries pin pre-clear bodies while
+        // everything newly interned is a post-clear generation: `ptr_eq`
+        // and the pointer-keyed defeq cache miss on the largest terms.
+        // `iota_lit_memo` *is* pointer-keyed (`Vec<usize>` of motive/
+        // minor addresses) and `iota_value_cache` holds `Rc` to those
+        // thunks, so both must go before the intern drop or a recycled
+        // address is a wrong hit. Ordinary runs never cross 4M nodes, so
+        // Init/Std keep the unfold memo.
+        const INTERN_RESET: usize = 4_000_000;
+        if expr::intern_node_count() > INTERN_RESET {
+            let intern_before = expr::intern_node_count();
+            let unfold_before = self.unfold_cache.borrow().len();
+            self.unfold_cache.borrow_mut().clear();
+            self.iota_value_cache.borrow_mut().clear();
+            self.iota_lit_memo.borrow_mut().clear();
+            expr::intern_clear_if_large(INTERN_RESET);
+            if std::env::var_os("KIOTA_INTERN_RESET_LOG").is_some() {
+                eprintln!(
+                    "INTERN_RESET decl={} intern {intern_before}→{} unfold={unfold_before}→{}",
+                    self.name_str(name),
+                    expr::intern_node_count(),
+                    self.unfold_cache.borrow().len(),
+                );
+            }
+        }
         if std::env::var_os("KIOTA_TRACE_DECL").is_some() {
             eprintln!("DECL {kind} {}", self.name_str(name));
         }
