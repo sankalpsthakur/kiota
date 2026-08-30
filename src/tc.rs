@@ -5903,7 +5903,20 @@ impl<'e> Checker<'e> {
         if args.len() < need {
             return Ok(None);
         }
-        let ty = self.whnf(ctx, &args[ty_i])?;
+        // Only δ-unfold as far as `whnf_core` (β/ι/proj, no δ) goes: a type
+        // argument that is *already* a bare `Nat`/`Int` constant is safe to
+        // fast-path to the matching primitive op, but one that needs a
+        // type-level δ-unfold to become `Nat`/`Int` (e.g. `Multiplicative
+        // Nat`, whose own `Mul` instance is repurposed from the underlying
+        // `Add`, not `Nat.mul`) is not: the operation identity this
+        // shortcut assumes ("this `HMul.hMul` *is* `Nat.mul`") does not
+        // survive unwrapping a type synonym whose instances can rename or
+        // repurpose the operation. Falling through to the general path is
+        // always safe here (slower, never wrong); the previous full
+        // `self.whnf` call on the type alone, with no check that the
+        // instance argument agrees, could substitute an unrelated `Nat.*`
+        // primitive for the *actual* instance's operation.
+        let ty = self.whnf_core(ctx, &args[ty_i])?;
         let ty_name = match &**ty {
             ExprData::Const(t, _) => self.name_str(*t),
             _ => return Ok(None),
@@ -5919,8 +5932,8 @@ impl<'e> Checker<'e> {
             "HAdd.hAdd" | "HSub.hSub" | "HMul.hMul" | "HDiv.hDiv" | "HMod.hMod"
         ) && args.len() >= 3
         {
-            let t1 = self.whnf(ctx, &args[1])?;
-            let t2 = self.whnf(ctx, &args[2])?;
+            let t1 = self.whnf_core(ctx, &args[1])?;
+            let t2 = self.whnf_core(ctx, &args[2])?;
             is_int_name(ty_name)
                 && matches!(&**t1, ExprData::Const(t, _) if is_int_name(self.name_str(*t)))
                 && matches!(&**t2, ExprData::Const(t, _) if is_int_name(self.name_str(*t)))

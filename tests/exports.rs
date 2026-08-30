@@ -931,3 +931,25 @@ fn lean_compiler_lcnf_code_ctorelim_accepts() {
 fn rat_inst_encodable_and_rec_theorem_major_accepts() {
     assert_accept("rat-instEncodable-and-rec-theorem-major.accept.ndjson");
 }
+
+/// A proof stated in `Multiplicative ℕ` terms (`HMul.hMul` using
+/// `Multiplicative.mulOneClass`, whose own `Mul` is *repurposed* from
+/// `Nat`'s `Add`, not `Nat`'s own `Mul`) against an expected type stated
+/// directly in `ℕ` with `HAdd.hAdd`. `try_hbin_nat`'s fast-path rewrite
+/// of `HMul.hMul`/`Mul.mul` to the primitive `Nat.mul` checked only that
+/// the *type* argument's full `whnf` (which δ-unfolds `Multiplicative ℕ`
+/// to `ℕ`) was `Nat` — never that the *instance* argument actually
+/// implements `Nat.mul`. Since `Multiplicative`'s own multiplication is
+/// the underlying addition under a different name, this silently
+/// substituted the wrong `Nat.*` primitive (`Nat.mul` where the real
+/// operation was `Nat.add`), so the two sides could never compare equal.
+/// Fixed by using `whnf_core` (no δ) for the type-argument check instead
+/// of full `whnf`: a type argument that is *already* a bare `Nat`/`Int`
+/// constant is safe to fast-path, but one that needs a type-level
+/// δ-unfold to become `Nat`/`Int` is not, since the operation identity
+/// this shortcut assumes does not survive unwrapping a type synonym
+/// whose instances can repurpose the operation.
+#[test]
+fn submonoid_log_mul_multiplicative_nat_accepts() {
+    assert_accept("submonoid-log-mul-multiplicative-nat.accept.ndjson");
+}
