@@ -953,3 +953,37 @@ fn rat_inst_encodable_and_rec_theorem_major_accepts() {
 fn submonoid_log_mul_multiplicative_nat_accepts() {
     assert_accept("submonoid-log-mul-multiplicative-nat.accept.ndjson");
 }
+
+/// `try_nat_extension`'s `OfNat.ofNat` handling had the same bug class as
+/// `try_hbin_nat`'s `HMul.hMul`/`Mul.mul` fast-path: `nat::of_nat_value`
+/// returns the raw numeral tag `n` unconditionally once the type
+/// argument's full `whnf` looks like `Nat`, with no check that the
+/// *instance* argument's `ofNat` field actually computes to `n`. For
+/// `OfNat.ofNat (Multiplicative Nat) 1 (One.toOfNat1 (... Multiplicative
+/// Nat.instAddMonoid))`, the instance's `ofNat` field is `Nat`'s own
+/// additive identity `0` repurposed as the multiplicative identity, not
+/// the literal `1` this numeral tag names — so this silently produced
+/// the wrong `Nat` literal. Fixed the same way: `whnf_core` (no δ)
+/// instead of full `whnf` for the type-argument check, so a type
+/// argument that needs a type-level δ-unfold to become `Nat` is not
+/// fast-pathed. As a side effect (not by touching the defeq cache or any
+/// congruence rule), this also fixes the previously-parked
+/// `FreeGroup.freeGroupUnitEquivInt._proof_3` hole, whose mismatch was
+/// exactly this same wrong-literal bug reached through a different
+/// `Multiplicative`-typed proof.
+#[test]
+fn skewpolynomial_phi_iterate_multiplicative_nat_accepts() {
+    assert_accept("skewpolynomial-phi-iterate-multiplicative-nat.accept.ndjson");
+}
+
+/// The previously-parked `FreeGroup.freeGroupUnitEquivInt._proof_3` hole:
+/// fixed by the same `OfNat.ofNat` fast-path correction above, not by any
+/// change to the defeq cache or `try_unreduced_const_congruence`. Its
+/// `got`/`expected` mismatch was `OfNat.ofNat Int 0` vs `OfNat.ofNat
+/// (Multiplicative Int) 1` — the latter used to (wrongly) `whnf` to the
+/// literal `1` via this same bug, when the instance's `ofNat` field is
+/// actually `Int`'s own `0`.
+#[test]
+fn freegroup_unit_equiv_int_multiplicative_accepts() {
+    assert_accept("freegroup-unit-equiv-int-multiplicative.accept.ndjson");
+}

@@ -5822,7 +5822,19 @@ impl<'e> Checker<'e> {
                 let Some(nat_ty) = self.nat_ref else {
                     return Ok(None);
                 };
-                let ty = self.whnf(ctx, &args[0])?;
+                // `whnf_core` (no δ), not full `whnf`, for the same reason
+                // as `try_hbin_nat`'s type-argument check: `nat::of_nat_value`
+                // returns the raw numeral tag `n` unconditionally once the
+                // type looks like `Nat`, with no check that the *instance*
+                // argument's `ofNat` field actually is `n` — e.g.
+                // `OfNat.ofNat (Multiplicative Nat) 1 (One.toOfNat1 (...
+                // Multiplicative.monoid ...))`, whose instance's `ofNat`
+                // field is `Nat`'s own additive identity `0`, repurposed as
+                // the multiplicative identity, not the literal `1` this tag
+                // names. A type argument that needs a type-level δ-unfold to
+                // become `Nat` is not safe to fast-path this way; one that
+                // is already a bare `Nat` constant still is.
+                let ty = self.whnf_core(ctx, &args[0])?;
                 let mut stripped = args.to_vec();
                 stripped[0] = ty.clone();
                 if let Some(v) = nat::of_nat_value(&stripped, nat_ty) {
