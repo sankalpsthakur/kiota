@@ -3015,9 +3015,15 @@ impl<'e> Checker<'e> {
             return false;
         };
         match self.env.get(ind) {
-            Some(ConstantInfo::InductiveType { typ, is_rec, .. }) => {
-                *is_rec && self.sort_codomain_is_prop(typ)
-            }
+            // Day 19: dropped `is_rec` too, for the same reason `ctors.len()
+            // == 1` was dropped above — a non-recursive Prop structure
+            // (`And`, `Iff`, …) with a theorem-headed major (e.g. a nested
+            // `match_N` splitter composing `Sigma.rec`/`Subtype.rec`/
+            // `And.rec` to rebuild a structure — a `Rat`-shaped
+            // round-trip proof) is exactly as valid to delta-retry as the
+            // `Acc`-shape case this gate was written for. `is_rec` only
+            // ever *declines* an unfold that would have succeeded.
+            Some(ConstantInfo::InductiveType { typ, .. }) => self.sort_codomain_is_prop(typ),
             _ => false,
         }
     }

@@ -909,3 +909,25 @@ fn lean_doc_block_nested_rec_param_shift_accepts() {
 fn lean_compiler_lcnf_code_ctorelim_accepts() {
     assert_accept("lean-compiler-lcnf-code-ctorelim.accept.ndjson");
 }
+
+/// `Rat.instEncodable`'s round-trip proof (`Encodable.ofEquiv` on
+/// `Σ n : ℤ, {d : ℕ // 0 < d ∧ Coprime n.natAbs d}`) composes a
+/// `Sigma.rec`/`Subtype.rec`/`And.rec` chain to reconstruct a `Rat` from
+/// its own destructured fields, then needs structure eta to see that
+/// reconstruction is the identity. `And`'s own field (the `0 < d`/
+/// `Coprime` proof) is produced by a *theorem* application
+/// (`Rat.instEncodable._proof_1`), so `And.rec`'s major is stuck on a
+/// theorem-headed neutral term rather than a literal `And.intro`.
+/// `whnf_major`'s theorem-delta retry only fired for a *recursive* Prop
+/// inductive (the `Acc`-shape case it was written for); `And` is Prop but
+/// not recursive, so the retry never fired and the round-trip never
+/// reduced far enough to expose the `Rat.mk'` head that structure eta
+/// needs. Fixed by dropping the `is_rec` requirement — delta-retrying a
+/// theorem-headed major is always a valid reduction step regardless of
+/// whether the inductive recurses on itself; a narrower gate can only
+/// ever decline an unfold that would have succeeded, never accept
+/// something wrongly.
+#[test]
+fn rat_inst_encodable_and_rec_theorem_major_accepts() {
+    assert_accept("rat-instEncodable-and-rec-theorem-major.accept.ndjson");
+}
