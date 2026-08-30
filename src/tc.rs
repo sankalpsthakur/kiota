@@ -909,16 +909,17 @@ pub struct Checker<'e> {
     /// *dispatching* `is_def_eq`/`infer_type`, which take a different
     /// path (eager vs NbE) depending on the flag, so a cached answer
     /// computed one way is not generally safe to reuse computed the
-    /// other way (Day 8's stale-cache bug). Rather than skip caching
-    /// during a rescue entirely (Day 8; correct but wasteful — every
-    /// rescue re-did all its own work from scratch, 2.7x-3.8x more
-    /// `Ir` than eager on every fixture that needed one), give
-    /// `FORCE_EAGER_DEFEQ`-computed answers their own cache: still pure,
-    /// deterministic answers for a given `(ctx, expr)` key *as long as
-    /// they were computed under the same flag*, so this is exactly as
-    /// safe as the originals were before Day 8 ever introduced the
-    /// bypass, just kept in a separate map so a rescue's answer can
-    /// never leak into (or be leaked into by) a non-rescue lookup.
+    /// other way (a stale-cache bug fixed by giving the two paths
+    /// separate caches). Skipping caching during a rescue entirely was
+    /// tried first — correct but wasteful, since every rescue then
+    /// re-did all its own work from scratch, 2.7x-3.8x more `Ir` than
+    /// eager on every fixture that needed one. Giving
+    /// `FORCE_EAGER_DEFEQ`-computed answers their own cache keeps them
+    /// still pure, deterministic answers for a given `(ctx, expr)` key
+    /// *as long as they were computed under the same flag*, so this is
+    /// exactly as safe as the shared cache was before a rescue path
+    /// existed at all, just kept in a separate map so a rescue's answer
+    /// can never leak into (or be leaked into by) a non-rescue lookup.
     eager_whnf_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
     eager_whnf_core_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
     eager_defeq_cache: RefCell<FxHashMap<(u64, usize, usize), bool>>,
@@ -1724,15 +1725,15 @@ impl<'e> Checker<'e> {
 
     // ---------------- Type inference ----------------
 
-    // History: Day 5 wired `infer_type` behind `KIOTA_NBE=1` and found two
+    // History: wiring `infer_type` behind `KIOTA_NBE=1` first found two
     // accept fixtures (`alg-conv-trans-acc-left`, `subject-reduction-redex`)
-    // newly rejecting, and reverted. Day 6 fixed the hypothesized cause
-    // (context reconstruction by quoting), but the fixtures still failed,
+    // newly rejecting, and was reverted. Fixing the hypothesized cause
+    // (context reconstruction by quoting) still left the fixtures failing,
     // tracing down to the *actual* cause: eager reduces `Acc.rec motive
     // minor x (Acc.intro x g)` via ordinary iota, and `try_iota_value`
     // couldn't match that (`Acc` is indexed and `Acc.intro`'s recursive
-    // field is higher-order). Day 7 implemented that rule and re-wired,
-    // but both fixtures still rejected — a *different*, smaller mismatch:
+    // field is higher-order). Implementing that rule and re-wiring still
+    // left both fixtures rejecting — a *different*, smaller mismatch:
     // eager's own comparison never re-derives an `Acc.rec`-headed type at
     // all, because it succeeds by comparing an *unreduced* wrapper
     // application (`f 1 h` vs `f 1 (Acc.intro …)`) via proof irrelevance
@@ -2983,20 +2984,16 @@ impl<'e> Checker<'e> {
     /// Recursive Prop inductive: theorem wrappers of the major
     /// (`_proof_2 := Acc.intro`) must unfold before iota.
     ///
-    /// Day 9: `try_iota_value` (Day 7) now also drives this same gate
-    /// (both eager `whnf_major` and the Value-space bridge call it), and
-    /// its own ctor/iota handling is no longer restricted to Acc's exact
-    /// shape (indexed + higher-order recursion both work generically now).
-    /// Tried dropping the `ctors.len() == 1` restriction (any recursive
-    /// Prop inductive, any constructor count) and ran the full suite both
-    /// flags plus a callgrind comparison on the three Acc-shape export
-    /// fixtures: no regression, no measurable instruction-count change.
-    /// Left in place that pass out of caution (labeled it
-    /// "soundness-adjacent" with "zero evidence of need").
-    ///
-    /// Day 15: dropped for real. Re-examined why: unfolding a theorem is
-    /// always a valid reduction step (delta on a theorem is no different
-    /// in kind from delta on a def) — this function only decides *which*
+    /// `try_iota_value` also drives this same gate (both eager
+    /// `whnf_major` and the Value-space bridge call it), and its own
+    /// ctor/iota handling is not restricted to Acc's exact shape (indexed
+    /// + higher-order recursion both work generically). The `ctors.len()
+    /// == 1` restriction this gate once had was first left in place out
+    /// of caution after a widening experiment showed no regression and no
+    /// measurable instruction-count change, then dropped for real on
+    /// re-examining why it existed at all: unfolding a theorem is always
+    /// a valid reduction step (delta on a theorem is no different in kind
+    /// from delta on a def) — this function only decides *which*
     /// recursor majors get an extra unfold-and-retry attempt before iota
     /// gives up, not whether unfolding itself is legal. A narrower ctor
     /// count can only ever *decline* to try an unfold that would have
@@ -3005,8 +3002,8 @@ impl<'e> Checker<'e> {
     /// major), not accept something wrongly — declining is a `Decline`
     /// outcome (deferred to eager/quit), never a false accept. Both
     /// eager `whnf_major` and NBE's `try_iota_value` bridge still call
-    /// this identical function, so the widening is symmetric across both
-    /// flags by construction, not a new eager/NBE asymmetry.
+    /// this identical function, so any widening here is symmetric across
+    /// both flags by construction, not a new eager/NBE asymmetry.
     fn recursor_unfolds_thm_major(&self, recursor: u32) -> bool {
         let Some(ConstantInfo::Recursor { all, .. }) = self.env.get(recursor) else {
             return false;
@@ -3015,8 +3012,8 @@ impl<'e> Checker<'e> {
             return false;
         };
         match self.env.get(ind) {
-            // Day 19: dropped `is_rec` too, for the same reason `ctors.len()
-            // == 1` was dropped above — a non-recursive Prop structure
+            // `is_rec` was dropped too, for the same reason as
+            // `ctors.len() == 1` above — a non-recursive Prop structure
             // (`And`, `Iff`, …) with a theorem-headed major (e.g. a nested
             // `match_N` splitter composing `Sigma.rec`/`Subtype.rec`/
             // `And.rec` to rebuild a structure — a `Rat`-shaped
@@ -3400,14 +3397,15 @@ impl<'e> Checker<'e> {
     /// a wrong answer — unfolding a definition is always a valid
     /// reduction step).
     ///
-    /// Day 9 raised this to 1_000_000 and found `large_regular_def_unfolds_in_whnf`
-    /// failing — but that test's own assertion is `!delta_body_is_small(2)`
-    /// for a synthetic body, used only to demonstrate "Regular-Def WHNF
+    /// Raising this cap once broke `large_regular_def_unfolds_in_whnf` —
+    /// but that test's own assertion is `!delta_body_is_small(2)` for a
+    /// synthetic body, used only to demonstrate "Regular-Def WHNF
     /// unfolding is not size-gated" by picking a body definitely over
     /// *whatever* this cap currently is; it does not assert the cap's
-    /// value itself is load-bearing. Day 15: lifted for real (no cap at
-    /// all) and grew that test's synthetic body so it still demonstrates
-    /// the same point against an uncapped `delta_body_is_small`.
+    /// value itself is load-bearing. The cap was lifted for real (no cap
+    /// at all) and that test's synthetic body was grown so it still
+    /// demonstrates the same point against an uncapped
+    /// `delta_body_is_small`.
     fn delta_body_is_small(&self, _n: u32) -> bool {
         true
     }
@@ -3611,27 +3609,27 @@ impl<'e> Checker<'e> {
         // Nested `Syntax.rec_k` ι is rule-ctor identity +
         // specialization-order rec_group, not a size band.
         //
-        // Day 9 tried widening this function alone (to
-        // `Theorem { .. } => self.delta_body_is_small(n)`) and found it
-        // inert: true, but only because every one of this function's own
-        // call sites paired it with `unfold_def`, which — unlike
+        // Widening this function alone (to `Theorem { .. } =>
+        // self.delta_body_is_small(n)`) was tried first and found inert:
+        // true, but only because every one of this function's own call
+        // sites paired it with `unfold_def`, which — unlike
         // `unfold_delta` — never returns a `Theorem`'s value at all
         // regardless of what this function answers. That is not "safe
         // to lift", it is "provably a no-op": the widened branch was
         // dead code by construction, not evidence the eager-bound gate
         // and the correctness of unfolding are decoupled.
         //
-        // Day 15: paired this widening with its call sites switching
-        // from `unfold_def` to `unfold_delta(.., true)` (which already
+        // Pairing this widening with its call sites switching from
+        // `unfold_def` to `unfold_delta(.., true)` (which already
         // implements exactly this theorem-and-size-cap rule for the
-        // lazy delta path in `is_def_eq`) so the widening is no longer
+        // lazy delta path in `is_def_eq`) made the widening no longer
         // inert. `delta_body_is_small`'s cap is still the size bound;
         // this only removes the *separate*, undocumented-as-soundness
         // restriction that the hot loop specifically excludes theorems
         // regardless of size.
         //
-        // Day 17: `ConstantInfo::Def { hints: Opaque, .. }` also
-        // unconditionally unfolds now, for the same reason. This variant
+        // `ConstantInfo::Def { hints: Opaque, .. }` also unconditionally
+        // unfolds now, for the same reason. This variant
         // is a `def` with a `hints` *reducibility* annotation of
         // `opaque` — it still has a real, checked value (the export's
         // `"defnDecl"`/`"def"` kind) — and is a completely different
@@ -3817,8 +3815,8 @@ impl<'e> Checker<'e> {
         // because `is_def_eq_via_nbe`'s own fallback can compute `false`
         // for a sub-pair that only looks unequal because `eval`
         // over-reduced one side (see `app_arg_type_ok_eager`'s comment).
-        // Namespacing (rather than Day 8's skip-caching-entirely fix)
-        // still lets one rescue's own repeated sub-comparisons — and later
+        // Namespacing (rather than skipping caching during a rescue
+        // entirely) still lets one rescue's own repeated sub-comparisons — and later
         // rescues on the same declaration — hit a cache, while keeping
         // that answer from ever being read by, or overwritten by, a
         // non-forced lookup.
@@ -8784,8 +8782,8 @@ impl<'e> Checker<'e> {
     /// `F Ds`, so instantiate F's constructors at `Ds` and require those
     /// fields to be strictly positive in `bound`.
     ///
-    /// Day 9: checked whether this repo has a "nested positivity depth
-    /// 16"-style cap that could now be replaced with a functor-identity
+    /// Checked whether this repo has a "nested positivity depth
+    /// 16"-style cap that could be replaced with a functor-identity
     /// cycle check. It doesn't — there's no depth counter anywhere in the
     /// positivity checker (`check_positivity`/`check_arg_positive_in`/
     /// `check_specialized_ctor_positive` all take no depth parameter).
@@ -9508,14 +9506,14 @@ impl<'e> Checker<'e> {
         }
     }
 
-    // ---------------- NbE spike, Day 4/5/6: infer_type on Values ----------------
+    // ---------------- NbE spike: infer_type on Values ----------------
     //
     // `pub fn infer_type` (the one every other part of the checker calls)
     // is untouched: it still always returns `Expr`, exactly as before, so
     // `check_decl`'s actual type-checking path has zero behavior change
     // from anything in this section unless/until it's wired in.
     //
-    // Day 5 wired this once and found a real disagreement: two accept
+    // Wiring this in once found a real disagreement: two accept
     // fixtures rejected under KIOTA_NBE=1, both on the same shape (a bound
     // variable vs. a theorem applied to that variable, both proofs of the
     // same Prop). The cause was `vctx_to_ctx`: every fallback point
@@ -9531,7 +9529,7 @@ impl<'e> Checker<'e> {
     // the cause — swapping that in changed nothing, isolating the bug to
     // the reconstruction itself, not to which comparator got called.
     //
-    // Day 6 fix: never reconstruct `Ctx` by quoting. `infer_type_value`
+    // Fix: never reconstruct `Ctx` by quoting. `infer_type_value`
     // (and every helper below) now carries the *original* `ctx: &Ctx`
     // alongside `tys`/`env`, growing it in lockstep for `Lam`/`Pi` (which
     // eager's own `Ctx` grows for too) — and every eager fallback call
@@ -9557,7 +9555,7 @@ impl<'e> Checker<'e> {
     /// `ctx`/`tys`/`env` at once, as `infer_type_uncached` does for
     /// `Lam`/`Pi` (the only forms whose eager `Ctx` actually grows).
     ///
-    /// `ty_thunk` is a `Thunk`, not a forced `Value` (Day 10's
+    /// `ty_thunk` is a `Thunk`, not a forced `Value` (a
     /// substitution-based redesign, see the comment above
     /// `infer_type_value`): the binder's type is not evaluated just
     /// because it was bound, only if/when some later `BVar` occurrence of
@@ -9618,7 +9616,7 @@ impl<'e> Checker<'e> {
     }
 
     fn infer_type_via_nbe_inner(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
-        // Day 10 (`KIOTA_TRACE_RESCUE=1`): confirms this function's own
+        // `KIOTA_TRACE_RESCUE=1` confirms this function's own
         // `ctx`-re-evaluation loop below is not the source of the Acc-shape
         // `Ir` cost either — on `alg-conv-trans-acc-right.accept.ndjson`
         // this runs 221 times with combined `ctx.len()` of 594, negligible
@@ -9627,7 +9625,7 @@ impl<'e> Checker<'e> {
         if std::env::var_os("KIOTA_TRACE_RESCUE").is_some() {
             eprintln!("INFER_VIA_NBE ctxlen={}", ctx.len());
         }
-        // Day 10: `ctx[i]`'s type used to be eagerly `eval`'d here on
+        // `ctx[i]`'s type used to be eagerly `eval`'d here on
         // every single call — for every sub-expression `infer_type`
         // recurses into, not just once — regardless of whether that
         // binder is ever actually looked up. Deferred instead: a `BVar`
@@ -9660,7 +9658,7 @@ impl<'e> Checker<'e> {
     /// re-dispatches to `infer_type_via_nbe` under `KIOTA_NBE=1`, which is
     /// *this function's own caller* — an unconditional infinite loop the
     /// instant this fallback ever fires with the flag on (confirmed by a
-    /// real stack overflow before that fix; see the Day 5 PR update).
+    /// real stack overflow before that fix).
     fn infer_type_value_fallback(
         &self,
         ctx: &Ctx,
@@ -9691,7 +9689,7 @@ impl<'e> Checker<'e> {
         }
         let got_q = self.quote(depth, got)?;
         let want_q = self.quote(depth, want)?;
-        // Day 10: this fallback was calling `is_def_eq_inner` directly,
+        // This fallback used to call `is_def_eq_inner` directly,
         // *not* wrapped in `with_forced_eager_defeq` — a real, separate
         // gap from the two named rescues (`app_arg_type_ok_eager`/
         // `value_type_ok_eager`), now closed the same way: as soon as its
@@ -9760,7 +9758,7 @@ impl<'e> Checker<'e> {
     /// accept that matches eager's own judgment; any error or eager
     /// mismatch here still rejects.
     fn app_arg_type_ok_eager(&self, ctx: &Ctx, f: &Expr, a: &Expr) -> R<bool> {
-        // Day 10: `KIOTA_TRACE_RESCUE=1` logs every invocation of this and
+        // `KIOTA_TRACE_RESCUE=1` logs every invocation of this and
         // `value_type_ok_eager` with the term sizes involved. Used to
         // confirm (not guess) that neither one is actually invoked on the
         // Acc-shape export fixtures at all — see the comment above
@@ -9829,7 +9827,7 @@ impl<'e> Checker<'e> {
     /// constant's own declared type, or `Nat`/`String`'s type) — never a
     /// subterm of the term actually being checked.
     ///
-    /// Day 8 found the concrete failure mode this fixes: `eval` always
+    /// The concrete failure mode this fixes: `eval` always
     /// fully reduces (`Def` unfolds, then tries iota), so eagerly
     /// `eval`-ing a `Lam`'s domain or an `App`'s argument as part of
     /// *inferring a type* could reduce a `Prop`-major recursor
@@ -9844,7 +9842,7 @@ impl<'e> Checker<'e> {
     /// subterm (the binder/argument itself) those `eval` calls used to
     /// touch unconditionally.
     ///
-    /// Day 10 found this was also the dominant cost on every Acc-shape
+    /// This was also the dominant cost on every Acc-shape
     /// export fixture: `eval`'s own reduction-counter hits (`eval` is
     /// called ~55k times inferring `alg-conv-trans-acc-right`'s largest
     /// declaration) came overwhelmingly from this function's own `App`
@@ -9858,38 +9856,39 @@ impl<'e> Checker<'e> {
     /// or an argument whose codomain doesn't depend on it, now costs
     /// nothing instead of a full `eval`.
     ///
-    /// Day 12 tried the same treatment for this function's own *return
+    /// The same treatment was tried for this function's own *return
     /// value* — changing its signature to `R<Rc<nbe::Thunk>>` so `App`'s
     /// own result (the substituted codomain, `body_pi` in an env extended
     /// with the argument) could be `Thunk::deferred` instead of
     /// `self.eval`'d immediately, i.e. eager's `instantiate1`-without-
     /// normalizing, "the Value equivalent of a Closure applied without
-    /// forcing." Implemented, sound (`a` itself stayed forced, per Day
-    /// 10 — deferring it too reproduced that exact 3x
-    /// `080_RBTree.id_spec.accept.ndjson` regression again, even with
+    /// forcing." Implemented, sound (`a` itself stayed forced, per the
+    /// binder-deferral fix above — deferring it too reproduced that exact
+    /// 3x `080_RBTree.id_spec.accept.ndjson` regression again, even with
     /// `body_pi` also deferred, confirming the two are the same
     /// regression, not two independent ones), full suite green both
     /// flags. Measured *zero* additional `Ir` improvement on all three
-    /// Acc-shape fixtures (identical to Day 10's numbers) and a small
-    /// (~1.5%) `Ir` regression on `080_RBTree.id_spec.accept.ndjson`
-    /// (reproduced across repeated runs, not noise): every caller that
-    /// needs to inspect an inferred type's shape — every enclosing `App`
-    /// checking `ft` is a `Pi`, every `Lam`/`Pi` checking its domain's
-    /// inferred type is a `Sort`, `types_compatible`'s own argument-type
-    /// check, and the final `quote` at the declaration boundary — forces
-    /// the thunk immediately anyway, via what would have been an
-    /// `infer_type_value_forced` helper. For these fixtures' own App
-    /// chains, that is *every* level, so the deferred `eval` just moved
-    /// from inside this function to the caller's forcing point a moment
-    /// later — same total work, plus one `Thunk` allocation's worth of
-    /// overhead and no case where the deferral actually paid off. Only a
-    /// caller using `infer_only` (skipping the argument-type check
-    /// entirely) or one that never inspects the result at all would ever
-    /// benefit, and neither pattern shows up enough in these fixtures'
-    /// own structure to matter. Reverted (this function still returns
-    /// `Rc<nbe::Value>`, `App`'s result is still built by evaluating
-    /// `body_pi` under the argument-extended env); Day 11's binder-`Thunk`
-    /// work above stays, since it measured as the real win.
+    /// Acc-shape fixtures (identical to the earlier binder-deferral
+    /// numbers) and a small (~1.5%) `Ir` regression on
+    /// `080_RBTree.id_spec.accept.ndjson` (reproduced across repeated
+    /// runs, not noise): every caller that needs to inspect an inferred
+    /// type's shape — every enclosing `App` checking `ft` is a `Pi`,
+    /// every `Lam`/`Pi` checking its domain's inferred type is a `Sort`,
+    /// `types_compatible`'s own argument-type check, and the final
+    /// `quote` at the declaration boundary — forces the thunk immediately
+    /// anyway, via what would have been an `infer_type_value_forced`
+    /// helper. For these fixtures' own App chains, that is *every*
+    /// level, so the deferred `eval` just moved from inside this function
+    /// to the caller's forcing point a moment later — same total work,
+    /// plus one `Thunk` allocation's worth of overhead and no case where
+    /// the deferral actually paid off. Only a caller using `infer_only`
+    /// (skipping the argument-type check entirely) or one that never
+    /// inspects the result at all would ever benefit, and neither pattern
+    /// shows up enough in these fixtures' own structure to matter.
+    /// Reverted (this function still returns `Rc<nbe::Value>`, `App`'s
+    /// result is still built by evaluating `body_pi` under the
+    /// argument-extended env); the binder-`Thunk` work above stays, since
+    /// it measured as the real win.
     pub(crate) fn infer_type_value(
         &self,
         ctx: &Ctx,
@@ -9956,7 +9955,7 @@ impl<'e> Checker<'e> {
                         return reject("application argument type mismatch (nbe)");
                     }
                 }
-                // Day 10: tried deferring `a` here too (unconditionally,
+                // Deferring `a` here too was tried (unconditionally,
                 // and gated on whether `body_pi` even references it via
                 // `occurs_bvar`) to match `eval`'s own `App` case. Both
                 // measured as a large *regression* on
@@ -9986,7 +9985,7 @@ impl<'e> Checker<'e> {
                 if !matches!(&*tt, nbe::Value::Sort(_)) {
                     return self.infer_type_value_fallback(ctx, env, e);
                 }
-                // Day 10: `ty` (the domain) is deferred, not `eval`'d —
+                // `ty` (the domain) is deferred, not `eval`'d —
                 // see the comment above this function. `vctx_push` stores
                 // the thunk directly; `Value::Pi`'s own domain field is
                 // already `Rc<Thunk>`, so no forcing happens here either.
@@ -10002,7 +10001,7 @@ impl<'e> Checker<'e> {
                     nbe::Value::Sort(l) => l.clone(),
                     _ => return self.infer_type_value_fallback(ctx, env, e),
                 };
-                // Day 10: same deferral as the `Lam` case above. Nothing
+                // Same deferral as the `Lam` case above. Nothing
                 // here needs the domain's *Value*, only the fact that a
                 // binder of this type now exists — `bs` (the codomain's
                 // own inferred sort) never reads it.
@@ -10442,7 +10441,7 @@ mod tests {
         ];
         let tc = Checker::new(&env, &names, None, None);
         let ctx = Ctx::new();
-        // Day 15: `delta_body_is_small`'s 512-node same-head-delta cap was
+        // `delta_body_is_small`'s 512-node same-head-delta cap was
         // lifted (it only ever cost completeness, never soundness — see
         // its own doc comment), so it is unconditionally `true` now; this
         // no longer distinguishes small vs. large bodies. What this test
@@ -12453,7 +12452,7 @@ mod tests {
         }
     }
 
-    // ---------------- Eager recursor-application memo (Day 2 build order) ----------------
+    // ---------------- Eager recursor-application memo ----------------
 
     /// Same shape as `insert_mini_nat0`, but wired as the checker's `Nat`
     /// (`nat_ref = Some(0)`) so a real `Lit::Nat` major exercises
@@ -12587,7 +12586,7 @@ mod tests {
         );
     }
 
-    // ---------------- NbE spike, Day 4: infer_type_value vs eager ----------------
+    // ---------------- NbE spike: infer_type_value vs eager ----------------
 
     /// `A : Type`, `a : A`, `id := fun (_:A) => A` (so `App`'s codomain
     /// exercises the beta step), `f := fun (x:A) => let (_:A) := a; x`.
@@ -12702,9 +12701,9 @@ mod tests {
         assert!(Rc::ptr_eq(&t_q, &a), "first field of PSigma A B must infer to A, got {}", tc.pp(&t_q));
     }
 
-    // ---------------- NbE spike, Day 7: indexed + higher-order iota ----------------
+    // ---------------- NbE spike: indexed + higher-order iota ----------------
     //
-    // Day 6 found the actual gap behind the two failing accept fixtures
+    // The actual gap behind the two failing accept fixtures
     // (`alg-conv-trans-acc-left`, `subject-reduction-redex`): eager reduces
     // `Acc.rec motive minor x (Acc.intro x g)` via ordinary iota (a
     // literal-constructor major), and the Value-native path couldn't —
@@ -12714,7 +12713,7 @@ mod tests {
     // occurrence, needing a binder-introducing rec-call `try_iota_value`
     // didn't build.
     //
-    // Day 7 implements both. `try_iota_value` no longer special-cases
+    // Both are implemented below. `try_iota_value` no longer special-cases
     // `num_indices` at all — indices are just extra major-position
     // arguments, skipped exactly like eager `try_iota` skips them. Once a
     // literal-constructor (or `Nat`-literal, or theorem-unfolds-to-one,
@@ -12803,7 +12802,7 @@ mod tests {
         env.rec_of.insert(1, 3);
     }
 
-    /// Shared plumbing for the Day 7 `MyAcc.rec` tests: `motive` and
+    /// Shared plumbing for the `MyAcc.rec` tests below: `motive` and
     /// `minor` (arity 3: the index field, the `g` field, and the "ih"
     /// rec-call — matching `iota_from_first_principles`'s field-then-rec
     /// ordering for `MyAcc.intro`'s two fields, one of which is
@@ -12886,8 +12885,8 @@ mod tests {
 
     /// The same recursor and minor, but the major is a bound variable —
     /// not a constructor application at all. Must still correctly decline
-    /// (stay a stuck `Neutral`), the same as before Day 7: the indexed/
-    /// higher-order rule only ever fires once a real constructor (or
+    /// (stay a stuck `Neutral`), the same as before the indexed/
+    /// higher-order rule was added: it only ever fires once a real constructor (or
     /// theorem-unfolds-to-one) major is found.
     #[test]
     fn try_iota_value_still_declines_when_major_is_not_a_ctor() {
@@ -12911,7 +12910,7 @@ mod tests {
         );
     }
 
-    // ---------------- NbE spike, Day 7 continued: the eager-rescue wiring bug ----------------
+    // ---------------- NbE spike: the eager-rescue wiring bug ----------------
     //
     // The two Acc-shape export fixtures still rejected with `infer_type`
     // wired even after `try_iota_value` grew the indexed/higher-order
