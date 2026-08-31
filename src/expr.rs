@@ -719,11 +719,36 @@ mod tests {
         assert_eq!(intern_node_count(), 0, "table itself is empty after reset");
         let a = bvar(0);
         let b = bvar(0);
-        assert!(
-            Rc::ptr_eq(&a, &b),
-            "post-clear intern must still hash-cons"
-        );
+        assert!(Rc::ptr_eq(&a, &b), "post-clear intern must still hash-cons");
         let _ = acc;
+    }
+
+    #[test]
+    fn bvar_occurrence_uses_index_after_intern_reset() {
+        // `elim_only_at_universe_zero` used to ask `args.iter().any(|a| **a ==
+        // *expr::bvar(i))`. `ExprNode::eq` is pointer identity. After
+        // `intern_clear_if_large`, env constructor terms still hold the old
+        // `BVar(i)` node while a fresh `bvar(i)` is a new allocation, so an
+        // Eq-shaped Prop inductive (data field occurring as a conclusion
+        // index) was false-restricted.
+        let args = vec![bvar(7), const_(1, vec![]), bvar(2)];
+        let old = args[2].clone();
+        assert!(intern_clear_if_large(0));
+        let expected = bvar(2);
+        assert!(
+            !Rc::ptr_eq(&old, &expected),
+            "reset must allocate a new intern node for BVar(2)"
+        );
+        assert!(
+            !args.iter().any(|a| **a == *expected),
+            "pointer equality is the intern-reset trap"
+        );
+        let want = 2u32;
+        assert!(
+            args.iter()
+                .any(|a| matches!(&***a, ExprData::BVar(i) if *i == want)),
+            "structural bvar index still finds the field in the conclusion"
+        );
     }
 
     #[test]
