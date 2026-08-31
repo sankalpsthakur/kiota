@@ -2356,6 +2356,20 @@ impl<'e> Checker<'e> {
         }
     }
 
+    /// Syntactic `… → Sort u` with `u ≠ 0`. `false` is not "is Prop": a
+    /// def-unfolded Prop family (`inductive singleton : Presieve X` with
+    /// `Presieve X := ∀ Y, (Y ⟶ X) → Prop`) peels to an app, not a Sort.
+    fn sort_codomain_is_nonzero_universe(ty: &Expr) -> bool {
+        let mut t = ty.clone();
+        loop {
+            match &**t {
+                ExprData::Pi(_, _, b) => t = b.clone(),
+                ExprData::Sort(l) => return !level::is_def_eq(l, &level::zero()),
+                _ => return false,
+            }
+        }
+    }
+
     fn const_typ(&self, n: u32) -> Option<&Expr> {
         match self.env.get(n)? {
             ConstantInfo::InductiveType { typ, .. }
@@ -2391,8 +2405,15 @@ impl<'e> Checker<'e> {
                     }) if (args.len() as u32) >= *num_params => !self.sort_codomain_is_prop(typ),
                     Some(ConstantInfo::Constructor { induct, .. }) => match self.env.get(*induct)
                     {
+                        // Only skip PI when the inductive's declared kind is
+                        // a non-Prop universe. `!sort_codomain_is_prop`
+                        // treated `singleton.mk` as data because the
+                        // inductive's type is the def `Presieve X`, not a
+                        // peeled `Sort 0` — then `eq_self`/`Eq.rec` of
+                        // `trivial` failed to convert with `singleton.mk`
+                        // (`FamilyOfElements.singletonEquiv._proof_3`).
                         Some(ConstantInfo::InductiveType { typ, .. }) => {
-                            !self.sort_codomain_is_prop(typ)
+                            Self::sort_codomain_is_nonzero_universe(typ)
                         }
                         _ => false,
                     },
@@ -10817,6 +10838,74 @@ mod tests {
             .is_def_eq(&Ctx::new(), &expr::const_(1, vec![]), &expr::const_(0, vec![]))
             .expect("defeq");
         assert!(!eq, "True and False must not convert by PI of Prop");
+    }
+
+    /// `inductive One : Pred` with `def Pred := True → Prop` is Prop-valued
+    /// only after unfolding `Pred`. The constructor must not be classified
+    /// as data, or PI fails to identify `One.mk` with another proof of
+    /// `One True.intro` (Mathlib `Presieve.singleton.mk`).
+    #[test]
+    fn def_codomain_prop_ctor_converts_by_pi() {
+        use crate::env::{ConstantInfo, Environment, ReducibilityHints};
+        let mut env = Environment::default();
+        insert_false_true(&mut env);
+        let true_ty = expr::const_(1, vec![]);
+        let intro = expr::const_(2, vec![]);
+        let sort0 = expr::sort(level::zero());
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            3,
+            ConstantInfo::Def {
+                level_params: vec![],
+                typ: sort1,
+                value: expr::pi(expr::BinderInfo::Default, true_ty.clone(), sort0),
+                hints: ReducibilityHints::Abbrev,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            4,
+            ConstantInfo::InductiveType {
+                level_params: vec![],
+                typ: expr::const_(3, vec![]),
+                num_params: 0,
+                num_indices: 1,
+                all: vec![4],
+                ctors: vec![5],
+                is_rec: false,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            5,
+            ConstantInfo::Constructor {
+                level_params: vec![],
+                typ: expr::app(expr::const_(4, vec![]), intro.clone()),
+                induct: 4,
+                cidx: 0,
+                num_params: 0,
+                num_fields: 0,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            6,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::app(expr::const_(4, vec![]), intro),
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["False", "True", "True.intro", "Pred", "One", "One.mk", "other"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let eq = tc
+            .is_def_eq(
+                &Ctx::new(),
+                &expr::const_(5, vec![]),
+                &expr::const_(6, vec![]),
+            )
+            .expect("defeq");
+        assert!(eq, "One.mk and another proof of One True.intro must convert by PI");
     }
 
     /// Two `Cl.mk` spines with PI-equal but not pointer-equal `True` fields
