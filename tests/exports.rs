@@ -728,6 +728,17 @@ fn prop_subsingleton_elim_data_field_rejects() {
     assert_reject("prop-subsingleton-elim-data-field.reject.ndjson");
 }
 
+/// Dual of `prop-subsingleton-elim-data-field`: one constructor, one data
+/// field, but the field occurs as an index in the constructor conclusion
+/// (`inductive Ok : Sort 1 → Prop | mk (x : Sort 1) : Ok x`), so large
+/// elim is allowed — the same Eq-shaped rule as `Eq.refl`. Recursor
+/// motive is `Sort u`. Does not depend on intern-pointer identity of
+/// conclusion bvars (see `bvar_occurrence_uses_index_after_intern_reset`).
+#[test]
+fn eq_shaped_index_field_accepts() {
+    assert_accept("eq-shaped-index-field.accept.ndjson");
+}
+
 /// Minimal dependency-closure slice, cut directly from a real
 /// `cedar-spec` export (not hand-assembled), of
 /// `Cedar.Spec.Value._sizeOf_3_eq` — the equation lemma bridging

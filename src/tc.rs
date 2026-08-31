@@ -8422,8 +8422,19 @@ impl<'e> Checker<'e> {
         }
         let (_, args) = expr::unfold_apps(&cur);
         for p in &to_check {
-            let expected = expr::bvar(pos - 1 - p);
-            if !args.iter().any(|a| **a == *expected) {
+            // De Bruijn *index*, not intern pointer. `intern_clear_if_large`
+            // drops the hash-cons table while env constructor types still
+            // hold the previous generation's `BVar` nodes; `expr::bvar(i)`
+            // then allocates a new node. `ExprNode::eq` is pointer identity,
+            // so that looks like "field missing from the conclusion" and
+            // falsely restricts large elim on Eq-shaped Prop inductives.
+            // Nested occurrences still do not count — only a top-level
+            // conclusion argument that is that bvar.
+            let want = pos - 1 - p;
+            if !args
+                .iter()
+                .any(|a| matches!(&***a, ExprData::BVar(i) if *i == want))
+            {
                 return Ok(true);
             }
         }
