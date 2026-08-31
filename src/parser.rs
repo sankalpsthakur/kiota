@@ -232,6 +232,10 @@ impl Parser {
         }
     }
 
+    fn name_str(&self, n: u32) -> &str {
+        self.names.get(n as usize).map(|s| s.as_str()).unwrap_or("")
+    }
+
     fn reject_if_dup(&self, name: u32) -> Result<(), TcError> {
         if self.env.get(name).is_some() {
             return Err(TcError::Reject(format!(
@@ -370,6 +374,20 @@ impl Parser {
             .cloned()
             .unwrap_or_default();
 
+        // Name -> declared `ctors` list, for every inductive type declared
+        // in *this* block. A constructor's `induct`/`cidx` are trusted
+        // metadata on the constructor's own JSON object, not derived from
+        // anything — without cross-checking them against the inductive's
+        // own `ctors` list below, a hand-crafted export can attach an
+        // arbitrary constructor (any name, any type) to an inductive that
+        // does not claim it (or does not exist at all), and the checker
+        // would treat it as a genuine inhabitant of whatever type its
+        // `type` field says, e.g. a constructor of `False` (see
+        // `orphan-ctor`: a `rogue` "constructor of `False`" whose `induct`
+        // names a `Orphan` inductive that this block, and the whole file,
+        // never declares).
+        let mut declared_ctors: std::collections::HashMap<u32, Vec<u32>> =
+            std::collections::HashMap::new();
         for t in &types {
             let name = Self::require_u32(t, "name")?;
             self.reject_if_dup(name)?;
@@ -390,6 +408,7 @@ impl Parser {
                         .unwrap_or("?")
                 )));
             }
+            declared_ctors.insert(name, ctor_names.clone());
             self.env.insert(
                 name,
                 ConstantInfo::InductiveType {
@@ -419,6 +438,32 @@ impl Parser {
                     "unsafe constructor `{}`",
                     self.names
                         .get(name as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or("?")
+                )));
+            }
+            let Some(owner_ctors) = declared_ctors.get(&induct) else {
+                return Err(TcError::Reject(format!(
+                    "constructor `{}` claims inductive `{}`, which this block does not declare",
+                    self.names
+                        .get(name as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or("?"),
+                    self.names
+                        .get(induct as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or("?")
+                )));
+            };
+            if owner_ctors.get(cidx as usize) != Some(&name) {
+                return Err(TcError::Reject(format!(
+                    "constructor `{}` is not `{}`'s own constructor at index {cidx}",
+                    self.names
+                        .get(name as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or("?"),
+                    self.names
+                        .get(induct as usize)
                         .map(|s| s.as_str())
                         .unwrap_or("?")
                 )));
@@ -469,6 +514,41 @@ impl Parser {
                         .unwrap_or("?")
                 )));
             }
+            // A recursor is only genuine if it was actually derived from
+            // an inductive declaration; nothing here re-derives it from
+            // one, so at minimum require that `all` isn't empty and that
+            // every name in it is a real inductive type declared in this
+            // same block. Without this, an `all: []` (or an `all`
+            // pointing at an undeclared name — the recursor-side twin of
+            // `orphan-ctor`'s constructor-side hole) recursor is added to
+            // the environment as a callable constant with no inductive
+            // ever associated with it, and nothing that only checks the
+            // recursors an inductive *does* claim ever looks at it again
+            // (`orphan-rec`: `all: []` on a `False`-typed `rogue`
+            // recursor with no motives/minors/rules, added anyway, then
+            // used directly as a "proof" of `False`).
+            if all.is_empty() {
+                return Err(TcError::Reject(format!(
+                    "recursor `{}` has an empty `all` (not derived from any inductive)",
+                    self.names.get(name as usize).map(|s| s.as_str()).unwrap_or("?")
+                )));
+            }
+            for ind in &all {
+                if !declared_ctors.contains_key(ind) {
+                    return Err(TcError::Reject(format!(
+                        "recursor `{}` claims inductive `{}`, which this block does not declare",
+                        self.names.get(name as usize).map(|s| s.as_str()).unwrap_or("?"),
+                        self.names.get(*ind as usize).map(|s| s.as_str()).unwrap_or("?"),
+                    )));
+                }
+            }
+            // Large-elimination check: see `Checker::elim_only_at_universe_zero`
+            // (`tc.rs`), run from `check_inductive_group` once this whole
+            // block's constants are in `self.env` and full type inference
+            // is available (needed for the "does a field live in Prop"
+            // part of Lean's own rule — not decidable from bare syntax
+            // the way the old, narrower `ctors.len() >= 2`-only check
+            // here used to approximate it).
             let rules = if let Some(arr) = r.get("rules").and_then(|x| x.as_array()) {
                 let mut out = Vec::with_capacity(arr.len());
                 for rule in arr {
@@ -519,6 +599,32 @@ impl Parser {
                 "extra recursor in inductive group ({} recs, expected {expected_recs})",
                 recs.len()
             )));
+        }
+        // `I.rec` is the name Lean reserves for `I`'s recursor, and it is the
+        // name every user of the recursor is compiled against. An export
+        // that supplies `I.not_rec` instead is not offering a constant the
+        // kernel would ever have built, so no amount of checking its *type*
+        // makes it legitimate. Nested auxiliaries are `I.rec_1`, `I.rec_2`,
+        // …; identity for iota stays rule constructors (see above), this
+        // only fixes what the constant may be called.
+        for r in &recs {
+            let rname = Self::get_u32(r, "name");
+            let rstr = self.name_str(rname);
+            let named_for_group = type_names.iter().any(|t| {
+                let tstr = self.name_str(*t);
+                match rstr.strip_prefix(tstr) {
+                    Some(".rec") => true,
+                    Some(suf) => suf
+                        .strip_prefix(".rec_")
+                        .is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit())),
+                    None => false,
+                }
+            });
+            if !named_for_group {
+                return Err(TcError::Reject(format!(
+                    "recursor `{rstr}` is not named `I.rec` for an inductive in this group"
+                )));
+            }
         }
         let mut seen_rec_for: FxHashSet<u32> = FxHashSet::default();
         for r in &recs {
@@ -635,7 +741,7 @@ impl Parser {
     /// `type_names`, including those found by instantiating a previous
     /// inductive's constructors (Array T also yields List T).
     fn counted_nested(&self, type_names: &[u32]) -> usize {
-        let mut seen: FxHashSet<usize> = FxHashSet::default();
+        let mut seen: FxHashSet<Expr> = FxHashSet::default();
         let mut work: Vec<Expr> = Vec::new();
         for &tname in type_names {
             let (ctors, nparams) = match self.env.get(tname) {
@@ -663,7 +769,7 @@ impl Parser {
         &self,
         e: &Expr,
         group: &[u32],
-        seen: &mut FxHashSet<usize>,
+        seen: &mut FxHashSet<Expr>,
         work: &mut Vec<Expr>,
     ) {
         match &***e {
@@ -700,7 +806,7 @@ impl Parser {
         us: &[Level],
         args: &[Expr],
         group: &[u32],
-        seen: &mut FxHashSet<usize>,
+        seen: &mut FxHashSet<Expr>,
         work: &mut Vec<Expr>,
     ) {
         if group.contains(&n) {
@@ -722,9 +828,21 @@ impl Parser {
         }
         let all = all.clone();
         for m in all {
+            // Keyed by the expression's own *structural* `Hash`/`Eq`
+            // (`ExprData` derives both, and `Rc<T>`'s in turn delegate to
+            // `T`'s), not by `Rc::as_ptr`: `expr::apps`/`expr::const_` both
+            // go through the global intern table, which already
+            // deduplicates by structural hash — `Const`'s own `us: Rc<Vec
+            // <Level>>` field hashes/compares structurally too, so
+            // `us.to_vec()` reallocating a fresh `Vec` each call is not
+            // itself the problem. The pointer was still unstable because
+            // `ctor_field_tys` (below) fed this call subtly different
+            // *values* for `params` on repeat visits to the same nested
+            // specialization (see its own doc comment), not merely
+            // different pointers to the same value; fixing that is what
+            // makes this structural key actually converge.
             let key_e = expr::apps(expr::const_(m, us.to_vec()), params);
-            let k = Rc::as_ptr(&key_e) as usize;
-            if !seen.insert(k) {
+            if !seen.insert(key_e) {
                 continue;
             }
             let (ctors, m_params, subst) = match self.env.get(m) {
@@ -915,6 +1033,7 @@ fn pi_telescope_len(typ: &Expr) -> u32 {
     }
 }
 
+
 fn ctor_field_tys(typ: &Expr, num_params: u32, inst: Option<&[Expr]>) -> Vec<Expr> {
     let mut cur = typ.clone();
     let mut peeled = 0u32;
@@ -931,12 +1050,39 @@ fn ctor_field_tys(typ: &Expr, num_params: u32, inst: Option<&[Expr]>) -> Vec<Exp
         let rev: Vec<Expr> = args.iter().rev().cloned().collect();
         cur = expr::instantiate(&cur, &rev);
     }
+    // Each successive field's domain lives one binder deeper than the
+    // last (`Pi(f0, Pi(f1, Pi(f2, ...)))`): a free variable referring to
+    // something *outside* this constructor's own telescope (e.g. the
+    // already-substituted outer params from `inst` above) sits at index
+    // `k` higher in the `k`-th field than in the first. Returning
+    // `dom.clone()` as-is silently left every field at its own,
+    // uncorrected depth. Callers that treat every entry of the returned
+    // `Vec` as living at the same (depth-0) frame of reference —
+    // `note_nested_app` does exactly this, scanning each field for
+    // occurrences of an outer group's own names and reusing the result as
+    // `params` for the *next* recursion level — then saw the outer
+    // params' bvar index drift upward by one per field position, and by
+    // one more with every additional nesting level recursed into. That is
+    // a genuine change in *value*, not just a fresh, unstable pointer to
+    // an unchanged value, so no amount of re-keying `note_nested_app`'s
+    // own dedup set fixes it on its own: each "repeat" visit to the same
+    // logical nested specialization (e.g. `Lean.PersistentHashMap.Node`'s
+    // `Array (Entry .. (Node ..))` cycling back through `List`/`Entry`)
+    // was really a *different* term one bvar index further out, so it
+    // never converged — turning what should be a small, finite BFS into
+    // one that never terminates. Shifting each field's domain down by its
+    // own position renormalizes it back to the same frame of reference as
+    // field 0; the shift's cutoff leaves any (rare) reference to a
+    // *sibling* field itself (index below the field's own position)
+    // untouched.
     let mut fields = Vec::new();
+    let mut k: u32 = 0;
     loop {
         match &**cur {
             ExprData::Pi(_, dom, body) => {
-                fields.push(dom.clone());
+                fields.push(expr::shift(dom, -(k as i32), k));
                 cur = body.clone();
+                k += 1;
             }
             _ => break,
         }

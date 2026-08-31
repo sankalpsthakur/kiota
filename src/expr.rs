@@ -76,6 +76,44 @@ impl Hash for ExprNode {
     }
 }
 
+// Interned terms form spines that can be thousands of nodes deep (e.g. a
+// left-nested `App` chain). The compiler-derived recursive drop would recurse
+// once per spine node and overflow the stack. Dismantle owned children with a
+// heap worklist so teardown depth is O(1) regardless of term depth.
+impl Drop for ExprNode {
+    fn drop(&mut self) {
+        let mut stack: Vec<Expr> = Vec::new();
+        take_children(&mut self.data, &mut stack);
+        while let Some(e) = stack.pop() {
+            if let Ok(mut node) = Rc::try_unwrap(e) {
+                take_children(&mut node.data, &mut stack);
+            }
+        }
+    }
+}
+
+/// Move any `Expr` children out of `d`, leaving a childless placeholder, so the
+/// caller can drop them iteratively instead of recursively.
+fn take_children(d: &mut ExprData, out: &mut Vec<Expr>) {
+    match std::mem::replace(d, ExprData::BVar(0)) {
+        ExprData::App(f, a) => {
+            out.push(f);
+            out.push(a);
+        }
+        ExprData::Lam(_, ty, body) | ExprData::Pi(_, ty, body) => {
+            out.push(ty);
+            out.push(body);
+        }
+        ExprData::Let(ty, val, body) => {
+            out.push(ty);
+            out.push(val);
+            out.push(body);
+        }
+        ExprData::Proj(_, _, v) => out.push(v),
+        ExprData::BVar(_) | ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => {}
+    }
+}
+
 pub type Expr = Rc<ExprNode>;
 
 fn ptr(e: &Expr) -> usize {
@@ -324,6 +362,31 @@ pub fn intern(d: ExprData) -> Expr {
 
 pub fn intern_node_count() -> usize {
     INTERN.with(|t| t.borrow().len())
+}
+
+/// Drop the hash-cons table's own lookup structure if it has grown past
+/// `threshold` nodes, returning whether it did. The lookup key is a
+/// structural hash of the node's content, not an address, so a miss
+/// after clearing just re-allocates an equal node — it cannot return a
+/// wrong one. Callers must drop every pointer-keyed cache *and* every
+/// map that holds a strong `Rc` into interned terms (`unfold_cache`,
+/// `iota_value_cache`, `iota_lit_memo`) *before* this runs: those maps
+/// otherwise pin the pre-clear generation, and `iota_lit_memo` keys on
+/// raw `usize` addresses that the allocator may reuse. A large finite
+/// threshold (well above Init, Std, or any existing fixture) keeps
+/// ordinary runs byte-for-byte unaffected. Cedar-scale exports hit it
+/// when the table's next capacity-doubling (~24M nodes → ~3.3 GB) is
+/// larger than one affordable allocation.
+pub fn intern_clear_if_large(threshold: usize) -> bool {
+    INTERN.with(|t| {
+        let mut t = t.borrow_mut();
+        if t.len() > threshold {
+            *t = Interner::default();
+            true
+        } else {
+            false
+        }
+    })
 }
 
 pub fn intern_calls() -> u64 {
@@ -634,6 +697,33 @@ mod tests {
             Rc::ptr_eq(&acc, &acc2),
             "primary intern map must still hash-cons after thousands of unique nodes"
         );
+    }
+
+    #[test]
+    fn intern_clear_if_large_is_a_noop_under_threshold() {
+        let _ = const_(1, vec![]);
+        let n = intern_node_count();
+        assert!(!intern_clear_if_large(n.saturating_add(1)));
+        assert_eq!(intern_node_count(), n);
+    }
+
+    #[test]
+    fn intern_clear_if_large_resets_table_and_still_hash_conses() {
+        let mut acc = bvar(0);
+        for i in 0..200u32 {
+            acc = app(acc, lit_nat(BigUint::from(i)));
+        }
+        let n = intern_node_count();
+        assert!(n > 50, "setup interned {n} nodes");
+        assert!(intern_clear_if_large(50));
+        assert_eq!(intern_node_count(), 0, "table itself is empty after reset");
+        let a = bvar(0);
+        let b = bvar(0);
+        assert!(
+            Rc::ptr_eq(&a, &b),
+            "post-clear intern must still hash-cons"
+        );
+        let _ = acc;
     }
 
     #[test]

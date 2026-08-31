@@ -2,13 +2,60 @@ use crate::env::{ConstantInfo, Environment, QuotKind, ReducibilityHints};
 use crate::expr::{self, BinderInfo, Expr, ExprData, Lit};
 use crate::level::{self, Level};
 use crate::nat;
+use crate::nbe;
 use num_bigint::{BigInt, BigUint, Sign};
 use rustc_hash::FxHashMap;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 thread_local! {
+    /// Recursion guard for `pub fn infer_type`'s `KIOTA_NBE=1` dispatch,
+    /// mirroring `DEFEQ_DEPTH`/`WHNF_DEPTH`/`CORE_DEPTH`'s existing use of
+    /// `CONV_DEPTH` as a shared cap: a genuine bug in the fallback chain
+    /// between `infer_type_via_nbe` and eager (confirmed once already —
+    /// `infer_type_value_fallback` calling the dispatching `infer_type`
+    /// instead of `infer_type_cached` was an unconditional infinite loop
+    /// before that was fixed) should decline, not segfault. The eager-only
+    /// path (`infer_type_cached`) is unaffected: this counter only wraps
+    /// the outer dispatch, exactly like `is_def_eq`'s `DEFEQ_DEPTH`.
+    static INFER_DEPTH: Cell<u32> = const { Cell::new(0) };
     static DEFEQ_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// Set for the duration of an "eager rescue" fallback (see
+    /// `with_forced_eager_defeq`): `pub fn is_def_eq`'s NbE dispatch is
+    /// a per-call decision, so a fallback that calls `is_def_eq_inner`
+    /// directly at its own top level still re-enters `is_def_eq_via_nbe`
+    /// as soon as `is_def_eq_core_go` recurses into a nested comparison
+    /// (Pi/Lam bodies, `app_spines_congruent`'s pairwise/`defeq_args`
+    /// args) — those recurse through the *dispatching* `is_def_eq`, not
+    /// `is_def_eq_inner`. This flag makes the whole recursive subtree of
+    /// one fallback attempt stay eager, not just its first call.
+    static FORCE_EAGER_DEFEQ: Cell<bool> = const { Cell::new(false) };
+    /// Set for the duration of `infer_type_via_nbe`'s own call tree (see
+    /// `infer_type`). Eager never proactively reduces a Prop-major
+    /// recursor application it doesn't have to: comparing `f 1 h` vs
+    /// `f 1 (Acc.intro …)` succeeds via proof irrelevance on `f`'s own
+    /// Prop-typed parameter *without ever unfolding `f`* (see
+    /// `try_unreduced_const_congruence`'s comment). `eval` has no such
+    /// laziness — it always fully reduces, so `infer_type_value`
+    /// evaluating two different Lambda's domains this way can see one
+    /// side's `Acc.rec` iota-reduce (major already a literal/theorem-
+    /// unfolds-to-a constructor) while the other's stays opaque, landing
+    /// on genuinely different normal forms (`Acc.rec … 1 …` vs
+    /// `Acc.rec … 0 …`) that eager never has to reconcile because it
+    /// never gets that far. `try_iota_value` checks this flag and departs
+    /// from `eval`'s "always fully reduce" default specifically for
+    /// Prop-major recursors (`recursor_unfolds_thm_major`'s Acc-shape
+    /// check) while it's set, staying neutral instead — the same
+    /// `app_arg_type_ok_eager`/`value_type_ok_eager` rescue this was
+    /// already falling back to still confirms it, now by comparing
+    /// *unreduced* forms that resolve via the same proof-irrelevance
+    /// shortcut eager uses, instead of two already-diverged reduced ones.
+    /// Never set during `is_def_eq_via_nbe`'s own comparison or plain
+    /// `eval`/`is_def_eq`: those still want full iota reduction, since
+    /// comparing two already-*Value*-space terms via `values_def_eq` is
+    /// exactly the case where reducing both sides to the same normal form
+    /// is the fast, legitimate confirmation.
+    static SUPPRESS_PROP_MAJOR_ITOA: Cell<bool> = const { Cell::new(false) };
     static WHNF_DEPTH: Cell<u32> = const { Cell::new(0) };
     /// `whnf_core` → iota → `whnf_major` → `whnf_core` is not counted by
     /// `WHNF_DEPTH` (that only wraps the outer `whnf` entry). Unbounded it
@@ -828,6 +875,24 @@ fn decline<T>(msg: impl Into<String>) -> R<T> {
     Err(TcError::Decline(msg.into()))
 }
 
+/// Pointer-identity `Rc<nbe::Thunk>` wrapper for `iota_value_cache`'s key.
+/// Unlike a bare `usize`, holding the `Rc` here keeps the thunk allocation
+/// alive for as long as the cache entry does, so a later, unrelated thunk
+/// can never be allocated at the same address and collide with this key.
+#[derive(Clone)]
+struct ThunkPtrKey(Rc<nbe::Thunk>);
+impl PartialEq for ThunkPtrKey {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for ThunkPtrKey {}
+impl std::hash::Hash for ThunkPtrKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (Rc::as_ptr(&self.0) as usize).hash(state)
+    }
+}
+
 pub struct Checker<'e> {
     pub env: &'e Environment,
     pub names: &'e [std::rc::Rc<String>],
@@ -837,10 +902,34 @@ pub struct Checker<'e> {
     whnf_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
     whnf_core_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
     defeq_cache: RefCell<FxHashMap<(u64, usize, usize), bool>>,
+    /// `FORCE_EAGER_DEFEQ`-only namespace for the four caches directly
+    /// above (see `with_forced_eager_defeq`'s comment). `is_def_eq_inner`/
+    /// `infer_type_cached`/`whnf`/`whnf_core` are not invariant under
+    /// `FORCE_EAGER_DEFEQ`: their own recursive calls go through the
+    /// *dispatching* `is_def_eq`/`infer_type`, which take a different
+    /// path (eager vs NbE) depending on the flag, so a cached answer
+    /// computed one way is not generally safe to reuse computed the
+    /// other way (a stale-cache bug fixed by giving the two paths
+    /// separate caches). Skipping caching during a rescue entirely was
+    /// tried first — correct but wasteful, since every rescue then
+    /// re-did all its own work from scratch, 2.7x-3.8x more `Ir` than
+    /// eager on every fixture that needed one. Giving
+    /// `FORCE_EAGER_DEFEQ`-computed answers their own cache keeps them
+    /// still pure, deterministic answers for a given `(ctx, expr)` key
+    /// *as long as they were computed under the same flag*, so this is
+    /// exactly as safe as the shared cache was before a rescue path
+    /// existed at all, just kept in a separate map so a rescue's answer
+    /// can never leak into (or be leaked into by) a non-rescue lookup.
+    eager_whnf_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
+    eager_whnf_core_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
+    eager_defeq_cache: RefCell<FxHashMap<(u64, usize, usize), bool>>,
+    eager_infer_cache: RefCell<FxHashMap<(u64, usize), (Expr, bool)>>,
     /// `(const name, levels)` to unfolded value, memoized like the C++ kernel's
     /// `m_unfold`. The delta path can unfold the same def/theorem at the same
     /// levels over and over; re-instantiating a large body each time (O(size)
-    /// `instantiate_level_params`) is what made `_proof_1_1` blow up.
+    /// `instantiate_level_params`) is what made `_proof_1_1` blow up. Kept
+    /// across declarations until the intern table is reset: after that the
+    /// entries pin a pre-clear generation and must go in the same reset.
     unfold_cache: RefCell<FxHashMap<(u32, Vec<Level>), Expr>>,
     /// `(context id, term)` to inferred type. Unlike the caches above this one
     /// works under binders, which is where the redundancy actually is: a term
@@ -852,6 +941,37 @@ pub struct Checker<'e> {
     /// Consts whose telescope has a Prop-inductive binder (`USquash`, `Eq`).
     /// Only those spines need `defeq_args`; everything else stays pairwise.
     proof_arg_cache: RefCell<FxHashMap<u32, bool>>,
+    /// `(rname, us, pointer-identity of params+motives+minors+major)` to
+    /// the already-reduced NbE `Value` (`KIOTA_NBE=1` only). This is what
+    /// lets two independently-evaluated sides that bottom out in "the same"
+    /// recursor call (same closures, same literal) collapse to one shared
+    /// `Rc`, so the later `Rc::ptr_eq` fast path in `values_def_eq` fires
+    /// instead of re-walking a `below`-sized structure.
+    ///
+    /// The key holds the actual `Rc<Thunk>` clones (via `ThunkPtrKey`), not
+    /// bare `usize` addresses: keying on a dropped thunk's address would
+    /// let an unrelated, later thunk that the allocator reuses that address
+    /// for collide with a stale entry and return a wrong (and, for a
+    /// self-referential `Nat.rec` chain, non-terminating) cached value.
+    /// Holding the `Rc` here keeps the address live for as long as the
+    /// cache entry does.
+    iota_value_cache: RefCell<FxHashMap<(u32, Vec<Level>, Vec<ThunkPtrKey>), Rc<nbe::Value>>>,
+    /// Eager-path counterpart: `(rname, us, motive-ptrs, minor-ptrs, literal
+    /// n) → one iota-peel result`, independent of `KIOTA_NBE`. Safe by
+    /// construction (unlike the NbE cache above, the key clones the
+    /// `BigUint`/`Level`s by value rather than keying on the literal's own
+    /// address, and `motives`/`minors` are borrowed from `args`, which the
+    /// caller keeps alive for the whole call — no dangling-pointer-reuse
+    /// risk to replicate here).
+    iota_lit_memo: RefCell<FxHashMap<(u32, Vec<Level>, Vec<usize>, Vec<usize>, BigUint), Expr>>,
+    /// Test/diagnostic only: counts `iota_lit_memo` misses (i.e. actual
+    /// `iota_from_first_principles` derivations of a Nat-literal peel).
+    iota_lit_memo_misses: std::cell::Cell<u32>,
+    /// Test-only override for whether `iota_lit_memo` is consulted, so a
+    /// test can disable it on *this* `Checker` without mutating the
+    /// process-wide `KIOTA_NO_IOTA_MEMO` env var (which `cargo test`'s
+    /// parallel test threads would otherwise race on).
+    iota_memo_override: std::cell::Cell<Option<bool>>,
     /// Consecutive `Nat.rec` peels of one `bits() >= 20` literal countdown.
     fuel_nat_peels: std::cell::Cell<u32>,
     /// Last bits≥20 literal peeled; used to detect one hugeFuel countdown.
@@ -880,6 +1000,23 @@ pub struct Checker<'e> {
     /// Eq/HEq argument heads only (not nested / value-scan). `f.eq_def`
     /// must unfold `f` even when `f` is circuit-like.
     eq_arg_heads: RefCell<Vec<u32>>,
+    /// The constant whose own declaration is being checked right now. Real
+    /// Lean's kernel adds a declaration to the environment only once it has
+    /// accepted it, so a declaration's type and value are checked against an
+    /// environment that does not yet contain it, and a reference to the
+    /// declaration's own name inside either is an unresolved identifier. The
+    /// export format cannot express recursion anyway (Lean compiles it to
+    /// recursors or well-founded fixpoints), so a value that does refer to
+    /// its own name is asserting itself: `theorem selfProof : ∀ p, p :=
+    /// selfProof`. This checker instead inserts each declaration into
+    /// `self.env` before `check_decl` runs (so the rest of a mutual block
+    /// can be built), so `infer_const`/`unfold_def` hide the one constant
+    /// under check for the duration of its own check — an O(1) check on
+    /// every constant lookup, in contrast to a one-shot recursive scan of
+    /// the whole declaration value for the name, which revisits every
+    /// shared subterm of a hash-consed DAG and can blow up on a proof term
+    /// with heavy sharing.
+    declaring: std::cell::Cell<Option<u32>>,
 }
 
 thread_local! {
@@ -1020,6 +1157,20 @@ impl std::ops::Index<usize> for Ctx {
     }
 }
 
+/// Shift every parameter expression recorded in the positivity checker's
+/// nested-functor `visiting` list by `by`, so entries captured at one de
+/// Bruijn context depth stay meaningful after more binders are pushed (see
+/// `check_arg_positive_in` / `check_specialized_ctor_positive`).
+fn shift_visiting(visiting: &[(u32, Vec<Expr>)], by: i32) -> Vec<(u32, Vec<Expr>)> {
+    if by == 0 {
+        return visiting.to_vec();
+    }
+    visiting
+        .iter()
+        .map(|(n, ps)| (*n, ps.iter().map(|p| expr::shift(p, by, 0)).collect()))
+        .collect()
+}
+
 pub(crate) fn expr_size_capped(e: &Expr, cap: u32) -> u32 {
     let mut n = 0u32;
     let mut stack = vec![e.clone()];
@@ -1105,9 +1256,17 @@ impl<'e> Checker<'e> {
             whnf_cache: RefCell::new(FxHashMap::default()),
             whnf_core_cache: RefCell::new(FxHashMap::default()),
             defeq_cache: RefCell::new(FxHashMap::default()),
+            eager_whnf_cache: RefCell::new(FxHashMap::default()),
+            eager_whnf_core_cache: RefCell::new(FxHashMap::default()),
+            eager_defeq_cache: RefCell::new(FxHashMap::default()),
+            eager_infer_cache: RefCell::new(FxHashMap::default()),
             infer_cache: RefCell::new(FxHashMap::default()),
             proof_arg_cache: RefCell::new(FxHashMap::default()),
             unfold_cache: RefCell::new(FxHashMap::default()),
+            iota_value_cache: RefCell::new(FxHashMap::default()),
+            iota_lit_memo: RefCell::new(FxHashMap::default()),
+            iota_lit_memo_misses: std::cell::Cell::new(0),
+            iota_memo_override: std::cell::Cell::new(None),
             fuel_nat_peels: std::cell::Cell::new(0),
             fuel_nat_last: std::cell::RefCell::new(None),
             infer_only: std::cell::Cell::new(false),
@@ -1117,6 +1276,7 @@ impl<'e> Checker<'e> {
             checking_simple_prop_inductive: std::cell::Cell::new(false),
             eq_related_defs: RefCell::new(Vec::new()),
             eq_arg_heads: RefCell::new(Vec::new()),
+            declaring: std::cell::Cell::new(None),
         }
     }
 
@@ -1379,7 +1539,6 @@ impl<'e> Checker<'e> {
         // Pointer-keyed WHNF/defeq/infer caches are only useful inside one
         // declaration. Keeping them across decls is how `#3491`–`#3495`
         // grew from ~0.9 GB to multi-GB before the next omega proof.
-        // `unfold_cache` is keyed by (const, levels) and is reused.
         expr::clear_subst_memos();
         CTX_IDS.with(|m| m.borrow_mut().clear());
         CTX_NEXT.with(|c| c.set(1));
@@ -1387,6 +1546,55 @@ impl<'e> Checker<'e> {
         self.whnf_core_cache.borrow_mut().clear();
         self.defeq_cache.borrow_mut().clear();
         self.infer_cache.borrow_mut().clear();
+        // `ctx_key`s (via `CTX_NEXT`, reset above) are reused across
+        // declarations, so a stale eager-namespace entry from the last
+        // declaration would be keyed identically but mean something
+        // different here. These must land *before* `intern_clear_if_large`:
+        // they are pointer-keyed, and dropping the intern table can free
+        // an `Expr` whose address the allocator then reuses. Clearing them
+        // in the same reset is not enough if the intern drop happens first
+        // and anything in between allocates.
+        self.eager_whnf_cache.borrow_mut().clear();
+        self.eager_whnf_core_cache.borrow_mut().clear();
+        self.eager_defeq_cache.borrow_mut().clear();
+        self.eager_infer_cache.borrow_mut().clear();
+        // The hash-cons table itself is the one node-lifetime root the
+        // above never bounded: it holds a strong `Rc` to every distinct
+        // `Expr` ever built, for the life of the process, regardless of
+        // whether any later declaration can still reach it. On a
+        // cedar.ndjson-scale export (tens of thousands of declarations)
+        // that table's own size — not any one recursive term — grows
+        // into a single doubling allocation (~24M nodes → next resize
+        // ~3.3 GB) too large for the process to satisfy, aborting
+        // outright instead of continuing to the next declaration.
+        //
+        // `unfold_cache` is keyed by (const, levels), not an address, so
+        // it is safe to keep across declarations *until* the intern table
+        // is dropped. After that its entries pin pre-clear bodies while
+        // everything newly interned is a post-clear generation: `ptr_eq`
+        // and the pointer-keyed defeq cache miss on the largest terms.
+        // `iota_lit_memo` *is* pointer-keyed (`Vec<usize>` of motive/
+        // minor addresses) and `iota_value_cache` holds `Rc` to those
+        // thunks, so both must go before the intern drop or a recycled
+        // address is a wrong hit. Ordinary runs never cross 4M nodes, so
+        // Init/Std keep the unfold memo.
+        const INTERN_RESET: usize = 4_000_000;
+        if expr::intern_node_count() > INTERN_RESET {
+            let intern_before = expr::intern_node_count();
+            let unfold_before = self.unfold_cache.borrow().len();
+            self.unfold_cache.borrow_mut().clear();
+            self.iota_value_cache.borrow_mut().clear();
+            self.iota_lit_memo.borrow_mut().clear();
+            expr::intern_clear_if_large(INTERN_RESET);
+            if std::env::var_os("KIOTA_INTERN_RESET_LOG").is_some() {
+                eprintln!(
+                    "INTERN_RESET decl={} intern {intern_before}→{} unfold={unfold_before}→{}",
+                    self.name_str(name),
+                    expr::intern_node_count(),
+                    self.unfold_cache.borrow().len(),
+                );
+            }
+        }
         if std::env::var_os("KIOTA_TRACE_DECL").is_some() {
             eprintln!("DECL {kind} {}", self.name_str(name));
         }
@@ -1404,6 +1612,12 @@ impl<'e> Checker<'e> {
                 seen.push(*p);
             }
         }
+        // Only reached for axiom/def/theorem/opaque (see `check_last`'s
+        // callers), none of which Lean lets mention themselves; the parser
+        // has already inserted this one into `self.env` so the rest of a
+        // mutual block can be built, so hide it again for the duration of
+        // its own check (`infer_const`/`unfold_def`).
+        self.declaring.set(Some(name));
         let typ = ci.typ();
         let ctx: Ctx = Ctx::new();
         let sort = self.infer_type(&ctx, typ)?;
@@ -1425,14 +1639,19 @@ impl<'e> Checker<'e> {
         }
         if let Some(value) = ci.value() {
             let vt = self.infer_type(&ctx, value)?;
-            if !self.is_def_eq(&ctx, &vt, typ)? {
+            if !self.is_def_eq(&ctx, &vt, typ)? && !self.value_type_ok_eager(&ctx, value, typ)? {
                 if std::env::var_os("KIOTA_DEBUG").is_some() {
+                    let eager_vt = self
+                        .infer_type_cached(&ctx, value)
+                        .map(|t| self.pp_budget(&t, 40))
+                        .unwrap_or_else(|e| format!("<eager infer failed: {e:?}>"));
                     return reject(format!(
-                        "{kind} {name}: value type does not match declared type\n  got:      {}\n  expected: {}\n  got_whnf: {}\n  exp_whnf: {}",
+                        "{kind} {name}: value type does not match declared type\n  got:      {}\n  expected: {}\n  got_whnf: {}\n  exp_whnf: {}\n  eager_vt: {}",
                         self.pp_budget(&vt, 40),
                         self.pp_budget(typ, 40),
                         self.pp_budget(&self.whnf(&ctx, &vt).unwrap_or_else(|_| vt.clone()), 40),
                         self.pp_budget(&self.whnf(&ctx, typ).unwrap_or_else(|_| typ.clone()), 40),
+                        eager_vt,
                     ));
                 }
                 return reject(format!(
@@ -1472,7 +1691,7 @@ impl<'e> Checker<'e> {
             if !self.eager_whnf_unfolds(*n) {
                 return Ok(core);
             }
-            let Some(unfolded) = self.unfold_def(*n, us)? else {
+            let Some(unfolded) = self.unfold_delta(*n, us, true)? else {
                 return Ok(core);
             };
             let (_, args) = expr::unfold_apps(&core);
@@ -1528,15 +1747,90 @@ impl<'e> Checker<'e> {
 
     // ---------------- Type inference ----------------
 
+    // History: wiring `infer_type` behind `KIOTA_NBE=1` first found two
+    // accept fixtures (`alg-conv-trans-acc-left`, `subject-reduction-redex`)
+    // newly rejecting, and was reverted. Fixing the hypothesized cause
+    // (context reconstruction by quoting) still left the fixtures failing,
+    // tracing down to the *actual* cause: eager reduces `Acc.rec motive
+    // minor x (Acc.intro x g)` via ordinary iota, and `try_iota_value`
+    // couldn't match that (`Acc` is indexed and `Acc.intro`'s recursive
+    // field is higher-order). Implementing that rule and re-wiring still
+    // left both fixtures rejecting — a *different*, smaller mismatch:
+    // eager's own comparison never re-derives an `Acc.rec`-headed type at
+    // all, because it succeeds by comparing an *unreduced* wrapper
+    // application (`f 1 h` vs `f 1 (Acc.intro …)`) via proof irrelevance
+    // on the wrapper's Prop-typed parameter, without ever unfolding the
+    // wrapper. `infer_type_value`'s `App` case, by contrast, calls `eval`
+    // — which always fully reduces, unfolding the wrapper and then
+    // iota-reducing its `Acc.rec` — so it can see an asymmetric "peel"
+    // (one side's major stayed opaque, the other's was already a literal
+    // constructor) that eager never reaches.
+    //
+    // `app_arg_type_ok_eager`/`value_type_ok_eager` (see their own
+    // comments) close that gap: when the Value-native comparison doesn't
+    // confirm, re-derive both sides' types the fully eager way and
+    // compare those instead, matching eager's own judgment exactly. Two
+    // more bugs had to be fixed before that rescue was actually eager end
+    // to end — see `FORCE_EAGER_DEFEQ`'s comment (`is_def_eq`'s own
+    // dispatch not respecting it once it recursed into a Pi/Lam body) and
+    // `infer_type`'s own dispatch check just below (it checked only
+    // `nbe::nbe_enabled()`, so `infer_type_uncached`'s recursive calls
+    // kept re-entering `infer_type_via_nbe`) — plus gating
+    // `defeq_cache`/`infer_cache`/`whnf_cache`/`whnf_core_cache` by the
+    // same flag, so a rescue can't read a stale, non-forced entry (or
+    // vice versa) for the same key. With all of that, both fixtures
+    // accept and the wire stays: `check_decl`'s `is_def_eq(&ctx,&vt,typ)`
+    // and `infer_type_value`'s own App-argument check now fall back to
+    // the eager rescue rather than rejecting outright.
     pub fn infer_type(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         crate::stats::infer_call();
+        // `FORCE_EAGER_DEFEQ` also gates `infer_type`'s own dispatch, not
+        // just `is_def_eq`'s (see `with_forced_eager_defeq`'s comment):
+        // `infer_type_uncached`'s own recursive calls (App's `f`/`a`, Lam's
+        // body, …) go through this same dispatching `infer_type`, not
+        // `infer_type_cached` directly, so without this an "eager rescue"
+        // started via `infer_type_cached` at its own top level would still
+        // re-enter `infer_type_via_nbe` for every sub-expression.
+        if !nbe::nbe_enabled() || FORCE_EAGER_DEFEQ.with(Cell::get) {
+            return self.infer_type_cached(ctx, e);
+        }
+        let depth = INFER_DEPTH.with(|d| {
+            let n = d.get() + 1;
+            d.set(n);
+            n
+        });
+        if depth > CONV_DEPTH {
+            INFER_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            return decline("infer_type depth limit");
+        }
+        let r = self.infer_type_via_nbe(ctx, e);
+        INFER_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        r
+    }
+
+    fn infer_type_cached(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         // Closed → 0. Open `loose = k` → k innermost binders, not the full
         // telescope: a 34k DAG with one loose bvar must not re-Check under
         // every extra PSigma/Acc motive (`._unary` well-founded proofs).
         let ctx_key = ctx.term_ctx_key(e);
         let key = (ctx_key, Self::ptr_key(e));
         let infer_only = self.infer_only.get();
-        if let Some((t, checked)) = self.infer_cache.borrow().get(&key) {
+        // `FORCE_EAGER_DEFEQ` ("eager rescue", see `with_forced_eager_defeq`)
+        // reads and writes its own namespaced cache (`eager_infer_cache`):
+        // a sub-expression's type here may differ depending on whether one
+        // of *its own* App-argument checks (line ~1693's `is_def_eq`)
+        // re-dispatched into NbE, which can reject where eager alone
+        // wouldn't (the same over-reduction `app_arg_type_ok_eager`'s own
+        // comment describes). Namespacing means a rescue still benefits
+        // from caching its own (and later rescues') repeated work, without
+        // ever reading or writing the non-forced cache.
+        let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
+        let cache_ref = if force_eager {
+            &self.eager_infer_cache
+        } else {
+            &self.infer_cache
+        };
+        if let Some((t, checked)) = cache_ref.borrow().get(&key) {
             if infer_only || *checked {
                 crate::stats::infer_hit();
                 return Ok(t.clone());
@@ -1545,7 +1839,7 @@ impl<'e> Checker<'e> {
         let t = self.infer_type_uncached(ctx, e)?;
         let checked = !self.infer_only.get();
         {
-            let mut cache = self.infer_cache.borrow_mut();
+            let mut cache = cache_ref.borrow_mut();
             match cache.get_mut(&key) {
                 Some((old, was_checked)) if checked && !*was_checked => {
                     *old = t.clone();
@@ -1634,6 +1928,12 @@ impl<'e> Checker<'e> {
     }
 
     fn infer_const(&self, n: u32, us: &[Level]) -> R<Expr> {
+        if self.declaring.get() == Some(n) {
+            return reject(format!(
+                "`{}` refers to itself; it is not in the environment until it is checked",
+                self.name_str(n)
+            ));
+        }
         let ci = self
             .env
             .get(n)
@@ -1699,39 +1999,85 @@ impl<'e> Checker<'e> {
             let (_, _dom, body) = self.ensure_pi(ctx, &ct)?;
             ct = expr::instantiate1(&body, p);
         }
-        // walk `idx` fields, substituting earlier fields with proj v i
-        let mut field_types = Vec::new();
+        // Every field's own type, substituting each earlier field with
+        // its own `proj sname i v` term as we walk the telescope — needed
+        // for *every* field (not only up to `idx`) to check the
+        // "dependent data field" rule below across the whole structure.
+        let mut doms: Vec<Expr> = Vec::with_capacity(num_fields as usize);
         let mut cur = ct;
-        for _ in 0..num_fields {
+        for i in 0..num_fields {
             let (_, dom, body) = self.ensure_pi(ctx, &cur)?;
-            field_types.push(dom.clone());
-            cur = body;
-            // note body still has a dangling bvar 0 representing this field;
-            // we substitute concretely below once we know which projections to build.
-            break;
-        }
-        // Re-derive properly: substitute proj(v,0)..proj(v,idx-1) into the telescope.
-        let mut ct2 = {
-            let subst2 = level::subst_map(&ctor_lp, &us);
-            let mut t = expr::instantiate_level_params(&ctor_typ, &subst2);
-            for p in args.iter().take(num_params as usize) {
-                let (_, _d, body) = self.ensure_pi(ctx, &t)?;
-                t = expr::instantiate1(&body, p);
-            }
-            t
-        };
-        for i in 0..idx {
-            let (_, _dom, body) = self.ensure_pi(ctx, &ct2)?;
+            doms.push(dom.clone());
             let proj_i = expr::proj(sname, i, v.clone());
-            ct2 = expr::instantiate1(&body, &proj_i);
+            cur = expr::instantiate1(&body, &proj_i);
         }
-        let (_, dom, _body) = self.ensure_pi(ctx, &ct2)?;
         if self.is_prop(ctx, &vtw)? {
-            if !self.is_prop(ctx, &dom)? {
+            // Lean's kernel rejects a projection out of a Prop-valued,
+            // single-constructor structure unless (a) the projected
+            // field is itself provably Prop at this instantiation, and
+            // (b) no *earlier* field is a "dependent data field": a
+            // field that is itself data (not Prop) and is referenced by
+            // some field's own type, anywhere in the telescope — not
+            // only by fields up to `idx`. Once such a field exists,
+            // extracting anything after it in the telescope is unsound
+            // (proof irrelevance forbids recovering that data field's
+            // value), even for a later field whose own type never
+            // mentions it (`094_projProp6`/`097_projMaybePropPast`:
+            // rejected purely for coming after `someMoreData`/`field`,
+            // not for using it). `091_projProp3`/`096_projMaybeProp`:
+            // a data field that *isn't* referenced by anything later is
+            // "non-dependent" and does not block subsequent projections.
+            if !self.is_prop(ctx, &doms[idx as usize])? {
                 return reject("cannot project a Type field from a Prop structure");
             }
+            let mut referenced = Vec::new();
+            for dom_k in &doms {
+                Self::collect_proj_indices(dom_k, sname, v, &mut referenced);
+            }
+            let mut dependent_data_bound: Option<u32> = None;
+            for j in referenced {
+                if (j as usize) < doms.len()
+                    && !self.is_prop(ctx, &doms[j as usize])?
+                    && dependent_data_bound.is_none_or(|m| j < m)
+                {
+                    dependent_data_bound = Some(j);
+                }
+            }
+            if let Some(m) = dependent_data_bound {
+                if idx >= m {
+                    return reject(
+                        "cannot project a Prop field that comes after a dependent data field",
+                    );
+                }
+            }
         }
-        Ok(dom)
+        Ok(doms[idx as usize].clone())
+    }
+
+    /// Collects every `i` such that `proj sname i v` occurs as a subterm
+    /// of `e` (matching `v` by pointer identity, since every occurrence
+    /// built by `infer_proj`'s own substitution loop clones the same
+    /// `Rc`). Used to find which earlier fields a later field's type
+    /// actually mentions.
+    fn collect_proj_indices(e: &Expr, sname: u32, v: &Expr, out: &mut Vec<u32>) {
+        match &***e {
+            ExprData::Proj(s, i, inner) if *s == sname && Rc::ptr_eq(inner, v) => out.push(*i),
+            ExprData::Proj(_, _, inner) => Self::collect_proj_indices(inner, sname, v, out),
+            ExprData::App(f, a) => {
+                Self::collect_proj_indices(f, sname, v, out);
+                Self::collect_proj_indices(a, sname, v, out);
+            }
+            ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
+                Self::collect_proj_indices(t, sname, v, out);
+                Self::collect_proj_indices(b, sname, v, out);
+            }
+            ExprData::Let(t, val, b) => {
+                Self::collect_proj_indices(t, sname, v, out);
+                Self::collect_proj_indices(val, sname, v, out);
+                Self::collect_proj_indices(b, sname, v, out);
+            }
+            _ => {}
+        }
     }
 
     fn occurs_bvar(e: &Expr, i: u32) -> bool {
@@ -1811,25 +2157,7 @@ impl<'e> Checker<'e> {
         all: &[u32],
         params: &[Expr],
         major: &Expr,
-    ) -> R<Option<(u32, u32, Vec<Expr>)>> {
-        if all.len() != 1 {
-            return Ok(None);
-        }
-        let tname = all[0];
-        if !self.is_non_rec_structure(tname) {
-            return Ok(None);
-        }
-        let (ctors, num_params) = match self.env.get(tname) {
-            Some(ConstantInfo::InductiveType {
-                ctors, num_params, ..
-            }) => (ctors.clone(), *num_params),
-            _ => return Ok(None),
-        };
-        let cname = ctors[0];
-        let nfields = match self.env.get(cname) {
-            Some(ConstantInfo::Constructor { num_fields, .. }) => *num_fields,
-            _ => return Ok(None),
-        };
+    ) -> R<Option<(u32, u32, Vec<Expr>, Vec<Level>)>> {
         let mt = match self.infer_type(ctx, major) {
             Ok(t) => t,
             Err(e) => {
@@ -1847,50 +2175,75 @@ impl<'e> Checker<'e> {
         if self.is_prop(ctx, &mtw)? {
             if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
                 eprintln!(
-                    "IOTA to_ctor skip Prop structure {} ty={}",
-                    self.name_str(tname),
+                    "IOTA to_ctor skip Prop structure ty={}",
                     self.pp_budget(&mtw, 10)
                 );
             }
             return Ok(None);
         }
         let (thead, targs) = expr::unfold_apps(&mtw);
-        match &**thead {
-            ExprData::Const(n, _) if *n == tname => {
-                if targs.len() < num_params as usize {
-                    if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
-                        eprintln!(
-                            "IOTA to_ctor underapplied {} targs={} nparams={}",
-                            self.name_str(tname),
-                            targs.len(),
-                            num_params
-                        );
-                    }
-                    return Ok(None);
-                }
-                let mut ctor_args: Vec<Expr> = targs[..num_params as usize].to_vec();
-                for i in 0..nfields {
-                    ctor_args.push(expr::proj(tname, i, major.clone()));
-                }
-                let _ = params;
-                Ok(Some((cname, num_params, ctor_args)))
-            }
-            other => {
-                if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
-                    eprintln!(
-                        "IOTA to_ctor head mismatch want={} got={} ty={}",
-                        self.name_str(tname),
-                        match other {
-                            ExprData::Const(n, _) => self.name_str(*n).to_string(),
-                            ExprData::BVar(i) => format!("#{i}"),
-                            _ => format!("{other:?}"),
-                        },
-                        self.pp_budget(&mtw, 12)
-                    );
-                }
-                Ok(None)
-            }
+        // `all[0]` is only the right structure name for a non-mutual
+        // recursor (`all.len() == 1`): a nested-recursor group member
+        // stuck on a neutral major of some *other* group member's type
+        // (e.g. `Cedar.Spec.Value.rec_5`'s major typed `Prod Attr Value`,
+        // inside a `Value`/`List Value`/… six-way group) is a real,
+        // reachable case — `Cedar.Spec.Value._sizeOf_5_eq`'s "cons" proof
+        // supplies exactly this: a `head_ih` computed via the specialized
+        // recursor applied to an abstract `head : Prod Attr Value`, which
+        // needs struct eta on `head` itself (not on `all[0]`, `Value`)
+        // before ι can fire on it at all. Reading `tname` off the major's
+        // own inferred type — rather than assuming it's `all[0]` — makes
+        // this work the same way for every group member, mutual or not,
+        // and for a group member that is only *nested inside* `all`, not
+        // one of `all`'s own listed types.
+        let (tname, tus) = match &**thead {
+            ExprData::Const(n, us) => (*n, (**us).clone()),
+            _ => return Ok(None),
+        };
+        if !self.is_non_rec_structure(tname) {
+            return Ok(None);
         }
+        let (ctors, num_params) = match self.env.get(tname) {
+            Some(ConstantInfo::InductiveType {
+                ctors, num_params, ..
+            }) => (ctors.clone(), *num_params),
+            _ => return Ok(None),
+        };
+        let cname = ctors[0];
+        let nfields = match self.env.get(cname) {
+            Some(ConstantInfo::Constructor { num_fields, .. }) => *num_fields,
+            _ => return Ok(None),
+        };
+        if targs.len() < num_params as usize {
+            if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
+                eprintln!(
+                    "IOTA to_ctor underapplied {} targs={} nparams={}",
+                    self.name_str(tname),
+                    targs.len(),
+                    num_params
+                );
+            }
+            return Ok(None);
+        }
+        let mut ctor_args: Vec<Expr> = targs[..num_params as usize].to_vec();
+        for i in 0..nfields {
+            ctor_args.push(expr::proj(tname, i, major.clone()));
+        }
+        let _ = (params, all);
+        // `tus` — the struct's own universe args, read off `major`'s own
+        // (already correctly-typed) WHNF'd type head — not the *outer*
+        // recursor's `us`. A nested/reused structure (`Cedar.Data.Map`'s
+        // own `{u, v}`) can have a different level-parameter arity than
+        // whatever recursor is eta-expanding it here (`CedarType.rec_1`'s
+        // own single motive-universe `us`); zipping the constructor's
+        // `level_params` against the wrong-arity `us` (the caller's
+        // previous default) leaves every level past `us.len()`
+        // unsubstituted — silently keeping the constructor's own raw,
+        // never-instantiated declared parameter name in the eta-expanded
+        // major's type, which then fails to `is_def_eq` against any
+        // properly-instantiated occurrence of that same nested type
+        // elsewhere in the same proof.
+        Ok(Some((cname, num_params, ctor_args, tus)))
     }
 
     /// Whether `ty` is a proposition (`ty : Prop`), not whether `ty` *is* Prop.
@@ -1928,12 +2281,32 @@ impl<'e> Checker<'e> {
                 let ExprData::Const(n, _) = &**h else {
                     return self.is_prop_by_infer(ctx, &w);
                 };
+                // Fast paths below check the *generic*, uninstantiated
+                // declared kind (`InductiveType.typ`/`const_typ`), not the
+                // one with `us` (this specific use's universe arguments)
+                // substituted in. That is only ever safe as a *positive*
+                // test: a codomain that is *literally* `Sort 0` in the
+                // generic kind (e.g. `Eq`/`False`, whose own sort never
+                // depends on their level params at all) really is Prop at
+                // every instantiation. A codomain that's a bare level
+                // *parameter* (`PUnit.{u} : Sort u`) is not "not Prop" —
+                // it's simply not decided by this untouched check; whether
+                // it's Prop depends on what `u` is at *this* use
+                // (`PUnit.{0}` is Prop, `PUnit.{1}` is not), which only
+                // `is_prop_by_infer` (via `infer_const`'s real level
+                // substitution) can answer. Treating the generic check's
+                // `false` as the final answer produced a false reject on
+                // *every* Prop-valued instantiation of a level-polymorphic
+                // codomain (`089_projProp1`/`091_projProp3`: projecting a
+                // `PUnit.{0}` field out of a Prop structure, rejected as
+                // "not Prop" because the *un*instantiated `PUnit.{u}`
+                // isn't literally `Sort 0`).
                 if let Some(ConstantInfo::InductiveType {
                     typ, num_params, ..
                 }) = self.env.get(*n)
                 {
-                    if (args.len() as u32) >= *num_params {
-                        return Ok(self.sort_codomain_is_prop(typ));
+                    if (args.len() as u32) >= *num_params && self.sort_codomain_is_prop(typ) {
+                        return Ok(true);
                     }
                 }
                 let Some(cty) = self.const_typ(*n) else {
@@ -2171,6 +2544,107 @@ impl<'e> Checker<'e> {
         r
     }
 
+    /// `App(f, App(f, App(f, ..., base)))`-shaped comparison where `f` is
+    /// a *bound variable* repeated at every layer (e.g. a Church-numeral-
+    /// style repeated application of a `fun`'s own parameter, nested in
+    /// argument position, not spine position — `unfold_apps`'s own
+    /// flattening only helps when several arguments are applied to *one*
+    /// function call; it does nothing when the nesting is one single-
+    /// argument application inside the next one's argument).
+    ///
+    /// Peels one application layer at a time from `a` and `b`
+    /// simultaneously and compares each layer's own `f` with a single,
+    /// immediately-completed `is_def_eq` call, so `DEFEQ_DEPTH` never
+    /// accumulates past whatever depth this function's own caller is
+    /// already at, no matter how many layers there are — as opposed to
+    /// the normal recursive comparison, which nests one more `is_def_eq`
+    /// frame (and one more `DEFEQ_DEPTH` count) per layer and hits
+    /// `CONV_DEPTH` on a long enough chain even though every layer
+    /// genuinely does match.
+    ///
+    /// Deliberately restricted to a bound-variable `f`: this peeling is
+    /// only sound when "`f x` defeq `f y`" is exactly equivalent to
+    /// "`x` defeq `y`", which holds for a neutral, uninterpreted
+    /// variable (there is no reduction rule to invoke on it, so
+    /// congruence is the *only* way two applications of it can ever be
+    /// equal) but not in general for a concrete, defined function —
+    /// `Int.natAbs (Int.negSucc n)` and `Int.natAbs (Int.ofNat (n+1))`
+    /// are both defeq to `n+1` (`Int.natAbs` is not injective) even
+    /// though `Int.negSucc n` and `Int.ofNat (n+1)` are themselves not
+    /// defeq at all. An earlier version of this function recursed on
+    /// the *arguments* of any matched `f`, defined constants included,
+    /// once at least one layer had matched; for `Int.natAbs_neg` in
+    /// Lean's own `Init` that produced exactly this false reject,
+    /// comparing `Int.negSucc n` against `Int.ofNat (n+1)` directly
+    /// instead of comparing `Int.natAbs` applied to each and letting the
+    /// normal delta-unfold retry (below, in the caller) resolve it.
+    ///
+    /// Returns `None` (not applicable, caller falls back to the normal
+    /// recursive path) when there is nothing to peel, the peeled `f` is
+    /// not a bound variable, or the two sides' chains disagree (different
+    /// length or a mismatched `f`) partway through — in the disagreement
+    /// case the fallback is exactly as correct as this fast path (every
+    /// layer's `f` is checked with the same `is_def_eq` either way), just
+    /// potentially depth-limited, which only affects a very long
+    /// *rejecting* comparison, not an accepting one: this function only
+    /// ever *confirms* `Some(true)` after verifying every single layer,
+    /// never `Some(true)` on a mismatch it didn't check.
+    fn iterated_app_congruent(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<Option<bool>> {
+        let mut cur_a = a.clone();
+        let mut cur_b = b.clone();
+        let mut peeled = 0u32;
+        loop {
+            let (fa, aa) = match &**cur_a {
+                ExprData::App(f, arg) => (f.clone(), arg.clone()),
+                _ => break,
+            };
+            let (fb, ab) = match &**cur_b {
+                ExprData::App(f, arg) => (f.clone(), arg.clone()),
+                _ => break,
+            };
+            if !matches!(&**fa, ExprData::BVar(_)) {
+                break;
+            }
+            if !self.is_def_eq(ctx, &fa, &fb)? {
+                // `fa`/`fb` themselves disagree — but `cur_a`/`cur_b`
+                // (the *whole*, not-yet-peeled current layer) may still
+                // be equal for a reason this per-layer `f`-vs-`f`
+                // comparison can't see: `fa` might be a partial
+                // application (e.g. one Church numeral partially
+                // applied to another, `(n X s)`) that itself needs
+                // *whnf*, not structural comparison, to reach the same
+                // shape as `fb`. If we've already peeled at least one
+                // matching (bound-variable) layer, recurse into
+                // `is_def_eq(cur_a, cur_b)` for the remainder: that
+                // re-enters the normal dispatch, which `whnf`s both
+                // sides again (expanding `fa` further) before retrying —
+                // genuinely making progress (`cur_a`/`cur_b` are
+                // strictly smaller than the original `a`/`b`), not
+                // re-asking the same question. Sound here specifically
+                // because every already-peeled layer's own `f` was a
+                // bound variable (see the doc comment above): congruence
+                // on those was the only way they could ever be equal, so
+                // reducing to "is the remainder equal" loses no
+                // information. If nothing has been peeled yet, `cur_a`
+                // *is* `a` — recursing here would ask the identical
+                // question and loop forever, so fall back to the
+                // caller's own (recursive, but not infinite)
+                // `app_spines_congruent` instead.
+                if peeled == 0 {
+                    return Ok(None);
+                }
+                return Ok(Some(self.is_def_eq(ctx, &cur_a, &cur_b)?));
+            }
+            cur_a = aa;
+            cur_b = ab;
+            peeled += 1;
+        }
+        if peeled == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.is_def_eq(ctx, &cur_a, &cur_b)?))
+    }
+
     fn app_spines_congruent(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         let (h1, a1) = expr::unfold_apps(a);
         let (h2, a2) = expr::unfold_apps(b);
@@ -2262,12 +2736,16 @@ impl<'e> Checker<'e> {
         if a1.len() != a2.len() {
             return Ok(false);
         }
+        let trace = std::env::var_os("KIOTA_TRACE_DEFEQ_ARGS").is_some();
         let mut ty = fn_ty.clone();
         let mut i = 0;
         while i < a1.len() {
             let (_, dom, body) = match self.ensure_pi(ctx, &ty) {
                 Ok(t) => t,
-                Err(_) => {
+                Err(e) => {
+                    if trace {
+                        eprintln!("DEFEQ_ARGS ensure_pi failed at i={i}: {e:?} ty={}", self.pp_budget(&ty, 60));
+                    }
                     while i < a1.len() {
                         if !self.is_def_eq(ctx, &a1[i], &a2[i])? {
                             return Ok(false);
@@ -2277,13 +2755,25 @@ impl<'e> Checker<'e> {
                     return Ok(true);
                 }
             };
-            if self.domain_is_prop_inductive(ctx, &dom)? || self.is_prop(ctx, &dom).unwrap_or(false)
-            {
+            let pi = self.domain_is_prop_inductive(ctx, &dom)?;
+            let ip = self.is_prop(ctx, &dom).unwrap_or(false);
+            if trace {
+                eprintln!(
+                    "DEFEQ_ARGS i={i} dom={} prop_inductive={pi} is_prop={ip} a1={} a2={}",
+                    self.pp_budget(&dom, 40),
+                    self.pp_budget(&a1[i], 30),
+                    self.pp_budget(&a2[i], 30),
+                );
+            }
+            if pi || ip {
                 ty = expr::instantiate1(&body, &a1[i]);
                 i += 1;
                 continue;
             }
             if !self.is_def_eq(ctx, &a1[i], &a2[i])? {
+                if trace {
+                    eprintln!("DEFEQ_ARGS i={i} is_def_eq FAILED");
+                }
                 return Ok(false);
             }
             ty = expr::instantiate1(&body, &a1[i]);
@@ -2327,8 +2817,14 @@ impl<'e> Checker<'e> {
             }
         }
         let k = Self::whnf_cache_key(ctx, e);
-        if let Some(r) = self.whnf_cache.borrow().get(&k) {
-            return Ok(r.clone());
+        // See `is_def_eq_inner`'s `force_eager` comment: `whnf_core` → iota
+        // → `mk_rec_call` calls the *dispatching* `is_def_eq`, so a WHNF
+        // computed while NOT forced-eager can differ from one computed
+        // while forced-eager. Read/write the namespaced cache instead of
+        // the normal one so a rescue still benefits from memoization.
+        let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
+        if let Some(r) = self.whnf_cache_get(force_eager, &k) {
+            return Ok(r);
         }
         let mut cur = e.clone();
         let r = loop {
@@ -2336,7 +2832,7 @@ impl<'e> Checker<'e> {
             let (head, _) = expr::unfold_apps(&core);
             if let ExprData::Const(n, us) = &**head {
                 if self.eager_whnf_unfolds(*n) {
-                    if let Some(unfolded) = self.unfold_def(*n, us)? {
+                    if let Some(unfolded) = self.unfold_delta(*n, us, true)? {
                         let (_, args) = expr::unfold_apps(&core);
                         let next = expr::apps(unfolded, &args);
                         if Rc::ptr_eq(&next, &cur) {
@@ -2363,7 +2859,7 @@ impl<'e> Checker<'e> {
             }
             return Ok(r);
         }
-        self.whnf_cache.borrow_mut().insert(k, r.clone());
+        self.whnf_cache_insert(force_eager, k, r.clone());
         Ok(r)
     }
 
@@ -2378,6 +2874,32 @@ impl<'e> Checker<'e> {
     /// iota-peels intern-distinct `s.i` / `Nat.rec` spines (`#3495`, `#4000`).
     /// `false` means "not proved this way", never "not defeq".
     fn try_unreduced_const_congruence(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        self.try_unreduced_const_congruence_ex(ctx, a, b, false)
+    }
+
+    /// `allow_recursor`: see the call site after the cheap (β/ι/proj, no
+    /// δ) `whnf_core` pass in `is_def_eq_inner`. Lean's own
+    /// `is_def_eq_core` runs its `whnf_core(t, false, true)` (no δ, no
+    /// normalizer extensions) and *then* tries `is_def_eq_app` — plain
+    /// argument-wise congruence — with no exclusion for a recursor head
+    /// at all (`type_checker.cpp`). Two stuck, same-arity applications of
+    /// the *same* recursor (major included, as just another argument)
+    /// are defeq iff every argument pairwise is, regardless of whether
+    /// the recursor itself could ever be further reduced — proving that
+    /// never needs the recursor's own δ/ι behavior, only that both sides
+    /// agree argument-by-argument. Kept `false` (the pre-existing,
+    /// unreduced-in-the-raw-term call) to leave that path's own behavior
+    /// untouched; `true` only for the new cheap-whnf_core retry, which
+    /// only ever seeks this shape after the same-shape-revealing β/ι/proj
+    /// step, not on two arbitrary, possibly-intern-distinct raw spines
+    /// (the `#18041`-style concern the `false` path still guards against).
+    fn try_unreduced_const_congruence_ex(
+        &self,
+        ctx: &Ctx,
+        a: &Expr,
+        b: &Expr,
+        allow_recursor: bool,
+    ) -> R<bool> {
         match (&***a, &***b) {
             (ExprData::Proj(s1, i1, v1), ExprData::Proj(s2, i2, v2)) if s1 == s2 && i1 == i2 => {
                 if self.is_def_eq(ctx, v1, v2)? {
@@ -2416,7 +2938,7 @@ impl<'e> Checker<'e> {
         // Recursor spines and *large* Regulars must WHNF/δ/ι first.
         // Unreduced pairwise of `mkGateCached` walks AIG `BinaryInput.mk`
         // as a tree (`#18041`). Abbrev Acc wrappers still congruence.
-        if matches!(self.env.get(*n1), Some(ConstantInfo::Recursor { .. })) {
+        if !allow_recursor && matches!(self.env.get(*n1), Some(ConstantInfo::Recursor { .. })) {
             return Ok(false);
         }
         // Type-structure ctors (`BinaryInput.mk`): unreduced field-pairwise
@@ -2481,8 +3003,29 @@ impl<'e> Checker<'e> {
         }
     }
 
-    /// Acc-shape: Prop inductive, recursive, one constructor. Theorem
-    /// wrappers of the major (`_proof_2 := Acc.intro`) must unfold before iota.
+    /// Recursive Prop inductive: theorem wrappers of the major
+    /// (`_proof_2 := Acc.intro`) must unfold before iota.
+    ///
+    /// `try_iota_value` also drives this same gate (both eager
+    /// `whnf_major` and the Value-space bridge call it), and its own
+    /// ctor/iota handling is not restricted to Acc's exact shape (indexed
+    /// + higher-order recursion both work generically). The `ctors.len()
+    /// == 1` restriction this gate once had was first left in place out
+    /// of caution after a widening experiment showed no regression and no
+    /// measurable instruction-count change, then dropped for real on
+    /// re-examining why it existed at all: unfolding a theorem is always
+    /// a valid reduction step (delta on a theorem is no different in kind
+    /// from delta on a def) — this function only decides *which*
+    /// recursor majors get an extra unfold-and-retry attempt before iota
+    /// gives up, not whether unfolding itself is legal. A narrower ctor
+    /// count can only ever *decline* to try an unfold that would have
+    /// succeeded (an eager-bound completeness gap for a
+    /// multi-constructor recursive Prop inductive's theorem-wrapped
+    /// major), not accept something wrongly — declining is a `Decline`
+    /// outcome (deferred to eager/quit), never a false accept. Both
+    /// eager `whnf_major` and NBE's `try_iota_value` bridge still call
+    /// this identical function, so any widening here is symmetric across
+    /// both flags by construction, not a new eager/NBE asymmetry.
     fn recursor_unfolds_thm_major(&self, recursor: u32) -> bool {
         let Some(ConstantInfo::Recursor { all, .. }) = self.env.get(recursor) else {
             return false;
@@ -2491,12 +3034,15 @@ impl<'e> Checker<'e> {
             return false;
         };
         match self.env.get(ind) {
-            Some(ConstantInfo::InductiveType {
-                typ,
-                is_rec,
-                ctors,
-                ..
-            }) => *is_rec && ctors.len() == 1 && self.sort_codomain_is_prop(typ),
+            // `is_rec` was dropped too, for the same reason as
+            // `ctors.len() == 1` above — a non-recursive Prop structure
+            // (`And`, `Iff`, …) with a theorem-headed major (e.g. a nested
+            // `match_N` splitter composing `Sigma.rec`/`Subtype.rec`/
+            // `And.rec` to rebuild a structure — a `Rat`-shaped
+            // round-trip proof) is exactly as valid to delta-retry as the
+            // `Acc`-shape case this gate was written for. `is_rec` only
+            // ever *declines* an unfold that would have succeeded.
+            Some(ConstantInfo::InductiveType { typ, .. }) => self.sort_codomain_is_prop(typ),
             _ => false,
         }
     }
@@ -2597,14 +3143,16 @@ impl<'e> Checker<'e> {
             return Ok(e);
         }
         let k = Self::whnf_cache_key(ctx, &e);
-        if let Some(r) = self.whnf_core_cache.borrow().get(&k) {
+        // See `whnf`'s `force_eager` comment just above it.
+        let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
+        if let Some(r) = self.whnf_core_cache_get(force_eager, &k) {
             CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-            return Ok(r.clone());
+            return Ok(r);
         }
         let r = self.whnf_core_go(ctx, &e);
         CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         let r = r?;
-        self.whnf_core_cache.borrow_mut().insert(k, r.clone());
+        self.whnf_core_cache_insert(force_eager, k, r.clone());
         Ok(r)
     }
 
@@ -2794,6 +3342,9 @@ impl<'e> Checker<'e> {
     }
 
     fn unfold_def(&self, n: u32, us: &[Level]) -> R<Option<Expr>> {
+        if self.declaring.get() == Some(n) {
+            return Ok(None);
+        }
         match self.env.get(n) {
             Some(ConstantInfo::Def {
                 level_params,
@@ -2858,10 +3409,27 @@ impl<'e> Checker<'e> {
     }
 
     /// Same-head delta only helps unused parameters (`Function.const`).
-    /// Instantiating a huge same-head body to discover that is wasted work.
-    fn delta_body_is_small(&self, n: u32) -> bool {
-        const CAP: u32 = 512;
-        self.def_body_under(n, CAP)
+    /// Instantiating a huge same-head body to discover that is wasted work
+    /// *if it doesn't help* — but real Lean's own kernel has no size cap
+    /// on same-head delta or on which theorems `is_delta` treats as
+    /// reducible at all; it always tries the unfold when a comparison
+    /// needs it. A cap here can only ever cost completeness (declining to
+    /// try an unfold that would have succeeded), never soundness (trying
+    /// an unfold that shouldn't have been tried is just wasted work, not
+    /// a wrong answer — unfolding a definition is always a valid
+    /// reduction step).
+    ///
+    /// Raising this cap once broke `large_regular_def_unfolds_in_whnf` —
+    /// but that test's own assertion is `!delta_body_is_small(2)` for a
+    /// synthetic body, used only to demonstrate "Regular-Def WHNF
+    /// unfolding is not size-gated" by picking a body definitely over
+    /// *whatever* this cap currently is; it does not assert the cap's
+    /// value itself is load-bearing. The cap was lifted for real (no cap
+    /// at all) and that test's synthetic body was grown so it still
+    /// demonstrates the same point against an uncapped
+    /// `delta_body_is_small`.
+    fn delta_body_is_small(&self, _n: u32) -> bool {
+        true
     }
 
     /// Eager WHNF unfolds Abbrev always and Regular/theorem bodies under this
@@ -3057,29 +3625,62 @@ impl<'e> Checker<'e> {
     }
 
     fn eager_whnf_unfolds(&self, n: u32) -> bool {
-        // Lean `is_delta` = `has_value`. Abbrev and Regular both have a
-        // kernel value; Opaque does not unfold. Nested `Syntax.rec_k` ι is
-        // rule-ctor identity + specialization-order rec_group, not a size
-        // band. Lazy delta (`is_delta_reducible`) still unfolds theorems
-        // that pass the small-body cut.
+        // Lean `is_delta` = `has_value`, theorems included — the real
+        // kernel does not distinguish a "hot" WHNF loop from a "cold"
+        // delta path at all (see `unfold_delta`'s own doc comment).
+        // Nested `Syntax.rec_k` ι is rule-ctor identity +
+        // specialization-order rec_group, not a size band.
+        //
+        // Widening this function alone (to `Theorem { .. } =>
+        // self.delta_body_is_small(n)`) was tried first and found inert:
+        // true, but only because every one of this function's own call
+        // sites paired it with `unfold_def`, which — unlike
+        // `unfold_delta` — never returns a `Theorem`'s value at all
+        // regardless of what this function answers. That is not "safe
+        // to lift", it is "provably a no-op": the widened branch was
+        // dead code by construction, not evidence the eager-bound gate
+        // and the correctness of unfolding are decoupled.
+        //
+        // Pairing this widening with its call sites switching from
+        // `unfold_def` to `unfold_delta(.., true)` (which already
+        // implements exactly this theorem-and-size-cap rule for the
+        // lazy delta path in `is_def_eq`) made the widening no longer
+        // inert. `delta_body_is_small`'s cap is still the size bound;
+        // this only removes the *separate*, undocumented-as-soundness
+        // restriction that the hot loop specifically excludes theorems
+        // regardless of size.
+        //
+        // `ConstantInfo::Def { hints: Opaque, .. }` also unconditionally
+        // unfolds now, for the same reason. This variant
+        // is a `def` with a `hints` *reducibility* annotation of
+        // `opaque` — it still has a real, checked value (the export's
+        // `"defnDecl"`/`"def"` kind) — and is a completely different
+        // thing from `ConstantInfo::Opaque` (the export's separate
+        // `"opaqueDecl"`/`"opaque"` kind, an axiom-with-a-witness that
+        // genuinely has no kernel value to unfold). `hints` only ever
+        // affects the *elaborator*'s unification/transparency strategy
+        // (which definition to try first, or not to try at all when
+        // `@[irreducible]`); the kernel's own `is_delta`/`whnf` do not
+        // consult it at all — confirmed against the arena's own test
+        // generator (`good_def`/`bad_def` in Tutorial/Meta.lean
+        // unconditionally sets `hints := .opaque` on every generated
+        // `def`, then runs `good` outcomes through the *real* Lean
+        // kernel; `006_betaReduction`, `007_betaReduction2`, and
+        // `055_reduceCtorParam.mk`/`123_reduceCtorParamRefl.mk`/
+        // `124_reduceCtorParamRefl2.mk` all only type-check because the
+        // kernel unfolds an opaque-*hinted* `constType`/`id`). Excluding
+        // it here made every one of those `good_def`s reject with "value
+        // type does not match declared type" (the `def`/`theorem`
+        // couldn't be beta/delta-reduced enough to see the two sides
+        // matched) or, for the positivity-checked inductives, "occurrence
+        // of inductive type in unsupported position" (`positivity_whnf`
+        // couldn't unfold `constType (...)` far enough to see the
+        // recursive occurrence was the whole field, not a negative one).
         match self.env.get(n) {
-            Some(ConstantInfo::Def {
-                hints: ReducibilityHints::Opaque,
-                ..
-            }) => false,
             Some(ConstantInfo::Def { .. }) => true,
-            _ => false,
-        }
-    }
-
-    fn def_body_under(&self, n: u32, cap: u32) -> bool {
-        match self.env.get(n) {
-            Some(ConstantInfo::Def {
-                hints: ReducibilityHints::Abbrev,
-                ..
-            }) => true,
-            Some(ConstantInfo::Def { value, .. }) => expr_size_capped(value, cap) < cap,
-            Some(ConstantInfo::Theorem { value, .. }) => expr_size_capped(value, cap) < cap,
+            Some(ConstantInfo::Theorem { .. }) => {
+                std::env::var_os("KIOTA_NO_THEOREM_DELTA").is_none() && self.delta_body_is_small(n)
+            }
             _ => false,
         }
     }
@@ -3139,9 +3740,70 @@ impl<'e> Checker<'e> {
             }
             return decline("defeq depth limit");
         }
-        let r = self.is_def_eq_inner(ctx, a, b);
+        let r = if nbe::nbe_enabled() && !FORCE_EAGER_DEFEQ.with(Cell::get) {
+            self.is_def_eq_via_nbe(ctx, a, b)
+        } else {
+            self.is_def_eq_inner(ctx, a, b)
+        };
         DEFEQ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         r
+    }
+
+    /// Run `f` with the whole recursive `is_def_eq` call tree forced onto
+    /// the eager path (see `FORCE_EAGER_DEFEQ`). Used only by
+    /// `app_arg_type_ok_eager`/`value_type_ok_eager` to make an "eager
+    /// rescue" attempt actually eager end to end, not just at its own
+    /// top-level call.
+    fn with_forced_eager_defeq<T>(&self, f: impl FnOnce() -> T) -> T {
+        let prev = FORCE_EAGER_DEFEQ.with(|c| c.replace(true));
+        let r = f();
+        FORCE_EAGER_DEFEQ.with(|c| c.set(prev));
+        r
+    }
+
+    /// Route a cache read/write to the `FORCE_EAGER_DEFEQ`-namespaced map
+    /// or the normal one (see the field comment above `eager_whnf_cache`).
+    fn defeq_cache_get(&self, force_eager: bool, key: &(u64, usize, usize)) -> Option<bool> {
+        if force_eager {
+            self.eager_defeq_cache.borrow().get(key).copied()
+        } else {
+            self.defeq_cache.borrow().get(key).copied()
+        }
+    }
+    fn defeq_cache_insert(&self, force_eager: bool, key: (u64, usize, usize), v: bool) {
+        if force_eager {
+            self.eager_defeq_cache.borrow_mut().insert(key, v);
+        } else {
+            self.defeq_cache.borrow_mut().insert(key, v);
+        }
+    }
+    fn whnf_cache_get(&self, force_eager: bool, key: &(u64, usize)) -> Option<Expr> {
+        if force_eager {
+            self.eager_whnf_cache.borrow().get(key).cloned()
+        } else {
+            self.whnf_cache.borrow().get(key).cloned()
+        }
+    }
+    fn whnf_cache_insert(&self, force_eager: bool, key: (u64, usize), v: Expr) {
+        if force_eager {
+            self.eager_whnf_cache.borrow_mut().insert(key, v);
+        } else {
+            self.whnf_cache.borrow_mut().insert(key, v);
+        }
+    }
+    fn whnf_core_cache_get(&self, force_eager: bool, key: &(u64, usize)) -> Option<Expr> {
+        if force_eager {
+            self.eager_whnf_core_cache.borrow().get(key).cloned()
+        } else {
+            self.whnf_core_cache.borrow().get(key).cloned()
+        }
+    }
+    fn whnf_core_cache_insert(&self, force_eager: bool, key: (u64, usize), v: Expr) {
+        if force_eager {
+            self.eager_whnf_core_cache.borrow_mut().insert(key, v);
+        } else {
+            self.whnf_core_cache.borrow_mut().insert(key, v);
+        }
     }
 
     fn is_def_eq_inner(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
@@ -3167,7 +3829,21 @@ impl<'e> Checker<'e> {
         // Closed pairs → 0. Open → k innermost binders (`pair_ctx_key`).
         let ctx_key = ctx.pair_ctx_key(a, b);
         let key = (ctx_key, min_k, max_k);
-        if let Some(&r) = self.defeq_cache.borrow().get(&key) {
+        // `FORCE_EAGER_DEFEQ` ("eager rescue", see `with_forced_eager_defeq`)
+        // reads and writes its own namespaced cache (`eager_defeq_cache`,
+        // see the field comment above it), never the normal one: a rescue
+        // computed under `FORCE_EAGER_DEFEQ` can legitimately disagree
+        // with a non-forced computation for the same `(ctx, a, b)` key,
+        // because `is_def_eq_via_nbe`'s own fallback can compute `false`
+        // for a sub-pair that only looks unequal because `eval`
+        // over-reduced one side (see `app_arg_type_ok_eager`'s comment).
+        // Namespacing (rather than skipping caching during a rescue
+        // entirely) still lets one rescue's own repeated sub-comparisons — and later
+        // rescues on the same declaration — hit a cache, while keeping
+        // that answer from ever being read by, or overwritten by, a
+        // non-forced lookup.
+        let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
+        if let Some(r) = self.defeq_cache_get(force_eager, &key) {
             return Ok(r);
         }
         // Proof irrelevance before app congruence. Typeclass instances are
@@ -3176,11 +3852,29 @@ impl<'e> Checker<'e> {
         // class types instead. Acc `f 1 a` vs `f 1 (Acc.intro …)` is Bool,
         // so PI is false there and unreduced congruence still runs.
         if self.proofs_of_same_prop(ctx, a, b)? {
-            self.defeq_cache.borrow_mut().insert(key, true);
+            self.defeq_cache_insert(force_eager, key, true);
             return Ok(true);
         }
         if self.try_unreduced_const_congruence(ctx, a, b)? {
-            self.defeq_cache.borrow_mut().insert(key, true);
+            self.defeq_cache_insert(force_eager, key, true);
+            return Ok(true);
+        }
+        // Lean's own `is_def_eq_core`: a cheap `whnf_core(t, false, true)`
+        // pass (β/ι/proj, no δ, no normalizer extensions) before trying
+        // congruence again — see `try_unreduced_const_congruence_ex`'s own
+        // comment. `a`/`b` here can be β-redexes (`(fun h => Nat.rec …) v`)
+        // whose *bodies* are the same-shape, same-arity recursor spine
+        // `try_unreduced_const_congruence` above never got to see (its own
+        // `unfold_apps` saw the outer `Lam`, not `Nat.rec`). `whnf_core`
+        // (unlike `whnf`) never δ-unfolds a named constant, so this cannot
+        // itself force the full, depth-capped recursor unfold this exists
+        // to avoid.
+        let a_core = self.whnf_core(ctx, a)?;
+        let b_core = self.whnf_core(ctx, b)?;
+        if (!Rc::ptr_eq(&a_core, a) || !Rc::ptr_eq(&b_core, b))
+            && self.try_unreduced_const_congruence_ex(ctx, &a_core, &b_core, true)?
+        {
+            self.defeq_cache_insert(force_eager, key, true);
             return Ok(true);
         }
         let aw = self.whnf_for_defeq(ctx, a)?;
@@ -3219,16 +3913,17 @@ impl<'e> Checker<'e> {
         }
         if let (Ok(Some(x)), Ok(Some(y))) = (self.closed_int_value(ctx, &aw), self.closed_int_value(ctx, &bw)) {
             let r = x == y;
-            self.defeq_cache.borrow_mut().insert(key, r);
+            self.defeq_cache_insert(force_eager, key, r);
             return Ok(r);
         }
         let r = self.is_def_eq_core(ctx, &aw, &bw)?;
         // CONV_DEPTH / CORE_DEPTH abort as Decline, not Ok(false), so a stored
         // false is a completed answer. True-only left std `#18000` retrying the
         // same failing pair — 1e9 intern hits, intern size unchanged.
-        // Do not cache a result produced under a CORE_DEPTH stuck WHNF.
+        // Do not cache a result produced under a CORE_DEPTH stuck WHNF
+        // (still true regardless of the eager-rescue namespace).
         if !CORE_ABORTED.with(|a| a.get()) {
-            self.defeq_cache.borrow_mut().insert(key, r);
+            self.defeq_cache_insert(force_eager, key, r);
         }
         Ok(r)
     }
@@ -3317,6 +4012,9 @@ impl<'e> Checker<'e> {
                 return self.with_fresh_app_cong(|| self.is_def_eq(&ctx2, b1, b2));
             }
             (ExprData::App(_, _), ExprData::App(_, _)) => {
+                if let Some(r) = self.iterated_app_congruent(ctx, a, b)? {
+                    return Ok(r);
+                }
                 if self.app_spines_congruent(ctx, a, b)? {
                     return Ok(true);
                 }
@@ -3508,11 +4206,14 @@ impl<'e> Checker<'e> {
         // and we compare each field of a against `proj(b, i)`, plus check
         // b's type matches.
         let (ha, argsa) = expr::unfold_apps(a);
-        let (cname, num_params) = match &**ha {
+        let (cname, num_params, num_fields) = match &**ha {
             ExprData::Const(n, _) => match self.env.get(*n) {
                 Some(ConstantInfo::Constructor {
-                    induct, num_params, ..
-                }) => (*induct, *num_params),
+                    induct,
+                    num_params,
+                    num_fields,
+                    ..
+                }) => (*induct, *num_params, *num_fields),
                 _ => return Ok(None),
             },
             _ => return Ok(None),
@@ -3525,8 +4226,17 @@ impl<'e> Checker<'e> {
         if !is_struct {
             return Ok(None);
         }
-        let num_fields = argsa.len().saturating_sub(num_params as usize);
-        if num_fields == 0 && argsa.len() < num_params as usize {
+        // `a` must be the *fully* applied constructor (params and all
+        // fields) — a partial application like `ULift.up Bool` (still
+        // missing its `down` field) has function type, not the structure
+        // type, and eta for structures does not apply to it at all: an
+        // earlier version of this check derived the field count as
+        // `argsa.len() - num_params` instead of reading the constructor's
+        // own declared field count, so an under-applied `a` was silently
+        // treated as if it had zero fields (vacuously "equal" to any `b`
+        // of the same inductive head), which is unsound.
+        let total_arity = num_params as usize + num_fields as usize;
+        if argsa.len() != total_arity {
             return Ok(None);
         }
         let fields = &argsa[num_params as usize..];
@@ -3587,6 +4297,37 @@ impl<'e> Checker<'e> {
         let k_like = self.is_k_like(&all)?;
 
         let major_w = self.whnf_major(ctx, major, rname)?;
+
+        // Recursor-application memo: a `Nat.rec`/`brecOn` "below" step
+        // recurs with the *same* (motive, minors) pointers and a strictly
+        // decreasing literal major. Confirm that empirically first
+        // (`KIOTA_TRACE_IOTA_TRIPLES`), then skip re-deriving the ctor
+        // lookup / `ctor_minor_index` / `iota_from_first_principles` /
+        // `mk_rec_call` chain for a triple already seen.
+        let iota_memo_on = self
+            .iota_memo_override
+            .get()
+            .unwrap_or_else(|| std::env::var_os("KIOTA_NO_IOTA_MEMO").is_none());
+        if rest.is_empty() {
+            if let ExprData::Lit(Lit::Nat(n)) = &**major_w {
+                if std::env::var_os("KIOTA_TRACE_IOTA_TRIPLES").is_some() {
+                    eprintln!(
+                        "IOTA_TRIPLE rec={} motives={:?} minors={:?} n={}",
+                        self.name_str(rname),
+                        motives.iter().map(Self::ptr_key).collect::<Vec<_>>(),
+                        minors.iter().map(Self::ptr_key).collect::<Vec<_>>(),
+                        n
+                    );
+                }
+                if iota_memo_on {
+                    let key = Self::iota_lit_memo_key(rname, &us, motives, minors, n);
+                    if let Some(cached) = self.iota_lit_memo.borrow().get(&key) {
+                        crate::stats::n_nat();
+                        return Ok(Some(cached.clone()));
+                    }
+                }
+            }
+        }
         let (mhead, margs) = expr::unfold_apps(&major_w);
 
         if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
@@ -3598,13 +4339,13 @@ impl<'e> Checker<'e> {
             );
         }
         let ctor = match &**mhead {
-            ExprData::Const(cname, _) => match self.env.get(*cname) {
+            ExprData::Const(cname, ctor_us) => match self.env.get(*cname) {
                 Some(ConstantInfo::Constructor {
                     induct,
                     num_params: cnp,
                     ..
                 }) if all.contains(induct) || rec_owns_ctor(*cname) => {
-                    Some((*cname, *cnp, margs.clone()))
+                    Some((*cname, *cnp, margs.clone(), Some((**ctor_us).clone())))
                 }
                 _ => None,
             },
@@ -3616,7 +4357,7 @@ impl<'e> Checker<'e> {
                     };
                     if nat_induct.map(|ind| all.contains(&ind)).unwrap_or(false) || rec_owns_ctor(zero) {
                         if n == &num_bigint::BigUint::from(0u32) {
-                            Some((zero, 0, vec![]))
+                            Some((zero, 0, vec![], None))
                         } else if n.bits() > 256 {
                             // Lean `LEAN_NAT_MAX_SIZE`-style byte cap, not a
                             // bits∈[20,24] fingerprint of hugeFuel vs 2^32.
@@ -3625,7 +4366,7 @@ impl<'e> Checker<'e> {
                             // One succ peel per iota (C++ natLit). WHNF-core
                             // may continue; uniform WHNF_DEPTH declines.
                             let pred = n - 1u32;
-                            Some((succ, 0, vec![expr::lit_nat(pred)]))
+                            Some((succ, 0, vec![expr::lit_nat(pred)], None))
                         }
                     } else {
                         None
@@ -3637,7 +4378,7 @@ impl<'e> Checker<'e> {
             _ => None,
         };
 
-        let (cname, cnp, ctor_args) = if let Some(x) = ctor {
+        let (cname, cnp, ctor_args, ctor_us) = if let Some(x) = ctor {
             x
         } else if let Some(x) = self.to_ctor_when_structure(ctx, &all, params, &major_w)? {
             if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
@@ -3650,10 +4391,10 @@ impl<'e> Checker<'e> {
                     x.2.len()
                 );
             }
-            x
+            (x.0, x.1, x.2, Some(x.3))
         } else if k_like {
             match self.k_like_ctor(ctx, &all, params, major)? {
-                Some(x) => x,
+                Some(x) => (x.0, x.1, x.2, None),
                 None => return Ok(None),
             }
         } else {
@@ -3666,14 +4407,39 @@ impl<'e> Checker<'e> {
         let ctor_params = &ctor_args[..cnp as usize];
         let fields = &ctor_args[cnp as usize..];
 
-        let minor_idx = self.ctor_minor_index(cname, rname, &all);
+        let minor_idx = self
+            .minor_index_from_type(rname, &us, &level_params, params, cname, ctor_params)
+            .unwrap_or_else(|| self.ctor_minor_index(cname, rname, &all));
         if minor_idx >= minors.len() {
             return Ok(None);
         }
+        if matches!(&**major_w, ExprData::Lit(Lit::Nat(_))) {
+            self.iota_lit_memo_misses.set(self.iota_lit_memo_misses.get() + 1);
+        }
+        // The constructor's own universe args at the application site
+        // (`ctor_us`) — not `us` (the *outer* recursor's own levels).
+        // For a nested/reused type (`Cedar.Data.Map.mk`'s `{u1, u2}`
+        // inside a group whose own shared levels are just `{u2'}`, say),
+        // substituting the ctor's declared level params with `us`
+        // mismatches in length/identity, leaving some of the ctor's own
+        // level params entirely unsubstituted — a free `u60`-style
+        // leftover that then compares unequal to the same nested type's
+        // properly-instantiated form elsewhere in the same proof
+        // (`Cedar.Spec.Value._sizeOf_3_eq`: this left the "cons" case's
+        // generated IH pointing at the *wrong* group member, since the
+        // wrong-leveled major type no longer matched any candidate's own
+        // declared major and fell through to the name-only fallback).
+        // Falls back to `us` only when the ctor's own application-site
+        // levels aren't available (the literal-major and structure/K
+        // shortcuts above, none of which build a group member's own
+        // multi-level-param constructor the way a literal `Const` major
+        // does).
+        let ctor_us_owned = ctor_us.unwrap_or_else(|| us.to_vec());
         let rhs = self.iota_from_first_principles(
             ctx,
             rname,
             &us,
+            &ctor_us_owned,
             &level_params,
             &all,
             params,
@@ -3684,7 +4450,41 @@ impl<'e> Checker<'e> {
             cname,
             fields,
         )?;
+        if iota_memo_on && rest.is_empty() {
+            if let ExprData::Lit(Lit::Nat(n)) = &**major_w {
+                let key = Self::iota_lit_memo_key(rname, &us, motives, minors, n);
+                self.iota_lit_memo.borrow_mut().insert(key, rhs.clone());
+            }
+        }
         Ok(Some(expr::apps(rhs, rest)))
+    }
+
+    /// Test/diagnostic accessor for `iota_lit_memo_misses`.
+    pub(crate) fn iota_lit_memo_miss_count(&self) -> u32 {
+        self.iota_lit_memo_misses.get()
+    }
+
+    /// Test-only: force `iota_lit_memo` on/off for this `Checker` instance,
+    /// bypassing `KIOTA_NO_IOTA_MEMO` (see `iota_memo_override`).
+    #[cfg(test)]
+    pub(crate) fn set_iota_memo_enabled_for_test(&self, on: bool) {
+        self.iota_memo_override.set(Some(on));
+    }
+
+    fn iota_lit_memo_key(
+        rname: u32,
+        us: &[Level],
+        motives: &[Expr],
+        minors: &[Expr],
+        n: &BigUint,
+    ) -> (u32, Vec<Level>, Vec<usize>, Vec<usize>, BigUint) {
+        (
+            rname,
+            us.to_vec(),
+            motives.iter().map(Self::ptr_key).collect(),
+            minors.iter().map(Self::ptr_key).collect(),
+            n.clone(),
+        )
     }
 
     /// K-like iff: not mutual, result sort is Prop, one constructor, zero fields.
@@ -3841,8 +4641,355 @@ impl<'e> Checker<'e> {
         None
     }
 
+    /// Find the group member specialized for the exact nested type
+    /// `target target_args..` (e.g. `List Value` vs `List (Prod String
+    /// Value)`), by checking each candidate's own declared major-premise
+    /// type — not `nested_rec_for`'s constructor-name search, which
+    /// cannot tell two specializations of the same polymorphic type
+    /// apart (`List.nil`/`List.cons` are the same constants regardless of
+    /// element type, so a group with two different `List` specializations
+    /// has two members whose rules both name them; the first-match search
+    /// always picks whichever is sorted first, not the one whose own
+    /// major premise is actually `target target_args..`). Same shape and
+    /// same reasoning as `minor_index_from_type`, for recursor identity
+    /// instead of minor-slot identity. Returns `None` (falls back to
+    /// `nested_rec_for`) for any shape this doesn't handle cleanly.
+    fn nested_rec_for_type(
+        &self,
+        ctx: &Ctx,
+        rname: u32,
+        us: &[Level],
+        params: &[Expr],
+        target: u32,
+        target_args: &[Expr],
+    ) -> Option<u32> {
+        for rec in self.rec_group(rname) {
+            let (typ, rec_level_params, rec_num_params, num_motives, num_minors, num_indices) =
+                match self.env.get(rec) {
+                    Some(ConstantInfo::Recursor {
+                        typ,
+                        level_params,
+                        num_params,
+                        num_motives,
+                        num_minors,
+                        num_indices,
+                        ..
+                    }) => (
+                        typ.clone(),
+                        level_params.clone(),
+                        *num_params,
+                        *num_motives,
+                        *num_minors,
+                        *num_indices,
+                    ),
+                    _ => continue,
+                };
+            if rec_level_params.len() != us.len() || rec_num_params as usize != params.len() {
+                continue;
+            }
+            let subst = level::subst_map(&rec_level_params, us);
+            let typ = expr::instantiate_level_params(&typ, &subst);
+            // `typ` is `rec`'s own closed declared type — still `Π`-headed
+            // over its params, not yet a term "under" any loose bvars —
+            // so `instantiate` (which substitutes loose bvars, not `Pi`
+            // binders) must run *after* the params' own `Pi`s are peeled,
+            // not on `typ` directly. Peeling all of
+            // `rec_num_params + num_motives + num_minors + num_indices`
+            // in one pass first (the previous shape here) made that
+            // instantiate call a no-op — invisible whenever
+            // `rec_num_params == 0` (nothing to substitute either way,
+            // true of every prior nested type this ran on), but wrong
+            // for a genuinely parametric target whose own major premise
+            // depends on those params (`Lean.Doc.Block`'s own two type
+            // arguments).
+            let mut cur = typ;
+            let mut ok = true;
+            for _ in 0..rec_num_params {
+                match &**cur {
+                    ExprData::Pi(_, _, body) => cur = body.clone(),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let params_rev: Vec<Expr> = params.iter().rev().cloned().collect();
+            let mut cur = expr::instantiate(&cur, &params_rev);
+            for _ in 0..(num_motives + num_minors + num_indices) {
+                match &**cur {
+                    ExprData::Pi(_, _, body) => cur = body.clone(),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let major_dom = match &**cur {
+                ExprData::Pi(_, dom, _) => dom.clone(),
+                _ => continue,
+            };
+            // The `num_motives + num_minors + num_indices` layers just
+            // peeled above are taken via a bare `body.clone()` on each
+            // `Pi`, never pushing a matching dummy binder onto any
+            // context — so any bvar in `major_dom` that actually names
+            // something *outside* all of them (an already-substituted
+            // parameter from the stage just above) is still indexed as
+            // if those layers were still there. Shifting down by exactly
+            // that count re-expresses it relative to the true, unpeeled
+            // depth `params`/`target_args` already live at: motives and
+            // minors are never referenced by a well-formed major
+            // premise's own type, so there is nothing here to
+            // substitute, only to un-nest.
+            let peeled = (num_motives + num_minors + num_indices) as i32;
+            let major_dom = expr::shift(&major_dom, -peeled, 0);
+            let (mh, margs) = expr::unfold_apps(&major_dom);
+            if let ExprData::Const(c, _) = &**mh {
+                if *c == target && margs.len() >= target_args.len() {
+                    // Structural `==` is too strict here: two occurrences
+                    // of the *same* nested type can carry differently
+                    // *named* (but defeq) universe level arguments —
+                    // e.g. one path substitutes a group's own concrete
+                    // levels, another leaves a generic level parameter
+                    // from a shared instance's own declaration in place.
+                    // A false decline here (from `!=` on an otherwise-
+                    // identical type) is what let `nested_rec_for`'s
+                    // ambiguous, name-only fallback silently pick the
+                    // wrong group member (`Cedar.Spec.Value._sizeOf_3_eq`:
+                    // `List Value`'s `rec_3`, sorted first, instead of
+                    // `List (Prod Attr Value)`'s `rec_4`, both owning
+                    // `List.cons`/`List.nil`).
+                    let matches = margs[..target_args.len()]
+                        .iter()
+                        .zip(target_args)
+                        .all(|(a, b)| a == b || self.is_def_eq(ctx, a, b).unwrap_or(false));
+                    if matches {
+                        return Some(rec);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Find `cname`'s minor-premise slot directly from `rname`'s own type
+    /// signature, instead of a heuristic count over the group's sort
+    /// order (`ctor_minor_index`). A nested-recursor group shares one
+    /// global minor numbering across every member (`minors.len()` is the
+    /// same for `rec`, `rec_1`, …), and each minor's own declared type is
+    /// `Π (fields/IHs...), motive_j (C params.. fields..)` — a shape that
+    /// names its constructor `C` and that constructor's own params
+    /// directly, with no ambiguity, regardless of how many *other*
+    /// specializations in the group happen to reuse the same constructor
+    /// name for a different element type (`List.cons` is one constant
+    /// shared by every `List _` instantiation, so a six-way mutual group
+    /// with two different `List` specializations has two separate
+    /// `List.nil`/`List.cons`-shaped minors at two different slots).
+    /// Matching on the constructor's own params (not just its name) is
+    /// what tells those two slots apart, and does so from the type
+    /// signature alone — no dependence on `self.rec_group`'s own sort
+    /// order at all. Returns `None` (falls back to the heuristic) for any
+    /// shape this doesn't handle cleanly, e.g. an indexed recursor whose
+    /// conclusion isn't a single-argument `motive major`, or if the type
+    /// doesn't parse as expected — never a wrong answer, just a decline
+    /// to the existing behavior.
+    ///
+    /// On `Cedar.Spec.Value._sizeOf_5_eq`'s own two-same-shaped-`List`
+    /// group, this independently derives the same slot `ctor_minor_index`
+    /// already did post-fix: the group's sort order was not, in fact, the
+    /// source of that reject (verified, not assumed — both approaches
+    /// agree here). The remaining gap there is a different one: the
+    /// generated `head_ih` for a nested-recursor field mutually typed
+    /// with the group (e.g. `Prod`) is a *specialized* recursor
+    /// application (`rec_5` here), while the proof compares it against a
+    /// *generic* typeclass-instance application for the same field
+    /// (`SizeOf.sizeOf` routed through `Prod`'s own, non-specialized
+    /// recursor) — both stuck on the same neutral variable, needing
+    /// "these are two different recursors for the same type, with
+    /// pointwise-equal motives/minors" as its own defeq principle, which
+    /// this checker does not implement. Out of scope for this pass.
+    fn minor_index_from_type(
+        &self,
+        rname: u32,
+        us: &[Level],
+        rec_level_params: &[u32],
+        params: &[Expr],
+        cname: u32,
+        ctor_params: &[Expr],
+    ) -> Option<usize> {
+        let (typ, rec_num_params, num_motives, num_minors) = match self.env.get(rname) {
+            Some(ConstantInfo::Recursor {
+                typ,
+                num_params,
+                num_motives,
+                num_minors,
+                ..
+            }) => (typ.clone(), *num_params, *num_motives, *num_minors),
+            _ => return None,
+        };
+        if rec_level_params.len() != us.len() || rec_num_params as usize != params.len() {
+            return None;
+        }
+        let subst = level::subst_map(rec_level_params, us);
+        let typ = expr::instantiate_level_params(&typ, &subst);
+        // `instantiate` substitutes *loose* bvars — a no-op on `typ` as a
+        // whole, since it's the recursor's own closed, Pi-wrapped declared
+        // type (`loose_bvar_range(typ) == 0`). The params (e.g. LCNF
+        // `Code`'s own `purity` index, threaded through as an explicit
+        // leading parameter rather than a plain non-indexed one) must be
+        // substituted into the *body*, after peeling their own binding
+        // `Pi`s first — exactly the same class of bug already fixed in
+        // `nested_rec_for_type` (`Lean.Doc.Block.brecOn_6.go`). Calling
+        // `instantiate` on the still-Pi-wrapped type left every reference
+        // to a param inside a minor's own conclusion as an unresolved,
+        // dangling bvar that could never match `ctor_params` — not "off
+        // by a shift", genuinely two different things being compared — so
+        // this always returned `None` for any recursor with
+        // `rec_num_params > 0`, falling through to `ctor_minor_index`'s
+        // name-only positional fallback (wrong here: `Lean.Compiler.LCNF.
+        // Code.rec`'s six-motive mutual group interleaves `Code`'s own
+        // constructors with `Alt`/`FunDecl`/`Cases`'s, so `Code.let`/
+        // `Code.fun`'s minors sit at positions 5/6, not the fallback's
+        // assumed 0/1).
+        let mut cur = typ;
+        for _ in 0..rec_num_params {
+            match &**cur {
+                ExprData::Pi(_, _, body) => cur = body.clone(),
+                _ => return None,
+            }
+        }
+        // `params` is in application order (outermost/first-bound first);
+        // `instantiate` substitutes bvar 0 (innermost) with `args[0]`, so
+        // reverse before substituting into the now-loose body.
+        let params_rev: Vec<Expr> = params.iter().rev().cloned().collect();
+        let mut cur = expr::instantiate(&cur, &params_rev);
+        for _ in 0..num_motives {
+            match &**cur {
+                ExprData::Pi(_, _, body) => cur = body.clone(),
+                _ => return None,
+            }
+        }
+        // Two passes over the same minor telescope. First, find every
+        // position whose conclusion's constructor head is `cname` by name
+        // alone (cheap, no de Bruijn bookkeeping). Most constructors are
+        // unique within their own recursor's minor list — `Code.let`/
+        // `Code.fun` never recur for any other type in the mutual group —
+        // so a unique name match already unambiguously answers "which
+        // minor", without needing `ctor_params` at all. Only a name that
+        // repeats (the documented `ctor_minor_index` case: two same-shaped
+        // nested specializations, e.g. two `List.cons` rules for distinct
+        // element types in one group) needs the second, params-based pass
+        // to disambiguate — that pass's own bookkeeping (comparing
+        // `ctor_params`, captured at the caller's scope, against `cargs`
+        // found by walking `num_motives + p` outer binders plus this
+        // minor's own inner ones) only has to get the shift right when
+        // there's more than one candidate, not for every recursor.
+        let mut by_name: Vec<usize> = Vec::new();
+        {
+            let mut probe = cur.clone();
+            for p in 0..num_minors {
+                let (mut inner, next) = match &**probe {
+                    ExprData::Pi(_, dom, body) => (dom.clone(), body.clone()),
+                    _ => return None,
+                };
+                loop {
+                    match &**inner {
+                        ExprData::Pi(_, _, body) => inner = body.clone(),
+                        _ => break,
+                    }
+                }
+                let (_motive, concl_args) = expr::unfold_apps(&inner);
+                if let Some(major_shape) = concl_args.last() {
+                    let (chead, _) = expr::unfold_apps(major_shape);
+                    if matches!(&**chead, ExprData::Const(c, _) if *c == cname) {
+                        by_name.push(p as usize);
+                    }
+                }
+                probe = next;
+            }
+        }
+        if by_name.len() == 1 {
+            return Some(by_name[0]);
+        }
+        if by_name.is_empty() {
+            return None;
+        }
+        for p in 0..num_minors {
+            let (mut inner, next) = match &**cur {
+                ExprData::Pi(_, dom, body) => (dom.clone(), body.clone()),
+                _ => return None,
+            };
+            loop {
+                match &**inner {
+                    ExprData::Pi(_, _, body) => inner = body.clone(),
+                    _ => break,
+                }
+            }
+            let (_motive, concl_args) = expr::unfold_apps(&inner);
+            if let Some(major_shape) = concl_args.last() {
+                let (chead, cargs) = expr::unfold_apps(major_shape);
+                if let ExprData::Const(c, _) = &**chead {
+                    if *c == cname
+                        && cargs.len() >= ctor_params.len()
+                        && cargs[..ctor_params.len()] == *ctor_params
+                    {
+                        return Some(p as usize);
+                    }
+                }
+            }
+            cur = next;
+        }
+        None
+    }
+
     fn ctor_minor_index(&self, cname: u32, rname: u32, all: &[u32]) -> usize {
+        // `rname`'s own position for `cname` first: a nested group's own
+        // constructor can be *polymorphic* (`List.cons` is the same
+        // constant regardless of its element type), so two different
+        // specializations in the same group (`List Value`'s recursor and
+        // `List (Prod Attr Value)`'s, say) can each list a rule for the
+        // exact same `cname`. Matching the first occurrence across the
+        // *whole* group, regardless of which recursor is actually being
+        // reduced, silently picked whichever specialization's rule (and
+        // RHS) happened to come first in the group's order — the wrong
+        // one whenever `rname` itself isn't that first specialization.
+        // This fixes that misattribution (never uses a *different*
+        // recursor's rule for the constructor being reduced), but the
+        // offset added below still assumes `self.rec_group`'s own sort
+        // order lines up with the actual, shared minor-slot layout the
+        // group's individual definitions (e.g. a mutual `sizeOf` helper)
+        // were built against; a group with more than one same-shaped
+        // nested specialization (two `List.nil`/`List.cons` pairs, for
+        // distinct element types, both in one group) can still combine
+        // with the wrong minor if that assumption doesn't hold for a
+        // given export. Confirmed independently correct — and needed —
+        // for every existing fixture (the `Acc`/`PersistentHashMap.Node`
+        // nested-recursor cases): only known to be incomplete on a case
+        // pulled from the live `cedar` export with two same-shaped `List`
+        // specializations in one six-way mutual group.
         let mut idx = 0usize;
+        for rec in self.rec_group(rname) {
+            let rules = match self.env.get(rec) {
+                Some(ConstantInfo::Recursor { rules, .. }) => rules,
+                _ => continue,
+            };
+            if rec == rname {
+                if let Some(local) = rules.iter().position(|r| r.ctor == cname) {
+                    return idx + local;
+                }
+            }
+            idx += rules.len();
+        }
+        // Fallback for a `cname` `rname` doesn't own directly (shouldn't
+        // normally happen: `try_iota`'s own ctor detection already
+        // requires `rec_owns_ctor(cname)` or `all.contains(induct)` before
+        // calling here) — first match by ctor name anywhere in the group.
+        idx = 0;
         for rec in self.rec_group(rname) {
             if let Some(ConstantInfo::Recursor { rules, .. }) = self.env.get(rec) {
                 for rule in rules {
@@ -3875,6 +5022,7 @@ impl<'e> Checker<'e> {
         ctx: &Ctx,
         rname: u32,
         us: &[Level],
+        ctor_us: &[Level],
         level_params: &[u32],
         all: &[u32],
         params: &[Expr],
@@ -3891,7 +5039,9 @@ impl<'e> Checker<'e> {
             }) => (level_params.clone(), typ.clone()),
             _ => return Ok(minor),
         };
-        let subst = level::subst_map(&ctor_lp, us);
+        // `ctor_us`, the constructor's own universe args at its
+        // application site — not `us` (see the call site's own comment).
+        let subst = level::subst_map(&ctor_lp, ctor_us);
         let mut ct = expr::instantiate_level_params(&ctor_typ, &subst);
         // Nested ctors (Array.mk, List.cons) carry their own params on the
         // major; the outer recursor's params may be empty (Syntax).
@@ -3996,8 +5146,50 @@ impl<'e> Checker<'e> {
                 iargs[..nparams].to_vec(),
                 &iargs[nparams..],
             )
+        } else if let Some(nrec) = {
+            // `params` is at `ctx`'s own depth; `target_args` (`iargs`,
+            // built from `ty`) is at `tctx`'s — `ctx` plus the `binders`
+            // this function's own `field_ty`-unfold loop just pushed.
+            // The direct-recursion branch just above already shifts
+            // `params` by `shift_by` before comparing it against
+            // anything `iargs`-derived (`p_rec_shifted`); this branch
+            // compared un-shifted `params` against `tctx`-depth
+            // `target_args` instead, so a candidate's own major type —
+            // wherever it embeds one of the outer recursor's own
+            // parameters, as any genuinely parametric nested type's
+            // major premise does — carried the wrong de Bruijn index
+            // whenever `shift_by > 0`. Invisible for a non-parametric
+            // target (nothing to embed), which is every prior nested
+            // type this ran on.
+            let shifted_params: Vec<Expr> = params
+                .iter()
+                .map(|p| expr::shift(p, shift_by, 0))
+                .collect();
+            self.nested_rec_for_type(&tctx, rname, us, &shifted_params, target, &iargs)
+        } {
+            // `nested_rec_for_type` matches on `ty`'s own head and args
+            // against each candidate's *actual declared major-premise
+            // type* — sound regardless of whether `occurs_any` (below)
+            // can see the recursion at all. `occurs_any` is a purely
+            // syntactic check for the group's own type *name* appearing
+            // literally inside `ty`; it correctly catches direct nesting
+            // (`List Value` inside `Value`'s own group) but misses
+            // *indirect* nesting through some other, independently-named
+            // type in between (`Cedar.Validation.CedarType`'s own
+            // `List (Prod Attr QualifiedType)` field: `QualifiedType`
+            // itself wraps `CedarType`, but the literal name `CedarType`
+            // never appears in `List (Prod Attr QualifiedType)`, so
+            // `occurs_any` said "not recursive" and this field's own
+            // induction hypothesis was silently dropped — under-applying
+            // a `below`-shaped minor by exactly that many argument slots
+            // and leaving it stuck as a bare, unapplied `Ctor.mk`-minor
+            // lambda instead of a fully-reduced value, which is what
+            // `Cedar.SymCC.TermType.ofType`'s own `.fst`/`.snd`
+            // projections out of that stuck lambda then reject on).
+            (nrec, params.iter().map(|p| expr::shift(p, shift_by, 0)).collect(), &[][..])
         } else if self.occurs_any(&ty, all) {
-            // Only `F … I …` (e.g. `Array Syntax`), not `List Preresolved`.
+            // Fallback for a shape `nested_rec_for_type` doesn't parse
+            // cleanly: the older, name-only search, unchanged.
             if let Some(nrec) = self.nested_rec_for(target, rname) {
                 (nrec, params.iter().map(|p| expr::shift(p, shift_by, 0)).collect(), &[][..])
             } else {
@@ -4652,7 +5844,19 @@ impl<'e> Checker<'e> {
                 let Some(nat_ty) = self.nat_ref else {
                     return Ok(None);
                 };
-                let ty = self.whnf(ctx, &args[0])?;
+                // `whnf_core` (no δ), not full `whnf`, for the same reason
+                // as `try_hbin_nat`'s type-argument check: `nat::of_nat_value`
+                // returns the raw numeral tag `n` unconditionally once the
+                // type looks like `Nat`, with no check that the *instance*
+                // argument's `ofNat` field actually is `n` — e.g.
+                // `OfNat.ofNat (Multiplicative Nat) 1 (One.toOfNat1 (...
+                // Multiplicative.monoid ...))`, whose instance's `ofNat`
+                // field is `Nat`'s own additive identity `0`, repurposed as
+                // the multiplicative identity, not the literal `1` this tag
+                // names. A type argument that needs a type-level δ-unfold to
+                // become `Nat` is not safe to fast-path this way; one that
+                // is already a bare `Nat` constant still is.
+                let ty = self.whnf_core(ctx, &args[0])?;
                 let mut stripped = args.to_vec();
                 stripped[0] = ty.clone();
                 if let Some(v) = nat::of_nat_value(&stripped, nat_ty) {
@@ -4733,7 +5937,20 @@ impl<'e> Checker<'e> {
         if args.len() < need {
             return Ok(None);
         }
-        let ty = self.whnf(ctx, &args[ty_i])?;
+        // Only δ-unfold as far as `whnf_core` (β/ι/proj, no δ) goes: a type
+        // argument that is *already* a bare `Nat`/`Int` constant is safe to
+        // fast-path to the matching primitive op, but one that needs a
+        // type-level δ-unfold to become `Nat`/`Int` (e.g. `Multiplicative
+        // Nat`, whose own `Mul` instance is repurposed from the underlying
+        // `Add`, not `Nat.mul`) is not: the operation identity this
+        // shortcut assumes ("this `HMul.hMul` *is* `Nat.mul`") does not
+        // survive unwrapping a type synonym whose instances can rename or
+        // repurpose the operation. Falling through to the general path is
+        // always safe here (slower, never wrong); the previous full
+        // `self.whnf` call on the type alone, with no check that the
+        // instance argument agrees, could substitute an unrelated `Nat.*`
+        // primitive for the *actual* instance's operation.
+        let ty = self.whnf_core(ctx, &args[ty_i])?;
         let ty_name = match &**ty {
             ExprData::Const(t, _) => self.name_str(*t),
             _ => return Ok(None),
@@ -4749,8 +5966,8 @@ impl<'e> Checker<'e> {
             "HAdd.hAdd" | "HSub.hSub" | "HMul.hMul" | "HDiv.hDiv" | "HMod.hMod"
         ) && args.len() >= 3
         {
-            let t1 = self.whnf(ctx, &args[1])?;
-            let t2 = self.whnf(ctx, &args[2])?;
+            let t1 = self.whnf_core(ctx, &args[1])?;
+            let t2 = self.whnf_core(ctx, &args[2])?;
             is_int_name(ty_name)
                 && matches!(&**t1, ExprData::Const(t, _) if is_int_name(self.name_str(*t)))
                 && matches!(&**t2, ExprData::Const(t, _) if is_int_name(self.name_str(*t)))
@@ -7092,6 +8309,127 @@ impl<'e> Checker<'e> {
         n > 0 && level::is_def_eq(&cur, lo)
     }
 
+    /// Lean kernel `elim_only_at_universe_zero` (`src/kernel/inductive.cpp`):
+    /// whether the recursor(s) for the (mutual) inductive group `all` may
+    /// only eliminate into `Prop` (motive codomain fixed at `Sort 0`),
+    /// rather than an arbitrary `Sort u`. This is Lean's own,
+    /// syntax-approximated "is this Prop a subsingleton" check — the
+    /// justification for the exception is that a subsingleton has at
+    /// most one proof, so a motive that can see into `Sort u` still
+    /// cannot distinguish two different proofs (there's only one).
+    ///
+    /// Sort-u inductives are entirely unaffected — the whole notion of
+    /// "elim only at 0" only makes sense for a type that could actually
+    /// *be* `Prop` for some universe assignment. Checked via
+    /// `level::is_not_zero` on the type's own declared sort, matching
+    /// the kernel's own `m_is_not_zero` exactly (not `is_def_eq` against
+    /// literal `zero`, which only catches an unconditionally-Prop type
+    /// and would let a level-polymorphic predicate like `Sort u` through
+    /// unrestricted for every `u`, including `u := 0`).
+    ///
+    /// For a possibly-Prop, non-mutual, single-constructor type, Lean's
+    /// own two-part field check (case 3 below) is why a `Sort u`-valued
+    /// field is only safe to expose through the motive when it already
+    /// occurs literally in the constructor's own conclusion (its own
+    /// index arguments): that information was never hidden — it's part
+    /// of the term's declared type, not something the recursor would be
+    /// leaking out of an opaque proof.
+    ///
+    /// Restricted (Prop-only) when any of:
+    ///   1. `all.len() > 1`: mutually recursive predicates.
+    ///   2. the type has more than one constructor.
+    ///   3. the type has exactly one constructor with a field that is
+    ///      not itself Prop-valued (case 1 below fails) *and* does not
+    ///      occur in the constructor's own conclusion (case 2 fails) —
+    ///      e.g. `inductive Bad : Prop | mk (x : Sort 1)`: `x`'s own
+    ///      type is `Sort 1` (not Prop, `is_not_zero`), and `Bad` has no
+    ///      indices at all for `x` to occur in, so a `Bad.rec` motive
+    ///      that reaches `Sort 1` could pull `x` itself out of an opaque
+    ///      `Bad` proof — combined with proof irrelevance (any two
+    ///      `Bad.mk` proofs are equal), that proves `False`.
+    /// Not restricted (large elim OK) when the type has zero
+    /// constructors (e.g. `False`: vacuously fine, nothing to leak) or
+    /// its one constructor's every non-Prop field occurs in the
+    /// conclusion (e.g. `Eq.refl`'s `a` occurs as both of `Eq`'s own
+    /// indices).
+    fn elim_only_at_universe_zero(&self, all: &[u32]) -> R<bool> {
+        let tname0 = all[0];
+        let (num_params0, num_indices0, typ0) = match self.env.get(tname0) {
+            Some(ConstantInfo::InductiveType {
+                num_params,
+                num_indices,
+                typ,
+                ..
+            }) => (*num_params, *num_indices, typ.clone()),
+            _ => return Ok(false),
+        };
+        let mut ctx0 = Ctx::new();
+        let mut cur0 = typ0;
+        for _ in 0..(num_params0 + num_indices0) {
+            let (_, dom, body) = self.ensure_pi(&ctx0, &cur0)?;
+            ctx0.push(dom);
+            cur0 = body;
+        }
+        let result_level = self.ensure_sort(&ctx0, &cur0)?;
+        if level::is_not_zero(&result_level) {
+            // For every universe assignment the type is not Prop, so
+            // it's not an inductive predicate at all.
+            return Ok(false);
+        }
+        if all.len() > 1 {
+            return Ok(true);
+        }
+        let ctors = match self.env.get(tname0) {
+            Some(ConstantInfo::InductiveType { ctors, .. }) => ctors.clone(),
+            _ => return Ok(false),
+        };
+        if ctors.len() > 1 {
+            return Ok(true);
+        }
+        let Some(&cname) = ctors.first() else {
+            // Zero constructors (`False`): vacuously large-elim OK.
+            return Ok(false);
+        };
+        let (c_typ, c_np) = match self.env.get(cname) {
+            Some(ConstantInfo::Constructor {
+                typ, num_params, ..
+            }) => (typ.clone(), *num_params),
+            _ => return Ok(false),
+        };
+        let mut cctx = Ctx::new();
+        let mut cur = c_typ;
+        let mut pos: u32 = 0;
+        // bvar-depth positions of fields that are not themselves Prop.
+        let mut to_check: Vec<u32> = Vec::new();
+        loop {
+            match &**cur {
+                ExprData::Pi(_, dom, body) => {
+                    if pos >= c_np {
+                        if let Ok(ds) = self.infer_type(&cctx, dom) {
+                            if let Ok(field_lvl) = self.ensure_sort(&cctx, &ds) {
+                                if level::is_not_zero(&field_lvl) {
+                                    to_check.push(pos);
+                                }
+                            }
+                        }
+                    }
+                    cctx.push(dom.clone());
+                    cur = body.clone();
+                    pos += 1;
+                }
+                _ => break,
+            }
+        }
+        let (_, args) = expr::unfold_apps(&cur);
+        for p in &to_check {
+            let expected = expr::bvar(pos - 1 - p);
+            if !args.iter().any(|a| **a == *expected) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn check_inductive_group(&self, first_name: u32) -> R<()> {
         let ci = self
             .env
@@ -7276,6 +8614,62 @@ impl<'e> Checker<'e> {
                 }
             }
         }
+        // Large-elimination check, once per group (not once per member —
+        // `check_inductive_group` runs once per type name in the block,
+        // all sharing the same `all`). See `elim_only_at_universe_zero`'s
+        // own comment for the exact rule being enforced.
+        if all.first() == Some(&first_name) && self.elim_only_at_universe_zero(&all)? {
+            let mut recs: Vec<u32> = all
+                .iter()
+                .filter_map(|t| self.env.rec_of.get(t).copied())
+                .collect();
+            recs.sort_unstable();
+            recs.dedup();
+            for rname in recs {
+                let (r_typ, r_np, r_nm) = match self.env.get(rname) {
+                    Some(ConstantInfo::Recursor {
+                        typ,
+                        num_params,
+                        num_motives,
+                        ..
+                    }) => (typ.clone(), *num_params, *num_motives),
+                    _ => continue,
+                };
+                let mut mctx = Ctx::new();
+                let mut cur = r_typ;
+                for _ in 0..r_np {
+                    let (_, dom, body) = self.ensure_pi(&mctx, &cur)?;
+                    mctx.push(dom);
+                    cur = body;
+                }
+                for _ in 0..r_nm {
+                    let (_, dom, body) = self.ensure_pi(&mctx, &cur)?;
+                    let motive_ok = {
+                        let mut mtctx = mctx.clone();
+                        let mut mt = dom.clone();
+                        loop {
+                            match self.ensure_pi(&mtctx, &mt) {
+                                Ok((_, d, b)) => {
+                                    mtctx.push(d);
+                                    mt = b;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        self.ensure_sort(&mtctx, &mt)
+                            .is_ok_and(|l| level::is_def_eq(&l, &level::zero()))
+                    };
+                    if !motive_ok {
+                        return reject(format!(
+                            "recursor `{}` allows large elimination out of a Prop-valued inductive that is not a subsingleton",
+                            self.name_str(rname)
+                        ));
+                    }
+                    mctx.push(dom);
+                    cur = body;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -7332,6 +8726,7 @@ impl<'e> Checker<'e> {
             crate::stats::ctx_clone();
             ctx.clone()
         };
+        let mut peeled = 0i32;
         loop {
             match &**cur {
                 ExprData::Pi(_, dom, body) => {
@@ -7342,11 +8737,29 @@ impl<'e> Checker<'e> {
                     }
                     ctx2.push(dom.clone());
                     cur = self.positivity_whnf(&ctx2, body)?;
+                    peeled += 1;
                 }
                 _ => break,
             }
         }
-        self.check_positive_spine(&ctx2, &cur, bound, num_params, visiting)
+        // `visiting` records, per outer nested-functor call, the parameter
+        // expressions the cycle check (`params_defeq`, called from
+        // `check_nested_functor`) later compares fresh occurrences against
+        // — but those recorded expressions are only meaningful relative to
+        // the de Bruijn context depth they were captured at. Every `Pi`
+        // peeled above pushes one more binder onto `ctx2` without this
+        // constructor argument's own binders being reflected in
+        // `visiting`'s stored expressions, so a later occurrence found
+        // under those same binders is compared, via `is_def_eq` at the
+        // *new*, deeper `ctx2`, against params that still sit at the
+        // *old*, shallower depth: never equal, no matter how many times
+        // the exact same nested type/params pair recurs. Shifting
+        // `visiting`'s contents by the same amount keeps them meaningful
+        // at `ctx2`'s depth, so a genuine repeat is recognized and the
+        // cycle check (which is the only thing bounding this recursion)
+        // actually bounds it.
+        let visiting_shifted = shift_visiting(visiting, peeled);
+        self.check_positive_spine(&ctx2, &cur, bound, num_params, &visiting_shifted)
     }
 
     fn expected_param_args(&self, ctx: &Ctx, num_params: u32) -> Vec<Expr> {
@@ -7415,6 +8828,19 @@ impl<'e> Checker<'e> {
     /// is checked on the specialized constructors. Export form still has
     /// `F Ds`, so instantiate F's constructors at `Ds` and require those
     /// fields to be strictly positive in `bound`.
+    ///
+    /// Checked whether this repo has a "nested positivity depth
+    /// 16"-style cap that could be replaced with a functor-identity
+    /// cycle check. It doesn't — there's no depth counter anywhere in the
+    /// positivity checker (`check_positivity`/`check_arg_positive_in`/
+    /// `check_specialized_ctor_positive` all take no depth parameter).
+    /// The only bound on nested-functor recursion is `visiting` below:
+    /// exact `(name, params)` identity, via `params_defeq`, which *is*
+    /// already the functor-identity check the candidate asked for, not a
+    /// raw depth cap standing in for one. Nothing to lift here; this is
+    /// inductive-declaration checking (`check_inductive_group`), not
+    /// `is_def_eq`/`infer_type`, so it was out of this pass's scope
+    /// either way.
     fn check_nested_functor(
         &self,
         ctx: &Ctx,
@@ -7532,11 +8958,19 @@ impl<'e> Checker<'e> {
             crate::stats::ctx_clone();
             ctx.clone()
         };
+        // Each field after the first sits one more binder deep than the
+        // last (`ctx2.push(dom)` below, once per preceding field), same
+        // reasoning as `check_arg_positive_in`'s own shift: `visiting`'s
+        // recorded params are only meaningful at the context depth they
+        // were captured at, so they need to be shifted to stay meaningful
+        // for a later field's own occurrence check.
+        let mut visiting_cur = visiting.to_vec();
         loop {
             match &**cur {
                 ExprData::Pi(_, dom, body) => {
-                    self.check_arg_positive_in(&ctx2, dom, bound, i_num_params, visiting)?;
+                    self.check_arg_positive_in(&ctx2, dom, bound, i_num_params, &visiting_cur)?;
                     ctx2.push(dom.clone());
+                    visiting_cur = shift_visiting(&visiting_cur, 1);
                     cur = body.clone();
                 }
                 _ => break,
@@ -7572,6 +9006,1204 @@ impl<'e> Checker<'e> {
             ExprData::Proj(_, _, v) => self.occurs_any(v, names),
             _ => false,
         }
+    }
+
+    // ---------------- NbE spike (`KIOTA_NBE=1`, `is_def_eq` only) ----------------
+    //
+    // See `nbe.rs` for the design rationale. Everything below only ever
+    // asserts `Ok(true)` when it can justify it structurally (two values
+    // reduced, via legitimate reduction steps, to a matching canonical or
+    // neutral shape); anything else — mismatch, or a construct this spike
+    // does not model — is surfaced as `Ok(false)`/`Err` and the caller
+    // (`is_def_eq_via_nbe`) falls back to the eager comparator for a
+    // definitive answer. NbE can only accelerate a `true` it would reach
+    // anyway; it never overrides the eager verdict.
+
+    pub(crate) fn is_def_eq_via_nbe(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        let depth = ctx.len() as u32;
+        let attempt: R<bool> = (|| {
+            let env = crate::nbe::generic_env(depth);
+            let va = self.eval(&env, a)?;
+            let vb = self.eval(&env, b)?;
+            self.values_def_eq(depth, &va, &vb)
+        })();
+        match attempt {
+            Ok(true) => Ok(true),
+            _ => self.is_def_eq_inner(ctx, a, b),
+        }
+    }
+
+    pub(crate) fn eval(&self, env: &nbe::VEnv, e: &Expr) -> R<Rc<nbe::Value>> {
+        crate::stats::whnf_call();
+        match &***e {
+            ExprData::BVar(i) => {
+                let idx = env
+                    .len()
+                    .checked_sub(1 + *i as usize)
+                    .ok_or_else(|| TcError::Other("nbe: bvar out of range".into()))?;
+                env[idx].force(self)
+            }
+            ExprData::Sort(l) => Ok(Rc::new(nbe::Value::Sort(l.clone()))),
+            ExprData::Lit(l) => Ok(Rc::new(nbe::Value::Lit(l.clone()))),
+            ExprData::Lam(bi, ty, body) => {
+                let dom = nbe::Thunk::deferred(env.clone(), ty.clone());
+                Ok(Rc::new(nbe::Value::Lam(*bi, dom, env.clone(), body.clone())))
+            }
+            ExprData::Pi(bi, ty, body) => {
+                let dom = nbe::Thunk::deferred(env.clone(), ty.clone());
+                Ok(Rc::new(nbe::Value::Pi(*bi, dom, env.clone(), body.clone())))
+            }
+            ExprData::Let(_ty, val, body) => {
+                let mut env2 = (**env).clone();
+                env2.push(nbe::Thunk::deferred(env.clone(), val.clone()));
+                self.eval(&Rc::new(env2), body)
+            }
+            ExprData::Proj(s, i, v) => {
+                let vv = self.eval(env, v)?;
+                self.eval_proj(*s, *i, vv)
+            }
+            ExprData::Const(n, us) => self.eval_const(*n, us),
+            ExprData::App(f, a) => {
+                let vf = self.eval(env, f)?;
+                let arg = nbe::Thunk::deferred(env.clone(), a.clone());
+                self.apply(vf, arg, env.len() as u32)
+            }
+        }
+    }
+
+    fn eval_const(&self, n: u32, us: &Rc<Vec<Level>>) -> R<Rc<nbe::Value>> {
+        if self.eager_whnf_unfolds(n) {
+            if let Some(body) = self.unfold_delta(n, us, true)? {
+                return self.eval(&nbe::empty_env(), &body);
+            }
+        }
+        Ok(Rc::new(nbe::Value::Neutral(nbe::Neutral::Const(n, us.clone()))))
+    }
+
+    fn eval_proj(&self, sname: u32, idx: u32, v: Rc<nbe::Value>) -> R<Rc<nbe::Value>> {
+        if let nbe::Value::Neutral(nv) = &*v {
+            let (chead, cargs) = Self::unwind_neutral(nv);
+            if let nbe::Neutral::Const(cname, _) = chead {
+                if let Some(ConstantInfo::Constructor {
+                    num_params,
+                    induct,
+                    ..
+                }) = self.env.get(*cname)
+                {
+                    if *induct == sname {
+                        let fi = (*num_params + idx) as usize;
+                        if let Some(f) = cargs.get(fi) {
+                            return f.force(self);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Rc::new(nbe::Value::Neutral(nbe::Neutral::Proj(
+            sname,
+            idx,
+            Rc::new(match &*v {
+                nbe::Value::Neutral(nv) => Self::clone_neutral(nv),
+                _ => return decline("nbe: proj of a non-structure value"),
+            }),
+        ))))
+    }
+
+    fn clone_neutral(n: &nbe::Neutral) -> nbe::Neutral {
+        match n {
+            nbe::Neutral::Var(l) => nbe::Neutral::Var(*l),
+            nbe::Neutral::Const(a, us) => nbe::Neutral::Const(*a, us.clone()),
+            nbe::Neutral::App(f, a) => nbe::Neutral::App(Rc::new(Self::clone_neutral(f)), a.clone()),
+            nbe::Neutral::Proj(s, i, v) => nbe::Neutral::Proj(*s, *i, Rc::new(Self::clone_neutral(v))),
+        }
+    }
+
+    /// Unwind a `Neutral` spine into `(root, args)`, args in application
+    /// order (first-applied first) — the `Value`-space analogue of
+    /// `expr::unfold_apps`.
+    fn unwind_neutral(n: &nbe::Neutral) -> (&nbe::Neutral, Vec<Rc<nbe::Thunk>>) {
+        let mut args = Vec::new();
+        let mut cur = n;
+        loop {
+            match cur {
+                nbe::Neutral::App(f, a) => {
+                    args.push(a.clone());
+                    cur = f;
+                }
+                _ => break,
+            }
+        }
+        args.reverse();
+        (cur, args)
+    }
+
+    pub(crate) fn apply(
+        &self,
+        vf: Rc<nbe::Value>,
+        arg: Rc<nbe::Thunk>,
+        depth: u32,
+    ) -> R<Rc<nbe::Value>> {
+        match &*vf {
+            nbe::Value::Lam(_, _, env, body) => {
+                let mut env2 = (**env).clone();
+                env2.push(arg);
+                self.eval(&Rc::new(env2), body)
+            }
+            nbe::Value::Neutral(n) => self.apply_neutral(n, arg, depth),
+            _ => decline("nbe: apply to a non-function value"),
+        }
+    }
+
+    fn apply_neutral(
+        &self,
+        n: &nbe::Neutral,
+        arg: Rc<nbe::Thunk>,
+        depth: u32,
+    ) -> R<Rc<nbe::Value>> {
+        let spine = nbe::Neutral::App(Rc::new(Self::clone_neutral(n)), arg);
+        if let Some(v) = self.try_iota_value(&spine, depth)? {
+            return Ok(v);
+        }
+        Ok(Rc::new(nbe::Value::Neutral(spine)))
+    }
+
+    /// Reduce a recursor application whose major is a `Nat` literal or a
+    /// fully-applied constructor of a type in `all` — `Nat.rec`/`List.rec`/
+    /// `brecOn`-shaped structural recursion, indexed recursors (`Acc.rec`),
+    /// and higher-order (binder-introducing) recursive occurrences
+    /// (`Acc.intro`'s `∀ y, r y x → Acc r y` field) all included. Anything
+    /// this can't match eager's own rule on (K-like/structure eta, nested-
+    /// inductive recursion, an unresolvable major) is left neutral:
+    /// `Ok(None)`, which makes the whole comparison "uncertain" and defers
+    /// to eager — never a "close enough" wrong reduction.
+    ///
+    /// Indices are handled exactly like eager `try_iota`: skipped over
+    /// (folded into `major_pos`) and never separately inspected — the
+    /// checker doesn't re-validate them here any more than eager does.
+    /// The "apply minor to fields, interleave one rec-call per recursive
+    /// field" step (arbitrary binder count, indices threaded through a
+    /// field's own occurrence type) is *not* reimplemented here: it calls
+    /// eager's own `iota_from_first_principles`/`mk_rec_call` directly, on
+    /// quoted params/ctor_params/motives/minors/fields, to guarantee it
+    /// matches eager's rule by construction rather than by a second,
+    /// independently-written (and soundness-critical) copy of it. This
+    /// bridge is bounded, not accumulating: params/motives/minors are
+    /// fixed for the whole reduction (never grow with recursion depth),
+    /// and `fields` are this one constructor application's own (small)
+    /// arguments — never the "below"/accumulator value itself, which
+    /// never gets serialized: it stays purely in Value space, nested
+    /// inside the *lazy* argument thunks `eval`'s own `App` case already
+    /// creates for the rec-call embedded in `rhs`, so a minor that
+    /// ignores its `ih` still never forces it.
+    fn try_iota_value(&self, spine: &nbe::Neutral, depth: u32) -> R<Option<Rc<nbe::Value>>> {
+        let (root, args) = Self::unwind_neutral(spine);
+        let (rname, us) = match root {
+            nbe::Neutral::Const(n, us) => (*n, us.clone()),
+            _ => return Ok(None),
+        };
+        let (level_params, all, num_params, num_motives, num_minors, num_indices) =
+            match self.env.get(rname) {
+                Some(ConstantInfo::Recursor {
+                    level_params,
+                    all,
+                    num_params,
+                    num_motives,
+                    num_minors,
+                    num_indices,
+                    ..
+                }) => (
+                    level_params.clone(),
+                    all.clone(),
+                    *num_params,
+                    *num_motives,
+                    *num_minors,
+                    *num_indices,
+                ),
+                _ => return Ok(None),
+            };
+        let major_pos = (num_params + num_motives + num_minors + num_indices) as usize;
+        if args.len() != major_pos + 1 {
+            return Ok(None);
+        }
+        if let Some(cached) = self.iota_value_cache(rname, &us, &args) {
+            return Ok(Some(cached));
+        }
+        // `SUPPRESS_PROP_MAJOR_ITOA` (see its own comment): inside
+        // `infer_type_via_nbe`'s call tree, a Prop-major recursor
+        // (Acc-shape) declines to iota-reduce even on a ctor/theorem-
+        // unfolds-to-ctor major, deferring to the eager rescue instead of
+        // risking an asymmetric reduction eager itself never performs.
+        // Nat.rec/List.rec/brecOn-shaped structural recursion (Nat's own
+        // major type isn't Prop) is entirely unaffected.
+        if SUPPRESS_PROP_MAJOR_ITOA.with(Cell::get) && self.recursor_unfolds_thm_major(rname) {
+            return Ok(None);
+        }
+        let params = &args[..num_params as usize];
+        let motives = &args[num_params as usize..(num_params + num_motives) as usize];
+        let minors =
+            &args[(num_params + num_motives) as usize..(num_params + num_motives + num_minors) as usize];
+        let mut major_v = args[major_pos].force(self)?;
+
+        let rec_owns_ctor = |cname: u32| -> bool {
+            matches!(
+                self.env.get(rname),
+                Some(ConstantInfo::Recursor { rules, .. }) if rules.iter().any(|r| r.ctor == cname)
+            )
+        };
+
+        // Theorem-wrapped major (`_proof := Acc.intro …`): eager unfolds
+        // this via `recursor_unfolds_thm_major` + `whnf_major` before iota
+        // ever sees it. Bridge to that exact mechanism — never a weaker
+        // reimplementation — when native forcing didn't already land on a
+        // ctor/`Nat`-literal head.
+        if self.recursor_unfolds_thm_major(rname) && !self.is_ctor_or_nat_lit_value(&major_v)? {
+            let major_q = self.quote(depth, &major_v)?;
+            let unfolded = self.whnf_major(&Self::dummy_ctx(depth), &major_q, rname)?;
+            major_v = self.eval(&nbe::generic_env(depth), &unfolded)?;
+        }
+
+        let ctor: Option<(u32, u32, Vec<Rc<nbe::Thunk>>, Option<Vec<Level>>)> = match &*major_v {
+            nbe::Value::Lit(Lit::Nat(n)) => {
+                let Some((zero, succ)) = self.nat_ctors() else {
+                    return Ok(None);
+                };
+                let nat_induct = match self.env.get(zero) {
+                    Some(ConstantInfo::Constructor { induct, .. }) => Some(*induct),
+                    _ => None,
+                };
+                if !(nat_induct.map(|i| all.contains(&i)).unwrap_or(false) || rec_owns_ctor(zero)) {
+                    return Ok(None);
+                }
+                if *n == BigUint::from(0u32) {
+                    Some((zero, 0, Vec::new(), None))
+                } else if n.bits() > 256 {
+                    // Same byte cap as the eager path (`nat.rs`); stays
+                    // neutral so the fallback keeps the eager decline.
+                    return Ok(None);
+                } else {
+                    let pred = n - 1u32;
+                    Some((
+                        succ,
+                        0,
+                        vec![nbe::Thunk::forced(Rc::new(nbe::Value::Lit(Lit::Nat(pred))))],
+                        None,
+                    ))
+                }
+            }
+            nbe::Value::Neutral(nv) => {
+                let (chead, cargs) = Self::unwind_neutral(nv);
+                match chead {
+                    nbe::Neutral::Const(cname, ctor_us) => match self.env.get(*cname) {
+                        Some(ConstantInfo::Constructor {
+                            induct,
+                            num_params: cnp,
+                            ..
+                        }) if all.contains(induct) || rec_owns_ctor(*cname) => {
+                            Some((*cname, *cnp, cargs, Some((**ctor_us).clone())))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((cname, cnp, ctor_args, ctor_us)) = ctor else {
+            return Ok(None);
+        };
+        if (ctor_args.len() as u32) < cnp {
+            return Ok(None);
+        }
+        let ctor_params = &ctor_args[..cnp as usize];
+        let fields = &ctor_args[cnp as usize..];
+
+        let dctx = Self::dummy_ctx(depth);
+        let params_q = self.quote_all(depth, params)?;
+        let ctor_params_q = self.quote_all(depth, ctor_params)?;
+        let motives_q = self.quote_all(depth, motives)?;
+        let minors_q = self.quote_all(depth, minors)?;
+        let fields_q = self.quote_all(depth, fields)?;
+
+        let minor_idx = self
+            .minor_index_from_type(rname, &us, &level_params, &params_q, cname, &ctor_params_q)
+            .unwrap_or_else(|| self.ctor_minor_index(cname, rname, &all));
+        if minor_idx >= minors.len() {
+            return Ok(None);
+        }
+        // See eager's own call site comment: the ctor's own
+        // application-site universe args, not `us` (the outer
+        // recursor's), or a nested type's own multi-level-param
+        // constructor is left partly unsubstituted.
+        let ctor_us_owned = ctor_us.unwrap_or_else(|| us.to_vec());
+        let rhs = self.iota_from_first_principles(
+            &dctx,
+            rname,
+            &us,
+            &ctor_us_owned,
+            &level_params,
+            &all,
+            &params_q,
+            &ctor_params_q,
+            &motives_q,
+            &minors_q,
+            minors_q[minor_idx].clone(),
+            cname,
+            &fields_q,
+        )?;
+        let result = self.eval(&nbe::generic_env(depth), &rhs)?;
+        self.iota_value_cache_insert(rname, &us, &args, result.clone());
+        Ok(Some(result))
+    }
+
+    /// `Ctx` of the given depth, entries of an arbitrary but valid
+    /// placeholder type (`Sort 0`) — used only to hand eager's
+    /// `iota_from_first_principles`/`mk_rec_call`/`whnf_major` a `Ctx` of
+    /// matching length for their own internal `ensure_pi`/`whnf`/
+    /// `is_def_eq` calls on the *quoted* (bounded, non-accumulating)
+    /// params/motives/minors/fields passed in alongside it. Those internal
+    /// checks (e.g. `mk_rec_call`'s param-match `is_def_eq`) only ever
+    /// gate whether a field counts as a recursive occurrence — a wrong
+    /// answer there can only make the bridge under- rather than over-
+    /// recognize a rec-call (`Ok(None)`, deferring to eager), never
+    /// produce an unsound accept.
+    fn dummy_ctx(depth: u32) -> Ctx {
+        let mut ctx = Ctx::new();
+        let placeholder = expr::sort(level::zero());
+        for _ in 0..depth {
+            ctx.push(placeholder.clone());
+        }
+        ctx
+    }
+
+    fn quote_all(&self, depth: u32, thunks: &[Rc<nbe::Thunk>]) -> R<Vec<Expr>> {
+        thunks
+            .iter()
+            .map(|t| {
+                let v = t.force(self)?;
+                self.quote(depth, &v)
+            })
+            .collect()
+    }
+
+    /// `Value`-space analogue of `is_ctor_or_nat_lit_head`.
+    fn is_ctor_or_nat_lit_value(&self, v: &nbe::Value) -> R<bool> {
+        Ok(match v {
+            nbe::Value::Lit(Lit::Nat(_)) => true,
+            nbe::Value::Neutral(nv) => {
+                let (chead, _) = Self::unwind_neutral(nv);
+                matches!(
+                    chead,
+                    nbe::Neutral::Const(n, _)
+                        if matches!(self.env.get(*n), Some(ConstantInfo::Constructor { .. }))
+                )
+            }
+            _ => false,
+        })
+    }
+
+    fn iota_value_cache_key(
+        &self,
+        rname: u32,
+        us: &Rc<Vec<Level>>,
+        args: &[Rc<nbe::Thunk>],
+    ) -> (u32, Vec<Level>, Vec<ThunkPtrKey>) {
+        let ptrs = args.iter().cloned().map(ThunkPtrKey).collect();
+        (rname, (**us).clone(), ptrs)
+    }
+
+    fn iota_value_cache(
+        &self,
+        rname: u32,
+        us: &Rc<Vec<Level>>,
+        args: &[Rc<nbe::Thunk>],
+    ) -> Option<Rc<nbe::Value>> {
+        let key = self.iota_value_cache_key(rname, us, args);
+        self.iota_value_cache.borrow().get(&key).cloned()
+    }
+
+    fn iota_value_cache_insert(
+        &self,
+        rname: u32,
+        us: &Rc<Vec<Level>>,
+        args: &[Rc<nbe::Thunk>],
+        v: Rc<nbe::Value>,
+    ) {
+        let key = self.iota_value_cache_key(rname, us, args);
+        self.iota_value_cache.borrow_mut().insert(key, v);
+    }
+
+    /// Convert a `Value` back to an `Expr`, for tests and error paths only —
+    /// the hot `values_def_eq` comparison never needs to quote.
+    pub(crate) fn quote(&self, depth: u32, v: &nbe::Value) -> R<Expr> {
+        match v {
+            nbe::Value::Sort(l) => Ok(expr::sort(l.clone())),
+            nbe::Value::Lit(Lit::Nat(n)) => Ok(expr::lit_nat(n.clone())),
+            nbe::Value::Lit(Lit::Str(s)) => Ok(expr::lit_str((**s).clone())),
+            nbe::Value::Lam(bi, dom, env, body) => {
+                let domv = dom.force(self)?;
+                let domq = self.quote(depth, &domv)?;
+                let fresh = nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(nbe::Neutral::Var(depth))));
+                let mut env2 = (**env).clone();
+                env2.push(fresh);
+                let bodyv = self.eval(&Rc::new(env2), body)?;
+                let bodyq = self.quote(depth + 1, &bodyv)?;
+                Ok(expr::lam(*bi, domq, bodyq))
+            }
+            nbe::Value::Pi(bi, dom, env, body) => {
+                let domv = dom.force(self)?;
+                let domq = self.quote(depth, &domv)?;
+                let fresh = nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(nbe::Neutral::Var(depth))));
+                let mut env2 = (**env).clone();
+                env2.push(fresh);
+                let bodyv = self.eval(&Rc::new(env2), body)?;
+                let bodyq = self.quote(depth + 1, &bodyv)?;
+                Ok(expr::pi(*bi, domq, bodyq))
+            }
+            nbe::Value::Neutral(n) => self.quote_neutral(depth, n),
+        }
+    }
+
+    fn quote_neutral(&self, depth: u32, n: &nbe::Neutral) -> R<Expr> {
+        match n {
+            nbe::Neutral::Var(level) => {
+                if *level >= depth {
+                    return Err(TcError::Other("nbe: level out of range during quote".into()));
+                }
+                Ok(expr::bvar(depth - level - 1))
+            }
+            nbe::Neutral::Const(name, us) => Ok(expr::const_(*name, (**us).clone())),
+            nbe::Neutral::App(f, a) => {
+                let fq = self.quote_neutral(depth, f)?;
+                let av = a.force(self)?;
+                let aq = self.quote(depth, &av)?;
+                Ok(expr::app(fq, aq))
+            }
+            nbe::Neutral::Proj(s, i, v) => {
+                let vq = self.quote_neutral(depth, v)?;
+                Ok(expr::proj(*s, *i, vq))
+            }
+        }
+    }
+
+    /// Structural equality of two `Value`s. `Ok(true)` is a sound, final
+    /// answer (matching canonical/neutral shapes are definitionally equal
+    /// by construction of `eval`). `Ok(false)` means "not confirmed" —
+    /// mismatch *or* an unsupported shape — and the caller must treat that
+    /// as "ask eager", never as a confirmed inequality.
+    pub(crate) fn values_def_eq(&self, depth: u32, va: &Rc<nbe::Value>, vb: &Rc<nbe::Value>) -> R<bool> {
+        if Rc::ptr_eq(va, vb) {
+            return Ok(true);
+        }
+        match (&**va, &**vb) {
+            (nbe::Value::Sort(l1), nbe::Value::Sort(l2)) => Ok(level::is_def_eq(l1, l2)),
+            (nbe::Value::Lit(x), nbe::Value::Lit(y)) => Ok(x == y),
+            (nbe::Value::Neutral(n1), nbe::Value::Neutral(n2)) => self.neutral_def_eq(depth, n1, n2),
+            (nbe::Value::Pi(_, d1, e1, b1), nbe::Value::Pi(_, d2, e2, b2)) => {
+                let dv1 = d1.force(self)?;
+                let dv2 = d2.force(self)?;
+                if !self.values_def_eq(depth, &dv1, &dv2)? {
+                    return Ok(false);
+                }
+                let fresh = nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(nbe::Neutral::Var(depth))));
+                let mut env1 = (**e1).clone();
+                env1.push(fresh.clone());
+                let mut env2 = (**e2).clone();
+                env2.push(fresh);
+                let bv1 = self.eval(&Rc::new(env1), b1)?;
+                let bv2 = self.eval(&Rc::new(env2), b2)?;
+                self.values_def_eq(depth + 1, &bv1, &bv2)
+            }
+            (nbe::Value::Lam(_, d1, e1, b1), nbe::Value::Lam(_, d2, e2, b2)) => {
+                let dv1 = d1.force(self)?;
+                let dv2 = d2.force(self)?;
+                if !self.values_def_eq(depth, &dv1, &dv2)? {
+                    return Ok(false);
+                }
+                let fresh = nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(nbe::Neutral::Var(depth))));
+                let mut env1 = (**e1).clone();
+                env1.push(fresh.clone());
+                let mut env2 = (**e2).clone();
+                env2.push(fresh);
+                let bv1 = self.eval(&Rc::new(env1), b1)?;
+                let bv2 = self.eval(&Rc::new(env2), b2)?;
+                self.values_def_eq(depth + 1, &bv1, &bv2)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn neutral_def_eq(&self, depth: u32, n1: &nbe::Neutral, n2: &nbe::Neutral) -> R<bool> {
+        match (n1, n2) {
+            (nbe::Neutral::Var(l1), nbe::Neutral::Var(l2)) => Ok(l1 == l2),
+            (nbe::Neutral::Const(a, ua), nbe::Neutral::Const(b, ub)) => Ok(a == b
+                && ua.len() == ub.len()
+                && ua.iter().zip(ub.iter()).all(|(x, y)| level::is_def_eq(x, y))),
+            (nbe::Neutral::App(f1, a1), nbe::Neutral::App(f2, a2)) => {
+                if !self.neutral_def_eq(depth, f1, f2)? {
+                    return Ok(false);
+                }
+                let v1 = a1.force(self)?;
+                let v2 = a2.force(self)?;
+                self.values_def_eq(depth, &v1, &v2)
+            }
+            (nbe::Neutral::Proj(s1, i1, v1), nbe::Neutral::Proj(s2, i2, v2)) => {
+                Ok(s1 == s2 && i1 == i2 && self.neutral_def_eq(depth, v1, v2)?)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    // ---------------- NbE spike: infer_type on Values ----------------
+    //
+    // `pub fn infer_type` (the one every other part of the checker calls)
+    // is untouched: it still always returns `Expr`, exactly as before, so
+    // `check_decl`'s actual type-checking path has zero behavior change
+    // from anything in this section unless/until it's wired in.
+    //
+    // Wiring this in once found a real disagreement: two accept
+    // fixtures rejected under KIOTA_NBE=1, both on the same shape (a bound
+    // variable vs. a theorem applied to that variable, both proofs of the
+    // same Prop). The cause was `vctx_to_ctx`: every fallback point
+    // rebuilt an eager `Ctx` by *quoting* each tracked `Value` type, and
+    // that round trip (through `eval` once when the type was first tracked,
+    // then `quote` again to reconstruct `Ctx`, then `eval` *again* inside
+    // whatever eager function the fallback called — `proofs_of_same_prop`
+    // calls `infer_type` on `ctx`, which under the flag re-enters this same
+    // machinery) was enough to lose whatever the real, never-reconstructed
+    // `Ctx` preserves that eager's proof-irrelevance/App-argument checks
+    // depend on. `types_compatible` calling `is_def_eq_inner` directly
+    // (bypassing `KIOTA_NBE`'s own dispatch) ruled out a dispatch loop as
+    // the cause — swapping that in changed nothing, isolating the bug to
+    // the reconstruction itself, not to which comparator got called.
+    //
+    // Fix: never reconstruct `Ctx` by quoting. `infer_type_value`
+    // (and every helper below) now carries the *original* `ctx: &Ctx`
+    // alongside `tys`/`env`, growing it in lockstep for `Lam`/`Pi` (which
+    // eager's own `Ctx` grows for too) — and every eager fallback call
+    // (`infer_type_cached`, `is_def_eq_inner`, `infer_proj`, and anything
+    // eager calls transitively, e.g. `proofs_of_same_prop`) gets that real
+    // `ctx` plus the *original* sub-`Expr`, never a quoted stand-in. `Let`
+    // is handled the way eager's own `infer_type_uncached` already does —
+    // zeta first (`expr::instantiate1(body, val)`), then infer the
+    // substituted term under the *same* `ctx`/`tys`/`env`, no new level at
+    // all — so there is no separate "did `ctx` grow here" bookkeeping to
+    // get wrong between the two structures. `quote` is now used only where
+    // it always should have been: turning a *Value-native* successful
+    // result back into an `Expr` at `infer_type_via_nbe`'s own boundary
+    // (and inside `types_compatible`, to hand a genuinely Value-native
+    // `got`/`want` pair — with no original `Expr` at all — to eager for a
+    // decisive comparison).
+
+    fn vctx_new() -> (Vec<Rc<nbe::Thunk>>, nbe::VEnv) {
+        (Vec::new(), nbe::empty_env())
+    }
+
+    /// Push a fresh (unknown-value) binder of type `ty` into all three of
+    /// `ctx`/`tys`/`env` at once, as `infer_type_uncached` does for
+    /// `Lam`/`Pi` (the only forms whose eager `Ctx` actually grows).
+    ///
+    /// `ty_thunk` is a `Thunk`, not a forced `Value` (a
+    /// substitution-based redesign, see the comment above
+    /// `infer_type_value`): the binder's type is not evaluated just
+    /// because it was bound, only if/when some later `BVar` occurrence of
+    /// it actually needs a `Value` (`infer_type_value`'s own `BVar` case
+    /// forces it then, and `Thunk::force` memoizes so that costs at most
+    /// once no matter how many occurrences there are).
+    fn vctx_push(
+        ctx: &Ctx,
+        tys: &[Rc<nbe::Thunk>],
+        env: &nbe::VEnv,
+        ty_expr: &Expr,
+        ty_thunk: Rc<nbe::Thunk>,
+    ) -> (Ctx, Vec<Rc<nbe::Thunk>>, nbe::VEnv) {
+        let level = env.len() as u32;
+        let mut ctx2 = ctx.clone();
+        ctx2.push(ty_expr.clone());
+        let mut tys2 = tys.to_vec();
+        tys2.push(ty_thunk);
+        let mut env2 = (**env).clone();
+        env2.push(nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(
+            nbe::Neutral::Var(level),
+        ))));
+        (ctx2, tys2, Rc::new(env2))
+    }
+
+    /// `KIOTA_NBE=1` dispatch target for `pub fn infer_type`. Computes the
+    /// type via `infer_type_value` (Value-native for the core calculus,
+    /// falling back to `infer_type_cached` — never `infer_type`'s own
+    /// dispatch again, to skip a redundant flag re-check — for anything it
+    /// doesn't model) and quotes the result back to `Expr` at the
+    /// declaration/call boundary this function itself is.
+    ///
+    /// A `Reject` from `infer_type_value` is trusted directly: every reject
+    /// it can produce is either a raw structural fact (an out-of-range
+    /// bvar/projection index — not a soundness judgement, the same either
+    /// representation) or backed by `types_compatible`/`is_prop`, which
+    /// only ever decide via the proven eager `is_def_eq`/`is_prop` — on the
+    /// real `ctx`, never a reconstructed one. Any other outcome (an
+    /// internal `Other`/`Decline`, or quoting failing on an otherwise-
+    /// successful inference) defers to `infer_type_cached` entirely: per
+    /// the contract, a bug here may cost completeness, never turn into a
+    /// wrong accept.
+    fn infer_type_via_nbe(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        if std::env::var_os("KIOTA_TRACE_INFER_NBE").is_some() {
+            eprintln!(
+                "infer_type_via_nbe ctxlen={} e={}",
+                ctx.len(),
+                self.pp_budget(e, 40)
+            );
+        }
+        // `SUPPRESS_PROP_MAJOR_ITOA` (see its own comment): scoped to this
+        // call's own recursive subtree, including any nested `infer_type`
+        // dispatch back into `infer_type_via_nbe` for a sub-expression.
+        let prev = SUPPRESS_PROP_MAJOR_ITOA.with(|c| c.replace(true));
+        let r = self.infer_type_via_nbe_inner(ctx, e);
+        SUPPRESS_PROP_MAJOR_ITOA.with(|c| c.set(prev));
+        r
+    }
+
+    fn infer_type_via_nbe_inner(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        // `KIOTA_TRACE_RESCUE=1` confirms this function's own
+        // `ctx`-re-evaluation loop below is not the source of the Acc-shape
+        // `Ir` cost either — on `alg-conv-trans-acc-right.accept.ndjson`
+        // this runs 221 times with combined `ctx.len()` of 594, negligible
+        // next to `eval`'s ~55k total calls. See `types_compatible`'s
+        // comment for where the cost actually is.
+        if std::env::var_os("KIOTA_TRACE_RESCUE").is_some() {
+            eprintln!("INFER_VIA_NBE ctxlen={}", ctx.len());
+        }
+        // `ctx[i]`'s type used to be eagerly `eval`'d here on
+        // every single call — for every sub-expression `infer_type`
+        // recurses into, not just once — regardless of whether that
+        // binder is ever actually looked up. Deferred instead: a `BVar`
+        // occurrence that's never inferred (e.g. `infer_only` skips the
+        // App-argument check it would've been needed for) now never
+        // forces it at all, and `Thunk::force`'s own memoization means a
+        // binder referenced many times still only costs one `eval`.
+        let mut tys: Vec<Rc<nbe::Thunk>> = Vec::with_capacity(ctx.len());
+        let mut env = nbe::empty_env();
+        for i in 0..ctx.len() {
+            tys.push(nbe::Thunk::deferred(env.clone(), ctx[i].clone()));
+            let level = env.len() as u32;
+            let mut env2 = (*env).clone();
+            env2.push(nbe::Thunk::forced(Rc::new(nbe::Value::Neutral(
+                nbe::Neutral::Var(level),
+            ))));
+            env = Rc::new(env2);
+        }
+        match self.infer_type_value(ctx, &tys, &env, e) {
+            Ok(tv) => self
+                .quote(ctx.len() as u32, &tv)
+                .or_else(|_| self.infer_type_cached(ctx, e)),
+            Err(rej @ TcError::Reject(_)) => Err(rej),
+            Err(_) => self.infer_type_cached(ctx, e),
+        }
+    }
+
+    /// `infer_type_cached` on the *real* `ctx` and the *original* `e` —
+    /// never a quoted stand-in for either. Also never `infer_type`: that
+    /// re-dispatches to `infer_type_via_nbe` under `KIOTA_NBE=1`, which is
+    /// *this function's own caller* — an unconditional infinite loop the
+    /// instant this fallback ever fires with the flag on (confirmed by a
+    /// real stack overflow before that fix).
+    fn infer_type_value_fallback(
+        &self,
+        ctx: &Ctx,
+        env: &nbe::VEnv,
+        e: &Expr,
+    ) -> R<Rc<nbe::Value>> {
+        let t = self.infer_type_cached(ctx, e)?;
+        self.eval(env, &t)
+    }
+
+    /// Definitive type-compatibility check: try the fast Value-native
+    /// comparison first (sound whenever it confirms `true`, per
+    /// `values_def_eq`'s contract), and only when it doesn't, fall back to
+    /// eager's own `is_def_eq_inner` (never `is_def_eq`'s dispatch) on the
+    /// real `ctx` — quoting `got`/`want` here is unavoidable (they may be
+    /// genuinely Value-native results, e.g. a `Pi` built from an inferred
+    /// `Lam` body, with no original `Expr` to fall back to at all), but
+    /// `ctx` itself is always the caller's real one, never reconstructed.
+    fn types_compatible(
+        &self,
+        ctx: &Ctx,
+        depth: u32,
+        got: &Rc<nbe::Value>,
+        want: &Rc<nbe::Value>,
+    ) -> R<bool> {
+        if self.values_def_eq(depth, got, want)? {
+            return Ok(true);
+        }
+        let got_q = self.quote(depth, got)?;
+        let want_q = self.quote(depth, want)?;
+        // This fallback used to call `is_def_eq_inner` directly,
+        // *not* wrapped in `with_forced_eager_defeq` — a real, separate
+        // gap from the two named rescues (`app_arg_type_ok_eager`/
+        // `value_type_ok_eager`), now closed the same way: as soon as its
+        // own recursion (Pi/Lam bodies, `app_spines_congruent`'s
+        // pairwise/`defeq_args` args) went through the *dispatching*
+        // `is_def_eq`, it re-entered `is_def_eq_via_nbe` for every nested
+        // sub-comparison regardless of whether either named rescue ever
+        // ran.
+        //
+        // Measured with `KIOTA_TRACE_RESCUE=1` on the three Acc-shape
+        // export fixtures: `app_arg_type_ok_eager`/`value_type_ok_eager`
+        // are invoked *zero* times on any of them, and forcing eager here
+        // (this fix) plus the cache-namespacing and `SUPPRESS_PROP_MAJOR_
+        // ITOA` fixes above changed the measured `callgrind` `Ir` by
+        // noise (<1%), not the 2.7x-3.8x this session's task expected to
+        // move. The actual cost, confirmed by instrumenting `eval` and
+        // `infer_type_via_nbe`'s own `ctx`-re-evaluation loop separately,
+        // is neither caches nor an asymmetric iota peel: it's that
+        // `infer_type_value` computes types by *evaluating* — `eval`
+        // always fully reduces every node it touches (Const unfolds,
+        // App applies, the final `motive`-substitution step calls `eval`
+        // again) — where eager's `infer_type_cached` computes the exact
+        // same types by *substituting* (`expr::instantiate1`, an O(1)
+        // pointer op via structural sharing/interning, no reduction at
+        // all). For a large proof term (the well-founded-recursion value
+        // these fixtures actually check), that is a real, structural
+        // difference in how much work each strategy does per node, not a
+        // missed cache or an avoidable reduction — `infer_type_via_nbe`
+        // itself only runs 221 times with 594 total `ctx` entries
+        // re-evaluated on the largest fixture (negligible), while `eval`
+        // alone accounts for essentially all ~55k reduction-counter hits.
+        // Closing this gap for real would mean `infer_type_value` (or a
+        // variant of it) computing types without evaluating through them
+        // — i.e. substitution-based, like eager — which is a materially
+        // different design for that function, not a bounded fix; out of
+        // scope for this pass. The three fixes above stay: each closes a
+        // real correctness/consistency gap in the eager-rescue mechanism
+        // ("a slower correct rescue is better than a wrong wire"), even
+        // though none of them, individually or together, move this
+        // fixture's `Ir` ratio.
+        self.with_forced_eager_defeq(|| self.is_def_eq_inner(ctx, &got_q, &want_q))
+    }
+
+    /// Last-resort fallback for an App argument-type check that
+    /// `types_compatible` couldn't confirm on the *evaluated* (`Value`)
+    /// forms. `eval` always fully reduces (unfolds every `Def` on the
+    /// spine, then tries iota) before anything gets compared, which can
+    /// turn `f x y` into a `Recursor`-headed spine — and
+    /// `try_unreduced_const_congruence` *deliberately* refuses to
+    /// proof-irrelevance-compare Recursor spines unreduced (its own
+    /// comment: "Recursor spines … must WHNF/δ/ι first"), while it
+    /// happily does so for an ordinary `Def` like `f` itself. So a check
+    /// that would succeed at the `f x y` level via proof irrelevance on a
+    /// `Prop`-typed argument, without ever needing to unfold `f`, can
+    /// still fail once `eval` has already unfolded `f` for us and only
+    /// one side's `Recursor` major happened to reduce further than the
+    /// other's (e.g. one side's major is a bound variable, the other a
+    /// theorem that unfolds to a constructor).
+    ///
+    /// Eager `infer_type`/`ensure_pi` never proactively reduces (it only
+    /// substitutes), so re-deriving both types the eager way and
+    /// comparing them with `is_def_eq_inner` (never `is_def_eq`, which
+    /// would re-dispatch into this same NbE path) reproduces exactly the
+    /// comparison eager itself would have made, at the same
+    /// (un-reduced) level. Only ever used to *rescue* a decline into an
+    /// accept that matches eager's own judgment; any error or eager
+    /// mismatch here still rejects.
+    fn app_arg_type_ok_eager(&self, ctx: &Ctx, f: &Expr, a: &Expr) -> R<bool> {
+        // `KIOTA_TRACE_RESCUE=1` logs every invocation of this and
+        // `value_type_ok_eager` with the term sizes involved. Used to
+        // confirm (not guess) that neither one is actually invoked on the
+        // Acc-shape export fixtures at all — see the comment above
+        // `types_compatible`.
+        if std::env::var_os("KIOTA_TRACE_RESCUE").is_some() {
+            eprintln!(
+                "RESCUE app f_size={} a_size={}",
+                expr_size_capped(f, 100_000),
+                expr_size_capped(a, 100_000)
+            );
+        }
+        // The whole rescue — including re-deriving `f`'s and `a`'s types,
+        // not just the final comparison — must stay eager: `infer_type_cached`
+        // itself calls the *dispatching* `is_def_eq` for its own App-argument
+        // checks (inside `f`'s or `a`'s own structure), which would otherwise
+        // re-enter NbE (and risk the exact over-reduction this rescue exists
+        // to route around) before this function's own comparison ever runs.
+        self.with_forced_eager_defeq(|| {
+            let ft = match self.infer_type_cached(ctx, f) {
+                Ok(t) => t,
+                Err(_) => return Ok(false),
+            };
+            let dom = match self.ensure_pi(ctx, &ft) {
+                Ok((_, dom, _)) => dom,
+                Err(_) => return Ok(false),
+            };
+            let at = match self.infer_type_cached(ctx, a) {
+                Ok(t) => t,
+                Err(_) => return Ok(false),
+            };
+            self.is_def_eq_inner(ctx, &at, &dom)
+        })
+    }
+
+    /// `check_decl`'s counterpart to `app_arg_type_ok_eager`: when `vt`
+    /// (`infer_type`'s, possibly Value-native, answer for the whole
+    /// declaration value) doesn't convert with the declared `typ` under
+    /// `is_def_eq` (which itself may re-dispatch into NbE and re-reduce
+    /// both sides), re-derive the value's type the fully eager way —
+    /// `infer_type_cached` never proactively reduces — and compare that
+    /// against `typ` with `is_def_eq_inner` directly (never `is_def_eq`,
+    /// to avoid re-dispatching into the same NbE path). Only ever rescues
+    /// a decline into an accept that matches eager's own judgment.
+    fn value_type_ok_eager(&self, ctx: &Ctx, value: &Expr, typ: &Expr) -> R<bool> {
+        if std::env::var_os("KIOTA_TRACE_RESCUE").is_some() {
+            eprintln!("RESCUE value value_size={}", expr_size_capped(value, 100_000));
+        }
+        // See `app_arg_type_ok_eager`'s comment: re-deriving `value`'s type
+        // must also stay eager end to end, not just the final comparison.
+        self.with_forced_eager_defeq(|| {
+            let eager_vt = match self.infer_type_cached(ctx, value) {
+                Ok(t) => t,
+                Err(_) => return Ok(false),
+            };
+            self.is_def_eq_inner(ctx, &eager_vt, typ)
+        })
+    }
+
+    /// `infer_type_value` mirrors eager `infer_type_uncached`'s own
+    /// strategy — **substitute, don't evaluate the term being inferred**
+    /// — not `eval`'s. `App`/`Lam`/`Pi`/`Let` build the result type by
+    /// deferring the just-introduced binder (`Thunk::deferred`, forced
+    /// only if a later `BVar` occurrence actually needs it) rather than
+    /// calling `self.eval` on it up front. Only `Const`/`Lit` evaluate
+    /// unconditionally, and only a small, fixed, closed type (the
+    /// constant's own declared type, or `Nat`/`String`'s type) — never a
+    /// subterm of the term actually being checked.
+    ///
+    /// The concrete failure mode this fixes: `eval` always
+    /// fully reduces (`Def` unfolds, then tries iota), so eagerly
+    /// `eval`-ing a `Lam`'s domain or an `App`'s argument as part of
+    /// *inferring a type* could reduce a `Prop`-major recursor
+    /// application that eager's own `infer_type`/`ensure_pi` never
+    /// touches at all (eager only substitutes). Comparing two
+    /// independently-`eval`'d domains that happened to iota-reduce by
+    /// different amounts (one major stayed opaque, the other was already
+    /// a literal/theorem-unfolds-to-a constructor) is exactly the
+    /// asymmetry `SUPPRESS_PROP_MAJOR_ITOA`/`app_arg_type_ok_eager`/
+    /// `value_type_ok_eager` exist to route around after the fact — this
+    /// redesign avoids creating it in the first place, for the *specific*
+    /// subterm (the binder/argument itself) those `eval` calls used to
+    /// touch unconditionally.
+    ///
+    /// This was also the dominant cost on every Acc-shape
+    /// export fixture: `eval`'s own reduction-counter hits (`eval` is
+    /// called ~55k times inferring `alg-conv-trans-acc-right`'s largest
+    /// declaration) came overwhelmingly from this function's own `App`
+    /// case eagerly forcing its argument, and its `Lam`/`Pi` cases eagerly
+    /// forcing their domain, to build the result — not from either named
+    /// rescue helper (confirmed zero invocations with
+    /// `KIOTA_TRACE_RESCUE=1`) and not from `infer_type_via_nbe`'s own
+    /// `ctx`-re-evaluation loop (confirmed negligible: 221 calls, 594
+    /// total `ctx` entries, on the same fixture). Deferring both is this
+    /// redesign's actual point: a binder whose type is never looked up,
+    /// or an argument whose codomain doesn't depend on it, now costs
+    /// nothing instead of a full `eval`.
+    ///
+    /// The same treatment was tried for this function's own *return
+    /// value* — changing its signature to `R<Rc<nbe::Thunk>>` so `App`'s
+    /// own result (the substituted codomain, `body_pi` in an env extended
+    /// with the argument) could be `Thunk::deferred` instead of
+    /// `self.eval`'d immediately, i.e. eager's `instantiate1`-without-
+    /// normalizing, "the Value equivalent of a Closure applied without
+    /// forcing." Implemented, sound (`a` itself stayed forced, per the
+    /// binder-deferral fix above — deferring it too reproduced that exact
+    /// 3x `080_RBTree.id_spec.accept.ndjson` regression again, even with
+    /// `body_pi` also deferred, confirming the two are the same
+    /// regression, not two independent ones), full suite green both
+    /// flags. Measured *zero* additional `Ir` improvement on all three
+    /// Acc-shape fixtures (identical to the earlier binder-deferral
+    /// numbers) and a small (~1.5%) `Ir` regression on
+    /// `080_RBTree.id_spec.accept.ndjson` (reproduced across repeated
+    /// runs, not noise): every caller that needs to inspect an inferred
+    /// type's shape — every enclosing `App` checking `ft` is a `Pi`,
+    /// every `Lam`/`Pi` checking its domain's inferred type is a `Sort`,
+    /// `types_compatible`'s own argument-type check, and the final
+    /// `quote` at the declaration boundary — forces the thunk immediately
+    /// anyway, via what would have been an `infer_type_value_forced`
+    /// helper. For these fixtures' own App chains, that is *every*
+    /// level, so the deferred `eval` just moved from inside this function
+    /// to the caller's forcing point a moment later — same total work,
+    /// plus one `Thunk` allocation's worth of overhead and no case where
+    /// the deferral actually paid off. Only a caller using `infer_only`
+    /// (skipping the argument-type check entirely) or one that never
+    /// inspects the result at all would ever benefit, and neither pattern
+    /// shows up enough in these fixtures' own structure to matter.
+    /// Reverted (this function still returns `Rc<nbe::Value>`, `App`'s
+    /// result is still built by evaluating `body_pi` under the
+    /// argument-extended env); the binder-`Thunk` work above stays, since
+    /// it measured as the real win.
+    pub(crate) fn infer_type_value(
+        &self,
+        ctx: &Ctx,
+        tys: &[Rc<nbe::Thunk>],
+        env: &nbe::VEnv,
+        e: &Expr,
+    ) -> R<Rc<nbe::Value>> {
+        let depth = env.len() as u32;
+        match &***e {
+            ExprData::BVar(i) => {
+                let idx = tys
+                    .len()
+                    .checked_sub(1 + *i as usize)
+                    .ok_or_else(|| TcError::Other("nbe infer: bvar out of range".into()))?;
+                tys[idx].force(self)
+            }
+            ExprData::Sort(l) => Ok(Rc::new(nbe::Value::Sort(level::succ(l.clone())))),
+            ExprData::Const(n, us) => {
+                let t = self.infer_const(*n, us)?;
+                self.eval(&nbe::empty_env(), &t)
+            }
+            ExprData::Lit(Lit::Nat(_)) => {
+                let t = self.nat_type()?;
+                self.eval(&nbe::empty_env(), &t)
+            }
+            ExprData::Lit(Lit::Str(_)) => {
+                let t = self.string_type()?;
+                self.eval(&nbe::empty_env(), &t)
+            }
+            ExprData::App(f, a) => {
+                let ft = self.infer_type_value(ctx, tys, env, f)?;
+                let (dom, env_pi, body_pi) = match &*ft {
+                    nbe::Value::Pi(_, dom, pi_env, body) => (dom.clone(), pi_env.clone(), body.clone()),
+                    _ => return self.infer_type_value_fallback(ctx, env, e),
+                };
+                // `dom` is the *function's own* declared parameter type
+                // (from `f`'s signature) — bounded by that signature's
+                // size, never by `a`'s. Needed unconditionally for the
+                // argument-type check below, so forcing it costs the same
+                // as eager's own `ensure_pi` needing `dom` as an `Expr`.
+                let dom_v = dom.force(self)?;
+                // Lean `check` infers every App argument; InferOnly (only
+                // ever set for already-checked terms, see `with_infer_only`)
+                // skips it, matching the eager App case exactly.
+                if !self.infer_only.get() {
+                    let at = self.infer_type_value(ctx, tys, env, a)?;
+                    if !self.types_compatible(ctx, depth, &at, &dom_v)? && !self.app_arg_type_ok_eager(ctx, f, a)? {
+                        if std::env::var_os("KIOTA_DEBUG").is_some() {
+                            let at_q = self.quote(depth, &at).unwrap_or_else(|_| a.clone());
+                            let dom_q = self.quote(depth, &dom_v).unwrap_or_else(|_| a.clone());
+                            let eager_at = self
+                                .infer_type_cached(ctx, a)
+                                .map(|t| self.pp(&t))
+                                .unwrap_or_else(|e| format!("<eager infer failed: {e:?}>"));
+                            return reject(format!(
+                                "application argument type mismatch (nbe)\n  got:      {}\n  expected: {}\n  eager_at: {}\n  fun:      {}\n  arg:      {}",
+                                self.pp(&at_q),
+                                self.pp(&dom_q),
+                                eager_at,
+                                self.pp(f),
+                                self.pp(a),
+                            ));
+                        }
+                        return reject("application argument type mismatch (nbe)");
+                    }
+                }
+                // Deferring `a` here too was tried (unconditionally,
+                // and gated on whether `body_pi` even references it via
+                // `occurs_bvar`) to match `eval`'s own `App` case. Both
+                // measured as a large *regression* on
+                // `080_RBTree.id_spec.accept.ndjson` — unconditional
+                // deferral tripled `eval`'s own call count (47.7k to
+                // 157k) and callgrind `Ir` (40.8M to 122.3M) versus eager;
+                // gating on `occurs_bvar` alone didn't fix it either
+                // (still 157k), meaning whatever interaction causes it
+                // isn't simply "the codomain is dependent so it always
+                // gets forced anyway" — there's some other, deeper
+                // interaction between the extra `Thunk` indirection here
+                // and `try_iota_value`'s own re-entry into `apply`/`eval`
+                // for this fixture's recursion pattern that this session
+                // didn't fully root-cause. Reverted to eager (matching
+                // the pre-redesign behavior) rather than ship a
+                // regression: `dom` above and the `Lam`/`Pi` cases below
+                // still get the `Thunk`-deferred treatment, which
+                // measured as a real, non-regressive improvement on every
+                // fixture tried.
+                let av = self.eval(env, a)?;
+                let mut env2 = (*env_pi).clone();
+                env2.push(nbe::Thunk::forced(av));
+                self.eval(&Rc::new(env2), &body_pi)
+            }
+            ExprData::Lam(bi, ty, body) => {
+                let tt = self.infer_type_value(ctx, tys, env, ty)?;
+                if !matches!(&*tt, nbe::Value::Sort(_)) {
+                    return self.infer_type_value_fallback(ctx, env, e);
+                }
+                // `ty` (the domain) is deferred, not `eval`'d —
+                // see the comment above this function. `vctx_push` stores
+                // the thunk directly; `Value::Pi`'s own domain field is
+                // already `Rc<Thunk>`, so no forcing happens here either.
+                let dom_thunk = nbe::Thunk::deferred(env.clone(), ty.clone());
+                let (ctx2, tys2, env2) = Checker::vctx_push(ctx, tys, env, ty, dom_thunk.clone());
+                let bt = self.infer_type_value(&ctx2, &tys2, &env2, body)?;
+                let bt_q = self.quote(depth + 1, &bt)?;
+                Ok(Rc::new(nbe::Value::Pi(*bi, dom_thunk, env.clone(), bt_q)))
+            }
+            ExprData::Pi(_bi, ty, body) => {
+                let tt = self.infer_type_value(ctx, tys, env, ty)?;
+                let l1 = match &*tt {
+                    nbe::Value::Sort(l) => l.clone(),
+                    _ => return self.infer_type_value_fallback(ctx, env, e),
+                };
+                // Same deferral as the `Lam` case above. Nothing
+                // here needs the domain's *Value*, only the fact that a
+                // binder of this type now exists — `bs` (the codomain's
+                // own inferred sort) never reads it.
+                let dom_thunk = nbe::Thunk::deferred(env.clone(), ty.clone());
+                let (ctx2, tys2, env2) = Checker::vctx_push(ctx, tys, env, ty, dom_thunk);
+                let bs = self.infer_type_value(&ctx2, &tys2, &env2, body)?;
+                let l2 = match &*bs {
+                    nbe::Value::Sort(l) => l.clone(),
+                    _ => return self.infer_type_value_fallback(ctx, env, e),
+                };
+                Ok(Rc::new(nbe::Value::Sort(level::imax(l1, l2))))
+            }
+            ExprData::Let(ty, val, body) => {
+                let tt = self.infer_type_value(ctx, tys, env, ty)?;
+                if !matches!(&*tt, nbe::Value::Sort(_)) {
+                    return self.infer_type_value_fallback(ctx, env, e);
+                }
+                // `ty` here is the `let`'s own declared annotation, not a
+                // subterm of the (potentially huge) value being checked,
+                // and `types_compatible` immediately below needs it as a
+                // `Value` unconditionally — no laziness opportunity to
+                // give up here without skipping the check itself, which
+                // would not be sound. Bounded by the annotation's own
+                // size, matching eager's own `is_def_eq` cost for `Let`.
+                let dom_v = self.eval(env, ty)?;
+                let vt = self.infer_type_value(ctx, tys, env, val)?;
+                if !self.types_compatible(ctx, depth, &vt, &dom_v)? {
+                    return reject("let value type mismatch (nbe)");
+                }
+                // Zeta first, exactly like `infer_type_uncached`'s own Let
+                // case: `ctx` never grows for a `let` (eager substitutes,
+                // it doesn't push), so this is the one binder-introducing
+                // form that does not call `vctx_push` — matching that
+                // keeps `ctx`'s depth in lockstep with the *substituted*
+                // term's bvar numbering, with no separate "did ctx grow
+                // here" bookkeeping against `tys`/`env` to get wrong.
+                let b = expr::instantiate1(body, val);
+                self.infer_type_value(ctx, tys, env, &b)
+            }
+            ExprData::Proj(sname, idx, v) => self.infer_proj_value(ctx, tys, env, *sname, *idx, v),
+        }
+    }
+
+    /// Value-space counterpart of `infer_proj`: walks the constructor's
+    /// declared Pi telescope directly (as `Expr`, since it's a fixed,
+    /// closed declaration, not something evaluation ever grows), building
+    /// up a `VEnv` of the inductive's own params followed by
+    /// `proj(sname, i, v)` for each field before `idx` — so the target
+    /// field's domain, `eval`'d against that env, comes out already
+    /// substituted, no `instantiate1` needed.
+    fn infer_proj_value(
+        &self,
+        ctx: &Ctx,
+        tys: &[Rc<nbe::Thunk>],
+        env: &nbe::VEnv,
+        sname: u32,
+        idx: u32,
+        v: &Expr,
+    ) -> R<Rc<nbe::Value>> {
+        let fallback = |tc: &Self| tc.infer_type_value_fallback_proj(ctx, env, sname, idx, v);
+        let vt = self.infer_type_value(ctx, tys, env, v)?;
+        let nv = match &*vt {
+            nbe::Value::Neutral(nv) => nv,
+            _ => return fallback(self),
+        };
+        let (chead, targs) = Self::unwind_neutral(nv);
+        let (ind_name, us) = match chead {
+            nbe::Neutral::Const(n, us) => (*n, us.clone()),
+            _ => return fallback(self),
+        };
+        if ind_name != sname {
+            return fallback(self);
+        }
+        let (num_params, ctor_name) = match self.env.get(ind_name) {
+            Some(ConstantInfo::InductiveType {
+                num_params, ctors, ..
+            }) if ctors.len() == 1 => (*num_params, ctors[0]),
+            _ => return fallback(self),
+        };
+        let (ctor_lp, ctor_typ, num_fields) = match self.env.get(ctor_name) {
+            Some(ConstantInfo::Constructor {
+                level_params,
+                typ,
+                num_fields,
+                ..
+            }) => (level_params.clone(), typ.clone(), *num_fields),
+            _ => return fallback(self),
+        };
+        if idx >= num_fields {
+            return reject("projection index out of range (nbe)");
+        }
+        if (targs.len() as u32) < num_params {
+            return fallback(self);
+        }
+        let subst = level::subst_map(&ctor_lp, &us);
+        let mut cur = expr::instantiate_level_params(&ctor_typ, &subst);
+        let mut fenv: nbe::VEnv = nbe::empty_env();
+        for a in targs.iter().take(num_params as usize) {
+            let body = match &**cur {
+                ExprData::Pi(_, _, body) => body.clone(),
+                _ => return fallback(self),
+            };
+            let pv = a.force(self)?;
+            let mut fenv2 = (*fenv).clone();
+            fenv2.push(nbe::Thunk::forced(pv));
+            fenv = Rc::new(fenv2);
+            cur = body;
+        }
+        let v_value = self.eval(env, v)?;
+        for i in 0..idx {
+            let body = match &**cur {
+                ExprData::Pi(_, _, body) => body.clone(),
+                _ => return fallback(self),
+            };
+            let proj_i = self.eval_proj(sname, i, v_value.clone())?;
+            let mut fenv2 = (*fenv).clone();
+            fenv2.push(nbe::Thunk::forced(proj_i));
+            fenv = Rc::new(fenv2);
+            cur = body;
+        }
+        let dom = match &**cur {
+            ExprData::Pi(_, dom, _) => dom.clone(),
+            _ => return fallback(self),
+        };
+        let result = self.eval(&fenv, &dom)?;
+        let depth = env.len() as u32;
+        let vt_q = self.quote(depth, &vt)?;
+        if self.is_prop(ctx, &vt_q)? {
+            // Projecting out of a genuinely Prop-valued structure needs
+            // the full "does an earlier field's own type get referenced
+            // by a later field, and is that earlier field itself data"
+            // analysis (see `infer_proj`'s own comment) — not just "is
+            // this one field itself Prop", which alone accepts unsound
+            // cases like projecting a field that comes after (but does
+            // not itself use) a dependent data field
+            // (`094_projProp6`/`097_projMaybePropPast`). Rather than
+            // reimplement that analysis in Value space for what is an
+            // inherently rare, non-hot-path shape, defer to the eager
+            // path, which already does it and is kept in sync with any
+            // future change to that rule.
+            return fallback(self);
+        }
+        Ok(result)
+    }
+
+    fn infer_type_value_fallback_proj(
+        &self,
+        ctx: &Ctx,
+        env: &nbe::VEnv,
+        sname: u32,
+        idx: u32,
+        v: &Expr,
+    ) -> R<Rc<nbe::Value>> {
+        let t = self.infer_proj(ctx, sname, idx, v)?;
+        self.eval(env, &t)
     }
 }
 
@@ -7856,13 +10488,20 @@ mod tests {
         ];
         let tc = Checker::new(&env, &names, None, None);
         let ctx = Ctx::new();
+        // `delta_body_is_small`'s 512-node same-head-delta cap was
+        // lifted (it only ever cost completeness, never soundness — see
+        // its own doc comment), so it is unconditionally `true` now; this
+        // no longer distinguishes small vs. large bodies. What this test
+        // actually demonstrates — WHNF's Regular unfolding is unconditional
+        // on size, `is_delta` = `has_value`, nothing more — is independent
+        // of that cap either way, so it stands on its own below.
         assert!(
             tc.delta_body_is_small(1),
             "abbrev is small for same-head delta"
         );
         assert!(
-            !tc.delta_body_is_small(2),
-            "large Regular is not small for same-head delta"
+            tc.delta_body_is_small(2),
+            "same-head delta has no size cap post-lift (was: large Regular is not small)"
         );
         let w_small = tc.whnf(&ctx, &expr::const_(1, vec![])).unwrap();
         assert!(
@@ -9099,6 +11738,13 @@ mod tests {
     /// WHNF makes `id a ≡ a` Ok(false) at the cap (stuck term as normal form).
     #[test]
     fn core_depth_abort_declines_not_stuck_whnf() {
+        // `CORE_DEPTH`/`WHNF_DEPTH` are eager-path recursion guards; the NbE
+        // spike (`KIOTA_NBE=1`) doesn't share them (`id a` reduces to `a` in
+        // O(1) via a closure, no counted recursion to abort), so this
+        // eager-internals test has nothing to assert there.
+        if crate::nbe::nbe_enabled() {
+            return;
+        }
         use crate::env::{ConstantInfo, Environment, ReducibilityHints};
         let mut env = Environment::default();
         let sort1 = expr::sort(level::succ(level::zero()));
@@ -9624,4 +12270,736 @@ mod tests {
             tc.pp(&arg)
         );
     }
+
+    // ---------------- NbE spike: eval/quote and is_def_eq_via_nbe vs eager ----------------
+
+    /// `Nat0 : Type`, `Z`/`S` ctors, `Nat0.rec` with the standard two rules —
+    /// enough to exercise `try_iota_value`'s "simple" (zero-index,
+    /// directly-recursive) path without pulling in the real `Nat` literal
+    /// fast path.
+    fn insert_mini_nat0(env: &mut crate::env::Environment) {
+        use crate::env::{ConstantInfo, RecRule};
+        let sort1 = expr::sort(level::succ(level::zero()));
+        let nat0 = expr::const_(0, vec![]);
+        env.insert(
+            0,
+            ConstantInfo::InductiveType {
+                level_params: vec![],
+                typ: sort1.clone(),
+                num_params: 0,
+                num_indices: 0,
+                all: vec![0],
+                ctors: vec![1, 2],
+                is_rec: true,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            1,
+            ConstantInfo::Constructor {
+                level_params: vec![],
+                typ: nat0.clone(),
+                induct: 0,
+                cidx: 0,
+                num_params: 0,
+                num_fields: 0,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            2,
+            ConstantInfo::Constructor {
+                level_params: vec![],
+                typ: expr::pi(expr::BinderInfo::Default, nat0.clone(), nat0.clone()),
+                induct: 0,
+                cidx: 1,
+                num_params: 0,
+                num_fields: 1,
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            3,
+            ConstantInfo::Recursor {
+                level_params: vec![],
+                typ: sort1,
+                all: vec![0],
+                num_params: 0,
+                num_indices: 0,
+                num_motives: 1,
+                num_minors: 2,
+                rules: vec![
+                    RecRule {
+                        ctor: 1,
+                        nfields: 0,
+                        rhs: expr::bvar(0),
+                    },
+                    RecRule {
+                        ctor: 2,
+                        nfields: 1,
+                        rhs: expr::bvar(0),
+                    },
+                ],
+                k: false,
+                is_unsafe: false,
+            },
+        );
+        env.rec_of.insert(0, 3);
+    }
+
+    fn nat0_lit(n: u32) -> Expr {
+        let z = expr::const_(1, vec![]);
+        let s = expr::const_(2, vec![]);
+        let mut cur = z;
+        for _ in 0..n {
+            cur = expr::app(s.clone(), cur);
+        }
+        cur
+    }
+
+    /// `Nat0.rec motive 1 (fun _ ih => S ih) 2` (i.e. `add 2 1`) must NbE-
+    /// evaluate, quote, and `is_def_eq_via_nbe` all agree with eager on `3`,
+    /// and must not agree on `2` — the closure-based iota path in
+    /// `try_iota_value`/`build_rec_call_value` has to reduce a real
+    /// `brecOn`-shaped recursive call (one rec-call per level, via a
+    /// `Thunk::RecCall`, not a re-quoted term) to the right answer.
+    #[test]
+    fn nbe_nat0_rec_add_matches_eager() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_nat0(&mut env);
+        let names = test_names(&["Nat0", "Nat0.Z", "Nat0.S", "Nat0.rec"]);
+        let tc = Checker::new(&env, &names, None, None);
+
+        let nat0 = expr::const_(0, vec![]);
+        let s = expr::const_(2, vec![]);
+        let rec_ = expr::const_(3, vec![]);
+        let motive = expr::lam(expr::BinderInfo::Default, nat0.clone(), nat0.clone());
+        let base = nat0_lit(1); // add's `m`
+        let step = expr::lam(
+            expr::BinderInfo::Default,
+            nat0.clone(),
+            expr::lam(
+                expr::BinderInfo::Default,
+                nat0,
+                expr::app(s, expr::bvar(0)),
+            ),
+        );
+        let two = nat0_lit(2);
+        let rec_app = expr::apps(rec_, &[motive, base, step, two.clone()]);
+        let three = nat0_lit(3);
+
+        let ctx = Ctx::new();
+        assert!(
+            tc.is_def_eq(&ctx, &rec_app, &three).unwrap(),
+            "eager: add 2 1 must convert to 3"
+        );
+        assert!(
+            tc.is_def_eq_via_nbe(&ctx, &rec_app, &three).unwrap(),
+            "nbe: add 2 1 must convert to 3"
+        );
+        assert!(
+            !tc.is_def_eq(&ctx, &rec_app, &two).unwrap(),
+            "eager: add 2 1 must not convert to 2"
+        );
+        assert!(
+            !tc.is_def_eq_via_nbe(&ctx, &rec_app, &two).unwrap(),
+            "nbe: add 2 1 must not convert to 2"
+        );
+
+        // eval/quote round-trip: the quoted normal form must itself be
+        // eager-defeq to `3` (and NOT to `2`).
+        let v = tc.eval(&crate::nbe::generic_env(0), &rec_app).unwrap();
+        let q = tc.quote(0, &v).unwrap();
+        assert!(
+            tc.is_def_eq(&ctx, &q, &three).unwrap(),
+            "quoted NbE normal form must eager-convert to 3, got {}",
+            tc.pp(&q)
+        );
+        assert!(!tc.is_def_eq(&ctx, &q, &two).unwrap());
+    }
+
+    /// Closed beta/eta-free lambda application: `(fun _:A => a) star` vs
+    /// `a`. Smallest possible eval/quote + `is_def_eq_via_nbe` sanity check,
+    /// independent of any inductive/iota machinery.
+    #[test]
+    fn nbe_beta_matches_eager_on_axioms() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1.clone(),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            1,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::const_(0, vec![]),
+                is_unsafe: false,
+            },
+        );
+        env.insert(
+            2,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::const_(0, vec![]),
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["A", "a", "star"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let a_ty = expr::const_(0, vec![]);
+        let a = expr::const_(1, vec![]);
+        let star = expr::const_(2, vec![]);
+        let redex = expr::app(
+            expr::lam(expr::BinderInfo::Default, a_ty, a.clone()),
+            star,
+        );
+        let ctx = Ctx::new();
+        assert!(tc.is_def_eq(&ctx, &redex, &a).unwrap());
+        assert!(tc.is_def_eq_via_nbe(&ctx, &redex, &a).unwrap());
+        assert!(!tc.is_def_eq(&ctx, &redex, &expr::const_(2, vec![])).unwrap());
+        assert!(!tc
+            .is_def_eq_via_nbe(&ctx, &redex, &expr::const_(2, vec![]))
+            .unwrap());
+
+        let v = tc.eval(&crate::nbe::generic_env(0), &redex).unwrap();
+        let q = tc.quote(0, &v).unwrap();
+        assert!(Rc::ptr_eq(&q, &a), "quoted beta-redex must be `a` itself, got {}", tc.pp(&q));
+    }
+
+    /// The `KIOTA_NBE=1` dispatch in `is_def_eq` must be a pure accelerator:
+    /// running the whole exports suite through it must not change any
+    /// accept/reject/decline verdict. `run_all_flag_combinations.sh`/CI sets
+    /// the env var; here we call `is_def_eq_via_nbe` directly so the test is
+    /// deterministic regardless of how the test binary itself was launched.
+    #[test]
+    fn nbe_never_confirms_true_when_eager_says_false() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_nat0(&mut env);
+        let names = test_names(&["Nat0", "Nat0.Z", "Nat0.S", "Nat0.rec"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let ctx = Ctx::new();
+        // Two unrelated numerals: NbE must not spuriously confirm equality.
+        for i in 0..5u32 {
+            for j in 0..5u32 {
+                let a = nat0_lit(i);
+                let b = nat0_lit(j);
+                let eager = tc.is_def_eq(&ctx, &a, &b).unwrap();
+                let nbe = tc.is_def_eq_via_nbe(&ctx, &a, &b).unwrap();
+                assert_eq!(eager, i == j);
+                assert_eq!(nbe, eager, "nbe/eager disagree on Nat0 {i} vs {j}");
+            }
+        }
+    }
+
+    // ---------------- Eager recursor-application memo ----------------
+
+    /// Same shape as `insert_mini_nat0`, but wired as the checker's `Nat`
+    /// (`nat_ref = Some(0)`) so a real `Lit::Nat` major exercises
+    /// `try_iota`'s literal-peel branch and `iota_lit_memo`, not the
+    /// constructor-tower path `insert_mini_nat0`'s own tests use.
+    fn insert_mini_natlit(env: &mut crate::env::Environment) {
+        insert_mini_nat0(env);
+    }
+
+    /// `add(n, 1) := Nat.rec 1 (fun _ ih => S ih) (lit n)`. Compared against
+    /// a `Nat0.Z`/`Nat0.S` ctor tower (`nat0_lit`), not a raw literal on the
+    /// RHS: `numeral_value`'s congruence shortcut inspects a term's shape
+    /// as-is rather than forcing it, so a stuck `Nat.rec` spine only gets
+    /// peeled level by level through `app_spines_congruent`'s recursive
+    /// `is_def_eq` on the `S`'s argument — which is exactly the recursion
+    /// this memo targets.
+    fn add_one_rec_app(motive: &Expr, step: &Expr, n: u32) -> Expr {
+        let rec_ = expr::const_(3, vec![]);
+        let base = expr::lit_nat(num_bigint::BigUint::from(1u32));
+        expr::apps(
+            rec_,
+            &[
+                motive.clone(),
+                base,
+                step.clone(),
+                expr::lit_nat(num_bigint::BigUint::from(n)),
+            ],
+        )
+    }
+
+    /// The operator's build order: (1) instrument to confirm the same
+    /// `(recursor, motive, minors)` triple recurs at overlapping literals,
+    /// (2) memoize it. This reproduces exactly that overlap: a first
+    /// `add(10, 1)` peels literals 10..=0 into `iota_lit_memo`; a second,
+    /// independent `add(7, 1)` — same motive/minor *pointers*, an entirely
+    /// separate top-level term, not reachable via the ordinary
+    /// `(ctx, ptr)` whnf cache — revisits literals 7..=0, all of which
+    /// should now be memo hits. `iota_lit_memo_miss_count` (real
+    /// `iota_from_first_principles` derivations) makes that observable
+    /// instead of only inferring it from wall-clock time.
+    #[test]
+    fn eager_iota_lit_memo_reuses_overlapping_countdown() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_natlit(&mut env);
+        let names = test_names(&["Nat0", "Nat0.Z", "Nat0.S", "Nat0.rec"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+
+        let nat0 = expr::const_(0, vec![]);
+        let motive = expr::lam(expr::BinderInfo::Default, nat0.clone(), nat0.clone());
+        let s = expr::const_(2, vec![]);
+        let step = expr::lam(
+            expr::BinderInfo::Default,
+            nat0.clone(),
+            expr::lam(expr::BinderInfo::Default, nat0, expr::app(s, expr::bvar(0))),
+        );
+
+        let ten = add_one_rec_app(&motive, &step, 10);
+        let eleven = nat0_lit(11);
+        assert!(tc.is_def_eq(&ctx, &ten, &eleven).unwrap(), "add 10 1 must convert to 11");
+        let misses_after_first = tc.iota_lit_memo_miss_count();
+        assert!(
+            misses_after_first >= 11,
+            "first countdown (11 levels, 10..=0) must derive each peel at least once, got {misses_after_first}"
+        );
+
+        // Independent term (fresh `expr::apps` spine, not reachable from
+        // `ten` via `(ctx, ptr)`), overlapping literals 7..=0.
+        let seven = add_one_rec_app(&motive, &step, 7);
+        let eight = nat0_lit(8);
+        assert!(tc.is_def_eq(&ctx, &seven, &eight).unwrap(), "add 7 1 must convert to 8");
+        let misses_after_second = tc.iota_lit_memo_miss_count();
+        assert_eq!(
+            misses_after_second, misses_after_first,
+            "every literal in the second (overlapping) countdown must hit iota_lit_memo, not re-derive"
+        );
+    }
+
+    /// Same overlap with the memo forced off on this `Checker` (test-only
+    /// override, not the process-wide `KIOTA_NO_IOTA_MEMO` env var — that
+    /// would race with other tests' `try_iota` calls under `cargo test`'s
+    /// parallel test threads): correctness must not depend on the memo.
+    ///
+    /// This also empirically confirms (rather than assumes) something the
+    /// build order didn't anticipate: with the memo off, the *first*
+    /// countdown still derives every peel (>= 11), but the *second*,
+    /// overlapping one derives **zero** more. That is not this memo at
+    /// work (it is disabled) — it is `whnf_cache`/`defeq_cache`, keyed on
+    /// `(ctx, ptr)`, already sharing the intermediate `Nat0.rec motive
+    /// base step (lit k)` terms for `k` in the overlap, because they are
+    /// pointer-identical (interned) across both countdowns. So on *this*
+    /// idealized reproduction — shared `motive`/`minors` pointers, an
+    /// interned literal — `iota_lit_memo` is redundant with caching kiota
+    /// already had; it can only add value where a (ctx, ptr) hit is not
+    /// available (e.g. across separate `Checker`s, or if two occurrences
+    /// of "the same" recursor call are ever *not* pointer-identical).
+    #[test]
+    fn eager_iota_lit_memo_disable_still_correct() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_natlit(&mut env);
+        let names = test_names(&["Nat0", "Nat0.Z", "Nat0.S", "Nat0.rec"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        tc.set_iota_memo_enabled_for_test(false);
+        let ctx = Ctx::new();
+        let nat0 = expr::const_(0, vec![]);
+        let motive = expr::lam(expr::BinderInfo::Default, nat0.clone(), nat0.clone());
+        let s = expr::const_(2, vec![]);
+        let step = expr::lam(
+            expr::BinderInfo::Default,
+            nat0.clone(),
+            expr::lam(expr::BinderInfo::Default, nat0, expr::app(s, expr::bvar(0))),
+        );
+        let ten = add_one_rec_app(&motive, &step, 10);
+        let eleven = nat0_lit(11);
+        assert!(tc.is_def_eq(&ctx, &ten, &eleven).unwrap());
+        let misses_after_first = tc.iota_lit_memo_miss_count();
+        assert!(
+            misses_after_first >= 11,
+            "memo disabled: first countdown must still fully re-derive (>= 11 peels), got {misses_after_first}"
+        );
+        let seven = add_one_rec_app(&motive, &step, 7);
+        let eight = nat0_lit(8);
+        assert!(tc.is_def_eq(&ctx, &seven, &eight).unwrap());
+        let misses_after_second = tc.iota_lit_memo_miss_count();
+        assert_eq!(
+            misses_after_second, misses_after_first,
+            "with the memo off, the overlap is still free — that's whnf_cache/defeq_cache \
+             (ctx, ptr) sharing the interned intermediate terms, not iota_lit_memo"
+        );
+    }
+
+    // ---------------- NbE spike: infer_type_value vs eager ----------------
+
+    /// `A : Type`, `a : A`, `id := fun (_:A) => A` (so `App`'s codomain
+    /// exercises the beta step), `f := fun (x:A) => let (_:A) := a; x`.
+    /// Runs `infer_type_value` on `f`'s *body* — a `Lam` nested inside a
+    /// `Let` — and checks the quoted result agrees with eager `infer_type`
+    /// on the same term, at the same context depth.
+    #[test]
+    fn infer_type_value_matches_eager_on_lam_pi_app_let() {
+        use crate::env::{ConstantInfo, Environment};
+        let mut env = Environment::default();
+        let sort1 = expr::sort(level::succ(level::zero()));
+        env.insert(
+            0,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: sort1,
+                is_unsafe: false,
+            },
+        );
+        let a_ty = expr::const_(0, vec![]);
+        env.insert(
+            1,
+            ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: a_ty.clone(),
+                is_unsafe: false,
+            },
+        );
+        let names = test_names(&["A", "a"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let a_val = expr::const_(1, vec![]);
+
+        // `fun (x:A) => let (_:A) := a; x` : `A -> A`.
+        let inner_let = expr::let_(a_ty.clone(), a_val.clone(), expr::bvar(1));
+        let f = expr::lam(expr::BinderInfo::Default, a_ty.clone(), inner_let);
+
+        let (tys, venv) = Checker::vctx_new();
+        let ctx = Ctx::new();
+        let ft_v = tc.infer_type_value(&ctx, &tys, &venv, &f).unwrap();
+        let ft_q = tc.quote(0, &ft_v).unwrap();
+        let ft_eager = tc.infer_type(&ctx, &f).unwrap();
+        assert!(
+            tc.is_def_eq(&ctx, &ft_q, &ft_eager).unwrap(),
+            "infer_type_value(f) = {} must eager-convert to infer_type(f) = {}",
+            tc.pp(&ft_q),
+            tc.pp(&ft_eager)
+        );
+        // `f`'s type must actually be `A -> A` (Pi, not stuck).
+        assert!(matches!(&*ft_v, nbe::Value::Pi(..)));
+
+        // Applying `f` to `a` must type-check (App's argument-type path)
+        // and infer `A`.
+        let app = expr::app(f, a_val);
+        let at_v = tc.infer_type_value(&ctx, &tys, &venv, &app).unwrap();
+        let at_q = tc.quote(0, &at_v).unwrap();
+        assert!(
+            tc.is_def_eq(&ctx, &at_q, &a_ty).unwrap(),
+            "infer_type_value(f a) must be A, got {}",
+            tc.pp(&at_q)
+        );
+
+        // Ill-typed application (wrong argument type) must reject, not
+        // silently accept: `f` applied to `A` itself (a `Sort`, not an
+        // `A`) is not well-typed.
+        let bad_app = expr::app(
+            expr::lam(expr::BinderInfo::Default, a_ty.clone(), expr::bvar(0)),
+            a_ty,
+        );
+        assert!(tc.infer_type_value(&ctx, &tys, &venv, &bad_app).is_err());
+    }
+
+    /// `PSigma.rec α β motive minor (mk α β x y)`'s projection form:
+    /// `infer_type_value` of `proj 0 0 #0` (first field of a bound
+    /// `PSigma A B`) must agree with eager `infer_proj`.
+    #[test]
+    fn infer_type_value_matches_eager_on_proj() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_psigma(&mut env);
+        let names = test_names(&["PSigma", "PSigma.mk", "PSigma.rec", "A", "B"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let a = expr::const_(3, vec![]);
+        let b = expr::const_(4, vec![]);
+        let psigma_ab = expr::apps(expr::const_(0, vec![]), &[a.clone(), b]);
+
+        let (tys0, venv0) = Checker::vctx_new();
+        let ctx0 = Ctx::new();
+        let psigma_ty_v = tc.infer_type_value(&ctx0, &tys0, &venv0, &psigma_ab).unwrap();
+        // `Sort 1`, so the binder we push below matches the eager `ensure_sort`
+        // path that would've been used to introduce this same bvar.
+        assert!(matches!(&*psigma_ty_v, nbe::Value::Sort(_)));
+        let psigma_ty_val = tc.eval(&venv0, &psigma_ab).unwrap();
+        let (ctx, tys, venv) = Checker::vctx_push(
+            &ctx0,
+            &tys0,
+            &venv0,
+            &psigma_ab,
+            nbe::Thunk::forced(psigma_ty_val),
+        );
+
+        let proj0 = expr::proj(0, 0, expr::bvar(0));
+        let t_v = tc.infer_type_value(&ctx, &tys, &venv, &proj0).unwrap();
+        let t_q = tc.quote(1, &t_v).unwrap();
+
+        let t_eager = tc.infer_proj(&ctx, 0, 0, &expr::bvar(0)).unwrap();
+        assert!(
+            tc.is_def_eq(&ctx, &t_q, &t_eager).unwrap(),
+            "infer_type_value(proj 0 0 #0) = {} must eager-convert to infer_proj = {}",
+            tc.pp(&t_q),
+            tc.pp(&t_eager)
+        );
+        assert!(Rc::ptr_eq(&t_q, &a), "first field of PSigma A B must infer to A, got {}", tc.pp(&t_q));
+    }
+
+    // ---------------- NbE spike: indexed + higher-order iota ----------------
+    //
+    // The actual gap behind the two failing accept fixtures
+    // (`alg-conv-trans-acc-left`, `subject-reduction-redex`): eager reduces
+    // `Acc.rec motive minor x (Acc.intro x g)` via ordinary iota (a
+    // literal-constructor major), and the Value-native path couldn't —
+    // `Acc` has a nonzero index (`num_indices`), which `try_iota_value`
+    // bailed on immediately, and separately `Acc.intro`'s one field has
+    // type `∀ y, r y x → Acc r y` — a `Pi`, not a bare recursive
+    // occurrence, needing a binder-introducing rec-call `try_iota_value`
+    // didn't build.
+    //
+    // Both are implemented below. `try_iota_value` no longer special-cases
+    // `num_indices` at all — indices are just extra major-position
+    // arguments, skipped exactly like eager `try_iota` skips them. Once a
+    // literal-constructor (or `Nat`-literal, or theorem-unfolds-to-one,
+    // via `recursor_unfolds_thm_major`/`whnf_major`) major is found, the
+    // "apply minor to fields, interleave one rec-call per recursive field"
+    // step is not reimplemented in Value space at all: it calls eager's
+    // own `iota_from_first_principles`/`mk_rec_call` directly on quoted
+    // (bounded, non-accumulating) params/motives/minors/fields, guaranteeing
+    // it matches eager's rule by construction — including indices threaded
+    // through a field's own occurrence type, and higher-order fields,
+    // which come back as a genuine `Value::Lam` (a real closure, not a
+    // quoted-and-reevaluated stand-in) ready to be applied to fresh
+    // arguments exactly like any other value.
+    fn insert_mini_acc(env: &mut crate::env::Environment) {
+        use crate::env::{ConstantInfo, RecRule};
+        let sort0 = expr::sort(level::zero());
+        let sort1 = expr::sort(level::succ(level::zero()));
+        let nat = expr::const_(0, vec![]);
+        // `MyAcc : Nat -> Prop` (one index, no params) — mirrors `Acc`'s
+        // shape (`Acc {α} (r : α → α → Prop) (x : α) : Prop`) collapsed to
+        // a fixed carrier/relation for the test.
+        let myacc_ty = expr::pi(expr::BinderInfo::Default, nat.clone(), sort0.clone());
+        env.insert(
+            1,
+            ConstantInfo::InductiveType {
+                level_params: vec![],
+                typ: myacc_ty.clone(),
+                num_params: 0,
+                num_indices: 1,
+                all: vec![1],
+                ctors: vec![2],
+                is_rec: true,
+                is_unsafe: false,
+            },
+        );
+        // `MyAcc.intro : (x : Nat) -> (∀ y, MyAcc y) -> MyAcc x` — the one
+        // field is a `Pi` returning the recursive occurrence, exactly
+        // `Acc.intro`'s higher-order shape (`∀ y, r y x → Acc r y`), just
+        // without the relation-membership hypothesis (irrelevant to the
+        // "is this field a bare recursive occurrence" question).
+        let field_ty = expr::pi(expr::BinderInfo::Default, nat.clone(), expr::app(expr::const_(1, vec![]), expr::bvar(0)));
+        let intro_ty = expr::pi(
+            expr::BinderInfo::Default,
+            nat.clone(),
+            expr::pi(
+                expr::BinderInfo::Default,
+                field_ty,
+                expr::app(expr::const_(1, vec![]), expr::bvar(1)),
+            ),
+        );
+        env.insert(
+            2,
+            ConstantInfo::Constructor {
+                level_params: vec![],
+                typ: intro_ty,
+                induct: 1,
+                cidx: 0,
+                num_params: 0,
+                num_fields: 2,
+                is_unsafe: false,
+            },
+        );
+        // `MyAcc.rec : (motive : Nat -> MyAcc #0 -> Sort 1) -> (minor) -> (x : Nat) -> (h : MyAcc x) -> motive x h`.
+        // The exact motive/minor types don't matter for `try_iota_value`
+        // (it never inspects them beyond position), only the telescope
+        // shape (`num_params=0, num_motives=1, num_minors=1, num_indices=1`).
+        env.insert(
+            3,
+            ConstantInfo::Recursor {
+                level_params: vec![],
+                typ: sort1,
+                all: vec![1],
+                num_params: 0,
+                num_indices: 1,
+                num_motives: 1,
+                num_minors: 1,
+                rules: vec![RecRule {
+                    ctor: 2,
+                    nfields: 2,
+                    rhs: expr::bvar(0),
+                }],
+                k: false,
+                is_unsafe: false,
+            },
+        );
+        env.rec_of.insert(1, 3);
+    }
+
+    /// Shared plumbing for the `MyAcc.rec` tests below: `motive` and
+    /// `minor` (arity 3: the index field, the `g` field, and the "ih"
+    /// rec-call — matching `iota_from_first_principles`'s field-then-rec
+    /// ordering for `MyAcc.intro`'s two fields, one of which is
+    /// recursive).
+    fn mini_acc_motive_and_minor() -> (Expr, Expr) {
+        let nat = expr::const_(0, vec![]);
+        let motive = expr::lam(
+            expr::BinderInfo::Default,
+            nat.clone(),
+            expr::lam(
+                expr::BinderInfo::Default,
+                expr::app(expr::const_(1, vec![]), expr::bvar(0)),
+                nat.clone(),
+            ),
+        );
+        // `minor := fun (x:Nat) (g : Nat -> MyAcc) (ih : Nat -> Nat) => x`
+        // (`x` referenced as `#2`, three binders deep): discards `g` and
+        // `ih` entirely and returns the index field it was actually
+        // applied to. A minor that ignores `ih` must never force it —
+        // exactly the laziness `eval`'s `App` case already gives any
+        // argument thunk, now exercised through the bridge in
+        // `try_iota_value` instead of the old dedicated `Thunk::RecCall`.
+        let minor = expr::lam(
+            expr::BinderInfo::Default,
+            nat.clone(),
+            expr::lam(
+                expr::BinderInfo::Default,
+                expr::pi(
+                    expr::BinderInfo::Default,
+                    nat.clone(),
+                    expr::app(expr::const_(1, vec![]), expr::bvar(0)),
+                ),
+                expr::lam(
+                    expr::BinderInfo::Default,
+                    expr::pi(expr::BinderInfo::Default, nat.clone(), nat.clone()),
+                    expr::bvar(2),
+                ),
+            ),
+        );
+        (motive, minor)
+    }
+
+    /// `MyAcc.rec motive minor x (MyAcc.intro x g)` — a literal-constructor
+    /// major over an *indexed* recursor whose recursive field is *higher-
+    /// order* (`Pi`-shaped), exactly `Acc.rec`/`Acc.intro`'s shape — must
+    /// now reduce, matching eager `try_iota`'s rule exactly (via the
+    /// `iota_from_first_principles`/`mk_rec_call` bridge), not decline.
+    /// `minor` discards both the field `g` and the rec-call `ih`, so the
+    /// correct answer is simply `x` — and since nothing ever forces `g`,
+    /// `g`'s own body doesn't need to be well-typed for this test (it
+    /// never gets evaluated).
+    #[test]
+    fn try_iota_value_reduces_indexed_higher_order_ctor_major() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_acc(&mut env);
+        let names = test_names(&["Nat0", "MyAcc", "MyAcc.intro", "MyAcc.rec"]);
+        let tc = Checker::new(&env, &names, None, None);
+
+        let nat = expr::const_(0, vec![]);
+        let x = expr::lit_nat(num_bigint::BigUint::from(7u32));
+        let (motive, minor) = mini_acc_motive_and_minor();
+        // `g`'s body is never forced by `minor` (which discards it), so a
+        // syntactically-closed placeholder is enough.
+        let g = expr::lam(expr::BinderInfo::Default, nat, x.clone());
+        let intro = expr::apps(expr::const_(2, vec![]), &[x.clone(), g]);
+        let rec_app = expr::apps(expr::const_(3, vec![]), &[motive, minor, x.clone(), intro]);
+
+        let v = tc.eval(&crate::nbe::generic_env(0), &rec_app).unwrap();
+        match &*v {
+            nbe::Value::Lit(Lit::Nat(n)) => {
+                assert_eq!(*n, num_bigint::BigUint::from(7u32));
+            }
+            other => panic!(
+                "MyAcc.rec on a literal MyAcc.intro major must reduce to the index (7), got {}",
+                tc.pp(&tc.quote(0, other).unwrap())
+            ),
+        }
+    }
+
+    /// The same recursor and minor, but the major is a bound variable —
+    /// not a constructor application at all. Must still correctly decline
+    /// (stay a stuck `Neutral`), the same as before the indexed/
+    /// higher-order rule was added: it only ever fires once a real constructor (or
+    /// theorem-unfolds-to-one) major is found.
+    #[test]
+    fn try_iota_value_still_declines_when_major_is_not_a_ctor() {
+        use crate::env::Environment;
+        let mut env = Environment::default();
+        insert_mini_acc(&mut env);
+        let names = test_names(&["Nat0", "MyAcc", "MyAcc.intro", "MyAcc.rec"]);
+        let tc = Checker::new(&env, &names, None, None);
+
+        let x = expr::lit_nat(num_bigint::BigUint::from(7u32));
+        let (motive, minor) = mini_acc_motive_and_minor();
+        let major_var = expr::bvar(0);
+        let rec_app = expr::apps(expr::const_(3, vec![]), &[motive, minor, x, major_var]);
+
+        let env1 = crate::nbe::generic_env(1);
+        let v = tc.eval(&env1, &rec_app).unwrap();
+        assert!(
+            matches!(&*v, nbe::Value::Neutral(_)),
+            "a non-constructor major must stay neutral (declined, not reduced), got {}",
+            tc.pp(&tc.quote(1, &v).unwrap())
+        );
+    }
+
+    // ---------------- NbE spike: the eager-rescue wiring bug ----------------
+    //
+    // The two Acc-shape export fixtures still rejected with `infer_type`
+    // wired even after `try_iota_value` grew the indexed/higher-order
+    // rule: eager's own comparison never re-derives an `Acc.rec`-headed
+    // type at all — it succeeds by comparing an *unreduced* wrapper
+    // application (`f 1 h` vs `f 1 (Acc.intro …)`) via proof irrelevance
+    // on the wrapper's own Prop-typed parameter, never even unfolding the
+    // wrapper. `infer_type_value`'s `App` case, by contrast, always calls
+    // `eval` (which always fully reduces, unfolding the wrapper and then
+    // iota-reducing its `Acc.rec`), so the value-native path can see an
+    // asymmetric "peel" (one side's major stayed a bound variable, the
+    // other's — theorem-wrapped or not — was already a literal
+    // constructor) that never arises for eager because eager never
+    // reduces that far. `app_arg_type_ok_eager`/`value_type_ok_eager`
+    // exist to re-run that exact eager comparison as a rescue, but the
+    // rescue itself had two more bugs before it actually stayed eager
+    // end to end (both now covered by `alg_conv_trans_acc_left_accepts`/
+    // `subject_reduction_redex_accepts` in `tests/exports.rs`, which
+    // reject without either fix and accept with both — that pair of real,
+    // Lean-exported fixtures is the regression test for this section; a
+    // synthetic in-crate repro needs a fully Pi-typed stand-in recursor,
+    // which the existing `insert_mini_acc` test fixture deliberately
+    // isn't, to actually exercise the recursive dispatch path below):
+    //
+    // 1. `pub fn is_def_eq`'s `FORCE_EAGER_DEFEQ` gate stayed eager for
+    //    its own top-level call, but `is_def_eq_core_go`'s own recursion
+    //    (Pi/Lam bodies) calls the *dispatching* `is_def_eq`, not
+    //    `is_def_eq_inner` — so a rescue's comparison re-entered NbE (and
+    //    could re-hit the same over-reduction) as soon as it recursed
+    //    past the outermost node. Fixed by making `FORCE_EAGER_DEFEQ`
+    //    thread through `pub fn is_def_eq`'s own dispatch, not just the
+    //    rescue's initial call.
+    // 2. `pub fn infer_type`'s dispatch checked only `nbe::nbe_enabled()`,
+    //    never `FORCE_EAGER_DEFEQ` at all — so `infer_type_uncached`'s
+    //    own recursive calls (App's `f`/`a`, Lam's body, …), which go
+    //    through the *dispatching* `infer_type`, kept re-entering
+    //    `infer_type_via_nbe` for every sub-expression even while a
+    //    rescue's outermost call used `infer_type_cached` directly. This
+    //    was the one that actually mattered for both fixtures.
+    //
+    // Both `defeq_cache`/`infer_cache`/`whnf_cache`/`whnf_core_cache` also
+    // skip reading and writing while `FORCE_EAGER_DEFEQ` is set, so a
+    // rescue can't read a stale entry a non-forced call populated (or
+    // vice versa) for the same `(ctx, expr)` key.
 }
