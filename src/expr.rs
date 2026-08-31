@@ -76,6 +76,44 @@ impl Hash for ExprNode {
     }
 }
 
+// Interned terms form spines that can be thousands of nodes deep (e.g. a
+// left-nested `App` chain). The compiler-derived recursive drop would recurse
+// once per spine node and overflow the stack. Dismantle owned children with a
+// heap worklist so teardown depth is O(1) regardless of term depth.
+impl Drop for ExprNode {
+    fn drop(&mut self) {
+        let mut stack: Vec<Expr> = Vec::new();
+        take_children(&mut self.data, &mut stack);
+        while let Some(e) = stack.pop() {
+            if let Ok(mut node) = Rc::try_unwrap(e) {
+                take_children(&mut node.data, &mut stack);
+            }
+        }
+    }
+}
+
+/// Move any `Expr` children out of `d`, leaving a childless placeholder, so the
+/// caller can drop them iteratively instead of recursively.
+fn take_children(d: &mut ExprData, out: &mut Vec<Expr>) {
+    match std::mem::replace(d, ExprData::BVar(0)) {
+        ExprData::App(f, a) => {
+            out.push(f);
+            out.push(a);
+        }
+        ExprData::Lam(_, ty, body) | ExprData::Pi(_, ty, body) => {
+            out.push(ty);
+            out.push(body);
+        }
+        ExprData::Let(ty, val, body) => {
+            out.push(ty);
+            out.push(val);
+            out.push(body);
+        }
+        ExprData::Proj(_, _, v) => out.push(v),
+        ExprData::BVar(_) | ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => {}
+    }
+}
+
 pub type Expr = Rc<ExprNode>;
 
 fn ptr(e: &Expr) -> usize {
