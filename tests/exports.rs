@@ -739,6 +739,21 @@ fn eq_shaped_index_field_accepts() {
     assert_accept("eq-shaped-index-field.accept.ndjson");
 }
 
+/// Reproduce the large-corpus state transition: constructor expressions
+/// survive a hash-cons table reset before their inductive is checked.
+#[test]
+fn eq_shaped_index_field_accepts_after_intern_reset() {
+    let input = fs::read_to_string(fixture("eq-shaped-index-field.accept.ndjson"))
+        .expect("read fixture");
+    let split = input.find("{\"inductive\":").expect("inductive block");
+    let mut parser = Parser::new();
+    parser.run(Cursor::new(&input[..split])).expect("parse expressions");
+    assert!(kiota::expr::intern_clear_if_large(0));
+    parser.run(Cursor::new(&input[split..])).expect(
+        "an indexed Prop recursor must remain valid across an intern-table reset",
+    );
+}
+
 /// Minimal dependency-closure slice, cut directly from a real
 /// `cedar-spec` export (not hand-assembled), of
 /// `Cedar.Spec.Value._sizeOf_3_eq` — the equation lemma bridging
