@@ -184,7 +184,7 @@ def run_gate(binary: Path, archive: Path, output: Path, modes: list[str], timeou
 
 
 def main() -> int:
-    if len(sys.argv) == 6 and sys.argv[1] == "--exec-limited":
+    if len(sys.argv) == 5 and sys.argv[1] == "--exec-limited":
         try:
             exec_limited(int(sys.argv[2]), sys.argv[3], sys.argv[4])
         except (OSError, ValueError) as exc:
