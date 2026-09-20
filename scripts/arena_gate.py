@@ -8,8 +8,10 @@ import json
 import math
 import os
 from pathlib import Path, PurePosixPath
+import resource
 import signal
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -60,7 +62,6 @@ def unpack_cases(archive: Path, destination: Path) -> list[tuple[str, int, Path]
                 payload = source.read(MAX_MEMBER_BYTES + 1)
             if len(payload) != member.size:
                 raise ValueError(f"incomplete member: {canonical}")
-            # Use our own flat filenames, never the untrusted member pathname.
             target = destination / f"{len(cases):05d}.ndjson"
             target.write_bytes(payload)
             cases.append((canonical, 0 if name.parts[0] == "good" else 1, target))
@@ -75,8 +76,24 @@ def classify(returncode: int | None, timed_out: bool) -> str:
     return {0: "accept", 1: "reject", 2: "decline", 3: "error"}.get(returncode, "crash")
 
 
+def exec_limited(memory_mib: int, binary: str, case: str) -> None:
+    """Limit the child, not the supervisor. No threaded-fork preexec hook."""
+    limit = memory_mib * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))
+    os.execv(binary, [binary, case])
+
+
+def write_report(output: Path, report: dict[str, Any]) -> None:
+    temporary = output / "report.json.tmp"
+    temporary.write_text(json.dumps(report, indent=2) + "\n")
+    temporary.replace(output / "report.json")
+
+
 def run_case(binary: Path, case: tuple[str, int, Path], mode: str,
-             timeout: float, log_dir: Path, ordinal: int) -> dict[str, Any]:
+             timeout: float, log_dir: Path, ordinal: int,
+             memory_mib: int = 4096) -> dict[str, Any]:
     name, expected, path = case
     env = {key: value for key, value in os.environ.items() if not key.startswith("KIOTA_")}
     if mode == "nbe":
@@ -84,8 +101,10 @@ def run_case(binary: Path, case: tuple[str, int, Path], mode: str,
     log = log_dir / f"{mode}-{ordinal:05d}.log"
     started = time.monotonic()
     timed_out = False
+    command = [sys.executable, str(Path(__file__).resolve()), "--exec-limited",
+               str(memory_mib), str(binary), str(path)]
     with log.open("wb") as output:
-        proc = subprocess.Popen([str(binary), str(path)], env=env, stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
                                 stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             returncode = proc.wait(timeout=timeout)
@@ -97,14 +116,19 @@ def run_case(binary: Path, case: tuple[str, int, Path], mode: str,
                 pass
             returncode = proc.wait()
     outcome = classify(returncode, timed_out)
-    return {"test": name, "test_sha256": sha256_file(path), "mode": mode,
-            "expected": "accept" if expected == 0 else "reject", "outcome": outcome,
-            "exit_code": returncode, "passed": not timed_out and returncode == expected,
-            "wall_seconds": round(time.monotonic() - started, 6), "log": log.name}
+    result = {"test": name, "test_sha256": sha256_file(path), "mode": mode,
+              "expected": "accept" if expected == 0 else "reject", "outcome": outcome,
+              "exit_code": returncode, "passed": not timed_out and returncode == expected,
+              "wall_seconds": round(time.monotonic() - started, 6), "log": log.name}
+    if not result["passed"]:
+        with log.open("rb") as stream:
+            stream.seek(max(0, log.stat().st_size - 2048))
+            result["diagnostic_tail"] = stream.read().decode("utf-8", errors="replace")
+    return result
 
 
 def run_gate(binary: Path, archive: Path, output: Path, modes: list[str], timeout: float,
-             min_good: int, min_bad: int) -> dict[str, Any]:
+             min_good: int, min_bad: int, memory_mib: int = 4096) -> dict[str, Any]:
     binary, archive = binary.resolve(strict=True), archive.resolve(strict=True)
     if not os.access(binary, os.X_OK):
         raise ValueError("binary is not executable")
@@ -114,16 +138,19 @@ def run_gate(binary: Path, archive: Path, output: Path, modes: list[str], timeou
         raise ValueError("minimum good and bad counts must both be positive")
     if not modes or any(mode not in {"default", "nbe"} for mode in modes):
         raise ValueError("invalid evaluation mode")
+    if memory_mib < 128:
+        raise ValueError("address-space limit must be at least 128 MiB")
     output.mkdir(parents=True, exist_ok=False)
     logs = output / "logs"
     logs.mkdir()
     report: dict[str, Any] = {
         "scope": "arena-small-tarball-only", "full_corpus_verified": False,
         "archive_sha256": sha256_file(archive), "binary_sha256": sha256_file(binary),
-        "modes": modes, "timeout_seconds": timeout,
+        "modes": modes, "timeout_seconds": timeout, "address_space_limit_mib": memory_mib,
         "removed_environment_variables": sorted(k for k in os.environ if k.startswith("KIOTA_")),
-        "results": [], "passed": False,
+        "results": [], "passed": False, "complete": False, "running": None,
     }
+    write_report(output, report)
     try:
         with tempfile.TemporaryDirectory(prefix="kiota-arena-") as tmp:
             cases = unpack_cases(archive, Path(tmp))
@@ -135,37 +162,53 @@ def run_gate(binary: Path, archive: Path, output: Path, modes: list[str], timeou
                                  f"minimum {min_good} / {min_bad}")
             for mode in modes:
                 for ordinal, case in enumerate(cases):
-                    result = run_case(binary, case, mode, timeout, logs, ordinal)
+                    report["running"] = {"mode": mode, "test": case[0]}
+                    write_report(output, report)
+                    print(f"RUN {mode} {ordinal + 1}/{len(cases)} {case[0]}", flush=True)
+                    result = run_case(binary, case, mode, timeout, logs, ordinal, memory_mib)
                     report["results"].append(result)
+                    report["running"] = None
+                    write_report(output, report)
+                    status = "PASS" if result["passed"] else "FAIL"
+                    print(f"{status} {mode} {result['test']}: {result['outcome']} "
+                          f"{result['wall_seconds']}s", flush=True)
                     if not result["passed"]:
-                        print(f"FAIL {mode} {result['test']}: {result['outcome']}", flush=True)
+                        print(result.get("diagnostic_tail", ""), flush=True)
+            report["complete"] = True
             report["passed"] = all(result["passed"] for result in report["results"])
     except (OSError, ValueError, tarfile.TarError) as exc:
         report["error"] = str(exc)
     finally:
-        (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+        write_report(output, report)
     return report
 
 
 def main() -> int:
+    if len(sys.argv) == 6 and sys.argv[1] == "--exec-limited":
+        try:
+            exec_limited(int(sys.argv[2]), sys.argv[3], sys.argv[4])
+        except (OSError, ValueError) as exc:
+            print(f"child setup failed: {exc}", file=sys.stderr)
+        return 3
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--mode", choices=("default", "nbe", "both"), default="both")
     parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--memory-mib", type=int, default=4096)
     parser.add_argument("--min-good", type=int, default=119)
     parser.add_argument("--min-bad", type=int, default=70)
     args = parser.parse_args()
     modes = ["default", "nbe"] if args.mode == "both" else [args.mode]
     try:
         report = run_gate(args.binary, args.archive, args.output, modes, args.timeout,
-                          args.min_good, args.min_bad)
+                          args.min_good, args.min_bad, args.memory_mib)
     except (OSError, ValueError) as exc:
         parser.exit(2, f"arena gate setup failed: {exc}\n")
     counts = report.get("counts", {})
     failures = sum(not item["passed"] for item in report["results"])
-    print(json.dumps({"passed": report["passed"], "counts": counts,
+    print(json.dumps({"passed": report["passed"], "complete": report["complete"], "counts": counts,
                       "executions": len(report["results"]), "failures": failures,
                       "error": report.get("error"), "scope": report["scope"]}))
     return 0 if report["passed"] else 1
