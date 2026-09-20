@@ -17,7 +17,9 @@ fn tree(start: u32, leaves: u32) -> expr::Expr {
 
 fn main() {
     let term = tree(0, 4096);
-    let bindings: FxHashMap<_, _> = (0..16).map(|n| (n, level::mk_const(n % 4))).collect();
+    let bindings: FxHashMap<u32, _> = (0..16)
+        .map(|n| (n, level::mk_const(u64::from(n % 4))))
+        .collect();
     for (workload, iterations) in [("cold", 100u32), ("warm", 20_000u32)] {
         expr::clear_subst_memos();
         black_box(expr::instantiate_level_params(&term, &bindings));
