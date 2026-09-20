@@ -13,7 +13,10 @@ impl Hasher for CollidingHasher {
 }
 
 fn subst(bindings: &[(u32, u32)]) -> FxHashMap<u32, Level> {
-    bindings.iter().map(|&(n, value)| (n, level::mk_const(value))).collect()
+    bindings
+        .iter()
+        .map(|&(n, value)| (n, level::mk_const(u64::from(value))))
+        .collect()
 }
 
 #[test]
