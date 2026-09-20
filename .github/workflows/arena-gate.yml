@@ -1,0 +1,62 @@
+name: arena-small-suite
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: arena-small-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test the gate itself
+        run: python3 -m unittest discover -s scripts/tests -v
+      - name: Unit and export tests, default
+        run: cargo test --locked
+      - name: Unit and export tests, NbE
+        run: KIOTA_NBE=1 cargo test --locked
+      - name: Build release checker
+        run: cargo build --release --locked
+      - name: Capture the published small suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p arena-input
+          curl --fail --location --retry 3 --max-time 120 --proto '=https' \
+            https://arena.lean-lang.org/results.json -o arena-input/results-before.json
+          curl --fail --location --retry 3 --max-time 120 --proto '=https' \
+            https://arena.lean-lang.org/lean-arena-tests.tar.gz -o arena-input/tests.tar.gz
+          curl --fail --location --retry 3 --max-time 120 --proto '=https' \
+            https://arena.lean-lang.org/results.json -o arena-input/results-after.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          before = json.loads(Path('arena-input/results-before.json').read_text())['meta']
+          after = json.loads(Path('arena-input/results-after.json').read_text())['meta']
+          if before != after:
+              raise SystemExit('Arena changed while downloading; rerun for a stable snapshot')
+          print(json.dumps(before, indent=2))
+          PY
+          git rev-parse HEAD > arena-input/checkout-sha.txt
+          sha256sum arena-input/tests.tar.gz > arena-input/tests.sha256
+      - name: Strict small-suite gate, both evaluators
+        run: |
+          python3 scripts/arena_gate.py \
+            --binary target/release/kiota --archive arena-input/tests.tar.gz \
+            --output arena-report --mode both --min-good 119 --min-bad 70
+      - name: Retain inputs, verdicts and failure logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arena-small-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            arena-input/
+            arena-report/
+          if-no-files-found: warn
+          retention-days: 14
