@@ -12,15 +12,24 @@ jobs:
   regression:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [default, nbe]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Test the gate itself
         run: python3 -m unittest discover -s scripts/tests -v
-      - name: Unit and export tests, default
-        run: cargo test --locked
-      - name: Unit and export tests, NbE
-        run: KIOTA_NBE=1 cargo test --locked
+      - name: Unit and export tests, release
+        env:
+          MODE: ${{ matrix.mode }}
+        run: |
+          if [ "$MODE" = nbe ]; then
+            KIOTA_NBE=1 cargo test --release --locked
+          else
+            cargo test --release --locked
+          fi
       - name: Build release checker
         run: cargo build --release --locked
       - name: Capture the published small suite
@@ -44,19 +53,32 @@ jobs:
           print(json.dumps(before, indent=2))
           PY
           git rev-parse HEAD > arena-input/checkout-sha.txt
-          sha256sum arena-input/tests.tar.gz > arena-input/tests.sha256
-      - name: Strict small-suite gate, both evaluators
+          sha256sum arena-input/tests.tar.gz target/release/kiota > arena-input/checksums.sha256
+          git archive --format=tar.gz HEAD > arena-input/source.tar.gz
+          rustc --version --verbose > arena-input/toolchain.txt
+      - name: Preserve inputs before running the checker
+        uses: actions/upload-artifact@v4
+        with:
+          name: arena-input-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            arena-input/
+            target/release/kiota
+          if-no-files-found: error
+          retention-days: 14
+      - name: Strict small-suite gate
+        timeout-minutes: 12
+        env:
+          MODE: ${{ matrix.mode }}
         run: |
           python3 scripts/arena_gate.py \
             --binary target/release/kiota --archive arena-input/tests.tar.gz \
-            --output arena-report --mode both --min-good 119 --min-bad 70
-      - name: Retain inputs, verdicts and failure logs
+            --output arena-report --mode "$MODE" --min-good 119 --min-bad 70 \
+            --memory-mib 4096
+      - name: Retain verdicts and failure logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: arena-small-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            arena-input/
-            arena-report/
+          name: arena-report-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: arena-report/
           if-no-files-found: warn
           retention-days: 14
