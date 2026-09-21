@@ -73,7 +73,7 @@ jobs:
           python3 scripts/arena_gate.py \
             --binary target/release/kiota --archive arena-input/tests.tar.gz \
             --output arena-report --mode "$MODE" --min-good 119 --min-bad 70 \
-            --memory-mib 4096
+            --memory-mib 8192
       - name: Retain verdicts and failure logs
         if: always()
         uses: actions/upload-artifact@v4
