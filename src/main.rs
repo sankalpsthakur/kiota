@@ -8,6 +8,7 @@ use std::io::{BufReader, Cursor, Read, Write};
 const EXIT_ACCEPT: i32 = 0;
 const EXIT_REJECT: i32 = 1;
 const EXIT_DECLINE: i32 = 2;
+const EXIT_ERROR: i32 = 3;
 
 /// Report the verdict and end the process. Never returns.
 ///
@@ -30,7 +31,7 @@ fn finish(result: Result<(), tc::TcError>) -> ! {
         }
         Err(tc::TcError::Other(msg)) => {
             eprintln!("ERROR: {msg}");
-            EXIT_REJECT
+            EXIT_ERROR
         }
     };
     let _ = std::io::stderr().flush();
