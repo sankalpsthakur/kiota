@@ -17,6 +17,56 @@ pub struct Parser {
     pub decl_count: usize,
 }
 
+/// Undo only writes made by the current inductive block. The journal owns
+/// replaced values rather than cloning the environment, so importing a block
+/// does not copy any earlier declarations. Reverse replay also preserves prior
+/// entries if a partially checked block fails after updating ownership maps.
+#[derive(Default)]
+struct InductiveUndo(Vec<InductiveWrite>);
+
+enum InductiveWrite {
+    Constant(u32, Option<ConstantInfo>),
+    Owner(u32, Option<u32>),
+    Group(u32, Option<Vec<u32>>),
+}
+
+impl InductiveUndo {
+    fn insert_constant(&mut self, env: &mut Environment, name: u32, value: ConstantInfo) {
+        self.0
+            .push(InductiveWrite::Constant(name, env.consts.insert(name, value)));
+    }
+
+    fn insert_owner(&mut self, env: &mut Environment, name: u32, recursor: u32) {
+        self.0
+            .push(InductiveWrite::Owner(name, env.rec_of.insert(name, recursor)));
+    }
+
+    fn insert_group(&mut self, env: &mut Environment, name: u32, group: Vec<u32>) {
+        self.0
+            .push(InductiveWrite::Group(name, env.rec_group.insert(name, group)));
+    }
+
+    fn rollback(self, env: &mut Environment) {
+        fn restore<T>(map: &mut FxHashMap<u32, T>, name: u32, prior: Option<T>) {
+            match prior {
+                Some(value) => {
+                    map.insert(name, value);
+                }
+                None => {
+                    map.remove(&name);
+                }
+            }
+        }
+        for write in self.0.into_iter().rev() {
+            match write {
+                InductiveWrite::Constant(name, prior) => restore(&mut env.consts, name, prior),
+                InductiveWrite::Owner(name, prior) => restore(&mut env.rec_of, name, prior),
+                InductiveWrite::Group(name, prior) => restore(&mut env.rec_group, name, prior),
+            }
+        }
+    }
+}
+
 fn bi_of(s: &str) -> BinderInfo {
     match s {
         "implicit" => BinderInfo::Implicit,
@@ -357,7 +407,11 @@ impl Parser {
         Ok(())
     }
 
-    fn handle_inductive_block(&mut self, v: &Value) -> Result<(), TcError> {
+    fn handle_inductive_block(
+        &mut self,
+        v: &Value,
+        undo: &mut InductiveUndo,
+    ) -> Result<(), TcError> {
         let types = v
             .get("types")
             .and_then(|x| x.as_array())
@@ -409,7 +463,8 @@ impl Parser {
                 )));
             }
             declared_ctors.insert(name, ctor_names.clone());
-            self.env.insert(
+            undo.insert_constant(
+                &mut self.env,
                 name,
                 ConstantInfo::InductiveType {
                     level_params,
@@ -468,7 +523,8 @@ impl Parser {
                         .unwrap_or("?")
                 )));
             }
-            self.env.insert(
+            undo.insert_constant(
+                &mut self.env,
                 name,
                 ConstantInfo::Constructor {
                     level_params,
@@ -481,9 +537,35 @@ impl Parser {
                 },
             );
         }
+        struct PendingRecursor {
+            name: u32,
+            level_params: Vec<u32>,
+            supplied_type: Expr,
+            all: Vec<u32>,
+            num_params: u32,
+            num_indices: u32,
+            num_motives: u32,
+            num_minors: u32,
+            rules: Vec<RecRule>,
+        }
+
+        // Decode recursor records without exposing any of them through the
+        // environment.  Their redundant type and count fields are assertions
+        // to compare with reconstruction, never inputs to later typing.
+        let mut pending_recs = Vec::with_capacity(recs.len());
+        let mut pending_names = FxHashSet::default();
         for r in &recs {
             let name = Self::require_u32(r, "name")?;
             self.reject_if_dup(name)?;
+            if !pending_names.insert(name) {
+                return Err(TcError::Reject(format!(
+                    "duplicate declaration of {}",
+                    self.names
+                        .get(name as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or("?")
+                )));
+            }
             let level_params = Self::get_vec_u32(r, "levelParams");
             let typ = self.require_expr(r, "type")?;
             let all = Self::get_vec_u32(r, "all");
@@ -491,7 +573,6 @@ impl Parser {
             let num_indices = Self::require_u32(r, "numIndices")?;
             let num_motives = Self::require_u32(r, "numMotives")?;
             let num_minors = Self::require_u32(r, "numMinors")?;
-            let k = Self::get_bool(r, "k");
             let is_unsafe = Self::get_bool(r, "isUnsafe");
             if is_unsafe {
                 return Err(TcError::Reject(format!(
@@ -502,53 +583,6 @@ impl Parser {
                         .unwrap_or("?")
                 )));
             }
-            let expected =
-                num_params as u64 + num_indices as u64 + num_motives as u64 + num_minors as u64 + 1;
-            let arity = pi_telescope_len(&typ);
-            if arity as u64 != expected {
-                return Err(TcError::Reject(format!(
-                    "recursor `{}` type telescope length {arity} != {expected}",
-                    self.names
-                        .get(name as usize)
-                        .map(|s| s.as_str())
-                        .unwrap_or("?")
-                )));
-            }
-            // A recursor is only genuine if it was actually derived from
-            // an inductive declaration; nothing here re-derives it from
-            // one, so at minimum require that `all` isn't empty and that
-            // every name in it is a real inductive type declared in this
-            // same block. Without this, an `all: []` (or an `all`
-            // pointing at an undeclared name — the recursor-side twin of
-            // `orphan-ctor`'s constructor-side hole) recursor is added to
-            // the environment as a callable constant with no inductive
-            // ever associated with it, and nothing that only checks the
-            // recursors an inductive *does* claim ever looks at it again
-            // (`orphan-rec`: `all: []` on a `False`-typed `rogue`
-            // recursor with no motives/minors/rules, added anyway, then
-            // used directly as a "proof" of `False`).
-            if all.is_empty() {
-                return Err(TcError::Reject(format!(
-                    "recursor `{}` has an empty `all` (not derived from any inductive)",
-                    self.names.get(name as usize).map(|s| s.as_str()).unwrap_or("?")
-                )));
-            }
-            for ind in &all {
-                if !declared_ctors.contains_key(ind) {
-                    return Err(TcError::Reject(format!(
-                        "recursor `{}` claims inductive `{}`, which this block does not declare",
-                        self.names.get(name as usize).map(|s| s.as_str()).unwrap_or("?"),
-                        self.names.get(*ind as usize).map(|s| s.as_str()).unwrap_or("?"),
-                    )));
-                }
-            }
-            // Large-elimination check: see `Checker::elim_only_at_universe_zero`
-            // (`tc.rs`), run from `check_inductive_group` once this whole
-            // block's constants are in `self.env` and full type inference
-            // is available (needed for the "does a field live in Prop"
-            // part of Lean's own rule — not decidable from bare syntax
-            // the way the old, narrower `ctors.len() >= 2`-only check
-            // here used to approximate it).
             let rules = if let Some(arr) = r.get("rules").and_then(|x| x.as_array()) {
                 let mut out = Vec::with_capacity(arr.len());
                 for rule in arr {
@@ -562,44 +596,121 @@ impl Parser {
             } else {
                 Vec::new()
             };
-            self.env.insert(
+            pending_recs.push(PendingRecursor {
                 name,
+                level_params,
+                supplied_type: typ,
+                all,
+                num_params,
+                num_indices,
+                num_motives,
+                num_minors,
+                rules,
+            });
+        }
+
+        // Reconstruct in declaration order, followed by nested auxiliaries in
+        // specialization order. Serialized signatures stay outside the
+        // environment until every recursor in the block has been compared.
+        // Exported `numNested`, `k`, and rule RHS are not construction inputs.
+        let type_names: Vec<u32> = types.iter().map(|t| Self::get_u32(t, "name")).collect();
+        if type_names.is_empty() {
+            return Err(TcError::Reject("empty inductive group".into()));
+        }
+        if pending_recs.is_empty() {
+            return Err(TcError::Reject(
+                "inductive group is missing recursors".into(),
+            ));
+        }
+        let nat_ref = self.name_by_str.get("Nat").copied();
+        let string_ref = self.name_by_str.get("String").copied();
+        for &name in &type_names {
+            Checker::new(&self.env, &self.names, nat_ref, string_ref)
+                .check_inductive_group_structure(name)?;
+        }
+        let supplied_level_params = pending_recs[0].level_params.clone();
+        let derived = Checker::new(&self.env, &self.names, nat_ref, string_ref)
+            .reconstruct_recursors(&type_names, &supplied_level_params)?;
+        if pending_recs.len() != derived.len() {
+            return Err(TcError::Reject(format!(
+                "inductive group has {} recursors but reconstruction requires {}",
+                pending_recs.len(),
+                derived.len()
+            )));
+        }
+
+        let first_name = self.name_str(type_names[0]).to_string();
+        let mut ordered = Vec::with_capacity(derived.len());
+        for (i, d) in derived.iter().enumerate() {
+            let expected_name = if i < type_names.len() {
+                format!("{}.rec", self.name_str(type_names[i]))
+            } else {
+                format!("{first_name}.rec_{}", i - type_names.len() + 1)
+            };
+            let Some(pos) = pending_recs
+                .iter()
+                .position(|r| self.name_str(r.name) == expected_name)
+            else {
+                return Err(TcError::Reject(format!(
+                    "inductive group is missing reconstructed recursor `{expected_name}`"
+                )));
+            };
+            let r = pending_recs.remove(pos);
+            let rname = self.name_str(r.name);
+            if r.all != d.all
+                || r.num_params != d.num_params
+                || r.num_indices != d.num_indices
+                || r.num_motives != d.num_motives
+                || r.num_minors != d.num_minors
+            {
+                return Err(TcError::Reject(format!(
+                    "recursor `{rname}` metadata does not match reconstruction"
+                )));
+            }
+            Checker::new(&self.env, &self.names, nat_ref, string_ref)
+                .validate_reconstructed_type(
+                    &r.supplied_type,
+                    &r.level_params,
+                    &d.typ,
+                    &d.level_params,
+                )
+                .map_err(|e| match e {
+                    TcError::Reject(_) | TcError::Decline(_) | TcError::Other(_) => {
+                        TcError::Reject(format!(
+                            "recursor `{rname}` type does not match reconstructed type"
+                        ))
+                    }
+                })?;
+            // Store the reconstructed type under this declaration's own
+            // validated alpha labels.  No serialized type structure crosses
+            // the transaction boundary.
+            let levels: Vec<Level> = r.level_params.iter().copied().map(level::param).collect();
+            let subst = level::subst_map(&d.level_params, &levels);
+            let mut stored = d.clone();
+            stored.typ = expr::instantiate_level_params(&d.typ, &subst);
+            stored.level_params = r.level_params.clone();
+            ordered.push((r, stored));
+        }
+        for (r, d) in ordered {
+            undo.insert_constant(
+                &mut self.env,
+                r.name,
                 ConstantInfo::Recursor {
-                    level_params,
-                    typ,
-                    all,
-                    num_params,
-                    num_indices,
-                    num_motives,
-                    num_minors,
-                    rules,
-                    k,
-                    is_unsafe,
+                    level_params: d.level_params,
+                    typ: d.typ,
+                    all: d.all,
+                    num_params: d.num_params,
+                    num_indices: d.num_indices,
+                    num_motives: d.num_motives,
+                    num_minors: d.num_minors,
+                    rules: r.rules,
+                    // Preserve the importer policy: ignore serialized `k`.
+                    k: d.k,
+                    is_unsafe: false,
                 },
             );
         }
-
-        // Recursor identity is the inductive of this recursor's *rule
-        // constructors*, not the pretty name `I.rec` and not `all[0]`.
-        // Nested `Syntax.rec`/`rec_1`/`rec_2` all export `all = [Syntax]`;
-        // `rec_2`'s rules are `List.nil`/`List.cons`. Mapping every rec to
-        // `all[0]` is a duplicate-recursor reject on type 8527; mapping by
-        // `I.rec` rejects a well-typed recursor named `elim`. Empty-rules
-        // recursors (`False.rec`) claim `all ∩ group`. Nested rec_k have
-        // rules for foreign constructors and must not steal `rec_of[I]`.
-        // Extra recursor: more recs than `types + nested specializations
-        // reconstructed from ctor fields`, or two recs claiming the same
-        // group type. Exported `numNested` / `k` / rule RHS are not trusted.
-        let type_names: Vec<u32> = types.iter().map(|t| Self::get_u32(t, "name")).collect();
-        let nested_n = self.counted_nested(&type_names);
-        let nested = nested_n > 0;
-        let expected_recs = type_names.len() + nested_n;
-        if recs.len() > expected_recs {
-            return Err(TcError::Reject(format!(
-                "extra recursor in inductive group ({} recs, expected {expected_recs})",
-                recs.len()
-            )));
-        }
+        let nested = derived.len() > type_names.len();
         // `I.rec` is the name Lean reserves for `I`'s recursor, and it is the
         // name every user of the recursor is compiled against. An export
         // that supplies `I.not_rec` instead is not offering a constant the
@@ -666,7 +777,7 @@ impl Parser {
                         "duplicate recursor for type {owner}"
                     )));
                 }
-                self.env.rec_of.insert(*owner, rname);
+                undo.insert_owner(&mut self.env, *owner, rname);
             }
             let num_motives = Self::get_u32(r, "numMotives");
             let motives_ok = num_motives as usize == all.len()
@@ -719,7 +830,7 @@ impl Parser {
                 }
             });
             for n in &group {
-                self.env.rec_group.insert(*n, group.clone());
+                undo.insert_group(&mut self.env, *n, group.clone());
             }
         }
         for t in &type_names {
@@ -920,20 +1031,31 @@ impl Parser {
             return Ok(());
         }
         if let Some(d) = v.get("inductive") {
-            self.handle_inductive_block(d)?;
-            let names: Vec<u32> = d
-                .get("types")
-                .and_then(|x| x.as_array())
-                .map(|a| a.iter().map(|t| Self::get_u32(t, "name")).collect())
-                .unwrap_or_default();
-            let nat_ref = self.name_by_str.get("Nat").copied();
-            let string_ref = self.name_by_str.get("String").copied();
-            for n in names {
-                Checker::new(&self.env, &self.names, nat_ref, string_ref)
-                    .check_inductive_group(n)
-                    .map_err(|e| self.annotate(n, e))?;
+            // An inductive block is one kernel transaction.  In particular,
+            // a malformed supplied recursor type must not leave the block's
+            // types, constructors, recursors, or ownership maps visible to a
+            // later declaration in the stream.
+            let mut undo = InductiveUndo::default();
+            let result = (|| {
+                self.handle_inductive_block(d, &mut undo)?;
+                let names: Vec<u32> = d
+                    .get("types")
+                    .and_then(|x| x.as_array())
+                    .map(|a| a.iter().map(|t| Self::get_u32(t, "name")).collect())
+                    .unwrap_or_default();
+                let nat_ref = self.name_by_str.get("Nat").copied();
+                let string_ref = self.name_by_str.get("String").copied();
+                for n in names {
+                    Checker::new(&self.env, &self.names, nat_ref, string_ref)
+                        .check_inductive_group(n)
+                        .map_err(|e| self.annotate(n, e))?;
+                }
+                Ok(())
+            })();
+            if result.is_err() {
+                undo.rollback(&mut self.env);
             }
-            return Ok(());
+            return result;
         }
         Ok(())
     }
