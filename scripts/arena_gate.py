@@ -98,6 +98,8 @@ def run_case(binary: Path, case: tuple[str, int, Path], mode: str,
     env = {key: value for key, value in os.environ.items() if not key.startswith("KIOTA_")}
     if mode == "nbe":
         env["KIOTA_NBE"] = "1"
+    elif mode == "reclaim":
+        env["KIOTA_RECLAIM"] = "1"
     log = log_dir / f"{mode}-{ordinal:05d}.log"
     started = time.monotonic()
     timed_out = False
@@ -136,7 +138,7 @@ def run_gate(binary: Path, archive: Path, output: Path, modes: list[str], timeou
         raise ValueError("timeout must be finite and positive")
     if min_good < 1 or min_bad < 1:
         raise ValueError("minimum good and bad counts must both be positive")
-    if not modes or any(mode not in {"default", "nbe"} for mode in modes):
+    if not modes or any(mode not in {"default", "nbe", "reclaim"} for mode in modes):
         raise ValueError("invalid evaluation mode")
     if memory_mib < 128:
         raise ValueError("address-space limit must be at least 128 MiB")
@@ -194,7 +196,7 @@ def main() -> int:
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--mode", choices=("default", "nbe", "both"), default="both")
+    parser.add_argument("--mode", choices=("default", "nbe", "reclaim", "both"), default="both")
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--memory-mib", type=int, default=4096)
     parser.add_argument("--min-good", type=int, default=119)

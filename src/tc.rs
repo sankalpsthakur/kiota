@@ -9,6 +9,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 mod recursor;
+#[cfg(test)]
+mod reclamation_tests;
 
 thread_local! {
     /// Recursion guard for `pub fn infer_type`'s `KIOTA_NBE=1` dispatch,
@@ -1080,7 +1082,7 @@ impl Ctx {
     }
 
     fn push(&mut self, ty: Expr) {
-        let ty_ptr = Rc::as_ptr(&ty) as usize;
+        let ty_ptr = expr::identity(&ty);
         let new_id = intern_ctx_id(self.id, ty_ptr);
         let mut suffix = vec![0];
         suffix.push(intern_ctx_id(0, ty_ptr));
@@ -1132,7 +1134,7 @@ impl Ctx {
             if (i as usize) >= n {
                 return self.suffix_key(loose as usize);
             }
-            let ty_ptr = Rc::as_ptr(&self.tys[n - 1 - i as usize]) as usize;
+            let ty_ptr = expr::identity(&self.tys[n - 1 - i as usize]);
             id = intern_ctx_id(id, ty_ptr);
         }
         id
@@ -1283,7 +1285,7 @@ impl<'e> Checker<'e> {
     }
 
     fn ptr_key(e: &Expr) -> usize {
-        Rc::as_ptr(e) as usize
+        expr::identity(e)
     }
 
     fn whnf_cache_key(ctx: &Ctx, e: &Expr) -> (u64, usize) {
@@ -1551,11 +1553,10 @@ impl<'e> Checker<'e> {
         // `ctx_key`s (via `CTX_NEXT`, reset above) are reused across
         // declarations, so a stale eager-namespace entry from the last
         // declaration would be keyed identically but mean something
-        // different here. These must land *before* `intern_clear_if_large`:
-        // they are pointer-keyed, and dropping the intern table can free
-        // an `Expr` whose address the allocator then reuses. Clearing them
-        // in the same reset is not enough if the intern drop happens first
-        // and anything in between allocates.
+        // different here. Clear them before dropping interner ownership.
+        // Keys now use non-recycled allocation IDs, not allocator addresses;
+        // clearing still bounds retained results and preserves declaration
+        // boundaries between conversion modes.
         self.eager_whnf_cache.borrow_mut().clear();
         self.eager_whnf_core_cache.borrow_mut().clear();
         self.eager_defeq_cache.borrow_mut().clear();
@@ -1575,11 +1576,10 @@ impl<'e> Checker<'e> {
         // is dropped. After that its entries pin pre-clear bodies while
         // everything newly interned is a post-clear generation: `ptr_eq`
         // and the pointer-keyed defeq cache miss on the largest terms.
-        // `iota_lit_memo` *is* pointer-keyed (`Vec<usize>` of motive/
-        // minor addresses) and `iota_value_cache` holds `Rc` to those
-        // thunks, so both must go before the intern drop or a recycled
-        // address is a wrong hit. Ordinary runs never cross 4M nodes, so
-        // Init/Std keep the unfold memo.
+        // `iota_lit_memo` uses exact allocation IDs for motives/minors;
+        // `iota_value_cache` owns its thunks. Clear both to release retained
+        // results before the intern reset. Ordinary runs never cross 4M
+        // nodes, so Init/Std keep the unfold memo.
         const INTERN_RESET: usize = 4_000_000;
         if expr::intern_node_count() > INTERN_RESET {
             let intern_before = expr::intern_node_count();
@@ -1842,6 +1842,9 @@ impl<'e> Checker<'e> {
         let checked = !self.infer_only.get();
         {
             let mut cache = cache_ref.borrow_mut();
+            if expr::reclamation_enabled() && cache.len() >= 50_000 {
+                cache.clear();
+            }
             match cache.get_mut(&key) {
                 Some((old, was_checked)) if checked && !*was_checked => {
                     *old = t.clone();
@@ -3795,9 +3798,9 @@ impl<'e> Checker<'e> {
     }
     fn defeq_cache_insert(&self, force_eager: bool, key: (u64, usize, usize), v: bool) {
         if force_eager {
-            self.eager_defeq_cache.borrow_mut().insert(key, v);
+            expr::memo_insert(&mut self.eager_defeq_cache.borrow_mut(), key, v);
         } else {
-            self.defeq_cache.borrow_mut().insert(key, v);
+            expr::memo_insert(&mut self.defeq_cache.borrow_mut(), key, v);
         }
     }
     fn whnf_cache_get(&self, force_eager: bool, key: &(u64, usize)) -> Option<Expr> {
@@ -3809,9 +3812,9 @@ impl<'e> Checker<'e> {
     }
     fn whnf_cache_insert(&self, force_eager: bool, key: (u64, usize), v: Expr) {
         if force_eager {
-            self.eager_whnf_cache.borrow_mut().insert(key, v);
+            expr::memo_insert(&mut self.eager_whnf_cache.borrow_mut(), key, v);
         } else {
-            self.whnf_cache.borrow_mut().insert(key, v);
+            expr::memo_insert(&mut self.whnf_cache.borrow_mut(), key, v);
         }
     }
     fn whnf_core_cache_get(&self, force_eager: bool, key: &(u64, usize)) -> Option<Expr> {
@@ -3823,9 +3826,9 @@ impl<'e> Checker<'e> {
     }
     fn whnf_core_cache_insert(&self, force_eager: bool, key: (u64, usize), v: Expr) {
         if force_eager {
-            self.eager_whnf_core_cache.borrow_mut().insert(key, v);
+            expr::memo_insert(&mut self.eager_whnf_core_cache.borrow_mut(), key, v);
         } else {
-            self.whnf_core_cache.borrow_mut().insert(key, v);
+            expr::memo_insert(&mut self.whnf_core_cache.borrow_mut(), key, v);
         }
     }
 
@@ -4476,7 +4479,7 @@ impl<'e> Checker<'e> {
         if iota_memo_on && rest.is_empty() {
             if let ExprData::Lit(Lit::Nat(n)) = &**major_w {
                 let key = Self::iota_lit_memo_key(rname, &us, motives, minors, n);
-                self.iota_lit_memo.borrow_mut().insert(key, rhs.clone());
+                expr::memo_insert(&mut self.iota_lit_memo.borrow_mut(), key, rhs.clone());
             }
         }
         Ok(Some(expr::apps(rhs, rest)))

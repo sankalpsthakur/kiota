@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [default, nbe]
+        mode: [default, nbe, reclaim]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,6 +27,8 @@ jobs:
         run: |
           if [ "$MODE" = nbe ]; then
             KIOTA_NBE=1 cargo test --release --locked
+          elif [ "$MODE" = reclaim ]; then
+            KIOTA_RECLAIM=1 cargo test --release --locked
           else
             cargo test --release --locked
           fi

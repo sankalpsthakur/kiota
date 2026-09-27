@@ -24,7 +24,8 @@ draft until this resource gate is established.
   intern nodes and making 9,846,835 substitution-node visits locally.
 - Interner resets happen between declarations; clearing it during a declaration
   without coordinating all pointer-keyed caches is not a safe shortcut.
-- Whether the cap failure is inherited from baseline is not yet verified.
+- Linux run 36318438401 confirms the same cap failure on immutable baseline
+  `9fa2c29` and integrated candidate `d8b34c1`; it is inherited.
 
 ## Proposed Solutions
 
@@ -40,7 +41,7 @@ the 16 GB Mac. Preserve exact inputs, binary hashes, and limits in reports.
 
 ## Acceptance Criteria
 
-- [ ] Baseline/candidate comparison distinguishes inherited failure from regression.
+- [x] Baseline/candidate comparison distinguishes inherited failure from regression.
 - [ ] Pair-n21 accepts under the unchanged 8,192 MiB Linux address-space cap.
 - [ ] Current 122 positive and 71 negative Arena cases pass the strict gate.
 - [ ] Default and experimental NbE outcomes are recorded separately.
@@ -60,6 +61,32 @@ Added a conditional immutable-baseline replay to the Linux workflow. It runs
 only after a failed default strict gate, uses the same archived input and
 unchanged memory cap, and retains a separate report. It cannot turn the
 candidate failure into a passing gate. Comparative result is pending CI.
+
+The comparison completed in run 36318438401. Default candidate and baseline
+both crash on pair-n21 under the unchanged 8,192 MiB cap: 61.53 and 59.82
+seconds respectively, with the same failed allocation size. The experimental
+NbE run separately has seven availability failures and is incomplete after its
+step timeout; it is not a substitute for default-mode acceptance.
+
+Implemented opt-in `KIOTA_RECLAIM=1`: weak lookup ownership, non-recycled
+allocation IDs for persistent expression/context keys, and eviction of
+disposable memo results at 50,000 entries. Universe identity tables are not
+cleared mid-traversal. Reviewed lifetime tests cover stale inference/WHNF/defeq
+and iota keys, recursive eviction, InferOnly validation, parent/child ownership,
+collisions, and deep teardown. All 192 Rust tests pass both with and without
+reclamation locally. A bounded local replay before the last boundary tests
+passed 122/122 positive and 71/71 negative cases; pair-n21 accepted in 16.49
+seconds with observed peak RSS 417,232 KiB. These are Mac measurements, not
+proof of passing Linux RLIMIT_AS or an Arena instruction-count improvement.
+An explicit third Linux CI mode now applies the unchanged strict gate to
+reclamation. It remains off by default pending those results.
+
+Final production-binary replay, with the failed arithmetic prototype excluded,
+again passes all 193 fixtures: 102.94 seconds, observed peak group RSS
+628,368 KiB under the same watchdog. The review's two test-isolation warnings
+were addressed by holding other substitution-key components and the queried
+expression fixed across reconstruction; only the relevant source/context
+allocation identity now distinguishes the retained stale entries.
 
 ## Resources
 

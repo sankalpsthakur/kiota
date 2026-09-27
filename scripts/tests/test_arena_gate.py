@@ -67,10 +67,17 @@ class GateTests(unittest.TestCase):
         self.assertTrue(all(r["outcome"] == "timeout" for r in report["results"]))
 
     def test_inherited_skip_flags_removed(self):
-        with patch.dict(os.environ, {"KIOTA_MAX_DECL": "1", "KIOTA_SKIP_DECLS": "1,2", "KIOTA_NBE": "yes"}):
-            report = self.run_gate("import os,sys\nfrom pathlib import Path\nassert 'KIOTA_MAX_DECL' not in os.environ\nassert 'KIOTA_SKIP_DECLS' not in os.environ\nassert os.environ.get('KIOTA_NBE') in (None, '1')\nsys.exit(int(Path(sys.argv[1]).read_text()))\n")
+        with patch.dict(os.environ, {"KIOTA_MAX_DECL": "1", "KIOTA_SKIP_DECLS": "1,2", "KIOTA_NBE": "yes", "KIOTA_RECLAIM": "1"}):
+            report = self.run_gate("import os,sys\nfrom pathlib import Path\nassert 'KIOTA_MAX_DECL' not in os.environ\nassert 'KIOTA_SKIP_DECLS' not in os.environ\nassert 'KIOTA_RECLAIM' not in os.environ\nassert os.environ.get('KIOTA_NBE') in (None, '1')\nsys.exit(int(Path(sys.argv[1]).read_text()))\n")
         self.assertTrue(report["passed"])
         self.assertIn("KIOTA_MAX_DECL", report["removed_environment_variables"])
+
+    def test_reclaim_mode_is_explicit_and_does_not_enable_nbe(self):
+        binary = self.binary("import os,sys\nfrom pathlib import Path\nassert os.environ.get('KIOTA_RECLAIM') == '1'\nassert 'KIOTA_NBE' not in os.environ\nsys.exit(int(Path(sys.argv[1]).read_text()))\n")
+        archive = self.archive([("good/a.ndjson", "0"), ("bad/b.ndjson", "1")])
+        report = gate.run_gate(binary, archive, self.root / "report", ["reclaim"], 2, 1, 1)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["modes"], ["reclaim"])
 
     def test_incomplete_suite_fails(self):
         report = self.run_gate("raise SystemExit(0)\n", [("good/a.ndjson", "0")])

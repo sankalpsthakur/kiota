@@ -45,17 +45,13 @@ The important claim is deliberately narrow: **the Arena snapshot rejected every 
 
 ## Current frontier
 
-The next independent target is not another toy test. It is:
-
-**121/121 good · 62/62 bad · 0 declines · completed mathlib benchmark**
-
-Large-corpus completion remains in progress. Current `main` reaches
+Large-corpus completion remains in progress. The integration candidate reaches
 `Int32.instRxcHasSize_eq` in Init and declines at the reduction-depth limit.
 The arena configuration runs the large corpora, but a configured run is not
 proof of acceptance. Full Init, Std, Mathlib, CSLib, and Cedar coverage must be
 verified against the exact checker revision and export version.
 
-Input is streamed on the checking worker, so the raw export need not remain in
+On the integration branch, input is streamed on the checking worker, so the raw export need not remain in
 memory beside the parsed environment. See the measured verification boundaries
 in [the September 27 checkpoint](docs/checkpoints/2026-09-27.md).
 
@@ -83,6 +79,14 @@ Exit codes:
 - `3` — internal or input parsing error (not a proof rejection)
 
 Set `KIOTA_DEBUG=1` to print both sides of an application-type mismatch.
+
+`KIOTA_RECLAIM=1` enables experimental weak interning and eviction of disposable
+memo tables. It is off by default. Persistent expression keys use allocation IDs
+that are never recycled; eviction does not clear universe-substitution identity
+tables during recursion. This mode is tested separately in Linux CI under the
+unchanged resource limits. It does not change proof rules or reduction limits,
+does not bound every table, and does not yet establish large-corpus acceptance
+or improved Arena instruction counts.
 
 ## What to read in the code
 

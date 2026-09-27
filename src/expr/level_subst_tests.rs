@@ -121,3 +121,62 @@ fn shared_dag_uses_one_substitution_identity() {
     assert_eq!(LEVEL_SUBST_IDS.with(|ids| ids.borrow().len()), 1);
     assert_eq!(LEVEL_INST_MEMO.with(|memo| memo.borrow().len()), 41);
 }
+
+#[test]
+fn recursive_eviction_keeps_complete_universe_substitution_identity() {
+    clear_subst_memos();
+    let term = app(sort(level::param(7)), sort(level::param(8)));
+    let low = subst(&[(7, 0), (8, 1)]);
+    let high = subst(&[(7, 2), (8, 3)]);
+    let prior = instantiate_level_params(&term, &low);
+    LEVEL_INST_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        for n in 0..50_000 {
+            memo.insert((usize::MAX - n, usize::MAX), prior.clone());
+        }
+    });
+    // A previously uncached child must insert and clear the full table while
+    // the outer traversal retains its precomputed substitution ID.
+    let outer = pi(BinderInfo::Default, sort(level::param(9)), term);
+    let a = instantiate_level_params(&outer, &low);
+    if reclamation_enabled() {
+        assert!(LEVEL_INST_MEMO.with(|memo| memo.borrow().len()) < 50_000);
+    }
+    let b = instantiate_level_params(&outer, &high);
+    assert_eq!(LEVEL_SUBST_IDS.with(|ids| ids.borrow().len()), 2);
+    assert!(Rc::ptr_eq(&a, &reference(&outer, &low)));
+    assert!(Rc::ptr_eq(&b, &reference(&outer, &high)));
+    assert!(!Rc::ptr_eq(&a, &b));
+    clear_subst_memos();
+}
+
+#[test]
+fn retained_substitution_entries_do_not_match_reallocated_sources() {
+    clear_subst_memos();
+    let source = app(const_(51, vec![]), bvar(0));
+    let source_id = identity(&source);
+    let a = const_(52, vec![]);
+    let first = instantiate1(&source, &a);
+    let shifted = shift(&source, 1, 0);
+    let old_inst_key = (source_id, identity(&a));
+    let old_shift_key = (source_id, 1, 0);
+    drop(source);
+    assert!(intern_clear_if_large(0));
+    let rebuilt = app(const_(51, vec![]), bvar(0));
+    assert_ne!(source_id, identity(&rebuilt));
+    // Keep every non-source key component fixed: only allocation identity
+    // distinguishes the old source from its structurally equal reconstruction.
+    let new_inst_key = (identity(&rebuilt), identity(&a));
+    let new_shift_key = (identity(&rebuilt), 1, 0);
+    assert!(INST1_MEMO.with(|memo| memo.borrow().contains_key(&old_inst_key)));
+    assert!(SHIFT_MEMO.with(|memo| memo.borrow().contains_key(&old_shift_key)));
+    assert!(!INST1_MEMO.with(|memo| memo.borrow().contains_key(&new_inst_key)));
+    assert!(!SHIFT_MEMO.with(|memo| memo.borrow().contains_key(&new_shift_key)));
+    let actual = instantiate1(&rebuilt, &a);
+    assert!(Rc::ptr_eq(&actual, &app(const_(51, vec![]), a.clone())));
+    assert!(matches!(&**first, ExprData::App(_, x) if Rc::ptr_eq(x, &a)));
+    let new_shift = shift(&rebuilt, 1, 0);
+    assert!(matches!(&**new_shift, ExprData::App(_, x) if matches!(&***x, ExprData::BVar(1))));
+    assert!(matches!(&**shifted, ExprData::App(_, x) if matches!(&***x, ExprData::BVar(1))));
+    clear_subst_memos();
+}

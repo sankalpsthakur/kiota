@@ -20,7 +20,9 @@ Std/Cedar. Current main contains Prop-elimination fixes absent from the arena.
 - Exact 6 MB Int32 slice declines at WHNF depth limit in 2.03 seconds.
 - Diagnostic trace expands symbolic Nat.add into Nat.rec on a bound near 2^31.
 - The CLI retains the entire raw export beside its parsed environment.
-- Local disk headroom is 11 GB; large checks must run sequentially and bounded.
+- Local disk headroom was 11 GB at the initial checkpoint; latest check is
+  4.4 GiB. Do not download/build full Mathlib locally; large checks must run
+  remotely, serially, and bounded.
 
 ## Proposed Solutions
 
@@ -74,3 +76,19 @@ Added todo 002 for this separate availability blocker. Combined full Init still
 declines at the same declaration: 38.41 seconds, 764,314,584-byte physical
 footprint. Core-only equality normalization also failed the small Int32 slice
 and was reverted; the verified binary hash was restored.
+
+Parallel investigation refreshed the deployed truth: Kiota is 19/26 at Arena
+SHA `8384b217ee3bf2da27e078af03cb647136427d57`, pinned to `2d2a9fa`.
+Mathlib/CSLib still false-reject on deployed Prop recursors; Init/Con-leche
+decline and Std/Cedar are availability failures. The full Mathlib accepted
+instruction count is a separate ranking gate, not implied by small fixtures.
+
+The optional head-exposure prototype still declines the exact Int32 slice
+in strong mode; reclamation only prolonged its arithmetic countdown. The
+prototype is preserved locally but excluded from the memory checkpoint.
+No normalization/depth-limit change is presented as a fix. Existing private
+Kaggle infrastructure can support serial resource checks, but the historical
+runner's COMPLETE status hid declines/timeouts and is not acceptance evidence.
+A strict exact-SHA replacement is being prepared; actual submission requires
+the user's response. Exact Mathlib/CSLib inputs and hardware-counter access
+remain separate prerequisites.

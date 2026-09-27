@@ -6,6 +6,24 @@ use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::rc::Rc;
 
+mod reclaim;
+
+/// Experimental only: retain no strong references in the interner and bound
+/// disposable memo tables. Off by default until full correctness/resource gates.
+pub(crate) fn reclamation_enabled() -> bool {
+    thread_local! {
+        static ENABLED: bool = std::env::var_os("KIOTA_RECLAIM").is_some();
+    }
+    ENABLED.with(|enabled| *enabled)
+}
+
+pub(crate) fn memo_insert<K: Eq + Hash, V>(memo: &mut FxHashMap<K, V>, key: K, value: V) {
+    if reclamation_enabled() && memo.len() >= 50_000 {
+        memo.clear();
+    }
+    memo.insert(key, value);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinderInfo {
     Default,
@@ -40,6 +58,7 @@ pub enum ExprData {
 /// `i` occurs); `u64::MAX` means some bvar is `≥ 64` and the defeq pair key
 /// must fall back to `suffix[loose]`.
 pub struct ExprNode {
+    identity: usize,
     data: ExprData,
     loose: u32,
     used_bvars: u64,
@@ -72,7 +91,7 @@ impl Eq for ExprNode {}
 impl Hash for ExprNode {
     #[inline(always)]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        (self as *const ExprNode as usize).hash(state)
+        self.identity.hash(state)
     }
 }
 
@@ -117,7 +136,14 @@ fn take_children(d: &mut ExprData, out: &mut Vec<Expr>) {
 pub type Expr = Rc<ExprNode>;
 
 fn ptr(e: &Expr) -> usize {
-    Rc::as_ptr(e) as usize
+    identity(e)
+}
+
+/// Exact allocation identity that is never reused, even after interner resets.
+/// Address reuse must not let a memo entry for a discarded term match a new
+/// allocation. IDs are thread-local, like the Rc terms and all checker caches.
+pub fn identity(e: &Expr) -> usize {
+    e.identity
 }
 
 /// The smallest `k` such that every loose bvar in `e` has index `< k`.
@@ -330,6 +356,11 @@ fn alloc_node(d: ExprData) -> Expr {
     let loose = loose_of(&d);
     let used_bvars = used_of(&d);
     Rc::new(ExprNode {
+        identity: NEXT_NODE_ID.with(|next| {
+            let id = next.get();
+            next.set(id.checked_add(1).expect("expression identity exhausted"));
+            id
+        }),
         data: d,
         loose,
         used_bvars,
@@ -337,7 +368,9 @@ fn alloc_node(d: ExprData) -> Expr {
 }
 
 thread_local! {
+    static NEXT_NODE_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
     static INTERN: RefCell<Interner> = RefCell::new(Interner::default());
+    static WEAK_INTERN: RefCell<reclaim::WeakInterner> = RefCell::new(reclaim::WeakInterner::default());
     static INTERN_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LEVEL_INST_MEMO: RefCell<FxHashMap<(usize, usize), Expr>> =
         RefCell::new(FxHashMap::default());
@@ -361,11 +394,19 @@ pub fn intern(d: ExprData) -> Expr {
         eprintln!("INTERN_CALLS {n} nodes={}", intern_node_count());
         let _ = std::io::Write::flush(&mut std::io::stderr());
     }
-    INTERN.with(|t| t.borrow_mut().intern(d))
+    if reclamation_enabled() {
+        WEAK_INTERN.with(|t| t.borrow_mut().intern(d))
+    } else {
+        INTERN.with(|t| t.borrow_mut().intern(d))
+    }
 }
 
 pub fn intern_node_count() -> usize {
-    INTERN.with(|t| t.borrow().len())
+    if reclamation_enabled() {
+        WEAK_INTERN.with(|t| t.borrow().len())
+    } else {
+        INTERN.with(|t| t.borrow().len())
+    }
 }
 
 /// Drop the hash-cons table's own lookup structure if it has grown past
@@ -382,6 +423,17 @@ pub fn intern_node_count() -> usize {
 /// when the table's next capacity-doubling (~24M nodes → ~3.3 GB) is
 /// larger than one affordable allocation.
 pub fn intern_clear_if_large(threshold: usize) -> bool {
+    if reclamation_enabled() {
+        return WEAK_INTERN.with(|t| {
+            let mut t = t.borrow_mut();
+            if t.len() > threshold {
+                *t = reclaim::WeakInterner::default();
+                true
+            } else {
+                false
+            }
+        });
+    }
     INTERN.with(|t| {
         let mut t = t.borrow_mut();
         if t.len() > threshold {
@@ -498,7 +550,7 @@ pub fn shift(e: &Expr, by: i32, cutoff: u32) -> Expr {
         ExprData::Proj(s, i, v) => proj(*s, *i, shift(v, by, cutoff)),
     };
     SHIFT_MEMO.with(|m| {
-        m.borrow_mut().insert(key, r.clone());
+        memo_insert(&mut m.borrow_mut(), key, r.clone());
     });
     r
 }
@@ -529,7 +581,7 @@ fn instantiate_core(
     if loose_bvar_range(e) <= depth {
         return e.clone();
     }
-    let key = (Rc::as_ptr(e) as usize, depth);
+    let key = (identity(e), depth);
     if let Some(r) = memo.get(&key) {
         return r.clone();
     }
@@ -579,7 +631,7 @@ pub fn instantiate1(e: &Expr, arg: &Expr) -> Expr {
     }
     let r = instantiate(e, std::slice::from_ref(arg));
     INST1_MEMO.with(|m| {
-        m.borrow_mut().insert(key, r.clone());
+        memo_insert(&mut m.borrow_mut(), key, r.clone());
     });
     r
 }
@@ -611,7 +663,7 @@ fn instantiate_level_params_cached(e: &Expr, subst: &FxHashMap<u32, Level>, id: 
     }
     let r = instantiate_level_params_go(e, subst, id);
     LEVEL_INST_MEMO.with(|m| {
-        m.borrow_mut().insert(key, r.clone());
+        memo_insert(&mut m.borrow_mut(), key, r.clone());
     });
     r
 }
@@ -733,6 +785,23 @@ mod tests {
         let b = bvar(0);
         assert!(Rc::ptr_eq(&a, &b), "post-clear intern must still hash-cons");
         let _ = acc;
+    }
+
+    #[test]
+    fn expression_identity_is_exact_and_never_reused_after_reset() {
+        let first = const_(91, vec![]);
+        let original_id = identity(&first);
+        assert_eq!(original_id, identity(&const_(91, vec![])));
+        clear_subst_memos();
+        assert!(intern_clear_if_large(0));
+        let second = const_(91, vec![]);
+        assert_ne!(original_id, identity(&second));
+        drop(first);
+        drop(second);
+        assert!(intern_clear_if_large(0));
+        for n in 0..1_000 {
+            assert!(identity(&const_(n, vec![])) > original_id);
+        }
     }
 
     #[test]
