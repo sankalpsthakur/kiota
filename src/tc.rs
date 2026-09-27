@@ -8,6 +8,8 @@ use rustc_hash::FxHashMap;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+mod recursor;
+
 thread_local! {
     /// Recursion guard for `pub fn infer_type`'s `KIOTA_NBE=1` dispatch,
     /// mirroring `DEFEQ_DEPTH`/`WHNF_DEPTH`/`CORE_DEPTH`'s existing use of
@@ -8360,10 +8362,10 @@ impl<'e> Checker<'e> {
     ///   1. `all.len() > 1`: mutually recursive predicates.
     ///   2. the type has more than one constructor.
     ///   3. the type has exactly one constructor with a field that is
-    ///      not itself Prop-valued (case 1 below fails) *and* does not
+    ///      not itself definitionally Prop-valued (case 1 below fails) *and* does not
     ///      occur in the constructor's own conclusion (case 2 fails) —
     ///      e.g. `inductive Bad : Prop | mk (x : Sort 1)`: `x`'s own
-    ///      type is `Sort 1` (not Prop, `is_not_zero`), and `Bad` has no
+    ///      type is `Sort 1` (not Prop), and `Bad` has no
     ///      indices at all for `x` to occur in, so a `Bad.rec` motive
     ///      that reaches `Sort 1` could pull `x` itself out of an opaque
     ///      `Bad` proof — combined with proof irrelevance (any two
@@ -8428,7 +8430,14 @@ impl<'e> Checker<'e> {
                     if pos >= c_np {
                         if let Ok(ds) = self.infer_type(&cctx, dom) {
                             if let Ok(field_lvl) = self.ensure_sort(&cctx, &ds) {
-                                if level::is_not_zero(&field_lvl) {
+                                // The kernel's field test is `!isZero`: a
+                                // universe parameter is not definitionally
+                                // zero even though it may later be
+                                // instantiated with zero.  `is_not_zero`
+                                // would ask the different question whether
+                                // the level is provably nonzero and would
+                                // incorrectly classify such data as a proof.
+                                if !level::is_def_eq(&field_lvl, &level::zero()) {
                                     to_check.push(pos);
                                 }
                             }
@@ -8462,7 +8471,14 @@ impl<'e> Checker<'e> {
         Ok(false)
     }
 
-    pub fn check_inductive_group(&self, first_name: u32) -> R<()> {
+    /// Check the part of an inductive block which does not mention a
+    /// recursor.  The parser calls this on its staged environment before it
+    /// asks `reconstruct_recursors` to make any current-block recursor
+    /// visible.  Keeping this separate is important: `infer_const` obtains a
+    /// constant's type from the environment, so installing an untrusted
+    /// recursor before this point would make the subsequent construction
+    /// circular.
+    pub(crate) fn check_inductive_group_structure(&self, first_name: u32) -> R<()> {
         let ci = self
             .env
             .get(first_name)
@@ -8646,6 +8662,20 @@ impl<'e> Checker<'e> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Validate the recursor-dependent part of a group after the parser has
+    /// atomically installed *derived* recursors and ownership maps.
+    fn check_inductive_group_large_elim(&self, first_name: u32) -> R<()> {
+        let ci = self
+            .env
+            .get(first_name)
+            .ok_or_else(|| TcError::Other("missing inductive".into()))?;
+        let all = match ci {
+            ConstantInfo::InductiveType { all, .. } => all.clone(),
+            _ => return Ok(()),
+        };
         // Large-elimination check, once per group (not once per member —
         // `check_inductive_group` runs once per type name in the block,
         // all sharing the same `all`). See `elim_only_at_universe_zero`'s
@@ -8703,6 +8733,14 @@ impl<'e> Checker<'e> {
             }
         }
         Ok(())
+    }
+
+    /// Full inductive validation. The parser runs the structural phase before
+    /// reconstruction, then this check with derived recursors installed before
+    /// committing the block transaction.
+    pub fn check_inductive_group(&self, first_name: u32) -> R<()> {
+        self.check_inductive_group_structure(first_name)?;
+        self.check_inductive_group_large_elim(first_name)
     }
 
     /// Walk a constructor's argument telescope; each argument type must be

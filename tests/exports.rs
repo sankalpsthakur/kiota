@@ -4,6 +4,8 @@
 //! `080_RBTree.id_spec` pins the iota field-then-rec order: two recursive
 //! fields must become `minor f1 f2 (rec f1) (rec f2)`, not interleaved.
 
+use kiota::env::ConstantInfo;
+use kiota::expr::{self, Expr, ExprData};
 use kiota::parser::Parser;
 use kiota::tc::TcError;
 use std::fs;
@@ -23,8 +25,26 @@ fn check_file(path: &std::path::Path) -> Result<(), TcError> {
 }
 
 fn assert_accept(name: &str) {
+    let _ = parse_accept(name);
+}
+
+fn parse_accept(name: &str) -> Parser {
     let path = fixture(name);
-    check_file(&path).unwrap_or_else(|e| panic!("{name} should accept, got {e:?}"));
+    let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let mut parser = Parser::new();
+    parser
+        .run(Cursor::new(bytes))
+        .unwrap_or_else(|e| panic!("{name} should accept, got {e:?}"));
+    parser
+}
+
+fn pi_domains(mut typ: Expr) -> Vec<Expr> {
+    let mut domains = Vec::new();
+    while let ExprData::Pi(_, domain, body) = &**typ {
+        domains.push(domain.clone());
+        typ = body.clone();
+    }
+    domains
 }
 
 /// Like `assert_accept`, but runs on a thread with a large stack, matching
@@ -51,6 +71,389 @@ fn assert_reject(name: &str) {
     match check_file(&path) {
         Err(TcError::Reject(_)) => {}
         other => panic!("{name} should reject, got {other:?}"),
+    }
+}
+
+fn assert_reject_exact(name: &str, expected: &str) {
+    let path = fixture(name);
+    match check_file(&path) {
+        Err(TcError::Reject(message)) if message == expected => {}
+        other => panic!("{name} should reject with {expected:?}, got {other:?}"),
+    }
+}
+
+// Keep fixture bytes unchanged: engineering variants are made only in this
+// parser instance, immediately before importing the selected inductive block.
+fn pending_inductive(fixture_name: &str, recursor: &str) -> (Parser, serde_json::Value) {
+    let text = fs::read_to_string(fixture(fixture_name)).expect("read fixture");
+    let mut parser = Parser::new();
+    for line in text.lines() {
+        let record: serde_json::Value = serde_json::from_str(line).expect("fixture JSON");
+        if let Some(recs) = record["inductive"]["recs"].as_array() {
+            if recs.iter().any(|r| {
+                parser.name_by_str.get(recursor).copied()
+                    == r["name"].as_u64().map(|n| n as u32)
+            }) {
+                return (parser, record);
+            }
+        }
+        parser.run(Cursor::new(line)).expect("valid fixture prefix");
+    }
+    panic!("fixture does not declare {recursor}");
+}
+
+fn import_record(parser: &mut Parser, record: &serde_json::Value) -> Result<(), TcError> {
+    parser.run(Cursor::new(serde_json::to_vec(record).unwrap()))
+}
+
+fn recursor_record<'a>(
+    record: &'a mut serde_json::Value,
+    name: u32,
+) -> &'a mut serde_json::Value {
+    record["inductive"]["recs"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|r| r["name"].as_u64() == Some(name as u64))
+        .expect("recursor in block")
+}
+
+fn replace_supplied_type(parser: &mut Parser, rec: &mut serde_json::Value, typ: Expr) {
+    rec["type"] = serde_json::json!(parser.exprs.len());
+    parser.exprs.push(typ);
+}
+
+fn environment_constants(parser: &Parser) -> std::collections::BTreeMap<u32, String> {
+    // ConstantInfo has no PartialEq. Its complete Debug representation includes
+    // types, values and metadata; sort by name ID to ignore hash iteration order.
+    parser.env.consts.iter().map(|(n, c)| (*n, format!("{c:?}"))).collect()
+}
+
+#[test]
+fn recursor_type_reconstruction_alpha_renamed_auxiliary_accepts() {
+    let (mut parser, mut record) = pending_inductive(
+        "recursor-type-reconstruction.accept.ndjson", "LALNest.rec_1",
+    );
+    let rec_name = parser.name_by_str["LALNest.rec_1"];
+    let rec = recursor_record(&mut record, rec_name);
+    let supplied = parser.exprs[rec["type"].as_u64().unwrap() as usize].clone();
+    let old = rec["levelParams"][0].as_u64().unwrap() as u32;
+    // Include the canonicalizer's initial choice to exercise collision avoidance.
+    let renamed = u32::MAX;
+    let subst = kiota::level::subst_map(&[old], &[kiota::level::param(renamed)]);
+    let renamed_supplied = expr::instantiate_level_params(&supplied, &subst);
+    assert_ne!(renamed_supplied, supplied);
+    let control = parse_accept("recursor-type-reconstruction.accept.ndjson");
+    let expected = expr::instantiate_level_params(control.env.get(rec_name).unwrap().typ(), &subst);
+    rec["levelParams"] = serde_json::json!([renamed]);
+    replace_supplied_type(&mut parser, rec, renamed_supplied);
+    import_record(&mut parser, &record).expect("positional alpha-renaming accepts");
+    let stored = parser.env.get(rec_name).unwrap();
+    assert_eq!(stored.level_params(), &[renamed]);
+    assert_eq!(stored.typ(), &expected);
+}
+
+#[test]
+fn recursor_type_reconstruction_convertible_type_is_replaced() {
+    let (mut parser, mut record) = pending_inductive(
+        "recursor-type-reconstruction.accept.ndjson", "LALNest.rec_1",
+    );
+    let rec_name = parser.name_by_str["LALNest.rec_1"];
+    let rec = recursor_record(&mut record, rec_name);
+    let original = parser.exprs[rec["type"].as_u64().unwrap() as usize].clone();
+    // let ignored : Type := Prop; <original signature>
+    let supplied = expr::let_(
+        expr::sort(kiota::level::succ(kiota::level::zero())),
+        expr::sort(kiota::level::zero()),
+        expr::shift(&original, 1, 0),
+    );
+    assert_ne!(supplied, original, "conversion must do real work");
+    replace_supplied_type(&mut parser, rec, supplied.clone());
+    import_record(&mut parser, &record).expect("definitionally equal signature accepts");
+    let control = parse_accept("recursor-type-reconstruction.accept.ndjson");
+    let expected = control.env.get(rec_name).unwrap().typ();
+    let stored = parser.env.get(rec_name).unwrap().typ();
+    assert_eq!(stored, expected, "the reconstructed signature is installed");
+    assert_ne!(stored, &supplied, "serialized syntax must not enter the environment");
+}
+
+#[test]
+fn recursor_type_reconstruction_universe_position_mismatch_rejects() {
+    let (mut parser, mut record) = pending_inductive("067_eqRec.accept.ndjson", "Eq.rec");
+    let rec_name = parser.name_by_str["Eq.rec"];
+    let rec = recursor_record(&mut record, rec_name);
+    assert_eq!(rec["levelParams"].as_array().unwrap().len(), 2);
+    // Swapping the declaration order without changing occurrences is not alpha-renaming.
+    rec["levelParams"].as_array_mut().unwrap().swap(0, 1);
+    assert!(matches!(import_record(&mut parser, &record), Err(TcError::Reject(m))
+        if m == "recursor `Eq.rec` type does not match reconstructed type"));
+}
+
+#[test]
+fn recursor_type_reconstruction_duplicate_universes_reject() {
+    let (mut parser, mut record) = pending_inductive("067_eqRec.accept.ndjson", "Eq.rec");
+    let rec_name = parser.name_by_str["Eq.rec"];
+    let rec = recursor_record(&mut record, rec_name);
+    rec["levelParams"][1] = rec["levelParams"][0].clone();
+    assert!(matches!(import_record(&mut parser, &record), Err(TcError::Reject(m))
+        if m == "recursor has duplicate universe parameters"));
+}
+
+#[test]
+fn recursor_type_reconstruction_undeclared_universe_rejects() {
+    let (mut parser, mut record) = pending_inductive(
+        "recursor-type-reconstruction.accept.ndjson", "LALNest.rec_1",
+    );
+    let rec_name = parser.name_by_str["LALNest.rec_1"];
+    let rec = recursor_record(&mut record, rec_name);
+    let original = parser.exprs[rec["type"].as_u64().unwrap() as usize].clone();
+    let old = rec["levelParams"][0].as_u64().unwrap() as u32;
+    let subst = kiota::level::subst_map(&[old], &[kiota::level::param(u32::MAX)]);
+    let supplied = expr::instantiate_level_params(&original, &subst);
+    assert_ne!(supplied, original);
+    // Deliberately keep the original declaration list: normalization must not
+    // capture this undeclared parameter even at its preferred canonical ID.
+    replace_supplied_type(&mut parser, rec, supplied);
+    assert!(matches!(import_record(&mut parser, &record), Err(TcError::Reject(m))
+        if m == "recursor `LALNest.rec_1` type does not match reconstructed type"));
+}
+
+#[test]
+fn recursor_type_reconstruction_serialized_k_is_recomputed() {
+    for (fixture_name, rec_name, expected_k) in [
+        ("067_eqRec.accept.ndjson", "Eq.rec", true),
+        ("recursor-type-reconstruction.accept.ndjson", "LALNest.rec_1", false),
+    ] {
+        let (mut parser, mut record) = pending_inductive(fixture_name, rec_name);
+        let rec_name = parser.name_by_str[rec_name];
+        let rec = recursor_record(&mut record, rec_name);
+        assert_eq!(rec["k"].as_bool(), Some(expected_k));
+        rec["k"] = serde_json::json!(!expected_k);
+        import_record(&mut parser, &record).expect("serialized k remains ignored");
+        let ConstantInfo::Recursor { k, .. } = parser.env.get(rec_name).unwrap() else {
+            panic!("expected reconstructed recursor");
+        };
+        assert_eq!(*k, expected_k, "stored k must be derived in both directions");
+    }
+}
+
+#[test]
+fn recursor_type_reconstruction_duplicate_name_preserves_prior_state() {
+    let (mut parser, mut record) = pending_inductive(
+        "recursor-type-reconstruction.accept.ndjson", "LALNest.rec",
+    );
+    let before = environment_constants(&parser);
+    let rec_of = parser.env.rec_of.clone();
+    let rec_group = parser.env.rec_group.clone();
+    let mut duplicate = record["inductive"]["types"][0].clone();
+    duplicate["name"] = serde_json::json!(parser.name_by_str["LALWrap"]);
+    record["inductive"]["types"].as_array_mut().unwrap().push(duplicate);
+    assert!(matches!(import_record(&mut parser, &record), Err(TcError::Reject(m))
+        if m == "duplicate declaration of LALWrap"));
+    assert_eq!(environment_constants(&parser), before);
+    assert_eq!(parser.env.rec_of, rec_of);
+    assert_eq!(parser.env.rec_group, rec_group);
+    assert!(parser.env.get(parser.name_by_str["LALNest"]).is_none());
+}
+
+#[test]
+fn recursor_type_reconstruction_late_failure_rolls_back_ownership() {
+    let (mut parser, original) = pending_inductive(
+        "recursor-type-reconstruction.accept.ndjson", "LALNest.rec",
+    );
+    let before = environment_constants(&parser);
+    let rec_of = parser.env.rec_of.clone();
+    let rec_group = parser.env.rec_group.clone();
+    let main = parser.name_by_str["LALNest.rec"];
+    let auxiliary = parser.name_by_str["LALNest.rec_1"];
+    let owner = parser.name_by_str["LALNest"];
+    let mut missing_owner = original.clone();
+    // A nonempty rule list naming an earlier block's constructor claims no
+    // current owner. This reaches the missing-owner check after rec_group has
+    // been filled, rather than failing during type reconstruction.
+    recursor_record(&mut missing_owner, main)["rules"][0]["ctor"] =
+        serde_json::json!(parser.name_by_str["LALWrap.mk"]);
+    let mut duplicate_owner = original.clone();
+    // Both recursors now claim the current constructor. Whichever comes first
+    // writes rec_of; the second fails, exercising rollback of that write too.
+    recursor_record(&mut duplicate_owner, auxiliary)["rules"][0]["ctor"] =
+        serde_json::json!(parser.name_by_str["LALNest.node"]);
+    for (record, expected) in [
+        (missing_owner, "inductive `LALNest` is missing a recursor".to_string()),
+        (duplicate_owner, format!("duplicate recursor for type {owner}")),
+    ] {
+        assert!(matches!(import_record(&mut parser, &record), Err(TcError::Reject(m))
+            if m == expected));
+        assert_eq!(environment_constants(&parser), before);
+        assert_eq!(parser.env.rec_of, rec_of);
+        assert_eq!(parser.env.rec_group, rec_group);
+    }
+    import_record(&mut parser, &original).expect("valid retry after late failures");
+    assert_eq!(parser.env.rec_of[&owner], main);
+}
+
+#[test]
+fn recursor_type_reconstruction_control_accepts() {
+    let parser = parse_accept("recursor-type-reconstruction.accept.ndjson");
+    let nest = parser.name_by_str["LALNest"];
+    let wrap = parser.name_by_str["LALWrap"];
+    for rec_name in ["LALNest.rec", "LALNest.rec_1"] {
+        let rec = parser.name_by_str[rec_name];
+        let ConstantInfo::Recursor {
+            typ,
+            all,
+            num_params,
+            num_indices,
+            num_motives,
+            num_minors,
+            ..
+        } = parser
+            .env
+            .get(rec)
+            .expect("reconstructed recursor is installed")
+        else {
+            panic!("{rec_name} is not a recursor")
+        };
+        assert_eq!(all, &[nest]);
+        assert_eq!(
+            (*num_params, *num_indices, *num_motives, *num_minors),
+            (0, 0, 2, 2)
+        );
+        let domains = pi_domains(typ.clone());
+        assert_eq!(domains.len(), 5, "two motives, two minors and one major");
+        let (head, args) = expr::unfold_apps(&domains[4]);
+        match rec_name {
+            "LALNest.rec" => {
+                assert!(matches!(&**head, ExprData::Const(name, _) if *name == nest));
+                assert!(args.is_empty());
+            }
+            "LALNest.rec_1" => {
+                assert!(matches!(&**head, ExprData::Const(name, _) if *name == wrap));
+                assert_eq!(args.len(), 1);
+                assert!(matches!(&**args[0], ExprData::Const(name, _) if *name == nest));
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn recursor_type_reconstruction_candidate_rejects_exactly() {
+    assert_reject_exact(
+        "recursor-type-reconstruction.reject.ndjson",
+        "recursor `LALNest.rec_1` type does not match reconstructed type",
+    );
+}
+
+#[test]
+fn recursor_type_reconstruction_rejection_is_atomic() {
+    let (mut parser, candidate) = pending_inductive(
+        "recursor-type-reconstruction.reject.ndjson", "LALNest.rec_1",
+    );
+    let before = environment_constants(&parser);
+    let rec_of = parser.env.rec_of.clone();
+    let rec_group = parser.env.rec_group.clone();
+    let prior_rec = parser.name_by_str["LALWrap.rec"];
+    let prior_group = &parser.env.rec_group[&prior_rec];
+    assert!(!prior_group.is_empty());
+    let prior_allocation = prior_group.as_ptr();
+    assert!(matches!(
+        import_record(&mut parser, &candidate),
+        Err(TcError::Reject(message))
+            if message == "recursor `LALNest.rec_1` type does not match reconstructed type"
+    ));
+    assert_eq!(environment_constants(&parser), before);
+    assert_eq!(parser.env.rec_of, rec_of);
+    assert_eq!(parser.env.rec_group, rec_group);
+    // Cloning and restoring the whole environment would replace this live,
+    // unrelated Vec allocation even though its contents compare equal.
+    assert_eq!(parser.env.rec_group[&prior_rec].as_ptr(), prior_allocation);
+    for name in ["LALNest", "LALNest.node", "LALNest.rec", "LALNest.rec_1"] {
+        assert!(parser.env.get(parser.name_by_str[name]).is_none());
+    }
+    // The valid and invalid fixtures differ at one recursor type index.
+    // Replace just that pending type with the independently parsed valid one;
+    // all preexisting constants and the failed parser instance remain intact.
+    let (control_parser, mut control) = pending_inductive(
+        "recursor-type-reconstruction.accept.ndjson", "LALNest.rec_1",
+    );
+    let rec = recursor_record(&mut control, parser.name_by_str["LALNest.rec_1"]);
+    let typ = control_parser.exprs[rec["type"].as_u64().unwrap() as usize].clone();
+    replace_supplied_type(&mut parser, rec, typ);
+    import_record(&mut parser, &control).expect("valid retry after type mismatch");
+    assert!(parser.env.get(parser.name_by_str["LALNest.rec_1"]).is_some());
+}
+
+#[test]
+fn recursor_type_reconstruction_ordinary_indexed_accepts() {
+    let parser = parse_accept("067_eqRec.accept.ndjson");
+    let eq = parser.name_by_str["Eq"];
+    let rec = parser.name_by_str["Eq.rec"];
+    let ConstantInfo::Recursor {
+        all,
+        num_params,
+        num_indices,
+        num_motives,
+        num_minors,
+        ..
+    } = parser.env.get(rec).expect("Eq.rec is installed")
+    else {
+        panic!("Eq.rec is not a recursor")
+    };
+    assert_eq!(all, &[eq]);
+    assert_eq!(
+        (*num_params, *num_indices, *num_motives, *num_minors),
+        (2, 1, 1, 1)
+    );
+}
+
+#[test]
+fn recursor_type_reconstruction_two_nested_specializations_accept() {
+    assert_accept("lean-value-two-list-specializations.accept.ndjson");
+}
+
+#[test]
+fn recursor_type_reconstruction_deep_parametric_nested_accepts() {
+    assert_accept("lean-doc-block-nested-rec-param-shift.accept.ndjson");
+}
+
+#[test]
+fn recursor_type_reconstruction_mutual_nested_accepts() {
+    let parser = parse_accept("lean-compiler-lcnf-code-ctorelim.accept.ndjson");
+    let all_names = [
+        "Lean.Compiler.LCNF.Alt",
+        "Lean.Compiler.LCNF.FunDecl",
+        "Lean.Compiler.LCNF.Cases",
+        "Lean.Compiler.LCNF.Code",
+    ];
+    let all: Vec<u32> = all_names
+        .iter()
+        .map(|name| parser.name_by_str[*name])
+        .collect();
+    for rec_name in [
+        "Lean.Compiler.LCNF.Alt.rec",
+        "Lean.Compiler.LCNF.FunDecl.rec",
+        "Lean.Compiler.LCNF.Cases.rec",
+        "Lean.Compiler.LCNF.Code.rec",
+        "Lean.Compiler.LCNF.Alt.rec_1",
+        "Lean.Compiler.LCNF.Alt.rec_2",
+    ] {
+        let rec = parser.name_by_str[rec_name];
+        let ConstantInfo::Recursor {
+            all: rec_all,
+            num_params,
+            num_motives,
+            num_minors,
+            ..
+        } = parser
+            .env
+            .get(rec)
+            .expect("mutual/nested recursor is installed")
+        else {
+            panic!("{rec_name} is not a recursor")
+        };
+        assert_eq!(rec_all, &all);
+        assert_eq!((*num_params, *num_motives, *num_minors), (1, 6, 19));
     }
 }
 
@@ -337,11 +740,15 @@ fn nested_neg_functor_rejects() {
     assert_reject("nested-neg-functor.reject.ndjson");
 }
 
-/// `List` is strictly positive; `Tree` with a `List Tree` field is a nested
-/// inductive Lean accepts (`Syntax` is the same shape).
+/// This legacy synthetic has the positive `Tree`/`List Tree` shape, but its
+/// serialized `List.rec` and `Tree.rec` are Prop-only dummy signatures: both
+/// omit the fresh elimination universe, and the nested block also omits the
+/// copied-`List` auxiliary recursor.  Preserve the bytes as a fail-closed
+/// regression instead of weakening reconstruction to accept the stale
+/// metadata.
 #[test]
-fn nested_list_tree_accepts() {
-    assert_accept("nested-list-tree.accept.ndjson");
+fn nested_list_tree_malformed_recursors_reject() {
+    assert_reject("nested-list-tree.reject.ndjson");
 }
 
 // ---- lean-kernel-arena live false accepts (fetched from
