@@ -49,7 +49,15 @@ The next independent target is not another toy test. It is:
 
 **121/121 good · 62/62 bad · 0 declines · completed mathlib benchmark**
 
-Current `main` includes the kernel that accepts Init.Prelude and an Init prefix through `utf8DecodeChar?.assemble₂` (closed `Int.ediv` / `gcd` / `Constraint.combine`). Full Init, std, mathlib, cslib and cedar are not yet walked end-to-end. The published arena pin still declines those five suites until they accept.
+Large-corpus completion remains in progress. Current `main` reaches
+`Int32.instRxcHasSize_eq` in Init and declines at the reduction-depth limit.
+The arena configuration runs the large corpora, but a configured run is not
+proof of acceptance. Full Init, Std, Mathlib, CSLib, and Cedar coverage must be
+verified against the exact checker revision and export version.
+
+Input is streamed on the checking worker, so the raw export need not remain in
+memory beside the parsed environment. See the measured verification boundaries
+in [the September 27 checkpoint](docs/checkpoints/2026-09-27.md).
 
 The performance gap also points toward a deeper architectural question. Eager implementations cluster far above closure-based kernels on full-corpus instruction counts. Kiota currently keeps an eager representation; moving more evaluation behind closures is likely the next major throughput step after correctness coverage.
 
@@ -72,6 +80,7 @@ Exit codes:
 - `0` — accept
 - `1` — reject
 - `2` — decline
+- `3` — internal or input parsing error (not a proof rejection)
 
 Set `KIOTA_DEBUG=1` to print both sides of an application-type mismatch.
 

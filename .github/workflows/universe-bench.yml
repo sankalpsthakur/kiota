@@ -1,0 +1,96 @@
+name: universe-substitution-benchmark
+on:
+  pull_request:
+    paths:
+      - src/expr.rs
+      - src/expr/**
+      - src/main.rs
+      - tests/cli_verdicts.rs
+      - examples/universe_subst_bench.rs
+      - .github/workflows/universe-bench.yml
+permissions:
+  contents: read
+concurrency:
+  group: universe-bench-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build candidate and immutable baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline=9fa2c297dd700fe8fd1712a86bdbb258e1c01c42
+          git fetch --no-tags --depth=1 origin "$baseline"
+          git worktree add --detach "$RUNNER_TEMP/kiota-bench-base" "$baseline"
+          mkdir -p "$RUNNER_TEMP/kiota-bench-base/examples" bench-report
+          cp examples/universe_subst_bench.rs "$RUNNER_TEMP/kiota-bench-base/examples/"
+          cargo build --release --locked --bin kiota --example universe_subst_bench
+          CARGO_TARGET_DIR="$RUNNER_TEMP/kiota-bench-target" \
+            cargo build --release --locked --bin kiota --example universe_subst_bench \
+            --manifest-path "$RUNNER_TEMP/kiota-bench-base/Cargo.toml"
+          printf '%s\n' "$baseline" > bench-report/baseline-sha.txt
+          git rev-parse HEAD > bench-report/candidate-sha.txt
+          sha256sum examples/universe_subst_bench.rs > bench-report/benchmark.sha256
+          rustc --version --verbose > bench-report/toolchain.txt
+      - name: Verify error-exit regression against baseline
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          baseline = str(Path(os.environ['RUNNER_TEMP']) / 'kiota-bench-target/release/kiota')
+          candidate = str(Path('target/release/kiota').resolve())
+          records = []
+          for name, binary, expected in [('baseline', baseline, 1), ('candidate', candidate, 3)]:
+              result = subprocess.run([binary, '--use-stdin'], input=b'{\n', capture_output=True, timeout=10)
+              row = {'binary': name, 'exit_code': result.returncode, 'stderr': result.stderr.decode()}
+              records.append(row)
+              assert result.returncode == expected, row
+          text = json.dumps(records, indent=2)
+          Path('bench-report/cli-red-green.json').write_text(text + '\n')
+          print(text)
+          PY
+      - name: Measure cold and warm paths on the same runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline="$RUNNER_TEMP/kiota-bench-target/release/examples/universe_subst_bench"
+          candidate=target/release/examples/universe_subst_bench
+          for round in 1 2 3 4 5; do
+            if (( round % 2 )); then
+              "$baseline" >> bench-report/baseline.jsonl
+              "$candidate" >> bench-report/candidate.jsonl
+            else
+              "$candidate" >> bench-report/candidate.jsonl
+              "$baseline" >> bench-report/baseline.jsonl
+            fi
+          done
+          python3 - <<'PY'
+          import json, statistics
+          from pathlib import Path
+          groups = {}
+          for name in ['baseline', 'candidate']:
+              rows = [json.loads(line) for line in Path(f'bench-report/{name}.jsonl').read_text().splitlines()]
+              groups[name] = {workload: [r['elapsed_ns'] for r in rows if r['workload'] == workload] for workload in ['cold', 'warm']}
+          report = {'scope': 'synthetic-universe-substitution-only', 'arena_score': False, 'results': {}}
+          for workload in ['cold', 'warm']:
+              old = statistics.median(groups['baseline'][workload])
+              new = statistics.median(groups['candidate'][workload])
+              report['results'][workload] = {'baseline_median_ns': old, 'candidate_median_ns': new, 'baseline_over_candidate': old / new}
+          text = json.dumps(report, indent=2)
+          Path('bench-report/summary.json').write_text(text + '\n')
+          print(text)
+          PY
+      - name: Preserve benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: universe-benchmark-${{ github.run_id }}-${{ github.run_attempt }}
+          path: bench-report/
+          if-no-files-found: warn
+          retention-days: 14

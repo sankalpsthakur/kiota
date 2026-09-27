@@ -42,6 +42,6 @@ fn streaming_file_and_stdin_agree() {
 fn streaming_stdin_checks_the_suffix() {
     let mut bytes = std::fs::read(fixture("proof-irrel.accept.ndjson")).unwrap();
     bytes.extend_from_slice(b"\ninvalid JSON\n");
-    assert_eq!(stdin_verdict(&bytes), 1,
+    assert_eq!(stdin_verdict(&bytes), 3,
                "a valid prefix must not conceal malformed trailing input");
 }

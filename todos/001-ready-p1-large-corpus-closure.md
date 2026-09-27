@@ -57,3 +57,12 @@ The long magma test accepts in separate baseline and streaming runs; its initial
 45-second timeout under competing jobs was not reproduced in the final replay.
 Discovered unmerged PRs #10 (cache identity/error verdicts) and #11 (recursor
 type reconstruction by phiferd); their changes are not on current main.
+
+Integrated both contributions on `fix/large-corpus-20260927`, preserving author
+history and reconstruction error categories. Combined default and experimental
+NbE release suites pass all 180 tests; default small-corpus replay passes all
+193 cases. The malformed imported recursor signature accepted by baseline is
+now rejected, with its valid control accepted. Internal/parse errors return 3.
+Strict memory-capped gate remains a Linux CI requirement: Darwin RLIMIT_AS
+causes 8 of 16 Python harness tests to fail locally. Large-corpus criteria above
+remain unchecked; no ranking improvement or end-to-end acceptance is claimed.

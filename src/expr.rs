@@ -339,7 +339,11 @@ fn alloc_node(d: ExprData) -> Expr {
 thread_local! {
     static INTERN: RefCell<Interner> = RefCell::new(Interner::default());
     static INTERN_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static LEVEL_INST_MEMO: RefCell<FxHashMap<(usize, u64), Expr>> =
+    static LEVEL_INST_MEMO: RefCell<FxHashMap<(usize, usize), Expr>> =
+        RefCell::new(FxHashMap::default());
+    // IDs are assigned only after comparing the complete substitution. A hash
+    // collision must never identify two different universe instantiations.
+    static LEVEL_SUBST_IDS: RefCell<FxHashMap<Vec<(u32, Level)>, usize>> =
         RefCell::new(FxHashMap::default());
     static SHIFT_MEMO: RefCell<FxHashMap<(usize, i32, u32), Expr>> =
         RefCell::new(FxHashMap::default());
@@ -408,6 +412,8 @@ pub fn warm_intern(n: u32) {
 /// and were never cleared, so std `#18000` hung after 18k decls of residue.
 pub fn clear_subst_memos() {
     LEVEL_INST_MEMO.with(|m| m.borrow_mut().clear());
+    // Clear the memo first: IDs can be reused only after its entries are gone.
+    LEVEL_SUBST_IDS.with(|m| m.borrow_mut().clear());
     SHIFT_MEMO.with(|m| m.borrow_mut().clear());
     INST1_MEMO.with(|m| m.borrow_mut().clear());
 }
@@ -578,33 +584,39 @@ pub fn instantiate1(e: &Expr, arg: &Expr) -> Expr {
     r
 }
 
-fn subst_hash(subst: &rustc_hash::FxHashMap<u32, Level>) -> u64 {
-    let mut keys: Vec<u32> = subst.keys().copied().collect();
-    keys.sort_unstable();
-    let mut h = FxHasher::default();
-    for k in keys {
-        k.hash(&mut h);
-        subst[&k].hash(&mut h);
-    }
-    h.finish()
+/// Canonicalize once per public call, not once per expression node. The hash
+/// table checks full key equality before reusing an ID, including collisions.
+fn level_subst_id<S: std::hash::BuildHasher>(
+    subst: &FxHashMap<u32, Level>,
+    ids: &mut std::collections::HashMap<Vec<(u32, Level)>, usize, S>,
+) -> usize {
+    let mut key: Vec<_> = subst.iter().map(|(&n, l)| (n, l.clone())).collect();
+    key.sort_unstable_by_key(|(n, _)| *n);
+    let next = ids.len();
+    *ids.entry(key).or_insert(next)
 }
 
-pub fn instantiate_level_params(e: &Expr, subst: &rustc_hash::FxHashMap<u32, Level>) -> Expr {
+pub fn instantiate_level_params(e: &Expr, subst: &FxHashMap<u32, Level>) -> Expr {
     if subst.is_empty() {
         return e.clone();
     }
-    let key = (ptr(e), subst_hash(subst));
+    let id = LEVEL_SUBST_IDS.with(|ids| level_subst_id(subst, &mut ids.borrow_mut()));
+    instantiate_level_params_cached(e, subst, id)
+}
+
+fn instantiate_level_params_cached(e: &Expr, subst: &FxHashMap<u32, Level>, id: usize) -> Expr {
+    let key = (ptr(e), id);
     if let Some(r) = LEVEL_INST_MEMO.with(|m| m.borrow().get(&key).cloned()) {
         return r;
     }
-    let r = instantiate_level_params_go(e, subst);
+    let r = instantiate_level_params_go(e, subst, id);
     LEVEL_INST_MEMO.with(|m| {
         m.borrow_mut().insert(key, r.clone());
     });
     r
 }
 
-fn instantiate_level_params_go(e: &Expr, subst: &rustc_hash::FxHashMap<u32, Level>) -> Expr {
+fn instantiate_level_params_go(e: &Expr, subst: &FxHashMap<u32, Level>, id: usize) -> Expr {
     match &***e {
         ExprData::BVar(_) | ExprData::Lit(_) => e.clone(),
         ExprData::Sort(l) => sort(crate::level::instantiate(l, subst)),
@@ -615,25 +627,25 @@ fn instantiate_level_params_go(e: &Expr, subst: &rustc_hash::FxHashMap<u32, Leve
                 .collect(),
         ),
         ExprData::App(f, a) => app(
-            instantiate_level_params(f, subst),
-            instantiate_level_params(a, subst),
+            instantiate_level_params_cached(f, subst, id),
+            instantiate_level_params_cached(a, subst, id),
         ),
         ExprData::Lam(bi, ty, body) => lam(
             *bi,
-            instantiate_level_params(ty, subst),
-            instantiate_level_params(body, subst),
+            instantiate_level_params_cached(ty, subst, id),
+            instantiate_level_params_cached(body, subst, id),
         ),
         ExprData::Pi(bi, ty, body) => pi(
             *bi,
-            instantiate_level_params(ty, subst),
-            instantiate_level_params(body, subst),
+            instantiate_level_params_cached(ty, subst, id),
+            instantiate_level_params_cached(body, subst, id),
         ),
         ExprData::Let(ty, val, body) => let_(
-            instantiate_level_params(ty, subst),
-            instantiate_level_params(val, subst),
-            instantiate_level_params(body, subst),
+            instantiate_level_params_cached(ty, subst, id),
+            instantiate_level_params_cached(val, subst, id),
+            instantiate_level_params_cached(body, subst, id),
         ),
-        ExprData::Proj(s, i, v) => proj(*s, *i, instantiate_level_params(v, subst)),
+        ExprData::Proj(s, i, v) => proj(*s, *i, instantiate_level_params_cached(v, subst, id)),
     }
 }
 
@@ -928,3 +940,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "expr/level_subst_tests.rs"]
+mod level_subst_tests;
