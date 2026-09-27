@@ -42,7 +42,7 @@ the 16 GB Mac. Preserve exact inputs, binary hashes, and limits in reports.
 ## Acceptance Criteria
 
 - [x] Baseline/candidate comparison distinguishes inherited failure from regression.
-- [ ] Pair-n21 accepts under the unchanged 8,192 MiB Linux address-space cap.
+- [x] Pair-n21 accepts under the unchanged 8,192 MiB Linux address-space cap.
 - [ ] Current 122 positive and 71 negative Arena cases pass the strict gate.
 - [ ] Default and experimental NbE outcomes are recorded separately.
 
@@ -87,6 +87,21 @@ again passes all 193 fixtures: 102.94 seconds, observed peak group RSS
 were addressed by holding other substitution-key components and the queried
 expression fixed across reconstruction; only the relevant source/context
 allocation identity now distinguishes the retained stale entries.
+
+Linux run 36330794589, candidate `4bdf088`: the explicit reclaim gate is
+complete but fails 192/193. Pair-n21 accepts in 34.76 seconds under unchanged
+8,192 MiB address space; deep-n36 instead times out at 120.00 seconds with
+over 500 million intern calls. All 71 negative cases reject. This trades one
+availability failure for another, so no promotion or all-green claim follows.
+Testing larger disposable memo retention (200,000 instead of 50,000 entries)
+under bounded local runs; limits and expected verdicts remain unchanged.
+
+Completed bounded experiments: larger memos, recent-root retention,
+constant-time weak entry counts, and pressure-triggered conversion did not
+clear the availability frontier. The 8M pressure variant hit the local
+90-second watchdog on deep-n36. Restored all checker source and tests exactly
+to `4bdf088`, retaining diagnostic results in the checkpoint. The opt-in mode
+is not promoted, and the full strict Linux acceptance criterion stays unchecked.
 
 ## Resources
 

@@ -1,0 +1,18 @@
+{
+  "repo_sha": null,
+  "mode": "default",
+  "inputs": [
+    {
+      "name": "mathlib",
+      "path": "/mounted/immutable/mathlib.ndjson",
+      "sha256": null,
+      "bytes": null,
+      "header": {
+        "lean": {"version": null, "githash": null},
+        "exporter": {"name": null, "version": null},
+        "format": {"version": null}
+      },
+      "timeout": 3600
+    }
+  ]
+}
