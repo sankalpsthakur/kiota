@@ -66,3 +66,11 @@ now rejected, with its valid control accepted. Internal/parse errors return 3.
 Strict memory-capped gate remains a Linux CI requirement: Darwin RLIMIT_AS
 causes 8 of 16 Python harness tests to fail locally. Large-corpus criteria above
 remain unchecked; no ranking improvement or end-to-end acceptance is claimed.
+
+Linux CI passed all 16 Python harness tests and 180 default Rust release tests,
+then failed the strict default gate on one allocation crash in
+`magma-list-pair-n21` under 8,192 MiB address space (192/193 correct verdicts).
+Added todo 002 for this separate availability blocker. Combined full Init still
+declines at the same declaration: 38.41 seconds, 764,314,584-byte physical
+footprint. Core-only equality normalization also failed the small Int32 slice
+and was reverted; the verified binary hash was restored.

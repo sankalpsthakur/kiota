@@ -66,6 +66,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Strict small-suite gate
+        id: strict-gate
         timeout-minutes: 12
         env:
           MODE: ${{ matrix.mode }}
@@ -74,6 +75,36 @@ jobs:
             --binary target/release/kiota --archive arena-input/tests.tar.gz \
             --output arena-report --mode "$MODE" --min-good 119 --min-bad 70 \
             --memory-mib 8192
+      - name: Compare immutable baseline after default resource failure
+        if: failure() && matrix.mode == 'default' && steps.strict-gate.outcome == 'failure'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline=9fa2c297dd700fe8fd1712a86bdbb258e1c01c42
+          baseline_root="${RUNNER_TEMP:?}/kiota-resource-base"
+          baseline_target="${RUNNER_TEMP:?}/kiota-resource-target"
+          git fetch --no-tags --depth=1 origin "$baseline"
+          git worktree add --detach "$baseline_root" "$baseline"
+          CARGO_TARGET_DIR="$baseline_target" cargo build --release --locked \
+            --manifest-path "$baseline_root/Cargo.toml"
+          printf '%s\n' "$baseline" > arena-input/resource-baseline-sha.txt
+          sha256sum "$baseline_target/release/kiota" > arena-input/resource-baseline-binary.sha256
+          python3 scripts/arena_gate.py \
+            --binary "$baseline_target/release/kiota" --archive arena-input/tests.tar.gz \
+            --output baseline-arena-report --mode default --min-good 119 --min-bad 70 \
+            --memory-mib 8192
+      - name: Retain baseline comparison
+        if: always() && matrix.mode == 'default'
+        uses: actions/upload-artifact@v4
+        with:
+          name: arena-baseline-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            baseline-arena-report/
+            arena-input/resource-baseline-*
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Retain verdicts and failure logs
         if: always()
         uses: actions/upload-artifact@v4
