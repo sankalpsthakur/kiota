@@ -3,7 +3,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use kiota::parser;
 use kiota::tc;
-use std::io::{BufReader, Cursor, Read, Write};
+use std::io::{BufReader, Write};
 
 const EXIT_ACCEPT: i32 = 0;
 const EXIT_REJECT: i32 = 1;
@@ -59,27 +59,21 @@ fn main() {
         }
     }
 
-    // Read all input up front so the actual checking work can run on a worker
-    // thread with a much larger stack (deeply nested terms in large proofs can
-    // otherwise blow the default 8MB stack).
-    let mut bytes = Vec::new();
-    if use_stdin || path.is_none() {
-        std::io::stdin()
-            .lock()
-            .read_to_end(&mut bytes)
-            .expect("read stdin");
-    } else {
-        let mut f = std::fs::File::open(path.unwrap()).expect("open input");
-        f.read_to_end(&mut bytes).expect("read file");
-    }
-
+    // Parse on the large-stack worker directly from the input stream. Keeping
+    // the entire export text beside the parsed environment unnecessarily adds
+    // the export's size to peak memory (gigabytes for the large corpora).
     let handle = std::thread::Builder::new()
         .stack_size(1024 * 1024 * 1024)
         .spawn(move || {
             let outcome = std::panic::catch_unwind(|| {
                 let mut p = parser::Parser::new();
-                let reader = BufReader::new(Cursor::new(bytes));
-                p.run(reader)
+                if use_stdin || path.is_none() {
+                    let stdin = std::io::stdin();
+                    p.run(BufReader::new(stdin.lock()))
+                } else {
+                    let file = std::fs::File::open(path.unwrap()).expect("open input");
+                    p.run(BufReader::new(file))
+                }
             });
             kiota::stats::report();
             kiota::stats::report_shortcuts();
@@ -96,6 +90,3 @@ fn main() {
     let _ = handle.join();
     finish(Err(tc::TcError::Other("worker thread panicked".into())))
 }
-
-#[allow(dead_code)]
-fn silence_unused(_: impl Read) {}
