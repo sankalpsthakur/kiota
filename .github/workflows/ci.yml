@@ -11,3 +11,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Test
         run: cargo test
+      - name: Test strict remote supervisor with fake binaries
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/remote/tests -v

@@ -6,6 +6,24 @@ use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::rc::Rc;
 
+mod reclaim;
+
+/// Experimental only: retain no strong references in the interner and bound
+/// disposable memo tables. Off by default until full correctness/resource gates.
+pub(crate) fn reclamation_enabled() -> bool {
+    thread_local! {
+        static ENABLED: bool = std::env::var_os("KIOTA_RECLAIM").is_some();
+    }
+    ENABLED.with(|enabled| *enabled)
+}
+
+pub(crate) fn memo_insert<K: Eq + Hash, V>(memo: &mut FxHashMap<K, V>, key: K, value: V) {
+    if reclamation_enabled() && memo.len() >= 50_000 {
+        memo.clear();
+    }
+    memo.insert(key, value);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinderInfo {
     Default,
@@ -40,6 +58,7 @@ pub enum ExprData {
 /// `i` occurs); `u64::MAX` means some bvar is `≥ 64` and the defeq pair key
 /// must fall back to `suffix[loose]`.
 pub struct ExprNode {
+    identity: usize,
     data: ExprData,
     loose: u32,
     used_bvars: u64,
@@ -72,7 +91,7 @@ impl Eq for ExprNode {}
 impl Hash for ExprNode {
     #[inline(always)]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        (self as *const ExprNode as usize).hash(state)
+        self.identity.hash(state)
     }
 }
 
@@ -117,7 +136,14 @@ fn take_children(d: &mut ExprData, out: &mut Vec<Expr>) {
 pub type Expr = Rc<ExprNode>;
 
 fn ptr(e: &Expr) -> usize {
-    Rc::as_ptr(e) as usize
+    identity(e)
+}
+
+/// Exact allocation identity that is never reused, even after interner resets.
+/// Address reuse must not let a memo entry for a discarded term match a new
+/// allocation. IDs are thread-local, like the Rc terms and all checker caches.
+pub fn identity(e: &Expr) -> usize {
+    e.identity
 }
 
 /// The smallest `k` such that every loose bvar in `e` has index `< k`.
@@ -330,6 +356,11 @@ fn alloc_node(d: ExprData) -> Expr {
     let loose = loose_of(&d);
     let used_bvars = used_of(&d);
     Rc::new(ExprNode {
+        identity: NEXT_NODE_ID.with(|next| {
+            let id = next.get();
+            next.set(id.checked_add(1).expect("expression identity exhausted"));
+            id
+        }),
         data: d,
         loose,
         used_bvars,
@@ -337,9 +368,15 @@ fn alloc_node(d: ExprData) -> Expr {
 }
 
 thread_local! {
+    static NEXT_NODE_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
     static INTERN: RefCell<Interner> = RefCell::new(Interner::default());
+    static WEAK_INTERN: RefCell<reclaim::WeakInterner> = RefCell::new(reclaim::WeakInterner::default());
     static INTERN_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static LEVEL_INST_MEMO: RefCell<FxHashMap<(usize, u64), Expr>> =
+    static LEVEL_INST_MEMO: RefCell<FxHashMap<(usize, usize), Expr>> =
+        RefCell::new(FxHashMap::default());
+    // IDs are assigned only after comparing the complete substitution. A hash
+    // collision must never identify two different universe instantiations.
+    static LEVEL_SUBST_IDS: RefCell<FxHashMap<Vec<(u32, Level)>, usize>> =
         RefCell::new(FxHashMap::default());
     static SHIFT_MEMO: RefCell<FxHashMap<(usize, i32, u32), Expr>> =
         RefCell::new(FxHashMap::default());
@@ -357,11 +394,19 @@ pub fn intern(d: ExprData) -> Expr {
         eprintln!("INTERN_CALLS {n} nodes={}", intern_node_count());
         let _ = std::io::Write::flush(&mut std::io::stderr());
     }
-    INTERN.with(|t| t.borrow_mut().intern(d))
+    if reclamation_enabled() {
+        WEAK_INTERN.with(|t| t.borrow_mut().intern(d))
+    } else {
+        INTERN.with(|t| t.borrow_mut().intern(d))
+    }
 }
 
 pub fn intern_node_count() -> usize {
-    INTERN.with(|t| t.borrow().len())
+    if reclamation_enabled() {
+        WEAK_INTERN.with(|t| t.borrow().len())
+    } else {
+        INTERN.with(|t| t.borrow().len())
+    }
 }
 
 /// Drop the hash-cons table's own lookup structure if it has grown past
@@ -378,6 +423,17 @@ pub fn intern_node_count() -> usize {
 /// when the table's next capacity-doubling (~24M nodes → ~3.3 GB) is
 /// larger than one affordable allocation.
 pub fn intern_clear_if_large(threshold: usize) -> bool {
+    if reclamation_enabled() {
+        return WEAK_INTERN.with(|t| {
+            let mut t = t.borrow_mut();
+            if t.len() > threshold {
+                *t = reclaim::WeakInterner::default();
+                true
+            } else {
+                false
+            }
+        });
+    }
     INTERN.with(|t| {
         let mut t = t.borrow_mut();
         if t.len() > threshold {
@@ -408,6 +464,8 @@ pub fn warm_intern(n: u32) {
 /// and were never cleared, so std `#18000` hung after 18k decls of residue.
 pub fn clear_subst_memos() {
     LEVEL_INST_MEMO.with(|m| m.borrow_mut().clear());
+    // Clear the memo first: IDs can be reused only after its entries are gone.
+    LEVEL_SUBST_IDS.with(|m| m.borrow_mut().clear());
     SHIFT_MEMO.with(|m| m.borrow_mut().clear());
     INST1_MEMO.with(|m| m.borrow_mut().clear());
 }
@@ -492,7 +550,7 @@ pub fn shift(e: &Expr, by: i32, cutoff: u32) -> Expr {
         ExprData::Proj(s, i, v) => proj(*s, *i, shift(v, by, cutoff)),
     };
     SHIFT_MEMO.with(|m| {
-        m.borrow_mut().insert(key, r.clone());
+        memo_insert(&mut m.borrow_mut(), key, r.clone());
     });
     r
 }
@@ -523,7 +581,7 @@ fn instantiate_core(
     if loose_bvar_range(e) <= depth {
         return e.clone();
     }
-    let key = (Rc::as_ptr(e) as usize, depth);
+    let key = (identity(e), depth);
     if let Some(r) = memo.get(&key) {
         return r.clone();
     }
@@ -573,38 +631,44 @@ pub fn instantiate1(e: &Expr, arg: &Expr) -> Expr {
     }
     let r = instantiate(e, std::slice::from_ref(arg));
     INST1_MEMO.with(|m| {
-        m.borrow_mut().insert(key, r.clone());
+        memo_insert(&mut m.borrow_mut(), key, r.clone());
     });
     r
 }
 
-fn subst_hash(subst: &rustc_hash::FxHashMap<u32, Level>) -> u64 {
-    let mut keys: Vec<u32> = subst.keys().copied().collect();
-    keys.sort_unstable();
-    let mut h = FxHasher::default();
-    for k in keys {
-        k.hash(&mut h);
-        subst[&k].hash(&mut h);
-    }
-    h.finish()
+/// Canonicalize once per public call, not once per expression node. The hash
+/// table checks full key equality before reusing an ID, including collisions.
+fn level_subst_id<S: std::hash::BuildHasher>(
+    subst: &FxHashMap<u32, Level>,
+    ids: &mut std::collections::HashMap<Vec<(u32, Level)>, usize, S>,
+) -> usize {
+    let mut key: Vec<_> = subst.iter().map(|(&n, l)| (n, l.clone())).collect();
+    key.sort_unstable_by_key(|(n, _)| *n);
+    let next = ids.len();
+    *ids.entry(key).or_insert(next)
 }
 
-pub fn instantiate_level_params(e: &Expr, subst: &rustc_hash::FxHashMap<u32, Level>) -> Expr {
+pub fn instantiate_level_params(e: &Expr, subst: &FxHashMap<u32, Level>) -> Expr {
     if subst.is_empty() {
         return e.clone();
     }
-    let key = (ptr(e), subst_hash(subst));
+    let id = LEVEL_SUBST_IDS.with(|ids| level_subst_id(subst, &mut ids.borrow_mut()));
+    instantiate_level_params_cached(e, subst, id)
+}
+
+fn instantiate_level_params_cached(e: &Expr, subst: &FxHashMap<u32, Level>, id: usize) -> Expr {
+    let key = (ptr(e), id);
     if let Some(r) = LEVEL_INST_MEMO.with(|m| m.borrow().get(&key).cloned()) {
         return r;
     }
-    let r = instantiate_level_params_go(e, subst);
+    let r = instantiate_level_params_go(e, subst, id);
     LEVEL_INST_MEMO.with(|m| {
-        m.borrow_mut().insert(key, r.clone());
+        memo_insert(&mut m.borrow_mut(), key, r.clone());
     });
     r
 }
 
-fn instantiate_level_params_go(e: &Expr, subst: &rustc_hash::FxHashMap<u32, Level>) -> Expr {
+fn instantiate_level_params_go(e: &Expr, subst: &FxHashMap<u32, Level>, id: usize) -> Expr {
     match &***e {
         ExprData::BVar(_) | ExprData::Lit(_) => e.clone(),
         ExprData::Sort(l) => sort(crate::level::instantiate(l, subst)),
@@ -615,25 +679,25 @@ fn instantiate_level_params_go(e: &Expr, subst: &rustc_hash::FxHashMap<u32, Leve
                 .collect(),
         ),
         ExprData::App(f, a) => app(
-            instantiate_level_params(f, subst),
-            instantiate_level_params(a, subst),
+            instantiate_level_params_cached(f, subst, id),
+            instantiate_level_params_cached(a, subst, id),
         ),
         ExprData::Lam(bi, ty, body) => lam(
             *bi,
-            instantiate_level_params(ty, subst),
-            instantiate_level_params(body, subst),
+            instantiate_level_params_cached(ty, subst, id),
+            instantiate_level_params_cached(body, subst, id),
         ),
         ExprData::Pi(bi, ty, body) => pi(
             *bi,
-            instantiate_level_params(ty, subst),
-            instantiate_level_params(body, subst),
+            instantiate_level_params_cached(ty, subst, id),
+            instantiate_level_params_cached(body, subst, id),
         ),
         ExprData::Let(ty, val, body) => let_(
-            instantiate_level_params(ty, subst),
-            instantiate_level_params(val, subst),
-            instantiate_level_params(body, subst),
+            instantiate_level_params_cached(ty, subst, id),
+            instantiate_level_params_cached(val, subst, id),
+            instantiate_level_params_cached(body, subst, id),
         ),
-        ExprData::Proj(s, i, v) => proj(*s, *i, instantiate_level_params(v, subst)),
+        ExprData::Proj(s, i, v) => proj(*s, *i, instantiate_level_params_cached(v, subst, id)),
     }
 }
 
@@ -721,6 +785,23 @@ mod tests {
         let b = bvar(0);
         assert!(Rc::ptr_eq(&a, &b), "post-clear intern must still hash-cons");
         let _ = acc;
+    }
+
+    #[test]
+    fn expression_identity_is_exact_and_never_reused_after_reset() {
+        let first = const_(91, vec![]);
+        let original_id = identity(&first);
+        assert_eq!(original_id, identity(&const_(91, vec![])));
+        clear_subst_memos();
+        assert!(intern_clear_if_large(0));
+        let second = const_(91, vec![]);
+        assert_ne!(original_id, identity(&second));
+        drop(first);
+        drop(second);
+        assert!(intern_clear_if_large(0));
+        for n in 0..1_000 {
+            assert!(identity(&const_(n, vec![])) > original_id);
+        }
     }
 
     #[test]
@@ -928,3 +1009,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "expr/level_subst_tests.rs"]
+mod level_subst_tests;
