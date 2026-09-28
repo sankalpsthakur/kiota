@@ -23,9 +23,14 @@ runner collapses all nonzero exits into rejection. Neither proves acceptance.
 - The historical Mathlib export SHA-256 matches Arena:
   `ca2ec20fd063b61e71867b2975c81bd989af9f879b4886b8f08cd23c767a47bb`,
   5,636,308,621 bytes. Saved outputs contain logs, not that export.
-- Latest deployed Kiota remains `2d2a9fa`, rank 19/26; candidate PR #12
-  is draft and not deployed. Accepted Mathlib hardware instructions are required
-  for a finite ranking metric; wall time is not a substitute.
+- As of 2026-09-28, deployed Kiota remains `2d2a9fa`, rank 20/28: all 71
+  invalid tests rejected, 124/130 valid tests accepted, one false reject and
+  five declines. Candidate PR #12 is draft and not deployed. Accepted Mathlib
+  hardware instructions are required for a finite ranking metric; wall time is
+  not a substitute.
+- The existing private `kiota-large-inputs-20260908` dataset lists Init, Std,
+  and Cedar only. It contains neither Mathlib nor CSLib; Cedar is not the exact
+  Arena export. Historical notebook `COMPLETE` status does not prove acceptance.
 
 ## Proposed Solutions
 
@@ -37,16 +42,17 @@ runner collapses all nonzero exits into rejection. Neither proves acceptance.
 
 ## Recommended Action
 
-Prepare and test the harness locally with fake binaries. Submit only after the
-user authorizes use of the existing private runner and the candidate gates pass.
-Do not generate/download full Mathlib on the 16 GB Mac with 4.4 GiB disk free.
+Prepare and test the harness locally with fake binaries. The user has authorized
+continued progress, but submit a private full-corpus run only when the exact
+inputs and source/toolchain prerequisites are available and validated. Do not
+generate/build full Mathlib on the 16 GB Mac solely to fill this gap.
 
 ## Acceptance Criteria
 
 - [x] Runner implements actual immutable-checkout and built-binary hash checks.
 - [x] Tests exercise missing inputs, mismatched hashes, every exit category,
       crashes, timeouts, process-group cleanup, and incomplete execution.
-- [ ] User authorizes the private remote submission.
+- [x] User authorizes continued progress and pushing verified updates.
 - [ ] Exact current large-corpus inputs are mounted and validated.
 - [ ] All requested corpora accept within the published limits.
 - [ ] Hardware-counter probe yields meaningful positive instruction counts.
@@ -76,6 +82,22 @@ seconds; Linux normal CI now executes them separately. The checker source was
 restored exactly after failed resource experiments, and its verified release
 binary hash matches the reviewed `4bdf088` checkpoint. Linux supervisor execution
 and real corpus checks are separate gates, not inferred from these fake tests.
+
+### 2026-09-28 - Live ranking and remote-input preflight
+
+The current Arena board places Kiota 20/28 at the same official pin
+`2d2a9fa31cba31abdd49543c3bb667591207577e`. It reports 71/71 negative
+tests rejected, 124/130 valid accepted, one false reject, five declines, and no
+Mathlib instruction score. The change from 19/26 is not a checker improvement;
+the official revision did not change.
+
+Read-only Kaggle inventory confirmed the private large-input dataset has Init,
+Std, and Cedar, but no full Mathlib or CSLib. The old large-CPU notebook is
+`COMPLETE`; this only indicates the notebook finished, not that all inputs
+accepted. No new remote job or dataset upload was submitted. Do not promote the
+draft PR or submit a mislabelled five-corpus result. A daily Codex heartbeat
+now watches the rank, pin, correctness counts, Mathlib score, and PR gate and
+notifies only on material changes.
 
 ## Resources
 
