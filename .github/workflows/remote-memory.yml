@@ -15,7 +15,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [default, reclaim, collect]
+        mode: [collect]
+        cache_limit: [50000, 200000, 1000000]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -23,8 +24,11 @@ jobs:
         timeout-minutes: 7
         env:
           MODE: ${{ matrix.mode }}
+          KIOTA_COLLECT_KERNEL_CACHE_LIMIT: ${{ matrix.cache_limit }}
         run: |
           set -euo pipefail
+          free -b
+          df -B1 . /mnt
           if [ "$MODE" = reclaim ]; then
             KIOTA_RECLAIM=1 cargo test --release --locked
           elif [ "$MODE" = collect ]; then
@@ -58,16 +62,17 @@ jobs:
         timeout-minutes: 10
         env:
           MODE: ${{ matrix.mode }}
-        run: python3 scripts/remote/profile_memory.py --mode "$MODE" --binary target/release/kiota --archive arena-input/tests.tar.gz --output memory-report
+          KIOTA_COLLECT_KERNEL_CACHE_LIMIT: ${{ matrix.cache_limit }}
+        run: python3 scripts/remote/profile_memory.py --mode "$MODE" --binary target/release/kiota --archive arena-input/tests.tar.gz --output memory-report --kernel-cache-limit "${{ matrix.cache_limit }}"
       - name: Verify full small suite after collection comparison passes
         if: matrix.mode == 'collect' && steps.memory.outcome == 'success'
         timeout-minutes: 13
-        run: python3 scripts/remote/profile_memory.py --mode collect --binary target/release/kiota --archive arena-input/tests.tar.gz --output small-report --all
+        run: python3 scripts/remote/profile_memory.py --mode collect --binary target/release/kiota --archive arena-input/tests.tar.gz --output small-report --all --kernel-cache-limit "${{ matrix.cache_limit }}"
       - name: Retain exact evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: collection-${{ matrix.mode }}-${{ github.run_id }}
+          name: collection-${{ matrix.mode }}-${{ matrix.cache_limit }}-${{ github.run_id }}
           path: |
             arena-input/
             memory-report/

@@ -85,13 +85,13 @@ fn eviction_from_child_inference_does_not_promote_an_infer_only_result() {
         let cache = if force { &tc.eager_infer_cache } else { &tc.infer_cache };
         {
             let mut memo = cache.borrow_mut();
-            for n in 0..50_000 {
+            for n in 0..expr::kernel_memo_limit() {
                 memo.insert((u64::MAX, n), (expr::const_(0, vec![]), false));
             }
         }
         assert!(matches!(tc.infer_type_cached(&ctx, &bad), Err(TcError::Reject(_))));
         if expr::reclamation_enabled() {
-            assert!(cache.borrow().len() < 50_000, "a child insertion must have evicted the table");
+            assert!(cache.borrow().len() < expr::kernel_memo_limit(), "a child insertion must have evicted the table");
         }
     }
     FORCE_EAGER_DEFEQ.with(|mode| mode.set(false));

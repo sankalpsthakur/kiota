@@ -24,6 +24,7 @@ parser.add_argument("--archive", type=Path, required=True)
 parser.add_argument("--binary", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
 parser.add_argument("--all", action="store_true")
+parser.add_argument("--kernel-cache-limit", type=int, choices=(50000, 200000, 1000000), default=50000)
 args = parser.parse_args()
 args.output.mkdir(parents=True, exist_ok=False)
 logs = args.output / "logs"
@@ -34,11 +35,12 @@ if args.mode == "reclaim":
     env["KIOTA_RECLAIM"] = "1"
 elif args.mode == "collect":
     env["KIOTA_COLLECT"] = "1"
+    env["KIOTA_COLLECT_KERNEL_CACHE_LIMIT"] = str(args.kernel_cache_limit)
 wanted = {"good/perf/magma-list-pair-n7.ndjson", "good/perf/magma-list-pair-n21.ndjson",
           "good/perf/magma-list-deep-n21.ndjson", "good/perf/magma-list-deep-n36.ndjson"}
 report = {"mode": args.mode, "scope": "arena-small-only" if args.all else "four-memory-fixtures",
           "full_corpus_verified": False, "arena_rank_verified": False, "complete": False,
-          "passed": False, "address_space_mib": 8192, "rss_watchdog_mib": 5120,
+          "passed": False, "kernel_cache_limit": args.kernel_cache_limit, "address_space_mib": 8192, "rss_watchdog_mib": 5120,
           "per_case_seconds": 120, "binary_sha256": gate.sha256_file(args.binary),
           "archive_sha256": gate.sha256_file(args.archive), "results": []}
 deadline = time.monotonic() + (720 if args.all else 500)

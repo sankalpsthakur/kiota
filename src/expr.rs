@@ -34,6 +34,30 @@ fn batch_collection_enabled() -> bool {
     ENABLED.with(|enabled| *enabled)
 }
 
+/// Diagnostic-only separation: transformations keep their existing 50k cap.
+/// Kernel retention can be varied only inside the opt-in batch collector.
+pub(crate) fn kernel_memo_limit() -> usize {
+    thread_local! {
+        static LIMIT: usize = std::env::var("KIOTA_COLLECT_KERNEL_CACHE_LIMIT")
+            .ok().and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| (50_000..=2_000_000).contains(n)).unwrap_or(50_000);
+    }
+    if batch_collection_enabled() && !weak_intern_enabled() {
+        LIMIT.with(|limit| *limit)
+    } else {
+        50_000
+    }
+}
+
+pub(crate) fn kernel_memo_insert<K: Eq + Hash, V>(
+    memo: &mut FxHashMap<K, V>, key: K, value: V,
+) {
+    if reclamation_enabled() && memo.len() >= kernel_memo_limit() {
+        memo.clear();
+    }
+    memo.insert(key, value);
+}
+
 pub(crate) fn memo_insert<K: Eq + Hash, V>(memo: &mut FxHashMap<K, V>, key: K, value: V) {
     if reclamation_enabled() && memo.len() >= 50_000 {
         memo.clear();

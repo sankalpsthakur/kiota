@@ -108,3 +108,22 @@ is not promoted, and the full strict Linux acceptance criterion stays unchecked.
 - https://github.com/sankalpsthakur/kiota/pull/12
 - https://github.com/sankalpsthakur/kiota/actions/runs/36317993571
 - `docs/checkpoints/2026-09-27.md`
+
+### 2026-09-29 - Remote-only batched-collection diagnostic
+
+All builds, tests and fixture execution are on disposable Linux runners. Local
+checkout and untracked prototypes remain unchanged. Diagnostic branch
+`fix/remote-collection-20260929`; first head `bcc8002` is not promoted.
+Run 36619718560: all 197 Rust tests passed in each mode. Default deep-n36 accepts
+46.615s at sampled 4.675GB RSS, but pair-n21 hits the added 5GiB RSS watchdog
+at 16.960s (not a false reject and not the earlier 8GiB allocation failure).
+Collect pair-n21 accepts 47.974s at 673MB RSS; collect deep-n36 times out at
+120s, with 25M WHNF calls and only 174MB peak sampled RSS. Weak reclaim also
+times out on deep-n36. Four-fixture comparison therefore fails in every mode;
+full small-suite step was correctly skipped. No all-green or rank claim.
+
+Next diagnostic separates checker/iota retention from transform retention:
+collect mode varies kernel memo caps 50k/200k/1M; expression transforms retain
+50k. Same 120s per case, 8192MiB address cap and stronger 5120MiB RSS watchdog.
+Each independent four-case pass must then clear all 193 archived small cases.
+Results pending; no production/default mode or Arena pin update.
