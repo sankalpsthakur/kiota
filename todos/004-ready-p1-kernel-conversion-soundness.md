@@ -39,8 +39,8 @@ Do not merge the diagnostic branch or change the official pin based on unit test
 
 - [x] Typed regressions reproduce actual false conversions on the prior source.
 - [x] Minimal three-case fix passes normal exact-head Linux CI (195 Rust tests).
-- [ ] Independent review validates fixture and conversion semantics.
-- [ ] Release tests and strict small-suite results recorded distinctly.
+- [x] Independent review validates fixture and conversion semantics.
+- [x] Release tests and strict small-suite results recorded distinctly.
 - [ ] Remaining symbolic arithmetic and instance-blind shortcuts audited/covered.
 - [ ] Full exact-corpus acceptance and live rank recorded separately.
 
@@ -110,3 +110,16 @@ limits; checker uses a separate 6GiB no-swap container and 600s timeout.
 No paid infrastructure, full-export upload, local build, or local download.
 Dispatch awaits final supervisor review. This is Init diagnosis, not Mathlib
 acceptance or an Arena instruction measurement.
+
+### 2026-09-30 - Exact Init dispatched after supervision review
+
+Hegel found no blocking issue in the final supervisor and independently matched
+live official Init metadata and the installer checksum. Dispatched run
+36625008017, orchestration head5bc99ce, immutable checker72f7fde. Initial state
+queued. It must pass remote Python compilation and the 29 supervisor tests,
+resource preflight, source/input/header/publication checks, then bounded Init.
+Do not call queued work completed, generation an acceptance, or Init a Mathlib
+score. Current live Arena pin and ranking remain distinct. All completed agents
+were closed; no local checker/build or new workspace file was created.
+
+- https://github.com/sankalpsthakur/kiota/actions/runs/36625008017
