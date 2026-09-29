@@ -2,6 +2,12 @@ name: remote-soundness-gate
 on:
   push:
     branches: [fix/remote-nat-soundness-20260929]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'Cargo.*'
+      - '.github/workflows/remote-soundness.yml'
 permissions:
   contents: read
 concurrency:

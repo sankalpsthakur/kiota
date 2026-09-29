@@ -63,3 +63,32 @@ and Nat.mul symbolic reductions require targeted review; not a global soundness 
 - https://github.com/sankalpsthakur/kiota/commit/894fa49aa1f8fa9ce16afda8af7a3198a3f507fc
 - https://github.com/sankalpsthakur/kiota/actions/runs/36621542392
 - https://github.com/sankalpsthakur/kiota/actions/runs/36621768690
+
+### 2026-09-30 - Broader instance controls and strict resource result
+
+Independent Hegel review validated the original typed fixtures and minimal
+removals. Additional typed custom Add Nat and Int OfNat regressions reproduce
+two more bugs at c98a478 (CI 36622947772): the custom Add projects 42 but
+instance-blind substitution gives 49; the raw Int recognizer reads tag 7 instead
+of field 42. 20ef776 removes class-method-to-primitive substitutions and lets
+closed Int recognition conservatively decline an unreduced OfNat accessor.
+65a1c7b adds positive custom Add conversion to 42, so a merely stuck accessor
+cannot pass. Exact-head normal Linux CI 36623326107 succeeds: 197 Rust tests.
+This is a diagnostic pushed branch, not production or official-pin promotion.
+
+Release/full downloadable run 36622139501 at f80e323 completes 192/193,
+with 195 Rust tests and 29 remote-runner tests passing. All 71 negative cases
+reject. Only pair-n21 fails the stronger 5GiB RSS watchdog in 17.276s; the
+8GiB address-space limit and 120s per-case limit were unchanged. Later-head
+strict results remain distinct and pending; do not copy this verdict onto them.
+
+Batch collector run 36621274996 at 2058ec2 failed all three kernel memo caps:
+50k/200k/1M each times out on deep-n36 at 120s. No collection promotion.
+Remaining symbolic Nat.mul/sub, Int/Rat numeral/cast and other class-instance
+recognition paths still require audit/regressions. No global soundness claim.
+
+Official readback on September 29 UTC: Kiota remains position 20, now among
+27 checkers; 71 invalid rejected, 124 valid accepted, 1 false reject, 6 declines,
+no Mathlib instruction metric. The board now has 131 valid cases, including
+con-leche. Official pin remains 2d2a9fa31cba31abdd49543c3bb667591207577e.
+No rank gain is attributed to these pushed diagnostic corrections.
