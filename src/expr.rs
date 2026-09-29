@@ -7,12 +7,29 @@ use std::io::Write;
 use std::rc::Rc;
 
 mod reclaim;
+mod collect;
 
-/// Experimental only: retain no strong references in the interner and bound
-/// disposable memo tables. Off by default until full correctness/resource gates.
+/// Experimental reclamation modes bound disposable memo tables. Weak mode
+/// releases lookup ownership immediately; batch mode collects unused terms.
+/// Both are off by default until full correctness/resource gates.
 pub(crate) fn reclamation_enabled() -> bool {
     thread_local! {
+        static ENABLED: bool = std::env::var_os("KIOTA_RECLAIM").is_some()
+            || std::env::var_os("KIOTA_COLLECT").is_some();
+    }
+    ENABLED.with(|enabled| *enabled)
+}
+
+fn weak_intern_enabled() -> bool {
+    thread_local! {
         static ENABLED: bool = std::env::var_os("KIOTA_RECLAIM").is_some();
+    }
+    ENABLED.with(|enabled| *enabled)
+}
+
+fn batch_collection_enabled() -> bool {
+    thread_local! {
+        static ENABLED: bool = std::env::var_os("KIOTA_COLLECT").is_some();
     }
     ENABLED.with(|enabled| *enabled)
 }
@@ -306,6 +323,7 @@ fn node_eq(a: &ExprData, b: &ExprData) -> bool {
 struct Interner {
     primary: FxHashMap<u64, Expr>,
     overflow: FxHashMap<u64, Vec<Expr>>,
+    next_collection: usize,
 }
 
 impl Default for Interner {
@@ -313,12 +331,17 @@ impl Default for Interner {
         Interner {
             primary: FxHashMap::default(),
             overflow: FxHashMap::default(),
+            next_collection: 1_000_000,
         }
     }
 }
 
 impl Interner {
     fn intern(&mut self, d: ExprData) -> Expr {
+        if batch_collection_enabled() && self.len() >= self.next_collection {
+            self.collect_dead();
+            self.next_collection = self.len().saturating_add(250_000);
+        }
         let h = hash_node(&d);
         if let Some(e) = self.primary.get(&h) {
             if node_eq(&d, e) {
@@ -394,7 +417,7 @@ pub fn intern(d: ExprData) -> Expr {
         eprintln!("INTERN_CALLS {n} nodes={}", intern_node_count());
         let _ = std::io::Write::flush(&mut std::io::stderr());
     }
-    if reclamation_enabled() {
+    if weak_intern_enabled() {
         WEAK_INTERN.with(|t| t.borrow_mut().intern(d))
     } else {
         INTERN.with(|t| t.borrow_mut().intern(d))
@@ -402,7 +425,7 @@ pub fn intern(d: ExprData) -> Expr {
 }
 
 pub fn intern_node_count() -> usize {
-    if reclamation_enabled() {
+    if weak_intern_enabled() {
         WEAK_INTERN.with(|t| t.borrow().len())
     } else {
         INTERN.with(|t| t.borrow().len())
@@ -423,7 +446,7 @@ pub fn intern_node_count() -> usize {
 /// when the table's next capacity-doubling (~24M nodes → ~3.3 GB) is
 /// larger than one affordable allocation.
 pub fn intern_clear_if_large(threshold: usize) -> bool {
-    if reclamation_enabled() {
+    if weak_intern_enabled() {
         return WEAK_INTERN.with(|t| {
             let mut t = t.borrow_mut();
             if t.len() > threshold {

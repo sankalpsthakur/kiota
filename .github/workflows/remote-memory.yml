@@ -1,0 +1,76 @@
+name: remote-memory-diagnostic
+on:
+  push:
+    branches: [fix/remote-collection-20260929]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: remote-collect-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [default, reclaim, collect]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and test remotely
+        timeout-minutes: 7
+        env:
+          MODE: ${{ matrix.mode }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = reclaim ]; then
+            KIOTA_RECLAIM=1 cargo test --release --locked
+          elif [ "$MODE" = collect ]; then
+            KIOTA_COLLECT=1 cargo test --release --locked
+          else
+            cargo test --release --locked
+          fi
+          cargo build --release --locked --bin kiota
+      - name: Capture stable Arena inputs and source
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          mkdir arena-input
+          curl --fail --location --max-time 60 --proto '=https' https://arena.lean-lang.org/results.json -o arena-input/before.json
+          curl --fail --location --max-time 60 --proto '=https' https://arena.lean-lang.org/lean-arena-tests.tar.gz -o arena-input/tests.tar.gz
+          curl --fail --location --max-time 60 --proto '=https' https://arena.lean-lang.org/results.json -o arena-input/after.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          before = json.loads(Path("arena-input/before.json").read_text())["meta"]
+          after = json.loads(Path("arena-input/after.json").read_text())["meta"]
+          if before != after:
+              raise SystemExit("Arena snapshot changed during input capture")
+          print(json.dumps(before))
+          PY
+          git rev-parse HEAD > arena-input/checkout-sha.txt
+          sha256sum target/release/kiota arena-input/tests.tar.gz > arena-input/checksums.sha256
+          rustc --version --verbose > arena-input/toolchain.txt
+      - name: Compare four memory fixtures
+        id: memory
+        timeout-minutes: 10
+        env:
+          MODE: ${{ matrix.mode }}
+        run: python3 scripts/remote/profile_memory.py --mode "$MODE" --binary target/release/kiota --archive arena-input/tests.tar.gz --output memory-report
+      - name: Verify full small suite after collection comparison passes
+        if: matrix.mode == 'collect' && steps.memory.outcome == 'success'
+        timeout-minutes: 13
+        run: python3 scripts/remote/profile_memory.py --mode collect --binary target/release/kiota --archive arena-input/tests.tar.gz --output small-report --all
+      - name: Retain exact evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: collection-${{ matrix.mode }}-${{ github.run_id }}
+          path: |
+            arena-input/
+            memory-report/
+            small-report/
+          if-no-files-found: warn
+          retention-days: 14
