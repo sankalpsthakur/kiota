@@ -1842,7 +1842,7 @@ impl<'e> Checker<'e> {
         let checked = !self.infer_only.get();
         {
             let mut cache = cache_ref.borrow_mut();
-            if expr::reclamation_enabled() && cache.len() >= 50_000 {
+            if expr::reclamation_enabled() && cache.len() >= expr::kernel_memo_limit() {
                 cache.clear();
             }
             match cache.get_mut(&key) {
@@ -3798,9 +3798,9 @@ impl<'e> Checker<'e> {
     }
     fn defeq_cache_insert(&self, force_eager: bool, key: (u64, usize, usize), v: bool) {
         if force_eager {
-            expr::memo_insert(&mut self.eager_defeq_cache.borrow_mut(), key, v);
+            expr::kernel_memo_insert(&mut self.eager_defeq_cache.borrow_mut(), key, v);
         } else {
-            expr::memo_insert(&mut self.defeq_cache.borrow_mut(), key, v);
+            expr::kernel_memo_insert(&mut self.defeq_cache.borrow_mut(), key, v);
         }
     }
     fn whnf_cache_get(&self, force_eager: bool, key: &(u64, usize)) -> Option<Expr> {
@@ -3812,9 +3812,9 @@ impl<'e> Checker<'e> {
     }
     fn whnf_cache_insert(&self, force_eager: bool, key: (u64, usize), v: Expr) {
         if force_eager {
-            expr::memo_insert(&mut self.eager_whnf_cache.borrow_mut(), key, v);
+            expr::kernel_memo_insert(&mut self.eager_whnf_cache.borrow_mut(), key, v);
         } else {
-            expr::memo_insert(&mut self.whnf_cache.borrow_mut(), key, v);
+            expr::kernel_memo_insert(&mut self.whnf_cache.borrow_mut(), key, v);
         }
     }
     fn whnf_core_cache_get(&self, force_eager: bool, key: &(u64, usize)) -> Option<Expr> {
@@ -3826,9 +3826,9 @@ impl<'e> Checker<'e> {
     }
     fn whnf_core_cache_insert(&self, force_eager: bool, key: (u64, usize), v: Expr) {
         if force_eager {
-            expr::memo_insert(&mut self.eager_whnf_core_cache.borrow_mut(), key, v);
+            expr::kernel_memo_insert(&mut self.eager_whnf_core_cache.borrow_mut(), key, v);
         } else {
-            expr::memo_insert(&mut self.whnf_core_cache.borrow_mut(), key, v);
+            expr::kernel_memo_insert(&mut self.whnf_core_cache.borrow_mut(), key, v);
         }
     }
 
@@ -4479,7 +4479,7 @@ impl<'e> Checker<'e> {
         if iota_memo_on && rest.is_empty() {
             if let ExprData::Lit(Lit::Nat(n)) = &**major_w {
                 let key = Self::iota_lit_memo_key(rname, &us, motives, minors, n);
-                expr::memo_insert(&mut self.iota_lit_memo.borrow_mut(), key, rhs.clone());
+                expr::kernel_memo_insert(&mut self.iota_lit_memo.borrow_mut(), key, rhs.clone());
             }
         }
         Ok(Some(expr::apps(rhs, rest)))
