@@ -13421,6 +13421,7 @@ fn regression_429_add_respects_custom_instance() {
         // Direct conversion verdict, after all type/projection controls.
         // Instance-blind Add.add -> Nat.add incorrectly produces 49.
         assert!(!tc.is_def_eq(&ctx, &lhs, &forty_nine).unwrap());
+        assert!(tc.is_def_eq(&ctx, &lhs, &forty_two).unwrap());
     });
 }
 
