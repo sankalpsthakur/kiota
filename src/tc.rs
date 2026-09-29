@@ -5907,91 +5907,10 @@ impl<'e> Checker<'e> {
     }
 
     /// Class methods `HAdd.hAdd` / `Add.add` / `HMul.hMul` / `Mul.mul` on `Nat`.
-    fn try_hbin_nat(&self, ctx: &Ctx, name: &str, args: &[Expr]) -> R<Option<Expr>> {
-        let (ty_i, lhs_i, need) = match name {
-            "HAdd.hAdd" | "HMul.hMul" | "HPow.hPow" | "HSub.hSub" | "HMod.hMod" | "HDiv.hDiv"
-            | "HShiftLeft.hShiftLeft" | "HShiftRight.hShiftRight" => (0usize, 4usize, 6usize),
-            "Add.add" | "Mul.mul" | "Pow.pow" | "Sub.sub" | "Mod.mod" | "Div.div"
-            | "ShiftLeft.shiftLeft" | "ShiftRight.shiftRight" => (0usize, 2usize, 4usize),
-            _ => return Ok(None),
-        };
-        if args.len() < need {
-            return Ok(None);
-        }
-        // Only δ-unfold as far as `whnf_core` (β/ι/proj, no δ) goes: a type
-        // argument that is *already* a bare `Nat`/`Int` constant is safe to
-        // fast-path to the matching primitive op, but one that needs a
-        // type-level δ-unfold to become `Nat`/`Int` (e.g. `Multiplicative
-        // Nat`, whose own `Mul` instance is repurposed from the underlying
-        // `Add`, not `Nat.mul`) is not: the operation identity this
-        // shortcut assumes ("this `HMul.hMul` *is* `Nat.mul`") does not
-        // survive unwrapping a type synonym whose instances can rename or
-        // repurpose the operation. Falling through to the general path is
-        // always safe here (slower, never wrong); the previous full
-        // `self.whnf` call on the type alone, with no check that the
-        // instance argument agrees, could substitute an unrelated `Nat.*`
-        // primitive for the *actual* instance's operation.
-        let ty = self.whnf_core(ctx, &args[ty_i])?;
-        let ty_name = match &**ty {
-            ExprData::Const(t, _) => self.name_str(*t),
-            _ => return Ok(None),
-        };
-        let is_nat = self
-            .nat_ref
-            .is_some_and(|n| matches!(&**ty, ExprData::Const(t, _) if *t == n));
-        let is_combo = ty_name == "LinearCombo" || ty_name.ends_with(".LinearCombo");
-        let is_int_name = |s: &str| s == "Int" || s.ends_with(".Int");
-        // HMul Int IntList IntList has first type Int — do not rewrite to Int.mul.
-        let is_int = if matches!(
-            name,
-            "HAdd.hAdd" | "HSub.hSub" | "HMul.hMul" | "HDiv.hDiv" | "HMod.hMod"
-        ) && args.len() >= 3
-        {
-            let t1 = self.whnf_core(ctx, &args[1])?;
-            let t2 = self.whnf_core(ctx, &args[2])?;
-            is_int_name(ty_name)
-                && matches!(&**t1, ExprData::Const(t, _) if is_int_name(self.name_str(*t)))
-                && matches!(&**t2, ExprData::Const(t, _) if is_int_name(self.name_str(*t)))
-        } else {
-            is_int_name(ty_name)
-        };
-        if !is_nat && !is_combo && !is_int {
-            return Ok(None);
-        }
-        let op = if is_combo {
-            match name {
-                "HAdd.hAdd" | "Add.add" => "LinearCombo.add",
-                "HSub.hSub" | "Sub.sub" => "LinearCombo.sub",
-                _ => return Ok(None),
-            }
-        } else if is_int {
-            match name {
-                "HAdd.hAdd" | "Add.add" => "Int.add",
-                "HSub.hSub" | "Sub.sub" => "Int.sub",
-                "HMul.hMul" | "Mul.mul" => "Int.mul",
-                "HPow.hPow" | "Pow.pow" => "Int.pow",
-                _ => return Ok(None),
-            }
-        } else {
-            match name {
-                "HAdd.hAdd" | "Add.add" => "Nat.add",
-                "HMul.hMul" | "Mul.mul" => "Nat.mul",
-                "HPow.hPow" | "Pow.pow" => "Nat.pow",
-                "HSub.hSub" | "Sub.sub" => "Nat.sub",
-                "HMod.hMod" | "Mod.mod" => "Nat.mod",
-                "HDiv.hDiv" | "Div.div" => "Nat.div",
-                "HShiftLeft.hShiftLeft" | "ShiftLeft.shiftLeft" => "Nat.shiftLeft",
-                "HShiftRight.hShiftRight" | "ShiftRight.shiftRight" => "Nat.shiftRight",
-                _ => return Ok(None),
-            }
-        };
-        let Some(opn) = self.find_name_ending(op) else {
-            return Ok(None);
-        };
-        let lhs = args[lhs_i].clone();
-        let rhs = args[lhs_i + 1].clone();
-        let r = expr::apps(expr::const_(opn, vec![]), &[lhs, rhs]);
-        Ok(Some(expr::apps(r, &args[need..])))
+    fn try_hbin_nat(&self, _ctx: &Ctx, _name: &str, _args: &[Expr]) -> R<Option<Expr>> {
+        // A carrier type does not identify the selected operation instance.
+        // Expose the actual class-method definition/projection in ordinary WHNF.
+        Ok(None)
     }
 
     /// `dite α c (isTrue p h) t e → t h` and `isFalse` → `e h`.
@@ -7739,13 +7658,9 @@ impl<'e> Checker<'e> {
             ExprData::Const(n, _) => self.name_str(*n),
             _ => return Ok(None),
         };
-        if name == "OfNat.ofNat" && args.len() >= 2 {
-            if !self.type_head_is_int(&args[0]) {
-                return Ok(None);
-            }
-            if let Some(n) = self.closed_nat_value(ctx, &args[1])? {
-                return Ok(Some(BigInt::from(n)));
-            }
+        if name == "OfNat.ofNat" {
+            // Its tag is not its instance value. Let ordinary WHNF expose
+            // the actual field before interpreting a closed Int constructor.
             return Ok(None);
         }
         if name == "Int.ofNat" || name.ends_with(".Int.ofNat") {
