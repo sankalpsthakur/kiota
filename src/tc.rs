@@ -13143,4 +13143,201 @@ mod tests {
     // skip reading and writing while `FORCE_EAGER_DEFEQ` is set, so a
     // rescue can't read a stale entry a non-forced call populated (or
     // vice versa) for the same `(ctx, expr)` key.
+
+fn regression_429_nat_add_env() -> Environment {
+    use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+
+    let mut env = Environment::default();
+    insert_mini_nat0(&mut env);
+    let c = |i| expr::const_(i, vec![]);
+    let v = expr::bvar;
+    let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
+    let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+    let nat = c(0);
+
+    // Nat.rec specialized to motives Nat -> Type.
+    let motive_ty = pi(nat.clone(), expr::sort(level::succ(level::zero())));
+    let base_ty = expr::app(v(0), c(1));
+    // Under motive, base: (k : Nat) -> motive k -> motive (succ k).
+    let step_ty = pi(
+        nat.clone(),
+        pi(
+            expr::app(v(2), v(0)),
+            expr::app(v(3), expr::app(c(2), v(1))),
+        ),
+    );
+    let rec_ty = pi(
+        motive_ty.clone(),
+        pi(
+            base_ty.clone(),
+            pi(step_ty.clone(), pi(nat.clone(), expr::app(v(3), v(0)))),
+        ),
+    );
+    match env.consts.get_mut(&3).unwrap() {
+        CI::Recursor { typ, rules, .. } => {
+            *typ = rec_ty;
+            rules[0].rhs = lam(
+                motive_ty.clone(),
+                lam(base_ty.clone(), lam(step_ty.clone(), v(1))),
+            );
+            rules[1].rhs = lam(
+                motive_ty,
+                lam(
+                    base_ty,
+                    lam(
+                        step_ty,
+                        lam(
+                            nat.clone(),
+                            expr::apps(
+                                v(1),
+                                &[
+                                    v(0),
+                                    expr::apps(c(3), &[v(3), v(2), v(1), v(0)]),
+                                ],
+                            ),
+                        ),
+                    ),
+                ),
+            );
+        }
+        _ => panic!("mini Nat fixture must contain Nat.rec"),
+    }
+
+    // add a b := Nat.rec (fun _ => Nat) a (fun _ ih => succ ih) b.
+    env.insert(4, CI::Def {
+        level_params: vec![],
+        typ: pi(nat.clone(), pi(nat.clone(), nat.clone())),
+        value: lam(
+            nat.clone(),
+            lam(
+                nat.clone(),
+                expr::apps(c(3), &[
+                    lam(nat.clone(), nat.clone()),
+                    v(1),
+                    lam(nat.clone(), lam(nat, expr::app(c(2), v(0)))),
+                    v(0),
+                ]),
+            ),
+        ),
+        hints: RH::Regular(1),
+        is_unsafe: false,
+    });
+    env
+}
+
+fn regression_429_assert_nat_nonconversion(lhs: Expr, rhs: Expr) {
+    let env = regression_429_nat_add_env();
+    let names = test_names(&[
+        "Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add",
+    ]);
+    let tc = Checker::new(&env, &names, Some(0), None);
+    tc.with_forced_eager_defeq(|| tc.check_decl(4, "def")).unwrap();
+
+    let nat = expr::const_(0, vec![]);
+    let mut ctx = Ctx::new();
+    ctx.push(nat.clone()); // x = #1
+    ctx.push(nat.clone()); // n = #0
+    tc.with_forced_eager_defeq(|| {
+        for term in [&lhs, &rhs] {
+            let ty = tc.infer_type(&ctx, term).unwrap();
+            assert!(tc.is_def_eq(&ctx, &ty, &nat).unwrap());
+        }
+        assert!(!tc.is_def_eq(&ctx, &lhs, &rhs).unwrap());
+    });
+}
+
+#[test]
+fn regression_429_zero_add_neutral_is_not_defeq() {
+    let n = expr::bvar(0);
+    regression_429_assert_nat_nonconversion(
+        expr::apps(
+            expr::const_(4, vec![]),
+            &[expr::const_(1, vec![]), n.clone()],
+        ),
+        n,
+    );
+}
+
+#[test]
+fn regression_429_succ_add_neutral_is_not_defeq() {
+    let succ = |e| expr::app(expr::const_(2, vec![]), e);
+    let add = |a, b| expr::apps(expr::const_(4, vec![]), &[a, b]);
+    let x = expr::bvar(1);
+    let n = expr::bvar(0);
+    regression_429_assert_nat_nonconversion(
+        add(succ(x.clone()), n.clone()),
+        succ(add(x, n)),
+    );
+}
+
+#[test]
+fn regression_429_ofnat_respects_custom_instance() {
+    use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+
+    let mut env = Environment::default();
+    insert_mini_nat0(&mut env);
+    let c = |i| expr::const_(i, vec![]);
+    let v = expr::bvar;
+    let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
+    let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+    let nat = c(0);
+    let type0 = expr::sort(level::succ(level::zero()));
+
+    // OfNat (α : Type) (n : Nat) : Type.
+    env.insert(4, CI::InductiveType {
+        level_params: vec![],
+        typ: pi(type0.clone(), pi(nat.clone(), type0.clone())),
+        num_params: 2,
+        num_indices: 0,
+        all: vec![4],
+        ctors: vec![5],
+        is_rec: false,
+        is_unsafe: false,
+    });
+    // OfNat.mk : (α : Type) -> (n : Nat) -> α -> OfNat α n.
+    env.insert(5, CI::Constructor {
+        level_params: vec![],
+        typ: pi(
+            type0.clone(),
+            pi(nat.clone(), pi(v(1), expr::apps(c(4), &[v(2), v(1)]))),
+        ),
+        induct: 4,
+        cidx: 0,
+        num_params: 2,
+        num_fields: 1,
+        is_unsafe: false,
+    });
+    let inst_ty = expr::apps(c(4), &[v(1), v(0)]);
+    env.insert(6, CI::Def {
+        level_params: vec![],
+        typ: pi(type0.clone(), pi(nat.clone(), pi(inst_ty.clone(), v(2)))),
+        value: lam(type0, lam(nat.clone(), lam(inst_ty, expr::proj(4, 0, v(0))))),
+        hints: RH::Abbrev,
+        is_unsafe: false,
+    });
+
+    let names = test_names(&[
+        "Nat", "Nat.zero", "Nat.succ", "Nat.rec",
+        "OfNat", "OfNat.mk", "OfNat.ofNat",
+    ]);
+    let tc = Checker::new(&env, &names, Some(0), None);
+    tc.with_forced_eager_defeq(|| tc.check_decl(6, "def")).unwrap();
+
+    let ctx = Ctx::new();
+    let seven = expr::lit_nat(num_bigint::BigUint::from(7u32));
+    let forty_two = expr::lit_nat(num_bigint::BigUint::from(42u32));
+    let inst = expr::apps(c(5), &[nat.clone(), seven.clone(), forty_two.clone()]);
+    let accessor = expr::apps(c(6), &[nat.clone(), seven.clone(), inst.clone()]);
+
+    tc.with_forced_eager_defeq(|| {
+        let ty = tc.infer_type(&ctx, &accessor).unwrap();
+        assert!(tc.is_def_eq(&ctx, &ty, &nat).unwrap());
+        assert!(tc.is_def_eq(
+            &ctx, &expr::proj(4, 0, inst), &forty_two,
+        ).unwrap());
+        assert!(!tc.is_def_eq(&ctx, &accessor, &seven).unwrap());
+        assert!(tc.is_def_eq(&ctx, &accessor, &forty_two).unwrap());
+    });
+}
+
 }
