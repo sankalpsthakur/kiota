@@ -92,3 +92,21 @@ Official readback on September 29 UTC: Kiota remains position 20, now among
 no Mathlib instruction metric. The board now has 131 valid cases, including
 con-leche. Official pin remains 2d2a9fa31cba31abdd49543c3bb667591207577e.
 No rank gain is attributed to these pushed diagnostic corrections.
+
+### 2026-09-30 - Latest strict readback and exact Init preparation
+
+Latest exact-head small gate 36623616614 at 72f7fde completes 192/193:
+all 71 negatives reject; all other 121 positives accept. Only pair-n21 hits
+the added 5GiB RSS watchdog after 17.964s. Source's normal and release Rust
+suites pass 197 tests. No newly introduced false verdict appears in this small
+snapshot; the resource gate still fails and remaining shortcut audits stay open.
+
+Prepared remote-only Init regeneration targeting the pinned official 347,555,345
+bytes / 6,487,065 lines / SHA-256 620502ac9e63ba4a2dea9d46386c2f6aebc49faf8848ea3aaa18a77a09491a6a.
+Lean 4.34.1, exporter66f1fb4, arena cdb3497, immutable checker72f7fde.
+Checker runs only after byte/header/generated-stat/current-publication matches.
+Build/generation phases use bounded logs and 12GiB RSS supervision, not file-size
+limits; checker uses a separate 6GiB no-swap container and 600s timeout.
+No paid infrastructure, full-export upload, local build, or local download.
+Dispatch awaits final supervisor review. This is Init diagnosis, not Mathlib
+acceptance or an Arena instruction measurement.
