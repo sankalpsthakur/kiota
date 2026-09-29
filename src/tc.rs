@@ -5355,9 +5355,6 @@ impl<'e> Checker<'e> {
                     if nat::is_zero(&b, zero) {
                         return Ok(Some(expr::apps(a, &args[2..])));
                     }
-                    if nat::is_zero(&a, zero) {
-                        return Ok(Some(expr::apps(b, &args[2..])));
-                    }
                     if nat::is_one(&b, zero, succ) {
                         let r = nat::mk_succ(succ, a);
                         return Ok(Some(expr::apps(r, &args[2..])));
@@ -5373,11 +5370,6 @@ impl<'e> Checker<'e> {
                     }
                     if let Some(p) = nat::pred(&b, zero, succ) {
                         let add = expr::apps(expr::const_(n, vec![]), &[a, p]);
-                        let r = nat::mk_succ(succ, add);
-                        return Ok(Some(expr::apps(r, &args[2..])));
-                    }
-                    if let Some(p) = nat::pred(&a, zero, succ) {
-                        let add = expr::apps(expr::const_(n, vec![]), &[p, b]);
                         let r = nat::mk_succ(succ, add);
                         return Ok(Some(expr::apps(r, &args[2..])));
                     }
@@ -5866,45 +5858,8 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
-            "OfNat.ofNat" if args.len() >= 3 => {
-                let Some(nat_ty) = self.nat_ref else {
-                    return Ok(None);
-                };
-                // `whnf_core` (no δ), not full `whnf`, for the same reason
-                // as `try_hbin_nat`'s type-argument check: `nat::of_nat_value`
-                // returns the raw numeral tag `n` unconditionally once the
-                // type looks like `Nat`, with no check that the *instance*
-                // argument's `ofNat` field actually is `n` — e.g.
-                // `OfNat.ofNat (Multiplicative Nat) 1 (One.toOfNat1 (...
-                // Multiplicative.monoid ...))`, whose instance's `ofNat`
-                // field is `Nat`'s own additive identity `0`, repurposed as
-                // the multiplicative identity, not the literal `1` this tag
-                // names. A type argument that needs a type-level δ-unfold to
-                // become `Nat` is not safe to fast-path this way; one that
-                // is already a bare `Nat` constant still is.
-                let ty = self.whnf_core(ctx, &args[0])?;
-                let mut stripped = args.to_vec();
-                stripped[0] = ty.clone();
-                if let Some(v) = nat::of_nat_value(&stripped, nat_ty) {
-                    return Ok(Some(expr::apps(v, &args[3..])));
-                }
-                if let Some(v) = nat::of_nat_value(args, nat_ty) {
-                    return Ok(Some(expr::apps(v, &args[3..])));
-                }
-                let ty_name = match &**ty {
-                    ExprData::Const(t, _) => self.name_str(*t),
-                    _ => return Ok(None),
-                };
-                if ty_name == "Int" || ty_name.ends_with(".Int") {
-                    if let Some(n) = self.closed_nat_value(ctx, &args[1])? {
-                        if let Some(ofn) = self.find_name_ending("Int.ofNat") {
-                            let r = expr::app(expr::const_(ofn, vec![]), nat::mk_lit(n));
-                            return Ok(Some(expr::apps(r, &args[3..])));
-                        }
-                    }
-                }
-                Ok(None)
-            }
+            // OfNat's numeral tag does not determine its stored value.
+            // Ordinary delta/projection reduction reads the actual instance.
             n if (n == "Int.beq'" || n.ends_with(".Int.beq'")) && args.len() >= 2 => {
                 if let (Some(a), Some(b)) = (
                     self.closed_int_value(ctx, &args[0])?,
