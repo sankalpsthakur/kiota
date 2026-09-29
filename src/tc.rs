@@ -13307,4 +13307,251 @@ fn regression_429_ofnat_respects_custom_instance() {
     });
 }
 
+
+// Append inside src/tc.rs's existing #[cfg(test)] mod tests.
+//
+// Read-only review:
+// - 894fa49 vs 5c5351a removes the two unsupported Nat.add reductions
+//   and the OfNat.ofNat primitive branch.
+// - Its three regressions check fixture/operand types before testing conversion.
+//   The negative assertions are direct; no later theorem failure substitutes
+//   for them. The OfNat constructor-projection control precedes its negative.
+// - Live branch head f80e323 adds gates/reporting; checker source is unchanged.
+// - CI 36621768690 succeeded at 894fa49; this does not establish promotion.
+//
+// Remaining source targets at 894fa49:
+// - src/tc.rs:5910-5994: try_hbin_nat selects arithmetic without checking instance.
+// - src/tc.rs:7742-7749: closed_int_value reads OfNat's tag without its instance.
+//
+// These are static regression drafts, not locally or remotely executed here.
+// Other Int/Rat instance shortcuts remain outside these two tests.
+
+fn regression_429_instance_fixture() -> (Environment, Vec<Rc<String>>) {
+    use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+
+    let mut env = regression_429_nat_add_env();
+    let c = |i| expr::const_(i, vec![]);
+    let v = expr::bvar;
+    let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
+    let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+    let nat = c(0);
+    let type0 = expr::sort(level::succ(level::zero()));
+
+    env.insert(5, CI::InductiveType {
+        level_params: vec![],
+        typ: pi(type0.clone(), pi(nat.clone(), type0.clone())),
+        num_params: 2,
+        num_indices: 0,
+        all: vec![5],
+        ctors: vec![6],
+        is_rec: false,
+        is_unsafe: false,
+    });
+    env.insert(6, CI::Constructor {
+        level_params: vec![],
+        typ: pi(
+            type0.clone(),
+            pi(nat.clone(), pi(v(1), expr::apps(c(5), &[v(2), v(1)]))),
+        ),
+        induct: 5,
+        cidx: 0,
+        num_params: 2,
+        num_fields: 1,
+        is_unsafe: false,
+    });
+    let ofnat_inst = expr::apps(c(5), &[v(1), v(0)]);
+    env.insert(7, CI::Def {
+        level_params: vec![],
+        typ: pi(
+            type0.clone(),
+            pi(nat.clone(), pi(ofnat_inst.clone(), v(2))),
+        ),
+        value: lam(
+            type0.clone(),
+            lam(nat.clone(), lam(ofnat_inst, expr::proj(5, 0, v(0)))),
+        ),
+        hints: RH::Abbrev,
+        is_unsafe: false,
+    });
+
+    env.insert(8, CI::InductiveType {
+        level_params: vec![],
+        typ: type0.clone(),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![8],
+        ctors: vec![9, 10],
+        is_rec: false,
+        is_unsafe: false,
+    });
+    for (ctor, cidx) in [(9, 0), (10, 1)] {
+        env.insert(ctor, CI::Constructor {
+            level_params: vec![],
+            typ: pi(nat.clone(), c(8)),
+            induct: 8,
+            cidx,
+            num_params: 0,
+            num_fields: 1,
+            is_unsafe: false,
+        });
+    }
+
+    env.insert(11, CI::InductiveType {
+        level_params: vec![],
+        typ: pi(type0.clone(), type0.clone()),
+        num_params: 1,
+        num_indices: 0,
+        all: vec![11],
+        ctors: vec![12],
+        is_rec: false,
+        is_unsafe: false,
+    });
+    env.insert(12, CI::Constructor {
+        level_params: vec![],
+        typ: pi(
+            type0.clone(),
+            pi(pi(v(0), pi(v(1), v(2))), expr::app(c(11), v(1))),
+        ),
+        induct: 11,
+        cidx: 0,
+        num_params: 1,
+        num_fields: 1,
+        is_unsafe: false,
+    });
+    let add_inst = expr::app(c(11), v(0));
+    env.insert(13, CI::Def {
+        level_params: vec![],
+        typ: pi(
+            type0.clone(),
+            pi(add_inst.clone(), pi(v(1), pi(v(2), v(3)))),
+        ),
+        value: lam(type0, lam(add_inst, expr::proj(11, 0, v(0)))),
+        hints: RH::Abbrev,
+        is_unsafe: false,
+    });
+
+    let names = test_names(&[
+        "Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add",
+        "OfNat", "OfNat.mk", "OfNat.ofNat",
+        "Int", "Int.ofNat", "Int.negSucc",
+        "Add", "Add.mk", "Add.add",
+    ]);
+    (env, names)
+}
+
+fn regression_429_validate_instance_fixture(
+    tc: &Checker<'_>,
+    env: &Environment,
+) {
+    tc.with_forced_eager_defeq(|| {
+        let ctx = Ctx::new();
+        for name in [4, 7, 13] {
+            let ConstantInfo::Def { typ, value, .. } = env.get(name).unwrap()
+            else {
+                panic!("expected fixture definition");
+            };
+            let actual = tc.infer_type(&ctx, value).unwrap();
+            assert!(
+                tc.is_def_eq(&ctx, &actual, typ).unwrap(),
+                "fixture definition {name} must be well typed",
+            );
+        }
+    });
+}
+
+#[test]
+fn regression_429_add_respects_custom_instance() {
+    let (env, names) = regression_429_instance_fixture();
+    let tc = Checker::new(&env, &names, Some(0), None);
+    regression_429_validate_instance_fixture(&tc, &env);
+
+    tc.with_forced_eager_defeq(|| {
+        let ctx = Ctx::new();
+        let c = |i| expr::const_(i, vec![]);
+        let nat = c(0);
+        let forty_two = expr::lit_nat(42u32.into());
+        let seven = expr::lit_nat(7u32.into());
+        let forty_nine = expr::lit_nat(49u32.into());
+
+        // A valid Add Nat instance whose operation returns its first argument.
+        let operation = expr::lam(
+            expr::BinderInfo::Default,
+            nat.clone(),
+            expr::lam(expr::BinderInfo::Default, nat.clone(), expr::bvar(1)),
+        );
+        let instance = expr::apps(c(12), &[nat.clone(), operation]);
+        let instance_ty = expr::app(c(11), nat.clone());
+        let projected = expr::apps(
+            expr::proj(11, 0, instance.clone()),
+            &[forty_two.clone(), seven.clone()],
+        );
+        let lhs = expr::apps(
+            c(13),
+            &[nat.clone(), instance.clone(), forty_two.clone(), seven],
+        );
+
+        for (term, expected) in [
+            (&instance, &instance_ty),
+            (&projected, &nat),
+            (&lhs, &nat),
+            (&forty_two, &nat),
+            (&forty_nine, &nat),
+        ] {
+            let actual = tc.infer_type(&ctx, term).unwrap();
+            assert!(tc.is_def_eq(&ctx, &actual, expected).unwrap());
+        }
+
+        assert!(tc.is_def_eq(&ctx, &projected, &forty_two).unwrap());
+
+        // Direct conversion verdict, after all type/projection controls.
+        // Instance-blind Add.add -> Nat.add incorrectly produces 49.
+        assert!(!tc.is_def_eq(&ctx, &lhs, &forty_nine).unwrap());
+    });
+}
+
+#[test]
+fn regression_429_closed_int_value_respects_custom_ofnat_instance() {
+    let (env, names) = regression_429_instance_fixture();
+    let tc = Checker::new(&env, &names, Some(0), None);
+    regression_429_validate_instance_fixture(&tc, &env);
+
+    tc.with_forced_eager_defeq(|| {
+        let ctx = Ctx::new();
+        let c = |i| expr::const_(i, vec![]);
+        let int = c(8);
+        let seven = expr::lit_nat(7u32.into());
+        let stored = expr::app(c(9), expr::lit_nat(42u32.into()));
+        let instance_ty = expr::apps(c(5), &[int.clone(), seven.clone()]);
+        let instance = expr::apps(
+            c(6),
+            &[int.clone(), seven.clone(), stored.clone()],
+        );
+        let field = expr::proj(5, 0, instance.clone());
+        let accessor = expr::apps(
+            c(7),
+            &[int.clone(), seven, instance.clone()],
+        );
+
+        for (term, expected) in [
+            (&instance, &instance_ty),
+            (&field, &int),
+            (&accessor, &int),
+            (&stored, &int),
+        ] {
+            let actual = tc.infer_type(&ctx, term).unwrap();
+            assert!(tc.is_def_eq(&ctx, &actual, expected).unwrap());
+        }
+
+        assert!(tc.is_def_eq(&ctx, &field, &stored).unwrap());
+        assert!(tc.is_def_eq(&ctx, &accessor, &stored).unwrap());
+
+        // A recognizer may decline. If it returns a value, it must read 42,
+        // not the instance's numeral tag 7. This tests the raw recognizer;
+        // public accessor conversion already takes the corrected fallback.
+        if let Some(actual) = tc.closed_int_value(&ctx, &accessor).unwrap() {
+            assert_eq!(actual, num_bigint::BigInt::from(42u32));
+        }
+    });
+}
+
 }
