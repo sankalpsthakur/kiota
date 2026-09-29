@@ -13231,7 +13231,13 @@ fn regression_429_assert_nat_nonconversion(lhs: Expr, rhs: Expr) {
         "Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add",
     ]);
     let tc = Checker::new(&env, &names, Some(0), None);
-    tc.with_forced_eager_defeq(|| tc.check_decl(4, "def")).unwrap();
+    tc.with_forced_eager_defeq(|| {
+        let ci = env.consts.get(&4).unwrap();
+        let ConstantInfo::Def { typ, value, .. } = ci else { panic!("definition fixture"); };
+        let actual = tc.infer_type(&Ctx::new(), value)?;
+        if tc.is_def_eq(&Ctx::new(), &actual, typ)? { Ok(()) }
+        else { reject("fixture definition is not well typed") }
+    }).unwrap();
 
     let nat = expr::const_(0, vec![]);
     let mut ctx = Ctx::new();
@@ -13321,7 +13327,13 @@ fn regression_429_ofnat_respects_custom_instance() {
         "OfNat", "OfNat.mk", "OfNat.ofNat",
     ]);
     let tc = Checker::new(&env, &names, Some(0), None);
-    tc.with_forced_eager_defeq(|| tc.check_decl(6, "def")).unwrap();
+    tc.with_forced_eager_defeq(|| {
+        let ci = env.consts.get(&6).unwrap();
+        let ConstantInfo::Def { typ, value, .. } = ci else { panic!("definition fixture"); };
+        let actual = tc.infer_type(&Ctx::new(), value)?;
+        if tc.is_def_eq(&Ctx::new(), &actual, typ)? { Ok(()) }
+        else { reject("fixture definition is not well typed") }
+    }).unwrap();
 
     let ctx = Ctx::new();
     let seven = expr::lit_nat(num_bigint::BigUint::from(7u32));
