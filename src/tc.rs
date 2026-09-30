@@ -1036,6 +1036,22 @@ thread_local! {
     /// that two contexts built from the same sequence of types share an id.
     static CTX_IDS: RefCell<FxHashMap<(u64, u32, usize), u64>> = RefCell::new(FxHashMap::default());
     static CTX_NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+    /// Optional bounded memo of pure dependency-key computation. Full context
+    /// IDs and occurrence summaries are exact fields, never pointer hashes.
+    static CTX_KEY_MEMO: RefCell<FxHashMap<(u64, u64, u32), u64>> = RefCell::new(FxHashMap::default());
+    static CTX_KEY_MEMO_ENABLED: bool = std::env::var_os("KIOTA_CTX_KEY_MEMO").is_some();
+    static CTX_KEY_MEMO_QUERIES: Cell<u64> = const { Cell::new(0) };
+    static CTX_KEY_MEMO_HITS: Cell<u64> = const { Cell::new(0) };
+    static CTX_KEY_MEMO_TRACE: bool = std::env::var_os("KIOTA_STATS").is_some();
+}
+
+const CTX_KEY_MEMO_LIMIT: usize = 4_096;
+
+/// Clear every derived key before context IDs are reused between declarations.
+fn reset_context_ids() {
+    CTX_KEY_MEMO.with(|m| m.borrow_mut().clear());
+    CTX_IDS.with(|m| m.borrow_mut().clear());
+    CTX_NEXT.with(|c| c.set(1));
 }
 
 /// Intern `(parent_id, type identity)` for the full exact context.
@@ -1116,6 +1132,38 @@ impl Ctx {
     }
 
     fn used_bvar_key(&self, used: u64, loose: u32) -> u64 {
+        if loose == 0 { return 0; }
+        if used == 0 || used == u64::MAX { return self.id; }
+        if CTX_KEY_MEMO_ENABLED.with(|enabled| *enabled) {
+            self.used_bvar_key_memoized(used, loose)
+        } else { self.used_bvar_key_uncached(used, loose) }
+    }
+
+    fn used_bvar_key_memoized(&self, used: u64, loose: u32) -> u64 {
+        let query = (self.id, used, loose);
+        let queries = CTX_KEY_MEMO_QUERIES.with(|c| {
+            let n = c.get().saturating_add(1); c.set(n); n
+        });
+        let found = CTX_KEY_MEMO.with(|m| m.borrow().get(&query).copied());
+        if found.is_some() {
+            CTX_KEY_MEMO_HITS.with(|c| c.set(c.get().saturating_add(1)));
+        }
+        if queries % 500_000 == 0 && CTX_KEY_MEMO_TRACE.with(|enabled| *enabled) {
+            eprintln!("MEM ctx_key queries={} hits={} entries={}", queries,
+                CTX_KEY_MEMO_HITS.with(Cell::get), CTX_KEY_MEMO.with(|m| m.borrow().len()));
+        }
+        if let Some(key) = found { return key; }
+        // No RefCell borrow survives computation or context interning.
+        let key = self.used_bvar_key_uncached(used, loose);
+        CTX_KEY_MEMO.with(|m| {
+            let mut memo = m.borrow_mut();
+            if memo.len() >= CTX_KEY_MEMO_LIMIT { memo.clear(); }
+            memo.insert(query, key);
+        });
+        key
+    }
+
+    fn used_bvar_key_uncached(&self, used: u64, loose: u32) -> u64 {
         if loose == 0 {
             return 0;
         }
@@ -1415,8 +1463,7 @@ impl<'e> Checker<'e> {
         // probe. Those maps otherwise hold one extra decl of residue while
         // `type_is_multiarg_prop_structure` runs.
         expr::clear_subst_memos();
-        CTX_IDS.with(|m| m.borrow_mut().clear());
-        CTX_NEXT.with(|c| c.set(1));
+        reset_context_ids();
         CORE_ABORTED.with(|a| a.set(false));
         crate::stats::set_theorem_delta_scope(self.name_str(name));
         if std::env::var_os("KIOTA_DEBUG").is_some() && self.name_str(name).contains("_mutual") {
@@ -1571,8 +1618,7 @@ impl<'e> Checker<'e> {
         // declaration. Keeping them across decls is how `#3491`–`#3495`
         // grew from ~0.9 GB to multi-GB before the next omega proof.
         expr::clear_subst_memos();
-        CTX_IDS.with(|m| m.borrow_mut().clear());
-        CTX_NEXT.with(|c| c.set(1));
+        reset_context_ids();
         self.whnf_cache.borrow_mut().clear();
         self.whnf_core_cache.borrow_mut().clear();
         self.defeq_cache.borrow_mut().clear();
@@ -14126,6 +14172,7 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             }
             for used in 1u64..(1u64 << depth) {
                 let loose = 64 - used.leading_zeros();
+                assert_eq!(ctx.used_bvar_key_memoized(used, loose), reference(&ctx, used, loose));
                 assert_eq!(ctx.used_bvar_key(used, loose), reference(&ctx, used, loose),
                     "sparse walk differs for depth={depth}, mask={used}");
             }
@@ -14144,6 +14191,56 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         assert_eq!(ctx.len(), 100);
         assert_ne!(ctx.id, 0);
         assert_eq!(ctx.term_ctx_key(&expr::bvar(64)), ctx.id);
+    }
+
+    #[test]
+    fn regression_441_key_memo_preserves_transitive_dependencies() {
+        let build = |outer| {
+            let mut ctx = Ctx::new();
+            ctx.push(expr::sort(outer)); ctx.push(expr::bvar(0)); ctx.push(expr::bvar(0));
+            ctx
+        };
+        let prop = build(level::zero());
+        let data = build(level::succ(level::zero()));
+        let p = prop.used_bvar_key_uncached(1, 1);
+        let d = data.used_bvar_key_uncached(1, 1);
+        assert_ne!(p, d);
+        assert_eq!(prop.used_bvar_key_memoized(1, 1), p);
+        assert_eq!(prop.used_bvar_key_memoized(1, 1), p);
+        assert_eq!(data.used_bvar_key_memoized(1, 1), d);
+        CTX_KEY_MEMO.with(|m| {
+            let memo = m.borrow();
+            assert_eq!(memo.get(&(prop.id, 1, 1)), Some(&p));
+            assert_eq!(memo.get(&(data.id, 1, 1)), Some(&d));
+        });
+    }
+
+    #[test]
+    fn regression_441_key_memo_is_bounded_and_eviction_preserves_keys() {
+        CTX_KEY_MEMO.with(|m| {
+            let mut memo = m.borrow_mut(); memo.clear();
+            for n in 0..CTX_KEY_MEMO_LIMIT { memo.insert((u64::MAX, n as u64, 1), u64::MAX); }
+        });
+        let mut ctx = Ctx::new(); ctx.push(ty(3_000_001));
+        let expected = ctx.used_bvar_key_uncached(1, 1);
+        assert_eq!(ctx.used_bvar_key_memoized(1, 1), expected);
+        assert_eq!(CTX_KEY_MEMO.with(|m| m.borrow().len()), 1);
+        assert_eq!(ctx.used_bvar_key_memoized(1, 1), expected);
+    }
+
+    #[test]
+    fn regression_441_recycled_context_namespace_clears_key_memo() {
+        let mut old = Ctx::new(); old.push(ty(3_000_002));
+        old.used_bvar_key_memoized(1, 1);
+        assert!(!CTX_KEY_MEMO.with(|m| m.borrow().is_empty()));
+        drop(old);
+        reset_context_ids();
+        assert!(CTX_KEY_MEMO.with(|m| m.borrow().is_empty()));
+        assert!(CTX_IDS.with(|m| m.borrow().is_empty()));
+        assert_eq!(CTX_NEXT.with(Cell::get), 1);
+        let mut new = Ctx::new(); new.push(ty(3_000_003));
+        let expected = new.used_bvar_key_uncached(1, 1);
+        assert_eq!(new.used_bvar_key_memoized(1, 1), expected);
     }
 
 }
