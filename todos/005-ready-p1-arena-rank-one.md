@@ -27,11 +27,15 @@ Diagnostic source already replaces intern-pointer comparison of conclusion
 BVars with numeric indices and includes reset-state positive/negative controls.
 That correction has not been verified on full current Mathlib.
 
-Remote Init's prior Docker startup blocker is fixed at5f3160c, with32 policy/
-supervisor tests and197 Rust tests passing. Exact Init then actually rejects at
-declaration17726, Int32.instRxcHasSize_eq, in127s, without OOM or timeout.
-Projection trace source d3b6c55 is pinned by orchestration8704fcc; run36716037326
-is the next bounded diagnostic, not an acceptance.
+Remote Init startup is repaired. A reproduced iota bug swallowed a depth
+decline and returned an unapplied minor; checker55ae14b propagates the error.
+Exact Init run36718955002 now correctly declines at declaration17726
+(Int32.instRxcHasSize_eq) in114.85s, no OOM; it still does not accept Init.
+Stuck-projection fix f4a3741 preserves the original major when reduction fails.
+Checker3260d92 passes199 Rust tests plus33 supervisor/policy tests. Reviewed
+strict run36720166680 executes194 unique cases:193 pass, all71 negatives
+reject, and new proj-stuck-struct accepts in0.068s. Only magma-list-pair-n21
+hits the unchanged5GiB RSS watchdog. No full-Mathlib or rank gain established.
 
 ## Proposed Solutions
 
@@ -57,7 +61,7 @@ and review succeed. No paid compute or Kaggle submission without fresh authority
 - [x] Rank-one objective and remote-only operating constraints recorded.
 - [x] Current official pin, verdicts and leader instruction baseline read back.
 - [ ] Remaining shortcut audit and targeted adversarial regressions complete.
-- [ ] All193 downloadable cases pass strict unchanged resource gate.
+- [ ] All194 reviewed downloadable cases pass strict unchanged resource gate.
 - [ ] Exact current Init and Std accept, with input/source/binary provenance.
 - [ ] Current Mathlib false rejection eliminated with reduced positive/negative controls.
 - [ ] Exact full Mathlib accepts; other valid false rejects/declines resolved.
@@ -83,3 +87,12 @@ Official pin/score unchanged. No local file was edited or heavy task executed.
 - https://github.com/sankalpsthakur/kiota/actions/runs/36715157362
 - https://github.com/sankalpsthakur/kiota/actions/runs/36716037326
 - https://github.com/sankalpsthakur/kiota/pull/12
+
+### 2026-09-30 - Two reproduced checker bugs fixed, no promotion
+
+Iota error propagation and stuck-projection head preservation each have typed
+regressions reproduced on the old code and passing on the fix. Strict small
+snapshot now pins SHA549477be6e17e6fc32b1c744822bfb2580be1faa10bdfc76d5154d18a3c7934e
+(194cases; all193 prior hashes unchanged). Exact Init next replays immutable
+checker3260d92 with the original6GiB/no-swap/600s gate. Official pin2d2a9fa
+remains unchanged; rank-one goal stays active and all full-corpus gates open.

@@ -92,5 +92,12 @@ except Exception as error:
     report["error"] = str(error)
 finally:
     save()
-print(json.dumps(report), flush=True)
+# Full per-case evidence stays in the retained remote report. A giant
+# single stdout line can be dropped by GitHub, so emit a bounded summary.
+summary = {key: value for key, value in report.items()
+           if key not in {"results", "case_inventory"}}
+summary["executions"] = len(report["results"])
+summary["passing_cases"] = sum(item["passed"] for item in report["results"])
+summary["failures"] = [item for item in report["results"] if not item["passed"]]
+print(json.dumps(summary), flush=True)
 raise SystemExit(0 if report["passed"] else 1)
