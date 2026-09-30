@@ -2954,7 +2954,7 @@ impl<'e> Checker<'e> {
                         }
                     }
                 }
-                if let ExprData::Lit(Lit::Str(s)) = &**major {
+                if let ExprData::Lit(Lit::Str(s)) = &***major {
                     if self.name_str(*sname) == "String" && *idx == 0 {
                         if let Some(bytes) = self.string_to_byte_array(s) {
                             return Ok(Some(expr::apps(bytes, &args)));
