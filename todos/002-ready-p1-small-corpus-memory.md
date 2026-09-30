@@ -108,3 +108,7 @@ is not promoted, and the full strict Linux acceptance criterion stays unchecked.
 - https://github.com/sankalpsthakur/kiota/pull/12
 - https://github.com/sankalpsthakur/kiota/actions/runs/36317993571
 - `docs/checkpoints/2026-09-27.md`
+
+### 2026-09-30 - Closure evaluator rejected by current remote evidence
+
+Separate29f2e57/source6bbc0fa run36728328775 passes207 default/opt-in release tests+33harness controls, but strict corpus stops at98/194 when720stotal watchdog expires:87passes,11failures. All71negatives ran:70reject,refute-cheap-last hits5GiBRSS (not a wrong accept, not a reject). Paired-n21 remains5GiBmemorylimit17.90s; deep-n21/deep-n36 each120stimeout,27MiBRSS. Multiple foldedconstant/arg/grind cases also memory/timefail. Remaining96cases unexecuted. No closure-evaluator promotion or speed gain; don't repeat unchanged mode or raisecaps. Default/lazy-head178c3ba still193/194 withall71negativesreject and onlypairmemory.
