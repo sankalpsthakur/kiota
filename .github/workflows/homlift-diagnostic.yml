@@ -1,16 +1,16 @@
-name: exact-std-remote-diagnostic
+name: selected-mathlib-homlift-diagnostic
 on:
   push:
     branches: [fix/remote-nat-soundness-20260929]
-    paths: ['scripts/remote/std_diagnostic.py', '.github/workflows/std-diagnostic.yml']
+    paths: ['scripts/remote/homlift_diagnostic.py', '.github/workflows/homlift-diagnostic.yml']
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: exact-std-${{ github.ref }}
+  group: exact-homlift-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  std:
+  homlift:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-22.04
     timeout-minutes: 40
@@ -27,15 +27,15 @@ jobs:
       - name: Validate runner, generation and diagnostic source
         timeout-minutes: 2
         run: |
-          python3 -m py_compile scripts/remote/std_diagnostic.py
+          python3 -m py_compile scripts/remote/homlift_diagnostic.py
           python3 -m unittest discover -s scripts/remote/tests -v
-      - name: Regenerate exact official Std, then bounded checker diagnostic
-        run: python3 scripts/remote/std_diagnostic.py
+      - name: Export pinned Mathlib HomLift recursor, then bounded checker diagnostic
+        run: python3 scripts/remote/homlift_diagnostic.py
       - name: Retain bounded evidence only, never full exports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: exact-std-${{ github.sha }}-${{ github.run_id }}
-          path: std-report/
+          name: exact-homlift-${{ github.sha }}-${{ github.run_id }}
+          path: homlift-report/
           if-no-files-found: warn
           retention-days: 7
