@@ -13532,4 +13532,77 @@ fn regression_430_iota_propagates_constructor_telescope_decline() {
     assert!(matches!(result, Err(TcError::Decline(_))),
         "resource failure must propagate, never become an unapplied minor: {result:?}");
 }
+
+    /// Lean 4.34.1 whnf_core returns the input when reduce_proj fails.
+    /// Keeping the wrapper head lets conversion compare its arguments
+    /// without unrolling shared recursive bodies below a stuck projection.
+    #[test]
+    fn regression_431_stuck_projection_preserves_input() {
+        use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+        let mut env = regression_429_nat_add_env();
+        let c = |n| expr::const_(n, vec![]);
+        let pi = |d, b| expr::pi(expr::BinderInfo::Default, d, b);
+        let lam = |d, b| expr::lam(expr::BinderInfo::Default, d, b);
+        let nat = c(0);
+        let fn_ty = pi(nat.clone(), nat.clone());
+        env.insert(5, CI::InductiveType {
+            level_params: vec![], typ: expr::sort(level::succ(level::zero())),
+            num_params: 0, num_indices: 0, all: vec![5], ctors: vec![6],
+            is_rec: false, is_unsafe: false,
+        });
+        env.insert(6, CI::Constructor {
+            level_params: vec![], typ: pi(nat.clone(), pi(fn_ty.clone(), c(5))),
+            induct: 5, cidx: 0, num_params: 0, num_fields: 2, is_unsafe: false,
+        });
+        env.insert(7, CI::Axiom {
+            level_params: vec![], typ: pi(nat.clone(), c(5)), is_unsafe: false,
+        });
+        env.insert(8, CI::Def {
+            level_params: vec![], typ: pi(nat.clone(), c(5)),
+            value: lam(nat.clone(), expr::app(c(7), expr::bvar(0))),
+            hints: RH::Regular(1), is_unsafe: false,
+        });
+        env.insert(9, CI::Def {
+            level_params: vec![], typ: pi(nat.clone(), c(5)),
+            value: lam(nat.clone(), expr::apps(c(6), &[
+                expr::bvar(0), lam(nat.clone(), expr::bvar(0)),
+            ])),
+            hints: RH::Regular(1), is_unsafe: false,
+        });
+        let names = test_names(&[
+            "Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add",
+            "Box", "Box.mk", "opaque", "wrapper", "constructorWrapper",
+        ]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        tc.with_forced_eager_defeq(|| {
+            let mut ctx = Ctx::new(); ctx.push(nat.clone());
+            for id in [8, 9] {
+                let CI::Def {typ, value, ..} = env.get(id).unwrap() else { panic!("fixture"); };
+                let actual = tc.infer_type(&Ctx::new(), value)?;
+                assert!(tc.is_def_eq(&Ctx::new(), &actual, typ)?);
+            }
+            let major = expr::app(c(8), expr::bvar(0));
+            let bare = expr::proj(5, 0, major.clone());
+            let applied = expr::app(expr::proj(5, 1, major), c(1));
+            for term in [&bare, &applied] {
+                let actual = tc.infer_type(&ctx, term)?;
+                assert!(tc.is_def_eq(&ctx, &actual, &nat)?);
+            }
+            // A real constructor still reduces, including a function field.
+            let ctor = expr::app(c(9), expr::bvar(0));
+            assert!(tc.is_def_eq(&ctx, &tc.whnf_core(&ctx, &expr::proj(5, 0, ctor.clone()))?, &expr::bvar(0))?);
+            assert!(tc.is_def_eq(&ctx, &tc.whnf_core(&ctx, &expr::app(expr::proj(5, 1, ctor), c(1)))?, &c(1))?);
+            // Reduction changed the major but did not expose a constructor:
+            // both bare and applied projections must retain the input head.
+            let bare_w = tc.whnf_core(&ctx, &bare)?;
+            let applied_w = tc.whnf_core(&ctx, &applied)?;
+            assert!(Rc::ptr_eq(&bare, &bare_w) && Rc::ptr_eq(&applied, &applied_w),
+                "stuck projection lost its wrapper head: bare={}, applied={}",
+                tc.pp(&bare_w), tc.pp(&applied_w));
+            let exposed = expr::proj(5, 0, expr::app(c(7), expr::bvar(0)));
+            assert!(tc.is_def_eq(&ctx, &bare, &exposed)?);
+            Ok(())
+        }).unwrap();
+    }
+
 }
