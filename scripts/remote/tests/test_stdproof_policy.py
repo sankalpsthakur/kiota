@@ -49,7 +49,7 @@ class StdProofContainerPolicyTests(unittest.TestCase):
 
     def test_selected_std_is_never_full_std_proof(self):
         source = SOURCE.read_text()
-        self.assertIn('CHECKER = "604e96646218585a441e1e6068483225f8548008"', source)
+        self.assertIn('CHECKER = "08dd3a4a8323ae9ccb23b1e13c6200d5fbfa676a"', source)
         self.assertIn('TARGET = "Std.Tactic.BVDecide.BVExpr.bitblast.blastAdd.go_denote_eq._unary"', source)
         self.assertIn('"full_std_verified": False', source)
         self.assertIn('"full_corpus_verified": False', source)
@@ -58,6 +58,14 @@ class StdProofContainerPolicyTests(unittest.TestCase):
         self.assertNotIn('MATHLIB', source)
         self.assertIn('"--init"', source)
         self.assertIn('"elan-init"', source)
+
+    def test_replay_requires_frozen_target_input_before_checker_fetch(self):
+        source = SOURCE.read_text()
+        self.assertIn('INPUT_SHA = "b13db37bcbae93d41d7d20405050beade15689511f1bb689ad866435270c33e6"', source)
+        self.assertIn("INPUT_BYTES, INPUT_LINES, INPUT_DECLARATIONS = 22877330, 436979, 4066", source)
+        for guard in ("actual_sha != INPUT_SHA", "source.stat().st_size != INPUT_BYTES", "lines != INPUT_LINES", "len(declared) != INPUT_DECLARATIONS"):
+            self.assertIn(guard, source)
+        self.assertLess(source.index("selected Std input differs from frozen baseline"), source.index('fetch("checker",'))
 
 if __name__ == "__main__":
     unittest.main()

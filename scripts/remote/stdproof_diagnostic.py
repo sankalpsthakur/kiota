@@ -19,11 +19,13 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 ARENA = "cdb3497bd9080229f3ea107b0b9d5d25bd9e71a6"
 EXPORTER = "66f1fb4bc256072069767fce52d39480e4524869"
-CHECKER = "604e96646218585a441e1e6068483225f8548008"
+CHECKER = "08dd3a4a8323ae9ccb23b1e13c6200d5fbfa676a"
 TOOLCHAIN = "leanprover/lean4:v4.34.1"
 LEAN_SHA = "5045d0056413266e57c625dcd7c365b10e377c52"
 MODULE = "Std"
 TARGET = "Std.Tactic.BVDecide.BVExpr.bitblast.blastAdd.go_denote_eq._unary"
+INPUT_SHA = "b13db37bcbae93d41d7d20405050beade15689511f1bb689ad866435270c33e6"
+INPUT_BYTES, INPUT_LINES, INPUT_DECLARATIONS = 22877330, 436979, 4066
 IMAGE = "ubuntu@sha256:281c5745f657873d78e5531fc5ba8575f46ab7769b94550ac99543f122679986"
 MIB = 1024 * 1024
 temp_root = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
@@ -142,6 +144,9 @@ try:
     if meta["lean"] != {"version": "4.34.1", "githash": LEAN_SHA} or meta["exporter"] != {"name": "lean4export", "version": "3.1.0"}:
         raise RuntimeError("wrong Lean/exporter header")
     actual_sha = sha(source)
+    if (actual_sha != INPUT_SHA or source.stat().st_size != INPUT_BYTES
+            or lines != INPUT_LINES or len(declared) != INPUT_DECLARATIONS):
+        raise RuntimeError("selected Std input differs from frozen baseline; checker will not run")
     report.update(stdproof_input_verified=True, input_sha256=actual_sha, input_header=header,
                   input_bytes=source.stat().st_size, input_lines=lines,
                   exported_declarations=len(declared), target_present=True)
