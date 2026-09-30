@@ -92,3 +92,7 @@ runner's COMPLETE status hid declines/timeouts and is not acceptance evidence.
 A strict exact-SHA replacement is being prepared; actual submission requires
 the user's response. Exact Mathlib/CSLib inputs and hardware-counter access
 remain separate prerequisites.
+
+### 2026-09-30 - Corrected lazy comparison replay
+
+Unsafe prototypef0129de exactInit36725031921 verifies current347555345byte/6487065line/SHA620502ac input and reaches declaration50862 before600stimeout/noOOM. It is not acceptance, and later strict negatives caught proj-of-subst-prop falseaccept. Do not use this run as correctness evidence. Corrected6bbc0fa adds strict projection-sort checks and passes all71 negatives in reviewed194case full matrix36727096974; onlypairRSS fails. NewexactInit is pinned to6bbc0fa with6GiB/no-swap/600s unchanged and boundedstatistics to localize remainingcost. All source/build/export/artifact work stays remote.
