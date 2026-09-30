@@ -116,3 +116,7 @@ Exact Std36730359430 remains live onimmutable178c3ba. Prepared distinct remote H
 Std36730359430 terminal: inputverified596655086bytes10826639lines/SHA289ed65a/checker178c3ba; DockerOOMKilledtrue exit137 after568.737s insideunchanged6GiB/no-swap/590s. Actualchecker maxRSS6281448KiB fromchecker.time (dockerattach29MiB isnotcheckerRSS). Last100-declaration marker21300 Std.Tactic.BVDecide.BVExpr.bitblast.blastAdd.go_get_aux; it doesnotidentify exactfailingdecl. Tailcachecountswhnf19155294/core21420086/infer29350002, interncalls1.8billion. This ismemoryfailure, noacceptance.
 
 HomLift36731974298 terminalaccept onimmutable178c3ba/orchestration7f78ec3: actualArena-pinnedMathlibd13f23b/Lean4.34.1/exporter3.1.0 selectedrecursorandall435declarationdependencies,673065bytes12080lines/SHA df2f1398d740f808c5ce0c39723822792740c5f1a682a0af07b2aa15ae202552,0.1904s,6GiB/no-swap/120sslice bound. Actualtarget/ownerpresencevalidated; nofullMathlibacceptance orrankclaim.
+
+### 2026-09-30 - Targeted Std availability triage prepared
+
+Preparedselected Std blastAdd.go_get_aux export withalllogicaldependencies, immutablechecker604e966 andLean4.34.1/exporter3.1.0. It islast100declmarkerofOOMStd,notprovenexactfailingdecl. Mustverifyactualtargetpresence/header/hashbeforebounded6GiB/no-swap/120schecker. FullStdremainsopen. NoMathlibcheckout/cachegatheringneededbecauseStdcomeswithLean. ExactInit/HomLiftandstrictmatrix5dd01cf remainlive; nostalerestart.

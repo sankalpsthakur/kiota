@@ -1,0 +1,41 @@
+name: selected-stdproof-diagnostic
+on:
+  push:
+    branches: [fix/remote-nat-soundness-20260929]
+    paths: ['scripts/remote/stdproof_diagnostic.py', '.github/workflows/stdproof-diagnostic.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: exact-stdproof-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  stdproof:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+        with:
+          version: "0.12.20"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Validate runner, generation and diagnostic source
+        timeout-minutes: 2
+        run: |
+          python3 -m py_compile scripts/remote/stdproof_diagnostic.py
+          python3 -m unittest discover -s scripts/remote/tests -v
+      - name: Export Std blastAdd theorem, then bounded checker diagnostic
+        run: python3 scripts/remote/stdproof_diagnostic.py
+      - name: Retain bounded evidence only, never full exports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-stdproof-${{ github.sha }}-${{ github.run_id }}
+          path: stdproof-report/
+          if-no-files-found: warn
+          retention-days: 7
