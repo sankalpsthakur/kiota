@@ -5,7 +5,7 @@ import unittest
 
 class SnapshotPolicyTests(unittest.TestCase):
     def test_reviewed_snapshot_and_resource_gates(self):
-        source = (Path(__file__).resolve().parents[2] / "profile_memory.py").read_text()
+        source = (Path(__file__).resolve().parents[1] / "profile_memory.py").read_text()
         tree = ast.parse(source)
         constants = {node.targets[0].id: ast.literal_eval(node.value)
                      for node in tree.body
