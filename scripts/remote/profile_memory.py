@@ -49,7 +49,14 @@ try:
     with tempfile.TemporaryDirectory(prefix="kiota-remote-cases-") as scratch:
         cases = gate.unpack_cases(args.archive, Path(scratch))
         if args.all:
-            if sum(expected == 0 for _, expected, _ in cases) != 122 or len(cases) != 193:
+            report["counts"] = {"good": sum(expected == 0 for _, expected, _ in cases),
+                                "bad": sum(expected == 1 for _, expected, _ in cases),
+                                "total": len(cases)}
+            report["case_inventory"] = [{"test": name, "expected": "accept" if expected == 0 else "reject",
+                                         "input_sha256": gate.sha256_file(path)}
+                                        for name, expected, path in cases]
+            save()
+            if report["counts"]["good"] != 122 or len(cases) != 193:
                 raise RuntimeError("small suite changed: require explicit snapshot review")
         else:
             cases = [case for case in cases if case[0] in wanted]
