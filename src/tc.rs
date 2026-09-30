@@ -2907,7 +2907,8 @@ impl<'e> Checker<'e> {
             let n = crate::stats::whnf_calls();
             if n > 0 && n % 50_000 == 0 {
                 eprintln!(
-                    "MEM whnf={n} defeq={} infer={} intern={}",
+                    "MEM whnf={n} decl={} defeq={} infer={} intern={}",
+                    self.declaring.get().map(|n| self.name_str(n)).unwrap_or("<shape-probe>"),
                     crate::stats::defeq_calls(),
                     crate::stats::infer_calls(),
                     expr::intern_node_count(),
@@ -4036,7 +4037,8 @@ impl<'e> Checker<'e> {
             let n = crate::stats::defeq_calls();
             if n > 0 && n % 20_000 == 0 {
                 eprintln!(
-                    "MEM defeq={n} whnf={} core={} defeqc={} unfold={} infer={}",
+                    "MEM defeq={n} decl={} whnf={} core={} defeqc={} unfold={} infer={}",
+                    self.declaring.get().map(|n| self.name_str(n)).unwrap_or("<shape-probe>"),
                     self.whnf_cache.borrow().len(),
                     self.whnf_core_cache.borrow().len(),
                     self.defeq_cache.borrow().len(),
