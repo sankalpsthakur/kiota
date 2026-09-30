@@ -973,6 +973,7 @@ pub struct Checker<'e> {
     iota_lit_memo_misses: std::cell::Cell<u32>,
     /// Optional bounded reduction history, printed only on a projection error.
     /// Diagnostics only; no changes to reduction or conversion decisions.
+    lazy_head_enabled: Cell<bool>,
     conversion_trace_enabled: bool,
     conversion_trace_reported: Cell<bool>,
     conversion_trace: RefCell<Vec<(usize, Expr, Expr)>>,
@@ -1277,6 +1278,7 @@ impl<'e> Checker<'e> {
             iota_value_cache: RefCell::new(FxHashMap::default()),
             iota_lit_memo: RefCell::new(FxHashMap::default()),
             iota_lit_memo_misses: std::cell::Cell::new(0),
+            lazy_head_enabled: Cell::new(std::env::var_os("KIOTA_LAZY_HEAD").is_some()),
             conversion_trace_enabled: std::env::var_os("KIOTA_TRACE_CONVERSION").is_some(),
             conversion_trace_reported: Cell::new(false),
             conversion_trace: RefCell::new(Vec::new()),
@@ -2926,6 +2928,97 @@ impl<'e> Checker<'e> {
     /// Acc.rec on only the constructor side. Same WHNF-first path also
     /// iota-peels intern-distinct `s.i` / `Nat.rec` spines (`#3495`, `#4000`).
     /// `false` means "not proved this way", never "not defeq".
+    /// One legal head step, never full WHNF of operands or recursive iota.
+    /// Projections use only a constructor exposed by these same head steps.
+    /// This is a speculative congruence pass, not a replacement normalizer.
+    fn lazy_head_step(&self, e: &Expr, fuel: usize) -> R<Option<Expr>> {
+        if fuel == 0 { return Ok(None); }
+        let (head, args) = expr::unfold_apps(e);
+        match &**head {
+            ExprData::Const(n, us) => {
+                Ok(self.unfold_def(*n, us)?.map(|body| expr::apps(body, &args)))
+            }
+            ExprData::Lam(_, _, body) if !args.is_empty() => {
+                Ok(Some(expr::apps(expr::instantiate1(body, &args[0]), &args[1..])))
+            }
+            ExprData::Let(_, value, body) => {
+                Ok(Some(expr::apps(expr::instantiate1(body, value), &args)))
+            }
+            ExprData::Proj(sname, idx, major) => {
+                let (ctor, fields) = expr::unfold_apps(major);
+                if let ExprData::Const(cname, _) = &**ctor {
+                    if let Some(ConstantInfo::Constructor {induct, num_params, ..}) = self.env.get(*cname) {
+                        let field = (*num_params + *idx) as usize;
+                        if *induct == *sname && field < fields.len() {
+                            return Ok(Some(expr::apps(fields[field].clone(), &args)));
+                        }
+                    }
+                }
+                if let ExprData::Lit(Lit::Str(s)) = &**major {
+                    if self.name_str(*sname) == "String" && *idx == 0 {
+                        if let Some(bytes) = self.string_to_byte_array(s) {
+                            return Ok(Some(expr::apps(bytes, &args)));
+                        }
+                    }
+                }
+                Ok(self.lazy_head_step(major, fuel - 1)?
+                    .map(|next| expr::apps(expr::proj(*sname, *idx, next), &args)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn lazy_same_head(a: &Expr, b: &Expr) -> bool {
+        let (ha, aa) = expr::unfold_apps(a);
+        let (hb, ab) = expr::unfold_apps(b);
+        match (&**ha, &**hb) {
+            (ExprData::Const(na, _), ExprData::Const(nb, _)) => na == nb && aa.len() == ab.len(),
+            _ => false,
+        }
+    }
+
+    /// Keep earlier folded heads while exposing aliases on each side.
+    /// One side may reveal the other's original head only after several
+    /// beta/projection steps. At most 25 expressions per side are retained.
+    fn try_lazy_head_congruence(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        let mut left = vec![a.clone()];
+        let mut right = vec![b.clone()];
+        let mut left_done = false;
+        let mut right_done = false;
+        for _ in 0..24 {
+            if !left_done {
+                match self.lazy_head_step(left.last().unwrap(), 16)? {
+                    Some(next) if !Rc::ptr_eq(&next, left.last().unwrap()) => {
+                        for other in &right {
+                            if Self::lazy_same_head(&next, other)
+                                && self.try_unreduced_const_congruence_ex(ctx, &next, other, true)? {
+                                return Ok(true);
+                            }
+                        }
+                        left.push(next);
+                    }
+                    _ => left_done = true,
+                }
+            }
+            if !right_done {
+                match self.lazy_head_step(right.last().unwrap(), 16)? {
+                    Some(next) if !Rc::ptr_eq(&next, right.last().unwrap()) => {
+                        for other in &left {
+                            if Self::lazy_same_head(other, &next)
+                                && self.try_unreduced_const_congruence_ex(ctx, other, &next, true)? {
+                                return Ok(true);
+                            }
+                        }
+                        right.push(next);
+                    }
+                    _ => right_done = true,
+                }
+            }
+            if left_done && right_done { break; }
+        }
+        Ok(false)
+    }
+
     fn try_unreduced_const_congruence(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         self.try_unreduced_const_congruence_ex(ctx, a, b, false)
     }
@@ -3935,6 +4028,10 @@ impl<'e> Checker<'e> {
             return Ok(true);
         }
         if self.try_unreduced_const_congruence(ctx, a, b)? {
+            self.defeq_cache_insert(force_eager, key, true);
+            return Ok(true);
+        }
+        if self.lazy_head_enabled.get() && self.try_lazy_head_congruence(ctx, a, b)? {
             self.defeq_cache_insert(force_eager, key, true);
             return Ok(true);
         }
@@ -13770,6 +13867,7 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         });
         let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add", "addAlias"]);
         let tc = Checker::new(&env, &names, Some(0), None);
+        tc.lazy_head_enabled.set(true);
         tc.with_forced_eager_defeq(|| {
             for id in [4, 5] {
                 let CI::Def {typ, value, ..} = env.get(id).unwrap() else {panic!("fixture");};
