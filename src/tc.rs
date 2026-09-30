@@ -1140,10 +1140,10 @@ impl Ctx {
         // Raw type of bvar i was recorded before that binder was pushed;
         // its free bvar j denotes current bvar (i + 1 + j). Dependencies
         // point strictly outward, so an inner-to-outer pass is transitive.
-        for i in 0..64u32 {
-            if closure & (1u64 << i) == 0 {
-                continue;
-            }
+        let mut pending = used;
+        while pending != 0 {
+            let i = pending.trailing_zeros();
+            pending &= pending - 1;
             if i as usize >= n {
                 return self.id;
             }
@@ -1159,13 +1159,15 @@ impl Ctx {
             if deps == 0 || deps == u64::MAX {
                 return self.id;
             }
-            closure |= deps << (i + 1);
+            let shifted = deps << (i + 1);
+            pending |= shifted & !closure;
+            closure |= shifted;
         }
         let mut id = 0u64;
-        for i in (0..64u32).rev() {
-            if closure & (1u64 << i) == 0 {
-                continue;
-            }
+        let mut remaining = closure;
+        while remaining != 0 {
+            let i = 63 - remaining.leading_zeros();
+            remaining &= !(1u64 << i);
             if i as usize >= n {
                 return self.id;
             }
@@ -14076,6 +14078,77 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         assert!(expr::is_closed(&warm_bad));
         assert!(matches!(check(bad_ty, warm_bad), Err(TcError::Reject(_))),
             "one closed declaration must not reuse Prop-only checked inference for data");
+    }
+
+    #[test]
+    fn regression_439_sparse_dependency_walk_matches_full_scan() {
+        fn reference(ctx: &Ctx, used: u64, loose: u32) -> u64 {
+        if loose == 0 {
+            return 0;
+        }
+        if used == 0 || used == u64::MAX {
+            // A suffix alone still omits dependencies outside that suffix.
+            return ctx.id;
+        }
+        let n = ctx.tys.len();
+        let mut closure = used;
+        // Raw type of bvar i was recorded before that binder was pushed;
+        // its free bvar j denotes current bvar (i + 1 + j). Dependencies
+        // point strictly outward, so an inner-to-outer pass is transitive.
+        for i in 0..64u32 {
+            if closure & (1u64 << i) == 0 {
+                continue;
+            }
+            if i as usize >= n {
+                return ctx.id;
+            }
+            let ty = &ctx.tys[n - 1 - i as usize];
+            let raw_loose = expr::loose_bvar_range(ty);
+            if raw_loose == 0 {
+                continue;
+            }
+            if i + 1 + raw_loose.min(64) > 64 || raw_loose > 64 {
+                return ctx.id;
+            }
+            let deps = expr::used_bvars(ty);
+            if deps == 0 || deps == u64::MAX {
+                return ctx.id;
+            }
+            closure |= deps << (i + 1);
+        }
+        let mut id = 0u64;
+        for i in (0..64u32).rev() {
+            if closure & (1u64 << i) == 0 {
+                continue;
+            }
+            if i as usize >= n {
+                return ctx.id;
+            }
+            let ty_ptr = expr::identity(&ctx.tys[n - 1 - i as usize]);
+            id = intern_ctx_binding_id(id, i, ty_ptr);
+        }
+        id
+    }
+
+
+        for depth in 1..=10u32 {
+            let mut ctx = Ctx::new();
+            for n in 0..depth {
+                let raw = if n == 0 {ty(21)} else {match n % 3 {
+                    0 => ty(22),
+                    1 => expr::bvar(n - 1),
+                    _ => expr::app(ty(23), expr::bvar(0)),
+                }};
+                ctx.push(raw);
+            }
+            for used in 1u64..(1u64 << depth) {
+                let loose = 64 - used.leading_zeros();
+                assert_eq!(ctx.used_bvar_key(used, loose), reference(&ctx, used, loose),
+                    "sparse walk differs for depth={depth}, mask={used}");
+            }
+            assert_eq!(ctx.used_bvar_key(u64::MAX, 65), reference(&ctx, u64::MAX, 65));
+            assert_eq!(ctx.used_bvar_key(0, 0), reference(&ctx, 0, 0));
+        }
     }
 
 }
