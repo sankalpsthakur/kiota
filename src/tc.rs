@@ -5451,7 +5451,10 @@ impl<'e> Checker<'e> {
                     let r = nat::mk_lit(nat::mul_values(&x, &y));
                     return Ok(Some(expr::apps(r, &args[2..])));
                 }
-                if nat::is_zero(&a, zero) || nat::is_zero(&b, zero) {
+                // Only the second argument drives the logical recursion.
+                // zero * neutral and succ a * neutral are theorem identities,
+                // not Lean definitional reductions.
+                if nat::is_zero(&b, zero) {
                     return Ok(Some(expr::apps(nat::mk_lit(0u32.into()), &args[2..])));
                 }
                 if nat::as_lit(&a).is_some_and(|n| n.bits() >= 16)
@@ -5463,13 +5466,6 @@ impl<'e> Checker<'e> {
                     let mul = expr::apps(expr::const_(n, vec![]), &[a.clone(), p]);
                     if let Some(add) = self.find_name("Nat.add") {
                         let r = expr::apps(expr::const_(add, vec![]), &[mul, a]);
-                        return Ok(Some(expr::apps(r, &args[2..])));
-                    }
-                }
-                if let Some(p) = nat::pred(&a, zero, succ) {
-                    let mul = expr::apps(expr::const_(n, vec![]), &[p, b.clone()]);
-                    if let Some(add) = self.find_name("Nat.add") {
-                        let r = expr::apps(expr::const_(add, vec![]), &[mul, b]);
                         return Ok(Some(expr::apps(r, &args[2..])));
                     }
                 }
@@ -5486,14 +5482,17 @@ impl<'e> Checker<'e> {
                     if nat::is_zero(&b, zero) {
                         return Ok(Some(expr::apps(a, &args[2..])));
                     }
-                    if nat::is_zero(&a, zero) {
-                        return Ok(Some(expr::apps(nat::mk_lit(0u32.into()), &args[2..])));
+                    // sub a (succ b) := pred (sub a b), not cancellation
+                    // of successors on both sides or zero-left simplification.
+                    if nat::as_lit(&b).is_some_and(|n| n.bits() >= 16) {
+                        return Ok(None);
                     }
-                    if let (Some(pa), Some(pb)) =
-                        (nat::pred(&a, zero, succ), nat::pred(&b, zero, succ))
-                    {
-                        let r = expr::apps(expr::const_(n, vec![]), &[pa, pb]);
-                        return Ok(Some(expr::apps(r, &args[2..])));
+                    if let Some(pb) = nat::pred(&b, zero, succ) {
+                        if let Some(pred) = self.find_name("Nat.pred") {
+                            let sub = expr::apps(expr::const_(n, vec![]), &[a, pb]);
+                            let r = expr::app(expr::const_(pred, vec![]), sub);
+                            return Ok(Some(expr::apps(r, &args[2..])));
+                        }
                     }
                 }
                 Ok(None)
