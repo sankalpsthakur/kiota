@@ -3980,6 +3980,14 @@ impl<'e> Checker<'e> {
 
     fn is_def_eq_inner_body(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         crate::stats::defeq_call();
+        // Speculative alias congruence must not rescue an aborted core
+        // normalization or bypass the existing core depth guard. Check
+        // before identity/cache hits too; a prior abort is sticky per decl.
+        if self.lazy_head_enabled.get()
+            && (CORE_ABORTED.with(Cell::get) || CORE_DEPTH.with(|d| d.get() >= CONV_DEPTH))
+        {
+            return decline("lazy head comparison after core depth abort");
+        }
         if crate::stats::enabled() {
             let n = crate::stats::defeq_calls();
             if n > 0 && n % 20_000 == 0 {
@@ -13891,6 +13899,28 @@ fn regression_432_defining_equations_and_closed_values_convert() {
                     "alias congruence must precede huge numeric normalization: {compared:?}");
             Ok::<(), TcError>(())
         }).unwrap();
+    }
+
+    #[test]
+    fn regression_434_lazy_head_preserves_core_abort_and_limit() {
+        let env = regression_429_nat_add_env();
+        let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        tc.lazy_head_enabled.set(true);
+        let zero = expr::lit_nat(num_bigint::BigUint::from(0u32));
+        let ty = tc.infer_type(&Ctx::new(), &zero).unwrap();
+        assert!(tc.is_def_eq(&Ctx::new(), &ty, &expr::const_(0, vec![])).unwrap());
+        // Even identity/cache candidates cannot hide an exhausted or
+        // previously aborted core. Restore thread locals before assertions.
+        for (depth, aborted) in [(CONV_DEPTH, false), (0, true)] {
+            let old_depth = CORE_DEPTH.with(|d| d.replace(depth));
+            let old_abort = CORE_ABORTED.with(|a| a.replace(aborted));
+            let r = tc.with_forced_eager_defeq(|| tc.is_def_eq(&Ctx::new(), &zero, &zero));
+            CORE_DEPTH.with(|d| d.set(old_depth));
+            CORE_ABORTED.with(|a| a.set(old_abort));
+            assert!(matches!(r, Err(TcError::Decline(_))), "lost abort: {r:?}");
+        }
+        assert!(tc.with_forced_eager_defeq(|| tc.is_def_eq(&Ctx::new(), &zero, &zero)).unwrap());
     }
 
 }
