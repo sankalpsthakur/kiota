@@ -1034,18 +1034,24 @@ pub struct Checker<'e> {
 thread_local! {
     /// Maps `(parent id, pushed type)` to the id of the extended context, so
     /// that two contexts built from the same sequence of types share an id.
-    static CTX_IDS: RefCell<FxHashMap<(u64, usize), u64>> = RefCell::new(FxHashMap::default());
+    static CTX_IDS: RefCell<FxHashMap<(u64, u32, usize), u64>> = RefCell::new(FxHashMap::default());
     static CTX_NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
 }
 
 /// Intern `(parent_id, type ptr)` to a context id. Shared by full `ctx.id`
 /// and by suffix keys (the k innermost binders of an open term).
 fn intern_ctx_id(parent: u64, ty_ptr: usize) -> u64 {
+    intern_ctx_binding_id(parent, u32::MAX, ty_ptr)
+}
+
+/// Exact dependency binding: numeric position and allocation identity are
+/// separate key fields, never XOR/hash-folded. MAX namespaces full contexts.
+fn intern_ctx_binding_id(parent: u64, index: u32, ty_ptr: usize) -> u64 {
     CTX_IDS.with(|m| {
-        *m.borrow_mut().entry((parent, ty_ptr)).or_insert_with(|| {
+        *m.borrow_mut().entry((parent, index, ty_ptr)).or_insert_with(|| {
             CTX_NEXT.with(|c| {
                 let v = c.get();
-                c.set(v + 1);
+                c.set(v.checked_add(1).expect("context identity exhausted"));
                 v
             })
         })
@@ -1105,12 +1111,10 @@ impl Ctx {
         self.tys.push(ty);
     }
 
-    /// Infer/defeq cache key: closed → 0; otherwise the intern of the types
-    /// of **bvars the term actually uses**, not a contiguous suffix of length
-    /// `loose`. Extra innermost binders (`Decidable.rec` in `#18041`) must not
-    /// split AIG `BinaryInput.mk` pair cache. `used_bvars == u64::MAX` (some
-    /// index `≥ 64`) falls back to `suffix[loose]`. Types are stored
-    /// unshifted; `local_ty` shifts on read.
+    /// Closed terms use 0. Open terms include every directly used binder
+    /// and the transitive dependencies of its raw type. Omitting those outer
+    /// bindings lets a checked Prop-only conversion leak into a Type context.
+    /// The 64-bit occurrence summary is conservative: overflow uses full id.
     fn term_ctx_key(&self, e: &Expr) -> u64 {
         self.used_bvar_key(expr::used_bvars(e), expr::loose_bvar_range(e))
     }
@@ -1128,22 +1132,45 @@ impl Ctx {
             return 0;
         }
         if used == 0 || used == u64::MAX {
-            return self.suffix_key(loose as usize);
+            // A suffix alone still omits dependencies outside that suffix.
+            return self.id;
         }
-        // Same fold as `suffix[k]` when `used` is bits `0..k`: outer-of-the
-        // used set first, innermost last (`intern_ctx_id` extends with the
-        // new innermost).
         let n = self.tys.len();
-        let mut id = 0u64;
-        for i in (0..64u32).rev() {
-            if used & (1u64 << i) == 0 {
+        let mut closure = used;
+        // Raw type of bvar i was recorded before that binder was pushed;
+        // its free bvar j denotes current bvar (i + 1 + j). Dependencies
+        // point strictly outward, so an inner-to-outer pass is transitive.
+        for i in 0..64u32 {
+            if closure & (1u64 << i) == 0 {
                 continue;
             }
-            if (i as usize) >= n {
-                return self.suffix_key(loose as usize);
+            if i as usize >= n {
+                return self.id;
+            }
+            let ty = &self.tys[n - 1 - i as usize];
+            let raw_loose = expr::loose_bvar_range(ty);
+            if raw_loose == 0 {
+                continue;
+            }
+            if i + 1 + raw_loose.min(64) > 64 || raw_loose > 64 {
+                return self.id;
+            }
+            let deps = expr::used_bvars(ty);
+            if deps == 0 || deps == u64::MAX {
+                return self.id;
+            }
+            closure |= deps << (i + 1);
+        }
+        let mut id = 0u64;
+        for i in (0..64u32).rev() {
+            if closure & (1u64 << i) == 0 {
+                continue;
+            }
+            if i as usize >= n {
+                return self.id;
             }
             let ty_ptr = expr::identity(&self.tys[n - 1 - i as usize]);
-            id = intern_ctx_id(id, ty_ptr);
+            id = intern_ctx_binding_id(id, i, ty_ptr);
         }
         id
     }
@@ -10375,11 +10402,10 @@ mod tests {
         );
     }
 
-    /// Open binder types (`Vec #0`) still share a suffix key. Falling back to
-    /// the full `ctx.id` re-Checks a 34k-DAG well-founded proof once per extra
-    /// PSigma/Acc motive (`._unary` / `blastAdd.go_denote_eq`).
+    /// Equal raw open types do not suffice when their parent bindings differ.
+    /// This used to assert equality for an unsafe performance shortcut.
     #[test]
-    fn suffix_ctx_key_shares_open_innermost_binder() {
+    fn dependent_ctx_key_distinguishes_open_innermost_binder() {
         let vec0 = expr::app(ty(99), expr::bvar(0));
         assert!(expr::loose_bvar_range(&vec0) > 0);
         let mut a = Ctx::new();
@@ -10389,10 +10415,10 @@ mod tests {
         b.push(ty(2));
         b.push(vec0);
         let e = expr::bvar(0);
-        assert_eq!(
+        assert_ne!(
             a.term_ctx_key(&e),
             b.term_ctx_key(&e),
-            "loose=1 keys on the raw innermost type, even when that type mentions the parent"
+            "an open binder type must also identify the parent it depends on"
         );
         assert_ne!(a.id, b.id);
     }
@@ -13940,6 +13966,116 @@ fn regression_432_defining_equations_and_closed_values_convert() {
     #[test]
     fn regression_436_custom_int_natcast_reads_instance() {
         regression_436_custom_unary_int_instance(true);
+    }
+
+    #[test]
+    fn regression_437_checked_inference_cache_tracks_outer_type_dependencies() {
+        let env = Environment::default();
+        let names = Vec::new();
+        let validator = Checker::new(&env, &names, None, None);
+        let make_ctx = |p_sort: Level| {
+            let mut ctx = Ctx::new();
+            // P, F : P -> Type, h1 h2 : P, f : F h1 -> Prop, x : F h2.
+            // The directly used binders f/x have identical raw types in the
+            // two contexts, but checking f x depends on whether P is Prop.
+            let domains = vec![
+                expr::sort(p_sort),
+                expr::pi(expr::BinderInfo::Default, expr::bvar(0), expr::sort(level::succ(level::zero()))),
+                expr::bvar(1),
+                expr::bvar(2),
+                expr::pi(expr::BinderInfo::Default,
+                    expr::app(expr::bvar(2), expr::bvar(1)), expr::sort(level::zero())),
+                expr::app(expr::bvar(3), expr::bvar(1)),
+            ];
+            for dom in domains {
+                let dom_ty = validator.infer_type(&ctx, &dom).expect("fixture binder is well typed");
+                validator.ensure_sort(&ctx, &dom_ty).expect("fixture binder type is a sort");
+                ctx.push(dom);
+            }
+            ctx
+        };
+        let prop_ctx = make_ctx(level::zero());
+        let type_ctx = make_ctx(level::succ(level::zero()));
+        assert_ne!(prop_ctx.id, type_ctx.id);
+        let term = expr::app(expr::bvar(1), expr::bvar(0));
+        assert_ne!(prop_ctx.term_ctx_key(&term), type_ctx.term_ctx_key(&term));
+        let cold = Checker::new(&env, &names, None, None);
+        assert!(matches!(cold.infer_type(&type_ctx, &term), Err(TcError::Reject(_))),
+            "distinct data indices h1/h2 must not convert without a warm cache");
+        let warm = Checker::new(&env, &names, None, None);
+        let result = warm.infer_type(&prop_ctx, &term).expect("proof indices convert by proof irrelevance");
+        assert!(matches!(&**result, ExprData::Sort(l) if level::is_def_eq(l, &level::zero())));
+        assert!(matches!(warm.infer_type(&type_ctx, &term), Err(TcError::Reject(_))),
+            "checked cache entry from P : Prop must not authorize f x under P : Type");
+        let lhs = expr::app(expr::bvar(4), expr::bvar(3));
+        let rhs = expr::app(expr::bvar(4), expr::bvar(2));
+        let equality = Checker::new(&env, &names, None, None);
+        assert!(equality.is_def_eq(&prop_ctx, &lhs, &rhs).unwrap());
+        assert!(!equality.is_def_eq(&type_ctx, &lhs, &rhs).unwrap(),
+            "defeq cache must also include the Prop/Type dependency");
+    }
+
+    #[test]
+    fn regression_437_dependency_keys_are_transitive_and_sparse() {
+        let make = |outer, unused| {
+            let mut ctx = Ctx::new();
+            ctx.push(ty(outer));
+            ctx.push(expr::bvar(0));
+            ctx.push(ty(unused));
+            ctx.push(expr::bvar(1));
+            ctx
+        };
+        let a = make(1, 7);
+        let b = make(2, 7);
+        let c = make(1, 8);
+        let e = expr::bvar(0);
+        assert_ne!(a.term_ctx_key(&e), b.term_ctx_key(&e), "two-hop outer dependency differs");
+        assert_eq!(a.term_ctx_key(&e), c.term_ctx_key(&e), "unreachable middle binder stays irrelevant");
+        let mut overflow = Ctx::new();
+        for _ in 0..65 { overflow.push(ty(1)); }
+        overflow.push(expr::bvar(64));
+        assert_eq!(overflow.term_ctx_key(&e), overflow.id, "overflow uses the full exact context");
+    }
+
+    #[test]
+    fn regression_437_closed_declaration_cannot_warm_prop_cache_for_data() {
+        let binder = |p_sort: Level| vec![
+            expr::sort(p_sort),
+            expr::pi(expr::BinderInfo::Default, expr::bvar(0), expr::sort(level::succ(level::zero()))),
+            expr::bvar(1), expr::bvar(2),
+            expr::pi(expr::BinderInfo::Default,
+                expr::app(expr::bvar(2), expr::bvar(1)), expr::sort(level::zero())),
+            expr::app(expr::bvar(3), expr::bvar(1)),
+        ];
+        let wrap = |domains: Vec<Expr>, body: Expr, lambda: bool| domains.into_iter().rev()
+            .fold(body, |body, domain| if lambda {
+                expr::lam(expr::BinderInfo::Default, domain, body)
+            } else { expr::pi(expr::BinderInfo::Default, domain, body) });
+        let prop = binder(level::zero());
+        let data = binder(level::succ(level::zero()));
+        let body = expr::app(expr::bvar(1), expr::bvar(0));
+        let good_ty = wrap(prop.clone(), expr::sort(level::zero()), false);
+        let good = wrap(prop, body.clone(), true);
+        let bad_ty = wrap(data.clone(), expr::sort(level::zero()), false);
+        let bad = wrap(data, body, true);
+        assert!(expr::is_closed(&good) && expr::is_closed(&bad));
+        let names = test_names(&["cacheRegression"]);
+        let check = |typ: Expr, value: Expr| {
+            let mut env = Environment::default();
+            env.insert(0, ConstantInfo::Def {level_params: vec![], typ, value,
+                hints: crate::env::ReducibilityHints::Regular(0), is_unsafe: false});
+            Checker::new(&env, &names, None, None).check_decl(0, "def")
+        };
+        assert!(check(good_ty.clone(), good.clone()).is_ok(), "closed Prop control accepts");
+        assert!(matches!(check(bad_ty.clone(), bad.clone()), Err(TcError::Reject(_))),
+            "cold closed data control rejects");
+        // The let value is valid and warms the same shared body under P:Prop.
+        // The let body is closed; no binder shifting or fixture assumptions
+        // can explain accepting it under P:Type.
+        let warm_bad = expr::let_(good_ty, good, bad);
+        assert!(expr::is_closed(&warm_bad));
+        assert!(matches!(check(bad_ty, warm_bad), Err(TcError::Reject(_))),
+            "one closed declaration must not reuse Prop-only checked inference for data");
     }
 
 }
