@@ -55,7 +55,7 @@ class StdContainerPolicyTests(unittest.TestCase):
                     values[node.targets[0].id] = ast.literal_eval(node.value)
                 except (ValueError, TypeError):
                     pass
-        self.assertEqual(values["CHECKER"], "178c3ba75787eb91375cd355236bb55136c95bee")
+        self.assertEqual(values["CHECKER"], "c54594965b31ff0fb89bfc311a1ca6e5d017e0cf")
         self.assertEqual(values["INPUT_SHA"], "289ed65a367abdc7388a855d2acf59cc1f401f5e06295acbb8a420682d9f00bd")
         source = SOURCE.read_text()
         self.assertIn("INPUT_BYTES, INPUT_LINES = 596655086, 10826639", source)

@@ -19,7 +19,7 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 ARENA = "cdb3497bd9080229f3ea107b0b9d5d25bd9e71a6"
 EXPORTER = "66f1fb4bc256072069767fce52d39480e4524869"
-CHECKER = "178c3ba75787eb91375cd355236bb55136c95bee"
+CHECKER = "c54594965b31ff0fb89bfc311a1ca6e5d017e0cf"
 TOOLCHAIN = "leanprover/lean4:v4.34.1"
 LEAN_SHA = "5045d0056413266e57c625dcd7c365b10e377c52"
 INPUT_SHA = "289ed65a367abdc7388a855d2acf59cc1f401f5e06295acbb8a420682d9f00bd"
@@ -45,6 +45,7 @@ for key in ("ELAN_TOOLCHAIN", "LEAN_PATH", "LEAN_SYSROOT", "LEAN_GITHASH", "LAKE
 deadline = time.monotonic() + 35 * 60
 report = {"orchestration_revision": os.environ["GITHUB_SHA"], "checker_revision": CHECKER,
           "arena_revision": ARENA, "exporter_revision": EXPORTER,
+          "mode": "lazy-head+dependency-closed-whnf",
           "full_corpus_verified": False, "arena_rank_verified": False,
           "std_input_verified": False, "std_accepted": False,
           "checker_started": False, "std_verdict": "not_run", "phases": []}
@@ -146,6 +147,7 @@ try:
           "--env", "KIOTA_TRACE_CONVERSION=1",
           "--env", "KIOTA_LAZY_HEAD=1",
           "--env", "KIOTA_STATS=1",
+          "--env", "KIOTA_DEPENDENT_WHNF=1",
           "--mount", "type=bind,src=" + str(binary) + ",dst=/checker,readonly",
           "--mount", "type=bind,src=" + str(source) + ",dst=/input,readonly",
           "--mount", "type=bind,src=/usr/bin/time,dst=/time,readonly",

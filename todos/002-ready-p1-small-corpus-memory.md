@@ -116,3 +116,7 @@ Separate29f2e57/source6bbc0fa run36728328775 passes207 default/opt-in release te
 ### 2026-09-30 - Dependency-closed WHNF memo experiment
 
 StdOOMreport has19mWHNF/21mcore/29minfer entries. CurrentWHNFmemo usesfullctx.idforanyopenterm, despitecorrectedinfer/defeqtransitiveclosure. Isolatedopt-inKIOTA_DEPENDENT_WHNF computesexactdependencyclosedctxkey (numericposition+rawtypeidentity,transitiveoutwardbindings,overflowfullid); doesnotchangekernelreductions, skipvalidation,evictmemos,orrelaxcaps. ModeimmutableperChecker. Comparelazy-headvsdep-whnf fullreviewed194caseswithall71negativesand8GiBAS/5GiBRSS/120sunchanged. Newreg438checkssharingonlyunreachablebindings,dependencydifferenceand64bitfallback. EntireRustsuitealsoexecuteswithbothflags. NofullStd/Init/rankclaimuntilboundedexactrevalidation.
+
+### 2026-09-30 - Full Std memo-sharing diagnostic prepared
+
+Opt-inWHNFdd169a2 fullmatrix36735443247 completes194cases193passall71negativesboth lazybaselineanddep-whnf, onlypairmemoryunchanged. This isnotmemoryfixyet. NewboundedMEMlinesincludeactivechecker.declaringname(or<shape-probe>), loggingonly; sourcec545949. PreparedfullStdcheckerpin c545949 withbothlazy/depflags: original596655086byteSHA289ed65ainput,6GiB/no-swap/590s andnoarenaedits. ActualearlierStdproofslice604e9663866declarations19.1MB accepts110.5s at636340KiBRSS,soitdidnotreprofullStdOOM; do notcallthatproofrootcause. ThisreplaytestsrealwholeStdavailability andidentifiesexactactivebodyifgrowthrecurs. Noheadpromotionorextendedcaps.

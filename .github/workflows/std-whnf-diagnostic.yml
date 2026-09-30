@@ -1,0 +1,41 @@
+name: exact-std-dependent-whnf-diagnostic
+on:
+  push:
+    branches: [fix/remote-dependent-whnf-20260930]
+    paths: ['scripts/remote/std_diagnostic.py', '.github/workflows/std-whnf-diagnostic.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: exact-std-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  std:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+        with:
+          version: "0.12.20"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Validate runner, generation and diagnostic source
+        timeout-minutes: 2
+        run: |
+          python3 -m py_compile scripts/remote/std_diagnostic.py
+          python3 -m unittest discover -s scripts/remote/tests -v
+      - name: Regenerate exact official Std, then bounded checker diagnostic
+        run: python3 scripts/remote/std_diagnostic.py
+      - name: Retain bounded evidence only, never full exports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-std-${{ github.sha }}-${{ github.run_id }}
+          path: std-report/
+          if-no-files-found: warn
+          retention-days: 7
