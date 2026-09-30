@@ -13958,4 +13958,62 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         assert!(matches!(r, Err(TcError::Reject(_))), "stuck inferred sort is not non-Prop: {r:?}");
     }
 
+    fn regression_436_custom_unary_int_instance(cast: bool) {
+        use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+        let (mut env, mut names) = regression_429_instance_fixture();
+        let c = |id| expr::const_(id, vec![]);
+        let v = expr::bvar;
+        let pi = |d, b| expr::pi(BinderInfo::Default, d, b);
+        let lam = |d, b| expr::lam(BinderInfo::Default, d, b);
+        let type0 = expr::sort(level::succ(level::zero()));
+        env.insert(14, CI::InductiveType {level_params: vec![], typ: pi(type0.clone(), type0.clone()),
+            num_params: 1, num_indices: 0, all: vec![14], ctors: vec![15], is_rec: false, is_unsafe: false});
+        let field_ty = pi(if cast {c(0)} else {v(0)}, v(1));
+        env.insert(15, CI::Constructor {level_params: vec![],
+            typ: pi(type0.clone(), pi(field_ty, expr::app(c(14), v(1)))),
+            induct: 14, cidx: 0, num_params: 1, num_fields: 1, is_unsafe: false});
+        let inst_ty = expr::app(c(14), v(0));
+        env.insert(16, CI::Def {level_params: vec![],
+            typ: pi(type0.clone(), pi(inst_ty.clone(), pi(if cast {c(0)} else {v(1)}, v(2)))),
+            value: lam(type0, lam(inst_ty, expr::proj(14, 0, v(0)))), hints: RH::Abbrev, is_unsafe: false});
+        names.extend(test_names(if cast {&["NatCast", "NatCast.mk", "NatCast.natCast"]}
+                               else {&["Neg", "Neg.mk", "Neg.neg"]}));
+        let tc = Checker::new(&env, &names, Some(0), None);
+        regression_429_validate_instance_fixture(&tc, &env);
+        tc.with_forced_eager_defeq(|| {
+            let ctx = Ctx::new();
+            let CI::Def {typ, value, ..} = env.get(16).unwrap() else {panic!("fixture");};
+            let got = tc.infer_type(&ctx, value)?; assert!(tc.is_def_eq(&ctx, &got, typ)?);
+            let int = c(8); let nat = c(0);
+            let stored = expr::app(c(9), expr::lit_nat(if cast {42u32} else {7u32}.into()));
+            let op = lam(if cast {nat.clone()} else {int.clone()}, if cast {stored.clone()} else {v(0)});
+            let inst = expr::apps(c(15), &[int.clone(), op]);
+            let arg = if cast {expr::lit_nat(7u32.into())} else {stored.clone()};
+            let projected = expr::app(expr::proj(14, 0, inst.clone()), arg.clone());
+            let accessor = expr::apps(c(16), &[int.clone(), inst.clone(), arg]);
+            let instance_type = expr::app(c(14), int.clone());
+            for (term, expected) in [(&inst, &instance_type), (&projected, &int), (&accessor, &int), (&stored, &int)] {
+                let inferred = tc.infer_type(&ctx, term)?; assert!(tc.is_def_eq(&ctx, &inferred, expected)?);
+            }
+            assert!(tc.is_def_eq(&ctx, &projected, &stored)?);
+            // The recognizer may defer, but cannot invent the standard
+            // operation instead of reading this valid instance's field.
+            if let Some(n) = tc.closed_int_value(&ctx, &accessor)? {
+                assert_eq!(n, num_bigint::BigInt::from(if cast {42u32} else {7u32}));
+            }
+            assert!(tc.is_def_eq(&ctx, &accessor, &stored)?);
+            Ok::<(), TcError>(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn regression_436_custom_int_negation_reads_instance() {
+        regression_436_custom_unary_int_instance(false);
+    }
+
+    #[test]
+    fn regression_436_custom_int_natcast_reads_instance() {
+        regression_436_custom_unary_int_instance(true);
+    }
+
 }
