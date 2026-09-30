@@ -13639,4 +13639,118 @@ fn regression_430_iota_propagates_constructor_telescope_decline() {
         }).unwrap();
     }
 
+
+fn regression_432_nat_arithmetic_env() -> Environment {
+    use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+    let mut env = regression_429_nat_add_env();
+    let c = |i| expr::const_(i, vec![]);
+    let v = expr::bvar;
+    let pi = |d, b| expr::pi(expr::BinderInfo::Default, d, b);
+    let lam = |d, b| expr::lam(expr::BinderInfo::Default, d, b);
+    let nat = c(0);
+    let motive = || lam(nat.clone(), nat.clone());
+    let binary = || pi(nat.clone(), pi(nat.clone(), nat.clone()));
+    // Lean Prelude: mul a 0 := 0; mul a (succ b) := add (mul a b) a.
+    env.insert(5, CI::Def {
+        level_params: vec![], typ: binary(),
+        value: lam(nat.clone(), lam(nat.clone(), expr::apps(c(3), &[
+            motive(), c(1),
+            lam(nat.clone(), lam(nat.clone(), expr::apps(c(4), &[v(0), v(3)]))),
+            v(0),
+        ]))), hints: RH::Regular(2), is_unsafe: false,
+    });
+    // pred 0 := 0; pred (succ n) := n.
+    env.insert(6, CI::Def {
+        level_params: vec![], typ: pi(nat.clone(), nat.clone()),
+        value: lam(nat.clone(), expr::apps(c(3), &[
+            motive(), c(1), lam(nat.clone(), lam(nat.clone(), v(1))), v(0),
+        ])), hints: RH::Regular(1), is_unsafe: false,
+    });
+    // Lean Prelude: sub a 0 := a; sub a (succ b) := pred (sub a b).
+    env.insert(7, CI::Def {
+        level_params: vec![], typ: binary(),
+        value: lam(nat.clone(), lam(nat.clone(), expr::apps(c(3), &[
+            motive(), v(1),
+            lam(nat.clone(), lam(nat.clone(), expr::app(c(6), v(0)))),
+            v(0),
+        ]))), hints: RH::Regular(2), is_unsafe: false,
+    });
+    env
+}
+
+fn regression_432_assert_conversion(lhs: Expr, rhs: Expr, expected: bool) {
+    let env = regression_432_nat_arithmetic_env();
+    let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add",
+                             "Nat.mul", "Nat.pred", "Nat.sub"]);
+    let tc = Checker::new(&env, &names, Some(0), None);
+    tc.with_forced_eager_defeq(|| {
+        for id in [4, 5, 6, 7] {
+            let ConstantInfo::Def {typ, value, ..} = env.get(id).unwrap() else {panic!("fixture");};
+            let inferred = tc.infer_type(&Ctx::new(), value)?;
+            assert!(tc.is_def_eq(&Ctx::new(), &inferred, typ)?,
+                    "logical model {id} must typecheck");
+        }
+        let nat = expr::const_(0, vec![]);
+        let mut ctx = Ctx::new(); ctx.push(nat.clone()); ctx.push(nat.clone());
+        for term in [&lhs, &rhs] {
+            let inferred = tc.infer_type(&ctx, term)?;
+            assert!(tc.is_def_eq(&ctx, &inferred, &nat)?);
+        }
+        assert_eq!(tc.is_def_eq(&ctx, &lhs, &rhs)?, expected,
+                   "wrong definitional equality: {} vs {}", tc.pp(&lhs), tc.pp(&rhs));
+        Ok::<(), TcError>(())
+    }).unwrap();
+}
+
+#[test]
+fn regression_432_zero_mul_neutral_is_not_defeq() {
+    regression_432_assert_conversion(
+        expr::apps(expr::const_(5, vec![]), &[expr::const_(1, vec![]), expr::bvar(0)]),
+        expr::const_(1, vec![]), false);
+}
+
+#[test]
+fn regression_432_succ_mul_neutral_is_not_defeq() {
+    let c = |n| expr::const_(n, vec![]);
+    let mul = |a, b| expr::apps(c(5), &[a, b]);
+    let x = expr::bvar(1); let n = expr::bvar(0);
+    regression_432_assert_conversion(
+        mul(expr::app(c(2), x.clone()), n.clone()),
+        expr::apps(c(4), &[mul(x, n.clone()), n]), false);
+}
+
+#[test]
+fn regression_432_zero_sub_neutral_is_not_defeq() {
+    regression_432_assert_conversion(
+        expr::apps(expr::const_(7, vec![]), &[expr::const_(1, vec![]), expr::bvar(0)]),
+        expr::const_(1, vec![]), false);
+}
+
+#[test]
+fn regression_432_succ_sub_succ_neutral_is_not_defeq() {
+    let c = |n| expr::const_(n, vec![]);
+    let sub = |a, b| expr::apps(c(7), &[a, b]);
+    let x = expr::bvar(1); let n = expr::bvar(0);
+    regression_432_assert_conversion(
+        sub(expr::app(c(2), x.clone()), expr::app(c(2), n.clone())),
+        sub(x, n), false);
+}
+
+#[test]
+fn regression_432_defining_equations_and_closed_values_convert() {
+    let c = |n| expr::const_(n, vec![]);
+    let mul = |a, b| expr::apps(c(5), &[a, b]);
+    let sub = |a, b| expr::apps(c(7), &[a, b]);
+    let add = |a, b| expr::apps(c(4), &[a, b]);
+    let x = expr::bvar(1); let n = expr::bvar(0);
+    for (lhs, rhs) in [
+        (mul(x.clone(), c(1)), c(1)),
+        (mul(x.clone(), expr::app(c(2), n.clone())), add(mul(x.clone(), n.clone()), x.clone())),
+        (sub(x.clone(), c(1)), x.clone()),
+        (sub(x.clone(), expr::app(c(2), n.clone())), expr::app(c(6), sub(x, n))),
+        (mul(expr::lit_nat(2u32.into()), expr::lit_nat(3u32.into())), expr::lit_nat(6u32.into())),
+        (sub(expr::lit_nat(2u32.into()), expr::lit_nat(3u32.into())), c(1)),
+    ] { regression_432_assert_conversion(lhs, rhs, true); }
+}
+
 }
