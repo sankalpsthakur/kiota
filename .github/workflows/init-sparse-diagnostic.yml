@@ -1,0 +1,41 @@
+name: exact-init-sparse-key-diagnostic
+on:
+  push:
+    branches: [fix/remote-sparse-key-walk-20260930]
+    paths: ['scripts/remote/init_diagnostic.py', '.github/workflows/init-sparse-diagnostic.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: exact-init-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  init:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+        with:
+          version: "0.12.20"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Validate runner, generation and diagnostic source
+        timeout-minutes: 2
+        run: |
+          python3 -m py_compile scripts/remote/init_diagnostic.py
+          python3 -m unittest discover -s scripts/remote/tests -v
+      - name: Regenerate exact official Init, then bounded checker diagnostic
+        run: python3 scripts/remote/init_diagnostic.py
+      - name: Retain bounded evidence only, never full exports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-init-${{ github.sha }}-${{ github.run_id }}
+          path: init-report/
+          if-no-files-found: warn
+          retention-days: 7

@@ -120,3 +120,9 @@ HomLift36731974298 terminalaccept onimmutable178c3ba/orchestration7f78ec3: actua
 ### 2026-09-30 - Targeted Std availability triage prepared
 
 Preparedselected Std blastAdd.go_get_aux export withalllogicaldependencies, immutablechecker604e966 andLean4.34.1/exporter3.1.0. It islast100declmarkerofOOMStd,notprovenexactfailingdecl. Mustverifyactualtargetpresence/header/hashbeforebounded6GiB/no-swap/120schecker. FullStdremainsopen. NoMathlibcheckout/cachegatheringneededbecauseStdcomeswithLean. ExactInit/HomLiftandstrictmatrix5dd01cf remainlive; nostalerestart.
+
+### 2026-09-30 - Exact Init cache-safe baseline and sparse-walk replay
+
+Run36734387788 onchecker604e966/orchestration5dd01cf verifiesofficialSHA620502ac/347555345bytes/6487065lines buttimesout600.264s exit124 noOOM; lastdeclaration50930Vector.extract_push._proof_5. Earlier6bbc0faaccept555s isnotacceptanceofcache-safe604e966; correctnesscostmustbeoptimizedwithoutrestoringunsafealiases.
+
+Sparse-set-bit-walk8094dfb normalCI36735747764 andbothrelease/fullmatrix36735968570complete194cases193pass, all71negativesreject;onlypair5GiBmemory,unchangedbounds. Reference-scanreg439 confirmsidenticalcachekeysforallmasksindepth1..10/overflow. RepinnedexactInittoimmutable8094dfbwithsameflags/input/6GiB/no-swap/600sgate. Opt-inWHNFexperimentisseparate,noeffectconfounding. NoInitacceptanceorperformancegainclaimeduntilterminalreadback.

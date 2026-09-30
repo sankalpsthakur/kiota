@@ -19,7 +19,7 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 ARENA = "cdb3497bd9080229f3ea107b0b9d5d25bd9e71a6"
 EXPORTER = "66f1fb4bc256072069767fce52d39480e4524869"
-CHECKER = "604e96646218585a441e1e6068483225f8548008"
+CHECKER = "8094dfba503a85f8b0a4f6dee7a590f7cbd36ebe"
 TOOLCHAIN = "leanprover/lean4:v4.34.1"
 LEAN_SHA = "5045d0056413266e57c625dcd7c365b10e377c52"
 INPUT_SHA = "620502ac9e63ba4a2dea9d46386c2f6aebc49faf8848ea3aaa18a77a09491a6a"
