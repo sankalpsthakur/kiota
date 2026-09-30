@@ -1,0 +1,65 @@
+name: paired-selected-std-context-key-diagnostic
+on:
+  push:
+    branches: [fix/remote-context-key-memo-20260930]
+    paths: ['scripts/remote/stdproof_context_key_diagnostic.py', '.github/workflows/stdproof-context-key-diagnostic.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: stdproof-context-key-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  stdproof:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+        with:
+          version: "0.12.20"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Validate paired command and unchanged limits
+        timeout-minutes: 2
+        run: |
+          python3 -m py_compile scripts/remote/stdproof_context_key_diagnostic.py
+          python3 -m unittest discover -s scripts/remote/tests -v
+      - name: Baseline flag-off on this runner
+        continue-on-error: true
+        run: KIOTA_CTX_DIAGNOSTIC_MODE=lazy-head python3 scripts/remote/stdproof_context_key_diagnostic.py
+      - name: Flag-on on the same runner and exact frozen input
+        continue-on-error: true
+        run: KIOTA_CTX_DIAGNOSTIC_MODE=ctx-key-memo python3 scripts/remote/stdproof_context_key_diagnostic.py
+      - name: Validate both executions and report revision-scoped comparison
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          reports = [json.loads((Path("stdproof-context-key-report") / mode / "report.json").read_text()) for mode in ("lazy-head", "ctx-key-memo")]
+          for mode, report in zip(("lazy-head", "ctx-key-memo"), reports):
+              assert report["mode"] == mode
+              assert report["checker_revision"] == "258a309f94afe506cf0c866c6551fb61ff625be3"
+              assert report["input_sha256"] == "b13db37bcbae93d41d7d20405050beade15689511f1bb689ad866435270c33e6"
+              assert report["input_bytes"] == 22877330 and report["input_lines"] == 436979
+              assert report["exported_declarations"] == 4066 and report["target_present"]
+              assert report["stdproof_input_verified"] and report["checker_started"]
+              assert not report.get("error") and not report.get("cleanup_error")
+              assert not report["full_std_verified"] and not report["arena_rank_verified"]
+          assert reports[0]["binary_sha256"] == reports[1]["binary_sha256"]
+          print(json.dumps({"same_runner": True, "same_binary": True, "full_std_verified": False, "arena_rank_verified": False, "comparisons": [{k: report[k] for k in ("mode", "checker_revision", "input_sha256", "binary_sha256", "stdproof_verdict", "stdproof_accepted", "diagnostic")} for report in reports]}))
+          raise SystemExit(0 if reports[1]["stdproof_accepted"] else 1)
+          PY
+      - name: Retain bounded paired evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stdproof-context-key-${{ github.sha }}-${{ github.run_id }}
+          path: stdproof-context-key-report/
+          if-no-files-found: warn
+          retention-days: 7

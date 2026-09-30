@@ -130,3 +130,7 @@ Sparse-set-bit-walk8094dfb normalCI36735747764 andbothrelease/fullmatrix36735968
 ### 2026-09-30 - Bounded exact context-key memo hypothesis
 
 Selected actualStdtarget on08dd3a4a run36739623514 stilltimesout120.202s noOOM with frozenSHA b13db37b/22877330bytes436979lines4066declarations. Notacceptance. Newisolated opt-in KIOTA_CTX_KEY_MEMO memoizes onlypure transitive keycomputation by exact(fullctxid,usedmask,looserange), capped4096scalarentries withclear-on-full. BothCTXnamespace reset sites clearnewmemo beforeIDreuse. Defaultreductionrules/cachekeys/limitsunchanged. Regressions441 covertransitivedependencies,eviction,namespace reset;439comparesmemoizedresulttofullreference foralldepth1..10masks. NoExprretention. Boundedquery/hittelemetry testswhether hypothesispaysbeforepromotion. Full194caserelease comparisonpreservesall71negatives and5GiB/120s gate. Allheavyworkremote.
+
+### 2026-09-30 - Same-runner paired Std command prepared
+
+No-suffix exactInit36739167260 on08dd3a4a reaches44435 at600.247stimeout/noOOM, versus55025earlier8094dfba; independenthardwarevariance orregressionmeansnogainclaimandnopromotion. PreparepairedselectedStdcomparison onimmutable258a309f, flag-offthenflag-on ononesameUbuntu22.04runner. ExactfrozenSHA b13db37b/bytes/lines/declarations,targetpresence,binarySHAequality andbothchecker-start readbacksrequired;6GiB/no-swap/120ssliceunchanged. Newmemo source must firstpassnormal/release tests andall71negative replay. NotfullStd,Mathliborofficialrankproof.
