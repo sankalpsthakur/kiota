@@ -19,7 +19,7 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 ARENA = "cdb3497bd9080229f3ea107b0b9d5d25bd9e71a6"
 EXPORTER = "66f1fb4bc256072069767fce52d39480e4524869"
-CHECKER = "c46771a38c9f530b355e7fc7d9c5c1355412196e"
+CHECKER = "f0129dea273d329f747b4f577136ee7419d2ad6f"
 TOOLCHAIN = "leanprover/lean4:v4.34.1"
 LEAN_SHA = "5045d0056413266e57c625dcd7c365b10e377c52"
 INPUT_SHA = "620502ac9e63ba4a2dea9d46386c2f6aebc49faf8848ea3aaa18a77a09491a6a"
@@ -145,6 +145,7 @@ try:
           "--user", str(os.getuid()) + ":" + str(os.getgid()),
           "--env", "KIOTA_PROGRESS=1",
           "--env", "KIOTA_TRACE_CONVERSION=1",
+          "--env", "KIOTA_LAZY_HEAD=1",
           "--mount", "type=bind,src=" + str(binary) + ",dst=/checker,readonly",
           "--mount", "type=bind,src=" + str(source) + ",dst=/input,readonly",
           "--mount", "type=bind,src=/usr/bin/time,dst=/time,readonly",
