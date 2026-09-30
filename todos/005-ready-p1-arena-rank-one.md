@@ -106,3 +106,7 @@ Remote arithmetic fixes pass204 Rust tests; latest abort guard206+33. Lazy-head 
 - Strict projection safety fix6bbc0fa closes the lazy-head falseaccept: all71negatives reject in default and opt-in runs36727096974, each193/194 (onlypairmemory).207Rust+33supervisor tests pass. New bounded exactInit replay will use immutable6bbc0fa; no official promotion, fullMathlib score, or rank gain.
 
 - ExactInitrun36727708589 verifies57551declarations accepted on immutable6bbc0fa withlazy-head+stats,555.3sunder6GiB/no-swap/600s. First real fullInitacceptance in this remote sequence. NoStd/Mathlibacceptance, officialpromotion, orrankgain. Currentnewsourcecorrects twoadditional reproducedIntinstancebugs and needsitsown exacthead/fullcorpusgates; do notcopy6bbc0faacceptanceontoit.
+
+### 2026-09-30 - Full Std memory gate and newly reproduced soundness gate
+
+FullStd178c3ba isnotaccepted: exactinputmatchesbut6GiB OOM at568.7s. ActualIsHomLift recursor dependency slice435declarations accepts0.19s; notfullMathlibproof. Sparse-contextcachecounterexample reproducedonisolatedbaadfdc (coldreject/warmfalseaccept) andfix5982cb1 isunderCI, notpromoted. PriorInitacceptance6bbc0fa remainsrevision-scoped; newlyfound cache issue meansallcandidate acceptanceevidence needsrevalidationaftercorrection. Officialpin2d2a9fa remainsunchanged;rank-onegateopen.

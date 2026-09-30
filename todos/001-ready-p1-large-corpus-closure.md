@@ -110,3 +110,9 @@ Prepared remote-only Std pipeline usingcurrent official596655086bytes/10826639li
 ### 2026-09-30 - Actual Mathlib recursor slice prepared
 
 Exact Std36730359430 remains live onimmutable178c3ba. Prepared distinct remote HomLift dependency export fromArena-pinnedMathlibd13f23b/exporter66f1fb4/Lean4.34.1; actualCategoryTheory.Functor.IsHomLift.rec andowner must be present beforechecker. Cache onlytargeted module dependencies, no fullMathlib build/export. Hash/header/source/binary readbacks andsame6GiB/no-swap with120s slice timeout. All71negative replay alreadyrejects onchecker178c3ba, but this newactualMatlib slice isnotfullMathlibclosure/rank evidence. Existing numeric-BVar large-elimination correction isnotrewritten withoutnewfailure. Corrected cosmeticStd workflowstep label; ongoingjob unchanged.
+
+### 2026-09-30 - Exact Std OOM and actual HomLift acceptance
+
+Std36730359430 terminal: inputverified596655086bytes10826639lines/SHA289ed65a/checker178c3ba; DockerOOMKilledtrue exit137 after568.737s insideunchanged6GiB/no-swap/590s. Actualchecker maxRSS6281448KiB fromchecker.time (dockerattach29MiB isnotcheckerRSS). Last100-declaration marker21300 Std.Tactic.BVDecide.BVExpr.bitblast.blastAdd.go_get_aux; it doesnotidentify exactfailingdecl. Tailcachecountswhnf19155294/core21420086/infer29350002, interncalls1.8billion. This ismemoryfailure, noacceptance.
+
+HomLift36731974298 terminalaccept onimmutable178c3ba/orchestration7f78ec3: actualArena-pinnedMathlibd13f23b/Lean4.34.1/exporter3.1.0 selectedrecursorandall435declarationdependencies,673065bytes12080lines/SHA df2f1398d740f808c5ce0c39723822792740c5f1a682a0af07b2aa15ae202552,0.1904s,6GiB/no-swap/120sslice bound. Actualtarget/ownerpresencevalidated; nofullMathlibacceptance orrankclaim.
