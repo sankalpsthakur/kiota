@@ -126,3 +126,7 @@ Preparedselected Std blastAdd.go_get_aux export withalllogicaldependencies, immu
 Run36734387788 onchecker604e966/orchestration5dd01cf verifiesofficialSHA620502ac/347555345bytes/6487065lines buttimesout600.264s exit124 noOOM; lastdeclaration50930Vector.extract_push._proof_5. Earlier6bbc0faaccept555s isnotacceptanceofcache-safe604e966; correctnesscostmustbeoptimizedwithoutrestoringunsafealiases.
 
 Sparse-set-bit-walk8094dfb normalCI36735747764 andbothrelease/fullmatrix36735968570complete194cases193pass, all71negativesreject;onlypair5GiBmemory,unchangedbounds. Reference-scanreg439 confirmsidenticalcachekeysforallmasksindepth1..10/overflow. RepinnedexactInittoimmutable8094dfbwithsameflags/input/6GiB/no-swap/600sgate. Opt-inWHNFexperimentisseparate,noeffectconfounding. NoInitacceptanceorperformancegainclaimeduntilterminalreadback.
+
+### 2026-09-30 - Sparse Init terminal result and no-suffix follow-up
+
+Exact Init36737090830 orchestratione59da412/checker8094dfba verifies official347555345bytes/6487065lines/SHA620502ac, timesout600.2086s exit124 noOOM at declaration55025. Baseline604e966 reached50930; increased progress is not full acceptance or hardware-independent speedup. Same6GiB/no-swap/600s, all57551 declarations required. No-suffix source08dd3a4a passes214 Rust+45 policy tests and strict matrix36737357680:194complete193pass in default/lazy-head, all71negatives reject, onlypair5GiBRSS. Repin exact Init to immutable08dd3a4a, unchangedinput/flags/limits. This source is not integrated/promoted. All work remote.
