@@ -971,6 +971,10 @@ pub struct Checker<'e> {
     /// Test/diagnostic only: counts `iota_lit_memo` misses (i.e. actual
     /// `iota_from_first_principles` derivations of a Nat-literal peel).
     iota_lit_memo_misses: std::cell::Cell<u32>,
+    /// Optional bounded reduction history, printed only on a projection error.
+    /// Diagnostics only; no changes to reduction or conversion decisions.
+    projection_trace_enabled: bool,
+    projection_iota_trace: RefCell<std::collections::VecDeque<(u32, u32, usize, usize, Expr, Expr)>>,
     /// Test-only override for whether `iota_lit_memo` is consulted, so a
     /// test can disable it on *this* `Checker` without mutating the
     /// process-wide `KIOTA_NO_IOTA_MEMO` env var (which `cargo test`'s
@@ -1270,6 +1274,8 @@ impl<'e> Checker<'e> {
             iota_value_cache: RefCell::new(FxHashMap::default()),
             iota_lit_memo: RefCell::new(FxHashMap::default()),
             iota_lit_memo_misses: std::cell::Cell::new(0),
+            projection_trace_enabled: std::env::var_os("KIOTA_TRACE_PROJECTION").is_some(),
+            projection_iota_trace: RefCell::new(std::collections::VecDeque::new()),
             iota_memo_override: std::cell::Cell::new(None),
             fuel_nat_peels: std::cell::Cell::new(0),
             fuel_nat_last: std::cell::RefCell::new(None),
@@ -1970,11 +1976,20 @@ impl<'e> Checker<'e> {
         let (head, args) = expr::unfold_apps(&vtw);
         let (ind_name, us) = match &**head {
             ExprData::Const(n, us) => (*n, us.clone()),
-            _ => return reject(format!(
-                "projection of non-inductive value: {}.{}; value={}; inferred={}; whnf={}",
-                self.name_str(sname), idx,
-                self.pp_budget(v, 12), self.pp_budget(&vt, 12), self.pp_budget(&vtw, 12),
-            )),
+            _ => {
+                if self.projection_trace_enabled {
+                    for (rec, ctor, slot, fields, major, rhs) in self.projection_iota_trace.borrow().iter() {
+                        eprintln!("PROJ_IOTA rec={} ctor={} slot={} fields={} major={} rhs={}",
+                            self.name_str(*rec), self.name_str(*ctor), slot, fields,
+                            self.pp_budget(major, 5), self.pp_budget(rhs, 5));
+                    }
+                }
+                return reject(format!(
+                    "projection of non-inductive value: {}.{}; value={}; inferred={}; whnf={}",
+                    self.name_str(sname), idx,
+                    self.pp_budget(v, 12), self.pp_budget(&vt, 12), self.pp_budget(&vtw, 12),
+                ));
+            },
         };
         if ind_name != sname {
             return reject("projection struct name mismatch");
@@ -4480,6 +4495,11 @@ impl<'e> Checker<'e> {
             cname,
             fields,
         )?;
+        if self.projection_trace_enabled {
+            let mut trace = self.projection_iota_trace.borrow_mut();
+            if trace.len() >= 16 { trace.pop_front(); }
+            trace.push_back((rname, cname, minor_idx, fields.len(), major_w.clone(), rhs.clone()));
+        }
         if iota_memo_on && rest.is_empty() {
             if let ExprData::Lit(Lit::Nat(n)) = &**major_w {
                 let key = Self::iota_lit_memo_key(rname, &us, motives, minors, n);
