@@ -24,7 +24,7 @@ root = Path(__file__).resolve().parents[2]
 gate = module("arena_gate", root / "scripts/arena_gate.py")
 runner = module("remote_runner", root / "scripts/remote/runner.py")
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--mode", choices=("default", "reclaim", "collect"), required=True)
+parser.add_argument("--mode", choices=("default", "reclaim", "collect", "collect-only"), required=True)
 parser.add_argument("--archive", type=Path, required=True)
 parser.add_argument("--binary", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
@@ -39,6 +39,8 @@ if args.mode == "reclaim":
     env["KIOTA_RECLAIM"] = "1"
 elif args.mode == "collect":
     env["KIOTA_COLLECT"] = "1"
+elif args.mode == "collect-only":
+    env["KIOTA_COLLECT_ONLY"] = "1"
 wanted = {"good/perf/magma-list-pair-n7.ndjson", "good/perf/magma-list-pair-n21.ndjson",
           "good/perf/magma-list-deep-n21.ndjson", "good/perf/magma-list-deep-n36.ndjson"}
 report = {"mode": args.mode, "scope": "arena-small-only" if args.all else "four-memory-fixtures",

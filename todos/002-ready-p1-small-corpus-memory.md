@@ -43,7 +43,7 @@ the 16 GB Mac. Preserve exact inputs, binary hashes, and limits in reports.
 
 - [x] Baseline/candidate comparison distinguishes inherited failure from regression.
 - [x] Pair-n21 accepts under the unchanged 8,192 MiB Linux address-space cap.
-- [ ] Current 122 positive and 71 negative Arena cases pass the strict gate.
+- [ ] Current 123 positive and 71 negative Arena cases pass the strict gate.
 - [ ] Default and experimental NbE outcomes are recorded separately.
 
 ## Work Log
@@ -108,3 +108,16 @@ is not promoted, and the full strict Linux acceptance criterion stays unchecked.
 - https://github.com/sankalpsthakur/kiota/pull/12
 - https://github.com/sankalpsthakur/kiota/actions/runs/36317993571
 - `docs/checkpoints/2026-09-27.md`
+
+### 2026-09-30 - Isolate collection from cache eviction
+
+Default checker479cf04 exact-head strict run36720934889 completes193/194,
+all71 negative inputs reject, only pair-n21 hits5GiB RSS watchdog. Prior
+collector experiment varied kernel caps while transformation caches still
+evicted at50k. A separate opt-in KIOTA_COLLECT_ONLY experiment reuses
+collector lifetime logic from immutable2058ec2, but keeps every existing
+transformation/kernel cache policy unchanged. It removes only interner-owned
+last references, keeps all live identities, and is off by default. Full194
+case baseline/experiment replay under identical8GiB address/5GiB RSS/120s
+gates determines whether cache eviction, not collection, caused deep-n36
+regression. No promotion, full-corpus or ranking claim follows yet.

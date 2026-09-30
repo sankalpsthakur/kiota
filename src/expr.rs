@@ -7,6 +7,16 @@ use std::io::Write;
 use std::rc::Rc;
 
 mod reclaim;
+mod collect;
+
+/// Diagnostic only: collect unowned strong-interner nodes without evicting
+/// any transformation or kernel memo. Off by default.
+fn collect_only_enabled() -> bool {
+    thread_local! {
+        static ENABLED: bool = std::env::var_os("KIOTA_COLLECT_ONLY").is_some();
+    }
+    ENABLED.with(|enabled| *enabled)
+}
 
 /// Experimental only: retain no strong references in the interner and bound
 /// disposable memo tables. Off by default until full correctness/resource gates.
@@ -306,6 +316,7 @@ fn node_eq(a: &ExprData, b: &ExprData) -> bool {
 struct Interner {
     primary: FxHashMap<u64, Expr>,
     overflow: FxHashMap<u64, Vec<Expr>>,
+    next_collection: usize,
 }
 
 impl Default for Interner {
@@ -313,12 +324,17 @@ impl Default for Interner {
         Interner {
             primary: FxHashMap::default(),
             overflow: FxHashMap::default(),
+            next_collection: 1_000_000,
         }
     }
 }
 
 impl Interner {
     fn intern(&mut self, d: ExprData) -> Expr {
+        if collect_only_enabled() && self.len() >= self.next_collection {
+            self.collect_dead();
+            self.next_collection = self.len().saturating_add(250_000);
+        }
         let h = hash_node(&d);
         if let Some(e) = self.primary.get(&h) {
             if node_eq(&d, e) {
