@@ -13982,4 +13982,45 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             "checked cache entry from P : Prop must not authorize f x under P : Type");
     }
 
+    #[test]
+    fn regression_437_closed_declaration_cannot_warm_prop_cache_for_data() {
+        let binder = |p_sort: Level| vec![
+            expr::sort(p_sort),
+            expr::pi(expr::BinderInfo::Default, expr::bvar(0), expr::sort(level::succ(level::zero()))),
+            expr::bvar(1), expr::bvar(2),
+            expr::pi(expr::BinderInfo::Default,
+                expr::app(expr::bvar(2), expr::bvar(1)), expr::sort(level::zero())),
+            expr::app(expr::bvar(3), expr::bvar(1)),
+        ];
+        let wrap = |domains: Vec<Expr>, body: Expr, lambda: bool| domains.into_iter().rev()
+            .fold(body, |body, domain| if lambda {
+                expr::lam(expr::BinderInfo::Default, domain, body)
+            } else { expr::pi(expr::BinderInfo::Default, domain, body) });
+        let prop = binder(level::zero());
+        let data = binder(level::succ(level::zero()));
+        let body = expr::app(expr::bvar(1), expr::bvar(0));
+        let good_ty = wrap(prop.clone(), expr::sort(level::zero()), false);
+        let good = wrap(prop, body.clone(), true);
+        let bad_ty = wrap(data.clone(), expr::sort(level::zero()), false);
+        let bad = wrap(data, body, true);
+        assert!(expr::is_closed(&good) && expr::is_closed(&bad));
+        let names = test_names(&["cacheRegression"]);
+        let check = |typ: Expr, value: Expr| {
+            let mut env = Environment::default();
+            env.insert(0, ConstantInfo::Def {level_params: vec![], typ, value,
+                hints: crate::env::ReducibilityHints::Regular(0), is_unsafe: false});
+            Checker::new(&env, &names, None, None).check_decl(0, "def")
+        };
+        assert!(check(good_ty.clone(), good.clone()).is_ok(), "closed Prop control accepts");
+        assert!(matches!(check(bad_ty.clone(), bad.clone()), Err(TcError::Reject(_))),
+            "cold closed data control rejects");
+        // The let value is valid and warms the same shared body under P:Prop.
+        // The let body is closed; no binder shifting or fixture assumptions
+        // can explain accepting it under P:Type.
+        let warm_bad = expr::let_(good_ty, good, bad);
+        assert!(expr::is_closed(&warm_bad));
+        assert!(matches!(check(bad_ty, warm_bad), Err(TcError::Reject(_))),
+            "one closed declaration must not reuse Prop-only checked inference for data");
+    }
+
 }
