@@ -118,3 +118,9 @@ Diagnosticchecker604e966integratesverifiedtransitivecontextfix5982cb1 plusclosed
 ### 2026-09-30 - Rank-one evidence remains open, optimization diagnostics continue
 
 Liveofficialboardreadbackstill20/25,71invalidreject/125validaccept/1falsereject/6declines,noMathlibscore. Fullcache-safeInit604e966 timesout600s, andStd178c3baOOM6GiB: cannotpromoteearlierunsafe-cacheInitpass. HomLift actual435declsliceandStd3866declsliceacceptbutnotfullMathlib/Std. All71downloadednegativesstillrejectinlatestfullmatrices, pairmemoryopen. Trackingseparatesverdictsfrompendingindependentmemorysharing andsparse-key-scanexperiments. OfficialpinanddraftPRunchanged;rank1objectiveactive.
+
+### 2026-09-30 - Rank-one goal retained and actual Std OOM isolated
+
+Goal remains verified official position1, not partial corpus acceptance. Live board readback still20/25,71invalidreject/125validaccept/1falsereject/6declines/noacceptedMathlibscore. ExactStd36736722100 verifiesSHA289ed65a and596655086bytes/10826639lines; opt-in dependency-WHNF checkerc5459496 hits6GiB OOM at292.912s. New declaring-name telemetry identifies actual active body Std.Tactic.BVDecide.BVExpr.bitblast.blastAdd.go_denote_eq._unary, not previous go_get_aux marker. Targeted dependency export run36738674776 launched at orchestration3e48c458/checker604e966; generation/hash/presence/120s outcome pending. FullStd acceptance not established.
+
+Sparse-key source8094dfba exactInit36737090830 timesout600.209s noOOM at declaration55025, versus50930 on604e966. Progress is not acceptance or independent instruction measurement. Source08dd3a4a removes unused suffix work, passes214Rust+45policy and strict194case matrix36737357680:193pass all71negativesreject both modes, onlypair5GiBRSS. Next exactInit separately pins08dd3a4a; no outcome copied between SHAs. Main diagnostic checker604e966 stays unchanged. Official pin, draftPR12 and public promotion remain untouched. Allheavyworkremote; capsunchanged.
