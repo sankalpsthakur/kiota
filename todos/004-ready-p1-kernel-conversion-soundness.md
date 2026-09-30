@@ -158,3 +158,14 @@ Official Mathlib false reject is CategoryTheory.Functor.IsHomLift's large
 elimination check. Official2d2a9fa compares conclusion BVars by intern pointer;
 72f7fde already uses the numeric index and has reset-state regression controls.
 This is a promising existing correction, not proof that full Mathlib accepts.
+
+### 2026-09-30 - Bounded trace distinguishes the actual malformed term
+
+Exact replay36716037326 (checker d3b6c55) again rejects at declaration17726,
+after150.7s, without OOM or timeout. The PProd.0 projection is applied to a
+two-argument lambda; its inferred type and WHNF are Pis, not a structure.
+Do not bypass this check. Optional trace906b605 retains at most16 recent iota
+reductions and prints them only at a projection error. No conversion rule was
+changed. Next exact replay pins this immutable trace checker with unchanged
+input, memory, swap, timeout and log budgets. Normal/release and strict small
+gates remain separate from large-corpus acceptance and official rank.
