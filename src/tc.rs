@@ -974,6 +974,8 @@ pub struct Checker<'e> {
     /// Optional bounded reduction history, printed only on a projection error.
     /// Diagnostics only; no changes to reduction or conversion decisions.
     lazy_head_enabled: Cell<bool>,
+    /// Opt-in dependency-closed WHNF keys; mode is immutable for a checker.
+    dependency_whnf_enabled: bool,
     conversion_trace_enabled: bool,
     conversion_trace_reported: Cell<bool>,
     conversion_trace: RefCell<Vec<(usize, Expr, Expr)>>,
@@ -1306,6 +1308,7 @@ impl<'e> Checker<'e> {
             iota_lit_memo: RefCell::new(FxHashMap::default()),
             iota_lit_memo_misses: std::cell::Cell::new(0),
             lazy_head_enabled: Cell::new(std::env::var_os("KIOTA_LAZY_HEAD").is_some()),
+            dependency_whnf_enabled: std::env::var_os("KIOTA_DEPENDENT_WHNF").is_some(),
             conversion_trace_enabled: std::env::var_os("KIOTA_TRACE_CONVERSION").is_some(),
             conversion_trace_reported: Cell::new(false),
             conversion_trace: RefCell::new(Vec::new()),
@@ -1329,10 +1332,13 @@ impl<'e> Checker<'e> {
         expr::identity(e)
     }
 
-    fn whnf_cache_key(ctx: &Ctx, e: &Expr) -> (u64, usize) {
-        // Closed terms are context-free. Open terms (K-like `Eq.rec`/`True.rec`
-        // of a bvar major) infer the major's type, so the key includes `ctx.id`.
-        let ctx_key = if expr::is_closed(e) { 0 } else { ctx.id };
+    fn whnf_cache_key(&self, ctx: &Ctx, e: &Expr) -> (u64, usize) {
+        // A reduction may inspect a free variable's inferred type (K/proj).
+        // Opt-in keys therefore include its entire transitive type dependency
+        // closure, not just directly used raw types. Unreachable bindings can
+        // safely share reductions; overflow conservatively uses full ctx.id.
+        let ctx_key = if self.dependency_whnf_enabled { ctx.term_ctx_key(e) }
+            else if expr::is_closed(e) { 0 } else { ctx.id };
         (ctx_key, Self::ptr_key(e))
     }
 
@@ -2909,7 +2915,7 @@ impl<'e> Checker<'e> {
                 let _ = std::io::Write::flush(&mut std::io::stderr());
             }
         }
-        let k = Self::whnf_cache_key(ctx, e);
+        let k = self.whnf_cache_key(ctx, e);
         // See `is_def_eq_inner`'s `force_eager` comment: `whnf_core` → iota
         // → `mk_rec_call` calls the *dispatching* `is_def_eq`, so a WHNF
         // computed while NOT forced-eager can differ from one computed
@@ -3327,7 +3333,7 @@ impl<'e> Checker<'e> {
             }
             return Ok(e);
         }
-        let k = Self::whnf_cache_key(ctx, &e);
+        let k = self.whnf_cache_key(ctx, &e);
         // See `whnf`'s `force_eager` comment just above it.
         let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
         if let Some(r) = self.whnf_core_cache_get(force_eager, &k) {
@@ -14076,6 +14082,24 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         assert!(expr::is_closed(&warm_bad));
         assert!(matches!(check(bad_ty, warm_bad), Err(TcError::Reject(_))),
             "one closed declaration must not reuse Prop-only checked inference for data");
+    }
+
+    #[test]
+    fn regression_438_whnf_keys_preserve_dependencies_not_unreachable_binders() {
+        let env = Environment::default(); let names = Vec::new();
+        let mut tc = Checker::new(&env, &names, None, None);
+        tc.dependency_whnf_enabled = true;
+        let mut a = Ctx::new(); a.push(ty(1)); a.push(ty(7)); a.push(expr::bvar(1));
+        let mut b = Ctx::new(); b.push(ty(1)); b.push(ty(8)); b.push(expr::bvar(1));
+        let mut different = Ctx::new(); different.push(ty(2)); different.push(ty(7)); different.push(expr::bvar(1));
+        let e = expr::bvar(0);
+        assert_ne!(a.id, b.id);
+        assert_eq!(tc.whnf_cache_key(&a, &e), tc.whnf_cache_key(&b, &e));
+        assert_ne!(tc.whnf_cache_key(&a, &e), tc.whnf_cache_key(&different, &e));
+        assert_eq!(tc.whnf_cache_key(&a, &ty(5)).0, 0);
+        let mut overflow = Ctx::new(); for _ in 0..65 {overflow.push(ty(1));}
+        overflow.push(expr::bvar(64));
+        assert_eq!(tc.whnf_cache_key(&overflow, &e).0, overflow.id);
     }
 
 }

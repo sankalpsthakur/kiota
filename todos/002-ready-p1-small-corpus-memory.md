@@ -112,3 +112,7 @@ is not promoted, and the full strict Linux acceptance criterion stays unchecked.
 ### 2026-09-30 - Closure evaluator rejected by current remote evidence
 
 Separate29f2e57/source6bbc0fa run36728328775 passes207 default/opt-in release tests+33harness controls, but strict corpus stops at98/194 when720stotal watchdog expires:87passes,11failures. All71negatives ran:70reject,refute-cheap-last hits5GiBRSS (not a wrong accept, not a reject). Paired-n21 remains5GiBmemorylimit17.90s; deep-n21/deep-n36 each120stimeout,27MiBRSS. Multiple foldedconstant/arg/grind cases also memory/timefail. Remaining96cases unexecuted. No closure-evaluator promotion or speed gain; don't repeat unchanged mode or raisecaps. Default/lazy-head178c3ba still193/194 withall71negativesreject and onlypairmemory.
+
+### 2026-09-30 - Dependency-closed WHNF memo experiment
+
+StdOOMreport has19mWHNF/21mcore/29minfer entries. CurrentWHNFmemo usesfullctx.idforanyopenterm, despitecorrectedinfer/defeqtransitiveclosure. Isolatedopt-inKIOTA_DEPENDENT_WHNF computesexactdependencyclosedctxkey (numericposition+rawtypeidentity,transitiveoutwardbindings,overflowfullid); doesnotchangekernelreductions, skipvalidation,evictmemos,orrelaxcaps. ModeimmutableperChecker. Comparelazy-headvsdep-whnf fullreviewed194caseswithall71negativesand8GiBAS/5GiBRSS/120sunchanged. Newreg438checkssharingonlyunreachablebindings,dependencydifferenceand64bitfallback. EntireRustsuitealsoexecuteswithbothflags. NofullStd/Init/rankclaimuntilboundedexactrevalidation.
