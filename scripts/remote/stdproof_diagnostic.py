@@ -23,7 +23,7 @@ CHECKER = "604e96646218585a441e1e6068483225f8548008"
 TOOLCHAIN = "leanprover/lean4:v4.34.1"
 LEAN_SHA = "5045d0056413266e57c625dcd7c365b10e377c52"
 MODULE = "Std"
-TARGET = "Std.Tactic.BVDecide.BVExpr.bitblast.blastAdd.go_get_aux"
+TARGET = "Std.Tactic.BVDecide.BVExpr.bitblast.blastAdd.go_denote_eq._unary"
 IMAGE = "ubuntu@sha256:281c5745f657873d78e5531fc5ba8575f46ab7769b94550ac99543f122679986"
 MIB = 1024 * 1024
 temp_root = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)

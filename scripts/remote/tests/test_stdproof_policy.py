@@ -50,7 +50,7 @@ class StdProofContainerPolicyTests(unittest.TestCase):
     def test_selected_std_is_never_full_std_proof(self):
         source = SOURCE.read_text()
         self.assertIn('CHECKER = "604e96646218585a441e1e6068483225f8548008"', source)
-        self.assertIn('TARGET = "Std.Tactic.BVDecide.BVExpr.bitblast.blastAdd.go_get_aux"', source)
+        self.assertIn('TARGET = "Std.Tactic.BVDecide.BVExpr.bitblast.blastAdd.go_denote_eq._unary"', source)
         self.assertIn('"full_std_verified": False', source)
         self.assertIn('"full_corpus_verified": False', source)
         self.assertIn('"arena_rank_verified": False', source)
