@@ -13942,4 +13942,44 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         regression_436_custom_unary_int_instance(true);
     }
 
+    #[test]
+    fn regression_437_checked_inference_cache_tracks_outer_type_dependencies() {
+        let env = Environment::default();
+        let names = Vec::new();
+        let validator = Checker::new(&env, &names, None, None);
+        let make_ctx = |p_sort: Level| {
+            let mut ctx = Ctx::new();
+            // P, F : P -> Type, h1 h2 : P, f : F h1 -> Prop, x : F h2.
+            // The directly used binders f/x have identical raw types in the
+            // two contexts, but checking f x depends on whether P is Prop.
+            let domains = vec![
+                expr::sort(p_sort),
+                expr::pi(expr::BinderInfo::Default, expr::bvar(0), expr::sort(level::succ(level::zero()))),
+                expr::bvar(1),
+                expr::bvar(2),
+                expr::pi(expr::BinderInfo::Default,
+                    expr::app(expr::bvar(2), expr::bvar(1)), expr::sort(level::zero())),
+                expr::app(expr::bvar(3), expr::bvar(1)),
+            ];
+            for dom in domains {
+                let dom_ty = validator.infer_type(&ctx, &dom).expect("fixture binder is well typed");
+                validator.ensure_sort(&ctx, &dom_ty).expect("fixture binder type is a sort");
+                ctx.push(dom);
+            }
+            ctx
+        };
+        let prop_ctx = make_ctx(level::zero());
+        let type_ctx = make_ctx(level::succ(level::zero()));
+        assert_ne!(prop_ctx.id, type_ctx.id);
+        let term = expr::app(expr::bvar(1), expr::bvar(0));
+        let cold = Checker::new(&env, &names, None, None);
+        assert!(matches!(cold.infer_type(&type_ctx, &term), Err(TcError::Reject(_))),
+            "distinct data indices h1/h2 must not convert without a warm cache");
+        let warm = Checker::new(&env, &names, None, None);
+        let result = warm.infer_type(&prop_ctx, &term).expect("proof indices convert by proof irrelevance");
+        assert!(matches!(&**result, ExprData::Sort(l) if level::is_def_eq(l, &level::zero())));
+        assert!(matches!(warm.infer_type(&type_ctx, &term), Err(TcError::Reject(_))),
+            "checked cache entry from P : Prop must not authorize f x under P : Type");
+    }
+
 }
