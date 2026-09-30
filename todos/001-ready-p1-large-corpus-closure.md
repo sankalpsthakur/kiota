@@ -96,3 +96,7 @@ remain separate prerequisites.
 ### 2026-09-30 - Corrected lazy comparison replay
 
 Unsafe prototypef0129de exactInit36725031921 verifies current347555345byte/6487065line/SHA620502ac input and reaches declaration50862 before600stimeout/noOOM. It is not acceptance, and later strict negatives caught proj-of-subst-prop falseaccept. Do not use this run as correctness evidence. Corrected6bbc0fa adds strict projection-sort checks and passes all71 negatives in reviewed194case full matrix36727096974; onlypairRSS fails. NewexactInit is pinned to6bbc0fa with6GiB/no-swap/600s unchanged and boundedstatistics to localize remainingcost. All source/build/export/artifact work stays remote.
+
+### 2026-09-30 - Exact Init acceptance finally verified
+
+Run36727708589, orchestration34f6f17/checker6bbc0fa, KIOTA_LAZY_HEAD=1 andKIOTA_STATS=1: official input verified347555345bytes6487065lines/SHA620502ac9e63ba4a2dea9d46386c2f6aebc49faf8848ea3aaa18a77a09491a6a; all57551declarations accept, exit0,555.2989s inside unchanged6GiB/no-swap/600scontainer, noOOM. BinarySHA379038e68ad1d9377625ad5cb8a9c4d0b95151163ddb469459205e3c79a4da1d. The reported29.8MiB sampledRSS belongs to docker attach, NOT Kiota; do not claim that checker RSS. STATS41729024infer/61160876whnf/26540054defeq/604723552instnodes/707486578interncalls; totalinputscopeInit only. NoMathlib,Std,officialpin orrankclosure. Twoadditional customNeg/cast corrections are onnewsource and must separately reverify.

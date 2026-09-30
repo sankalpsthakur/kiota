@@ -5981,56 +5981,6 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
-            "Neg.neg" if args.len() >= 3 => {
-                let ty = self.whnf(ctx, &args[0])?;
-                let ty_name = match &**ty {
-                    ExprData::Const(t, _) => self.name_str(*t),
-                    _ => return Ok(None),
-                };
-                if ty_name != "Int" && !ty_name.ends_with(".Int") {
-                    return Ok(None);
-                }
-                if let Some(inner) = self.peel_int_neg(&args[2]) {
-                    let inner_w = self.whnf(ctx, &inner)?;
-                    let closed = self.is_closed_int_numeral(&inner_w);
-                    if std::env::var_os("KIOTA_TRACE_NEG").is_some() {
-                        eprintln!(
-                            "NEG Neg.neg peel inner={} closed={closed}",
-                            self.pp_budget(&inner_w, 24)
-                        );
-                    }
-                    if closed {
-                        return Ok(Some(expr::apps(inner_w, &args[3..])));
-                    }
-                }
-                let Some(ineg) = self.find_name_ending("Int.neg") else {
-                    return Ok(None);
-                };
-                let r = expr::app(expr::const_(ineg, vec![]), args[2].clone());
-                return Ok(Some(expr::apps(r, &args[3..])));
-            }
-            "Nat.cast" | "NatCast.natCast" if args.len() >= 2 => {
-                let (ty_i, val_i) = if name == "Nat.cast" && args.len() >= 3 {
-                    (0usize, 2usize)
-                } else if name == "NatCast.natCast" && args.len() >= 3 {
-                    (0usize, 2usize)
-                } else {
-                    return Ok(None);
-                };
-                let ty = self.whnf(ctx, &args[ty_i])?;
-                let ty_name = match &**ty {
-                    ExprData::Const(t, _) => self.name_str(*t),
-                    _ => return Ok(None),
-                };
-                if ty_name == "Int" || ty_name.ends_with(".Int") {
-                    if let Some(n) = self.closed_nat_value(ctx, &args[val_i])? {
-                        if let Some(r) = self.mk_closed_int(&BigInt::from(n)) {
-                            return Ok(Some(expr::apps(r, &args[val_i + 1..])));
-                        }
-                    }
-                }
-                Ok(None)
-            }
             // OfNat's numeral tag does not determine its stored value.
             // Ordinary delta/projection reduction reads the actual instance.
             n if (n == "Int.beq'" || n.ends_with(".Int.beq'")) && args.len() >= 2 => {
@@ -7775,13 +7725,14 @@ impl<'e> Checker<'e> {
             return !args.is_empty()
                 && matches!(&**args[0], ExprData::Lit(Lit::Nat(_)));
         }
-        if name == "Int.neg" || name.ends_with(".Int.neg") || name == "Neg.neg" {
+        if name == "Int.neg" || name.ends_with(".Int.neg") {
             return args.last().is_some_and(|a| self.is_closed_int_numeral(a));
         }
         false
     }
 
-    /// `Int.neg x` or `Neg.neg Int _ x` → `x`. Used only to cancel a
+    /// `Int.neg x` → `x`. Class accessors must first read their instance.
+    /// Used only to cancel a
     /// second closed negation (`- - n = n`); open `n` must stay a `neg`
     /// so `Int.neg_neg` still matches its recursor motive.
     fn peel_int_neg(&self, e: &Expr) -> Option<Expr> {
@@ -7792,9 +7743,6 @@ impl<'e> Checker<'e> {
         };
         if name == "Int.neg" || name.ends_with(".Int.neg") {
             return args.first().cloned();
-        }
-        if name == "Neg.neg" && args.len() >= 3 {
-            return Some(args[2].clone());
         }
         None
     }
@@ -7860,15 +7808,6 @@ impl<'e> Checker<'e> {
             }
             return Ok(None);
         }
-        if name == "Neg.neg" && args.len() >= 3 {
-            if !self.type_head_is_int(&args[0]) {
-                return Ok(None);
-            }
-            if let Some(v) = self.closed_int_value(ctx, &args[2])? {
-                return Ok(Some(-v));
-            }
-            return Ok(None);
-        }
         if (name == "Int.ediv" || name.ends_with(".Int.ediv") || name == "Int.div")
             && args.len() >= 2
         {
@@ -7889,24 +7828,6 @@ impl<'e> Checker<'e> {
                 self.closed_int_value(ctx, &args[5])?,
             ) {
                 return Ok(Some(int_ediv(&a, &b)));
-            }
-            return Ok(None);
-        }
-        if (name == "Nat.cast" || name == "NatCast.natCast") && args.len() >= 3 {
-            if !self.type_head_is_int(&args[0]) {
-                return Ok(None);
-            }
-            if let Some(n) = self.closed_nat_value(ctx, &args[2])? {
-                return Ok(Some(BigInt::from(n)));
-            }
-            return Ok(None);
-        }
-        if name == "NatCast.natCast" && args.len() >= 2 {
-            if !self.type_head_is_int(&args[0]) {
-                return Ok(None);
-            }
-            if let Some(n) = self.closed_nat_value(ctx, &args[1])? {
-                return Ok(Some(BigInt::from(n)));
             }
             return Ok(None);
         }
@@ -14002,6 +13923,11 @@ fn regression_432_defining_equations_and_closed_values_convert() {
                 assert_eq!(n, num_bigint::BigInt::from(if cast {42u32} else {7u32}));
             }
             assert!(tc.is_def_eq(&ctx, &accessor, &stored)?);
+            let wrong = if cast {expr::app(c(9), expr::lit_nat(7u32.into()))}
+                        else {expr::app(c(10), expr::lit_nat(6u32.into()))};
+            let wrong_ty = tc.infer_type(&ctx, &wrong)?;
+            assert!(tc.is_def_eq(&ctx, &wrong_ty, &int)?);
+            assert!(!tc.is_def_eq(&ctx, &accessor, &wrong)?);
             Ok::<(), TcError>(())
         }).unwrap();
     }
