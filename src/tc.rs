@@ -13601,7 +13601,7 @@ fn regression_430_iota_propagates_constructor_telescope_decline() {
                 tc.pp(&bare_w), tc.pp(&applied_w));
             let exposed = expr::proj(5, 0, expr::app(c(7), expr::bvar(0)));
             assert!(tc.is_def_eq(&ctx, &bare, &exposed)?);
-            Ok(())
+            Ok::<(), TcError>(())
         }).unwrap();
     }
 
