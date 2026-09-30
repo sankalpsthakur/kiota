@@ -15,6 +15,11 @@ def module(name, path):
     spec.loader.exec_module(result)
     return result
 
+SMALL_SUITE_SHA256 = "549477be6e17e6fc32b1c744822bfb2580be1faa10bdfc76d5154d18a3c7934e"
+SMALL_SUITE_REVISION = "4c30c4ac4f14a3a899116beb3ea6131880e79a98"
+EXPECTED_GOOD = 123
+EXPECTED_TOTAL = 194
+
 root = Path(__file__).resolve().parents[2]
 gate = module("arena_gate", root / "scripts/arena_gate.py")
 runner = module("remote_runner", root / "scripts/remote/runner.py")
@@ -40,12 +45,14 @@ report = {"mode": args.mode, "scope": "arena-small-only" if args.all else "four-
           "full_corpus_verified": False, "arena_rank_verified": False, "complete": False,
           "passed": False, "address_space_mib": 8192, "rss_watchdog_mib": 5120,
           "per_case_seconds": 120, "binary_sha256": gate.sha256_file(args.binary),
-          "archive_sha256": gate.sha256_file(args.archive), "results": []}
+          "archive_sha256": gate.sha256_file(args.archive), "reviewed_suite_revision": SMALL_SUITE_REVISION, "results": []}
 deadline = time.monotonic() + (720 if args.all else 500)
 def save():
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
 save()
 try:
+    if args.all and report["archive_sha256"] != SMALL_SUITE_SHA256:
+        raise RuntimeError("small suite checksum changed: require explicit snapshot review")
     with tempfile.TemporaryDirectory(prefix="kiota-remote-cases-") as scratch:
         cases = gate.unpack_cases(args.archive, Path(scratch))
         if args.all:
@@ -56,7 +63,7 @@ try:
                                          "input_sha256": gate.sha256_file(path)}
                                         for name, expected, path in cases]
             save()
-            if report["counts"]["good"] != 122 or len(cases) != 193:
+            if report["counts"]["good"] != EXPECTED_GOOD or len(cases) != EXPECTED_TOTAL:
                 raise RuntimeError("small suite changed: require explicit snapshot review")
         else:
             cases = [case for case in cases if case[0] in wanted]

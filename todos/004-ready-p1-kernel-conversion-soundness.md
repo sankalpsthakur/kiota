@@ -182,3 +182,6 @@ Int32 large-number laziness and other swallowed-error sites remain open; this
 correction alone does not imply full Init acceptance or any Arena gain.
 
 - 2026-09-30: checker 55ae14b36e78bf3d625ed04b5ba299fba66c37c3 passes normal CI 36718002248. Strict run 36718002323 stopped before cases: live small-suite snapshot changed; no pass or new checker failure claimed. Exact Init replay repinned to this immutable checker, projection tracing disabled after reproduction; unchanged corpus and 6 GiB/no-swap/600s gates.
+
+- 2026-09-30: exact Init run 36718955002, orchestration 60bb488/checker 55ae14b: exact input verified, checker started, exit 2 depth decline in 114.85s, no OOM. Iota fix removes prior wrong projection rejection; Init remains unaccepted.
+- Reviewed strict snapshot 4c30c4ac / SHA549477be6e17e6fc32b1c744822bfb2580be1faa10bdfc76d5154d18a3c7934e against run36623616614: all193 existing input hashes unchanged, only added good/perf/proj-stuck-struct.ndjson (SHA b2fed80e90e956f24bcbe898ce7cfef5ae4c92d0f81daf42e0a2a3c817012f6f). New expected counts123good/71bad/194total; checksum guard added, existing caps preserved.
