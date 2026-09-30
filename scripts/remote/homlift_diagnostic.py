@@ -19,12 +19,14 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 ARENA = "cdb3497bd9080229f3ea107b0b9d5d25bd9e71a6"
 EXPORTER = "66f1fb4bc256072069767fce52d39480e4524869"
-CHECKER = "178c3ba75787eb91375cd355236bb55136c95bee"
+CHECKER = "604e96646218585a441e1e6068483225f8548008"
 TOOLCHAIN = "leanprover/lean4:v4.34.1"
 LEAN_SHA = "5045d0056413266e57c625dcd7c365b10e377c52"
 MATHLIB = "d13f23b723b8a846827a245b89c10fc7d3f11612"
 MODULE = "Mathlib.CategoryTheory.FiberedCategory.HomLift"
 TARGET = "CategoryTheory.Functor.IsHomLift.rec"
+INPUT_SHA = "df2f1398d740f808c5ce0c39723822792740c5f1a682a0af07b2aa15ae202552"
+INPUT_BYTES, INPUT_LINES = 673065, 12080
 IMAGE = "ubuntu@sha256:281c5745f657873d78e5531fc5ba8575f46ab7769b94550ac99543f122679986"
 MIB = 1024 * 1024
 temp_root = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
@@ -148,6 +150,8 @@ try:
     if meta["lean"] != {"version": "4.34.1", "githash": LEAN_SHA} or meta["exporter"] != {"name": "lean4export", "version": "3.1.0"}:
         raise RuntimeError("wrong Lean/exporter header")
     actual_sha = sha(source)
+    if actual_sha != INPUT_SHA or source.stat().st_size != INPUT_BYTES or lines != INPUT_LINES:
+        raise RuntimeError("selected HomLift bytes differ from the verified slice")
     report.update(homlift_input_verified=True, input_sha256=actual_sha, input_header=header,
                   input_bytes=source.stat().st_size, input_lines=lines,
                   exported_declarations=len(declared), target_present=True)

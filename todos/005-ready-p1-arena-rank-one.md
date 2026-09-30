@@ -110,3 +110,7 @@ Remote arithmetic fixes pass204 Rust tests; latest abort guard206+33. Lazy-head 
 ### 2026-09-30 - Full Std memory gate and newly reproduced soundness gate
 
 FullStd178c3ba isnotaccepted: exactinputmatchesbut6GiB OOM at568.7s. ActualIsHomLift recursor dependency slice435declarations accepts0.19s; notfullMathlibproof. Sparse-contextcachecounterexample reproducedonisolatedbaadfdc (coldreject/warmfalseaccept) andfix5982cb1 isunderCI, notpromoted. PriorInitacceptance6bbc0fa remainsrevision-scoped; newlyfound cache issue meansallcandidate acceptanceevidence needsrevalidationaftercorrection. Officialpin2d2a9fa remainsunchanged;rank-onegateopen.
+
+### 2026-09-30 - Corrected cache candidate revalidation
+
+Diagnosticchecker604e966integratesverifiedtransitivecontextfix5982cb1 plusclosednegative85731b. Earliercloseddeclaration989b8e1falseacceptwasreproducedlastassert;212Rust+41normaltests passonfixedsource. Fullmatrix5982cb1executes194cases193passall71negativesrejectboth modes; pairRSSnotresolved. RepinnedexactInitandHomLiftworkflows toimmutable604e966;newHomLiftsha/bytes/linesmustmatchthepreviousselectedsliceexactly. FullInit6bbc0faacceptancecannotbecopiedtonewsource. Std178c3baOOMremainsnextavailabilitytriage; donotrepeatunchangedStdorrelaxcaps. Awaitexact-head CI beforedispatchnewgates. NoofficialpromotionorMathlibscore.

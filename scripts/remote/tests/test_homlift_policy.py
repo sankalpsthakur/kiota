@@ -50,14 +50,15 @@ class HomLiftContainerPolicyTests(unittest.TestCase):
     def test_pinned_selection_is_never_full_mathlib_proof(self):
         source = SOURCE.read_text()
         self.assertIn('MATHLIB = "d13f23b723b8a846827a245b89c10fc7d3f11612"', source)
-        self.assertIn('CHECKER = "178c3ba75787eb91375cd355236bb55136c95bee"', source)
+        self.assertIn('CHECKER = "604e96646218585a441e1e6068483225f8548008"', source)
         self.assertIn('TARGET = "CategoryTheory.Functor.IsHomLift.rec"', source)
         self.assertIn('"full_mathlib_verified": False', source)
         self.assertIn('"full_corpus_verified": False', source)
         self.assertIn('"arena_rank_verified": False', source)
         self.assertIn('target recursor/owner absent', source)
         self.assertIn('"lake", "exe", "cache", "get", MODULE', source)
-        self.assertNotIn('INPUT_SHA', source)
+        self.assertIn('INPUT_SHA = "df2f1398d740f808c5ce0c39723822792740c5f1a682a0af07b2aa15ae202552"', source)
+        self.assertIn('INPUT_BYTES, INPUT_LINES = 673065, 12080', source)
         self.assertIn('"--init"', source)
         self.assertIn('"elan-init"', source)
 
