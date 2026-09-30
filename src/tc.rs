@@ -5106,10 +5106,10 @@ impl<'e> Checker<'e> {
         let mut rec_calls: Vec<Expr> = Vec::new();
         let mut cctx = ctx.clone();
         for f in fields {
-            let (_, dom, body) = match self.ensure_pi(&cctx, &ct) {
-                Ok(x) => x,
-                Err(_) => break,
-            };
+            // There is one constructor binder for every supplied field.
+            // A resource/type error is not the end of the telescope: returning
+            // a partly applied minor here constructs an ill-typed reduction.
+            let (_, dom, body) = self.ensure_pi(&cctx, &ct)?;
             result = expr::app(result, f.clone());
             if let Some(rec_call) =
                 self.mk_rec_call(&cctx, rname, us, all, params, motives, minors, f, &dom)?
@@ -13516,6 +13516,13 @@ fn regression_430_iota_propagates_constructor_telescope_decline() {
     tc.infer_type(&ctx, &step).unwrap();
     let ctor_ty = env.get(2).unwrap().typ();
     tc.ensure_pi(&ctx, ctor_ty).unwrap();
+    let normal = tc.iota_from_first_principles(
+        &ctx, 3, &[], &[], &[], &[0], &[], &[],
+        &[motive.clone()], &[base.clone(), step.clone()], step.clone(), 2, &[field.clone()],
+    ).unwrap();
+    let normal_ty = tc.infer_type(&ctx, &normal).unwrap();
+    assert!(tc.is_def_eq(&ctx, &normal_ty, &nat_ty).unwrap());
+    assert!(tc.is_def_eq(&ctx, &normal, &expr::app(expr::const_(2, vec![]), field.clone())).unwrap());
     let saved = WHNF_DEPTH.with(|depth| depth.replace(CONV_DEPTH));
     let result = tc.iota_from_first_principles(
         &ctx, 3, &[], &[], &[], &[0], &[], &[],

@@ -169,3 +169,14 @@ reductions and prints them only at a projection error. No conversion rule was
 changed. Next exact replay pins this immutable trace checker with unchanged
 input, memory, swap, timeout and log budgets. Normal/release and strict small
 gates remain separate from large-corpus acceptance and official rank.
+
+### 2026-09-30 - Reproduced swallowed telescope decline and minimal correction
+
+Trace run36717033489 shows the original billions-scale Nat.rec countdown,
+not a safe closed-arithmetic shortcut opportunity. Regression d124347 reproduces
+the exact error-transparency failure in Linux CI36717750876: typed constructor/
+minor controls pass, but a forced WHNF limit returns Ok(unapplied minor) instead
+of Decline. Fix propagates ensure_pi errors with ?, never a partial reduction.
+An additional positive control checks ordinary iota's type and value. Remaining
+Int32 large-number laziness and other swallowed-error sites remain open; this
+correction alone does not imply full Init acceptance or any Arena gain.
