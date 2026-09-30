@@ -1970,7 +1970,11 @@ impl<'e> Checker<'e> {
         let (head, args) = expr::unfold_apps(&vtw);
         let (ind_name, us) = match &**head {
             ExprData::Const(n, us) => (*n, us.clone()),
-            _ => return reject("projection of non-inductive value"),
+            _ => return reject(format!(
+                "projection of non-inductive value: {}.{}; value={}; inferred={}; whnf={}",
+                self.name_str(sname), idx,
+                self.pp_budget(v, 12), self.pp_budget(&vt, 12), self.pp_budget(&vtw, 12),
+            )),
         };
         if ind_name != sname {
             return reject("projection struct name mismatch");

@@ -143,3 +143,18 @@ Next gates: exact Init diagnostic; fix smallest false reject; paired-proof memor
 closure; exact Std/Mathlib acceptance; official Linux instruction measurement;
 reviewed promotion and official pin; live-board number-one readback. Remaining
 shortcut audits and all negative gates stay mandatory throughout optimization.
+
+### 2026-09-30 - Runner repair verified; real Init false rejection isolated
+
+Head5f3160c passes normal CI36715110660 including 32 supervisor/policy
+tests. Exact Init run36715157362 verifies the official input and successfully
+starts immutable checker72f7fde in its unchanged 6GiB/no-swap container.
+After127s, declaration17726 Int32.instRxcHasSize_eq rejects: projection of
+non-inductive value. No OOM, Docker startup failure or timeout occurred.
+Init acceptance remains false. Diagnostic-only richer projection error records
+the requested structure, value, inferred type and its WHNF; semantics unchanged.
+
+Official Mathlib false reject is CategoryTheory.Functor.IsHomLift's large
+elimination check. Official2d2a9fa compares conclusion BVars by intern pointer;
+72f7fde already uses the numeric index and has reset-state regression controls.
+This is a promising existing correction, not proof that full Mathlib accepts.
