@@ -13752,4 +13752,47 @@ fn regression_432_defining_equations_and_closed_values_convert() {
     ] { regression_432_assert_conversion(lhs, rhs, true); }
 }
 
+
+    /// Congruence should expose a harmless alias before normalizing the
+    /// huge symbolic addition on either side (the Int32-size failure shape).
+    #[test]
+    fn regression_433_alias_comparison_avoids_huge_nat_countdown() {
+        use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+        let mut env = regression_429_nat_add_env();
+        let c = |i| expr::const_(i, vec![]);
+        let nat = c(0);
+        let pi = |d, b| expr::pi(expr::BinderInfo::Default, d, b);
+        let lam = |d, b| expr::lam(expr::BinderInfo::Default, d, b);
+        env.insert(5, CI::Def {
+            level_params: vec![], typ: pi(nat.clone(), pi(nat.clone(), nat.clone())),
+            value: lam(nat.clone(), lam(nat.clone(), expr::apps(c(4), &[expr::bvar(1), expr::bvar(0)]))),
+            hints: RH::Regular(2), is_unsafe: false,
+        });
+        let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add", "addAlias"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        tc.with_forced_eager_defeq(|| {
+            for id in [4, 5] {
+                let CI::Def {typ, value, ..} = env.get(id).unwrap() else {panic!("fixture");};
+                let inferred = tc.infer_type(&Ctx::new(), value)?;
+                assert!(tc.is_def_eq(&Ctx::new(), &inferred, typ)?);
+            }
+            let mut ctx = Ctx::new(); ctx.push(nat.clone());
+            let big = expr::lit_nat(num_bigint::BigUint::from(1u64 << 32));
+            let lhs = expr::apps(c(4), &[expr::bvar(0), big.clone()]);
+            let rhs = expr::apps(c(5), &[expr::bvar(0), big]);
+            for term in [&lhs, &rhs] {
+                let ty = tc.infer_type(&ctx, term)?;
+                assert!(tc.is_def_eq(&ctx, &ty, &nat)?);
+            }
+            // Keep the old reproduction bounded: just a few WHNF frames
+            // remain, whereas alias exposure needs no recursive Nat peel.
+            let old = WHNF_DEPTH.with(|depth| depth.replace(CONV_DEPTH - 4));
+            let compared = tc.is_def_eq_inner(&ctx, &lhs, &rhs);
+            WHNF_DEPTH.with(|depth| depth.set(old));
+            assert!(matches!(compared, Ok(true)),
+                    "alias congruence must precede huge numeric normalization: {compared:?}");
+            Ok::<(), TcError>(())
+        }).unwrap();
+    }
+
 }
