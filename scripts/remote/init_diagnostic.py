@@ -46,7 +46,8 @@ deadline = time.monotonic() + 35 * 60
 report = {"orchestration_revision": os.environ["GITHUB_SHA"], "checker_revision": CHECKER,
           "arena_revision": ARENA, "exporter_revision": EXPORTER,
           "full_corpus_verified": False, "arena_rank_verified": False,
-          "init_input_verified": False, "init_accepted": False, "phases": []}
+          "init_input_verified": False, "init_accepted": False,
+          "checker_started": False, "init_verdict": "not_run", "phases": []}
 def save():
     (report_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
 def sha(path):
@@ -140,6 +141,7 @@ try:
           "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "64",
           "--memory", str(6 * 1024**3), "--memory-swap", str(6 * 1024**3),
           "--log-driver", "local", "--log-opt", "max-size=1m", "--log-opt", "max-file=1",
+          "--log-opt", "compress=false",
           "--user", str(os.getuid()) + ":" + str(os.getgid()),
           "--env", "KIOTA_PROGRESS=1",
           "--mount", "type=bind,src=" + str(binary) + ",dst=/checker,readonly",
@@ -161,6 +163,9 @@ try:
     phase("container-state", ["docker", "inspect", "--format", "{{json .State}}", cid], 20)
     state = json.loads((logs / "container-state.log").read_text())
     report["container_state"] = state
+    report["checker_started"] = state["StartedAt"] != "0001-01-01T00:00:00Z" and not state["Error"]
+    if not report["checker_started"]:
+        raise RuntimeError("checker never started: " + state["Error"])
     if state["Running"]:
         raise RuntimeError("checker container still running")
     if sha(binary) != report["binary_sha256"] or sha(source) != actual_sha:
@@ -168,6 +173,10 @@ try:
     phase("checker-post-clean", ["git", "diff", "--exit-code"], 20, checker)
     phase("checker-post-index-clean", ["git", "diff", "--cached", "--exit-code"], 20, checker)
     report["init_accepted"] = diagnostic["outcome"] == "accept" and state["ExitCode"] == 0 and not state["OOMKilled"] and not state["Error"]
+    report["init_verdict"] = ("accept" if report["init_accepted"] else
+                              "memory_limit" if state["OOMKilled"] else
+                              "timeout" if state["ExitCode"] in (124, 137) else
+                              diagnostic["outcome"])
 except Exception as error:
     report["error"] = str(error)
 finally:

@@ -123,3 +123,23 @@ score. Current live Arena pin and ranking remain distinct. All completed agents
 were closed; no local checker/build or new workspace file was created.
 
 - https://github.com/sankalpsthakur/kiota/actions/runs/36625008017
+
+### 2026-09-30 - Rank-one goal resumed; infrastructure failure isolated
+
+Active objective: verified number one on the official Arena, not a local timing
+or unit-test claim. All source changes, builds, exports, runs and evidence remain
+remote. Current live position is 20 of 25 checkers (field shrank from 27), with
+71 invalid rejected, 124 valid accepted, 1 false reject, 6 declines and no Mathlib
+score. Official pin remains 2d2a9fa. Draft PR12 is unpromoted.
+
+Init run36625008017 produced exactly the required bytes/lines/SHA and built
+immutable checker72f7fde, but Docker never started the container: local logging
+compression defaults on and cannot use max-file=1. Explicit compress=false
+preserves the 1MiB single-file cap; new static regression controls cover logging,
+unchanged 6GiB no-swap/600s bounds and explicit not-run versus checker verdict.
+Remote CI and a new exact Init run must validate the repair before closure.
+
+Next gates: exact Init diagnostic; fix smallest false reject; paired-proof memory
+closure; exact Std/Mathlib acceptance; official Linux instruction measurement;
+reviewed promotion and official pin; live-board number-one readback. Remaining
+shortcut audits and all negative gates stay mandatory throughout optimization.
