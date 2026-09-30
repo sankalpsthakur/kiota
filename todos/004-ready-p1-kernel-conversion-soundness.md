@@ -180,3 +180,5 @@ of Decline. Fix propagates ensure_pi errors with ?, never a partial reduction.
 An additional positive control checks ordinary iota's type and value. Remaining
 Int32 large-number laziness and other swallowed-error sites remain open; this
 correction alone does not imply full Init acceptance or any Arena gain.
+
+- 2026-09-30: checker 55ae14b36e78bf3d625ed04b5ba299fba66c37c3 passes normal CI 36718002248. Strict run 36718002323 stopped before cases: live small-suite snapshot changed; no pass or new checker failure claimed. Exact Init replay repinned to this immutable checker, projection tracing disabled after reproduction; unchanged corpus and 6 GiB/no-swap/600s gates.
