@@ -185,3 +185,5 @@ correction alone does not imply full Init acceptance or any Arena gain.
 
 - 2026-09-30: exact Init run 36718955002, orchestration 60bb488/checker 55ae14b: exact input verified, checker started, exit 2 depth decline in 114.85s, no OOM. Iota fix removes prior wrong projection rejection; Init remains unaccepted.
 - Reviewed strict snapshot 4c30c4ac / SHA549477be6e17e6fc32b1c744822bfb2580be1faa10bdfc76d5154d18a3c7934e against run36623616614: all193 existing input hashes unchanged, only added good/perf/proj-stuck-struct.ndjson (SHA b2fed80e90e956f24bcbe898ce7cfef5ae4c92d0f81daf42e0a2a3c817012f6f). New expected counts123good/71bad/194total; checksum guard added, existing caps preserved.
+
+- Regression431 reproduced stuck-projection head loss remotely in CI36719630338: both bare/applied projections changed wrapper #0 to opaque #0, while typed and constructor positive controls passed. Minimal fix preserves original expression when projection fails, matching Lean4.34.1 type_checker.cpp; constructor and string reductions unchanged. Exact-head CI and reviewed194-case strict replay pending.

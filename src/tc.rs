@@ -3272,10 +3272,10 @@ impl<'e> Checker<'e> {
                                     }
                                 }
                             }
-                            if Rc::ptr_eq(&vw, v) {
-                                return Ok(cur);
-                            }
-                            return Ok(expr::apps(expr::proj(*sname, *idx, vw), &args));
+                            // A failed projection reduction preserves its input,
+                            // just as Lean whnf_core does. Do not lose a shared
+                            // definition head by rebuilding with the reduced major.
+                            return Ok(cur);
                         }
                         _ => {
                             if let Some(r) = self.try_iota(ctx, &head, &args)? {
@@ -3363,10 +3363,9 @@ impl<'e> Checker<'e> {
                             }
                         }
                     }
-                    if Rc::ptr_eq(&vw, v) {
-                        return Ok(cur);
-                    }
-                    return Ok(expr::proj(*sname, *idx, vw));
+                    // Stuck projection: preserve the unreduced major so
+                    // conversion can compare its head and arguments first.
+                    return Ok(cur);
                 }
                 _ => return Ok(cur),
             }
