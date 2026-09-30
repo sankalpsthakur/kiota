@@ -13494,4 +13494,35 @@ fn regression_429_closed_int_value_respects_custom_ofnat_instance() {
     });
 }
 
+
+#[test]
+fn regression_430_iota_propagates_constructor_telescope_decline() {
+    let env = regression_429_nat_add_env();
+    let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add"]);
+    let tc = Checker::new(&env, &names, Some(0), None);
+    let nat_ty = expr::const_(0, vec![]);
+    let motive = expr::lam(BinderInfo::Default, nat_ty.clone(), nat_ty.clone());
+    let base = expr::const_(1, vec![]);
+    let step = expr::lam(
+        BinderInfo::Default, nat_ty.clone(),
+        expr::lam(BinderInfo::Default, nat_ty.clone(), expr::app(expr::const_(2, vec![]), expr::bvar(0))),
+    );
+    let field = expr::const_(1, vec![]);
+    // Validate the actual constructor field, motive and minor before the
+    // artificial resource limit. This is not a malformed-constructor test.
+    let ctx = Ctx::new();
+    assert!(tc.is_def_eq(&ctx, &tc.infer_type(&ctx, &field).unwrap(), &nat_ty).unwrap());
+    tc.infer_type(&ctx, &motive).unwrap();
+    tc.infer_type(&ctx, &step).unwrap();
+    let ctor_ty = env.get(2).unwrap().typ();
+    tc.ensure_pi(&ctx, ctor_ty).unwrap();
+    let saved = WHNF_DEPTH.with(|depth| depth.replace(CONV_DEPTH));
+    let result = tc.iota_from_first_principles(
+        &ctx, 3, &[], &[], &[], &[0], &[], &[],
+        &[motive], &[base, step.clone()], step, 2, &[field],
+    );
+    WHNF_DEPTH.with(|depth| depth.set(saved));
+    assert!(matches!(result, Err(TcError::Decline(_))),
+        "resource failure must propagate, never become an unapplied minor: {result:?}");
+}
 }
