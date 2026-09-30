@@ -973,6 +973,9 @@ pub struct Checker<'e> {
     iota_lit_memo_misses: std::cell::Cell<u32>,
     /// Optional bounded reduction history, printed only on a projection error.
     /// Diagnostics only; no changes to reduction or conversion decisions.
+    conversion_trace_enabled: bool,
+    conversion_trace_reported: Cell<bool>,
+    conversion_trace: RefCell<Vec<(usize, Expr, Expr)>>,
     projection_trace_enabled: bool,
     projection_iota_trace: RefCell<std::collections::VecDeque<(u32, u32, usize, usize, Expr, Expr)>>,
     /// Test-only override for whether `iota_lit_memo` is consulted, so a
@@ -1274,6 +1277,9 @@ impl<'e> Checker<'e> {
             iota_value_cache: RefCell::new(FxHashMap::default()),
             iota_lit_memo: RefCell::new(FxHashMap::default()),
             iota_lit_memo_misses: std::cell::Cell::new(0),
+            conversion_trace_enabled: std::env::var_os("KIOTA_TRACE_CONVERSION").is_some(),
+            conversion_trace_reported: Cell::new(false),
+            conversion_trace: RefCell::new(Vec::new()),
             projection_trace_enabled: std::env::var_os("KIOTA_TRACE_PROJECTION").is_some(),
             projection_iota_trace: RefCell::new(std::collections::VecDeque::new()),
             iota_memo_override: std::cell::Cell::new(None),
@@ -1386,6 +1392,7 @@ impl<'e> Checker<'e> {
     }
 
     pub fn check_decl(&self, name: u32, kind: &str) -> R<()> {
+        self.conversion_trace_reported.set(false);
         let ci = self
             .env
             .get(name)
@@ -2840,6 +2847,7 @@ impl<'e> Checker<'e> {
             if depth == CONV_DEPTH + 1 && std::env::var_os("KIOTA_DEBUG").is_some() {
                 eprintln!("WHNF_DEPTH {}", self.pp_budget(e, 50));
             }
+            self.dump_conversion_trace(e);
             return decline("WHNF depth limit");
         }
         let r = self.whnf_inner(ctx, e);
@@ -3169,6 +3177,7 @@ impl<'e> Checker<'e> {
             n
         });
         if depth > CONV_DEPTH {
+            self.dump_conversion_trace(&e);
             CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
             CORE_ABORTED.with(|a| a.set(true));
             // Do not cache. A β/ζ/proj redex at the cap is not WHNF — Decline.
@@ -3851,6 +3860,32 @@ impl<'e> Checker<'e> {
     }
 
     fn is_def_eq_inner(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        if !self.conversion_trace_enabled {
+            return self.is_def_eq_inner_body(ctx, a, b);
+        }
+        // Retain at most the first 32 active comparisons, not every call
+        // or generated intermediate. Unwind entries on both Ok and Err.
+        let pushed = self.conversion_trace.borrow().len() < 32;
+        if pushed {
+            self.conversion_trace.borrow_mut().push((ctx.len(), a.clone(), b.clone()));
+        }
+        let result = self.is_def_eq_inner_body(ctx, a, b);
+        if pushed { self.conversion_trace.borrow_mut().pop(); }
+        result
+    }
+
+    fn dump_conversion_trace(&self, e: &Expr) {
+        if !self.conversion_trace_enabled || self.conversion_trace_reported.replace(true) {
+            return;
+        }
+        eprintln!("CONVERSION_DEPTH term={}", self.pp_budget(e, 8));
+        for (i, (len, a, b)) in self.conversion_trace.borrow().iter().enumerate() {
+            eprintln!("CONVERSION_FRAME {i} ctx={len} lhs={} rhs={}",
+                self.pp_budget(a, 8), self.pp_budget(b, 8));
+        }
+    }
+
+    fn is_def_eq_inner_body(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         crate::stats::defeq_call();
         if crate::stats::enabled() {
             let n = crate::stats::defeq_calls();
