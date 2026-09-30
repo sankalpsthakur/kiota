@@ -1,0 +1,68 @@
+name: remote-nbe-readback-diagnostic
+on:
+  push:
+    branches: [fix/remote-nbe-readback-20260930]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'Cargo.*'
+      - '.github/workflows/remote-nbe-readback.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: remote-nbe-readback-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  strict:
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [nbe]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Release regressions and harness tests
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cargo test --release --locked
+          KIOTA_NBE=1 cargo test --release --locked
+          cargo build --release --locked --bin kiota
+          python3 -m unittest discover -s scripts/remote/tests -v
+      - name: Capture stable official small suite
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          mkdir arena-input
+          curl --fail --location --max-time 60 --proto '=https' https://arena.lean-lang.org/results.json -o arena-input/before.json
+          curl --fail --location --max-time 60 --proto '=https' https://arena.lean-lang.org/lean-arena-tests.tar.gz -o arena-input/tests.tar.gz
+          curl --fail --location --max-time 60 --proto '=https' https://arena.lean-lang.org/results.json -o arena-input/after.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          before = json.loads(Path("arena-input/before.json").read_text())["meta"]
+          after = json.loads(Path("arena-input/after.json").read_text())["meta"]
+          if before != after:
+              raise SystemExit("Arena changed during capture")
+          print(json.dumps(before))
+          PY
+          git rev-parse HEAD > arena-input/checkout-sha.txt
+          sha256sum target/release/kiota arena-input/tests.tar.gz > arena-input/checksums.sha256
+          rustc --version --verbose > arena-input/toolchain.txt
+      - name: Strict full downloadable suite
+        timeout-minutes: 13
+        run: python3 scripts/remote/profile_memory.py --mode ${{ matrix.mode }} --binary target/release/kiota --archive arena-input/tests.tar.gz --output small-report --all
+      - name: Retain reports only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nbe-readback-${{ matrix.mode }}-${{ github.sha }}-${{ github.run_id }}
+          path: |
+            arena-input/
+            small-report/
+          retention-days: 14

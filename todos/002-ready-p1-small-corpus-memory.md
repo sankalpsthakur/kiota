@@ -43,7 +43,7 @@ the 16 GB Mac. Preserve exact inputs, binary hashes, and limits in reports.
 
 - [x] Baseline/candidate comparison distinguishes inherited failure from regression.
 - [x] Pair-n21 accepts under the unchanged 8,192 MiB Linux address-space cap.
-- [ ] Current 122 positive and 71 negative Arena cases pass the strict gate.
+- [ ] Current 123 positive and 71 negative Arena cases pass the strict gate.
 - [ ] Default and experimental NbE outcomes are recorded separately.
 
 ## Work Log
@@ -108,3 +108,7 @@ is not promoted, and the full strict Linux acceptance criterion stays unchecked.
 - https://github.com/sankalpsthakur/kiota/pull/12
 - https://github.com/sankalpsthakur/kiota/actions/runs/36317993571
 - `docs/checkpoints/2026-09-27.md`
+
+### 2026-09-30 - Current immutable closure-evaluator readback
+
+Reviewed194-case matrix36727096974 checker6bbc0fa passes193/194 in both default and lazy-head modes, all71negativesreject; pair-n21 still hits5GiBRSS. Collection-only e4a7ebd accepts pair114s but deep-n36timeout120s, notpromoted. Separate remote branchfix/remote-nbe-readback-20260930 forks immutable34f6f17f518f11af18285c2a921178981a53eef4 without checker changes and tests current KIOTA_NBE=1 through default/opt-in release regressions,33harness controls, and all194 strict cases. Same8GiBaddress/5GiBRSS/120scaps, reviewed archiveSHA549477be unchanged. Report exact terminal failure before altering evaluator. No local source/build/export/artifact work.
