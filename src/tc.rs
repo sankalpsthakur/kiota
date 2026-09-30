@@ -1038,8 +1038,7 @@ thread_local! {
     static CTX_NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
 }
 
-/// Intern `(parent_id, type ptr)` to a context id. Shared by full `ctx.id`
-/// and by suffix keys (the k innermost binders of an open term).
+/// Intern `(parent_id, type identity)` for the full exact context.
 fn intern_ctx_id(parent: u64, ty_ptr: usize) -> u64 {
     intern_ctx_binding_id(parent, u32::MAX, ty_ptr)
 }
@@ -1066,9 +1065,9 @@ fn intern_ctx_binding_id(parent: u64, index: u32, ty_ptr: usize) -> u64 {
 /// that built it. Equal ids therefore imply equal contexts; distinct ids for
 /// equal contexts would only cost a cache miss, and interning rules that out.
 ///
-/// `suffix[k]` is the interned id of the **k innermost** binder types
-/// (`suffix[0] = 0`). A term with `loose = k` only reads those k binders,
-/// so infer/defeq can key on `suffix[k]` instead of the full telescope.
+/// Open-term keys compute exact transitive binder-type dependencies on demand.
+/// The old suffix table is not used: a raw suffix alone omits outer
+/// dependencies, while precomputing every suffix retained quadratic residue.
 #[derive(Clone)]
 struct Ctx {
     /// Invariant: only ever extended through `push`, which keeps `id` in step.
@@ -1077,7 +1076,6 @@ struct Ctx {
     /// inferred under other bindings — a false accept, silently.
     tys: Vec<Expr>,
     id: u64,
-    suffix: Vec<u64>,
 }
 
 impl Default for Ctx {
@@ -1085,7 +1083,6 @@ impl Default for Ctx {
         Ctx {
             tys: Vec::new(),
             id: 0,
-            suffix: vec![0],
         }
     }
 }
@@ -1098,16 +1095,7 @@ impl Ctx {
     fn push(&mut self, ty: Expr) {
         let ty_ptr = expr::identity(&ty);
         let new_id = intern_ctx_id(self.id, ty_ptr);
-        let mut suffix = vec![0];
-        suffix.push(intern_ctx_id(0, ty_ptr));
-        for k in 1..self.tys.len() {
-            suffix.push(intern_ctx_id(self.suffix[k], ty_ptr));
-        }
-        if !self.tys.is_empty() {
-            suffix.push(new_id);
-        }
         self.id = new_id;
-        self.suffix = suffix;
         self.tys.push(ty);
     }
 
@@ -1175,11 +1163,6 @@ impl Ctx {
             id = intern_ctx_binding_id(id, i, ty_ptr);
         }
         id
-    }
-
-    fn suffix_key(&self, k: usize) -> u64 {
-        let k = k.min(self.tys.len());
-        self.suffix.get(k).copied().unwrap_or(self.id)
     }
 
     fn len(&self) -> usize {
@@ -14149,6 +14132,18 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             assert_eq!(ctx.used_bvar_key(u64::MAX, 65), reference(&ctx, u64::MAX, 65));
             assert_eq!(ctx.used_bvar_key(0, 0), reference(&ctx, 0, 0));
         }
+    }
+
+    #[test]
+    fn regression_440_push_builds_only_the_used_full_context_identity() {
+        let before = CTX_IDS.with(|m| m.borrow().len());
+        let mut ctx = Ctx::new();
+        for n in 0..100u32 { ctx.push(ty(2_000_000 + n)); }
+        let after = CTX_IDS.with(|m| m.borrow().len());
+        assert_eq!(after - before, 100, "unused suffix identities must not accumulate quadratically");
+        assert_eq!(ctx.len(), 100);
+        assert_ne!(ctx.id, 0);
+        assert_eq!(ctx.term_ctx_key(&expr::bvar(64)), ctx.id);
     }
 
 }
