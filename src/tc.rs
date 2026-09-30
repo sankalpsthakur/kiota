@@ -2044,7 +2044,7 @@ impl<'e> Checker<'e> {
             let proj_i = expr::proj(sname, i, v.clone());
             cur = expr::instantiate1(&body, &proj_i);
         }
-        if self.is_prop(ctx, &vtw)? {
+        if self.is_prop_checked(ctx, &vtw)? {
             // Lean's kernel rejects a projection out of a Prop-valued,
             // single-constructor structure unless (a) the projected
             // field is itself provably Prop at this instantiation, and
@@ -2060,7 +2060,7 @@ impl<'e> Checker<'e> {
             // not for using it). `091_projProp3`/`096_projMaybeProp`:
             // a data field that *isn't* referenced by anything later is
             // "non-dependent" and does not block subsequent projections.
-            if !self.is_prop(ctx, &doms[idx as usize])? {
+            if !self.is_prop_checked(ctx, &doms[idx as usize])? {
                 return reject("cannot project a Type field from a Prop structure");
             }
             let mut referenced = Vec::new();
@@ -2070,7 +2070,7 @@ impl<'e> Checker<'e> {
             let mut dependent_data_bound: Option<u32> = None;
             for j in referenced {
                 if (j as usize) < doms.len()
-                    && !self.is_prop(ctx, &doms[j as usize])?
+                    && !self.is_prop_checked(ctx, &doms[j as usize])?
                     && dependent_data_bound.is_none_or(|m| j < m)
                 {
                     dependent_data_bound = Some(j);
@@ -2351,6 +2351,17 @@ impl<'e> Checker<'e> {
                 self.is_prop_by_infer(ctx, &w)
             }
         }
+    }
+
+    /// Security-critical Prop classification must distinguish a genuine
+    /// nonzero Sort from a stuck or invalid inferred sort. A failed check
+    /// is not permission to project data from a proof (Lean PR14807).
+    fn is_prop_checked(&self, ctx: &Ctx, ty: &Expr) -> R<bool> {
+        self.with_infer_only(|| {
+            let inferred = self.infer_type(ctx, ty)?;
+            let universe = self.ensure_sort(ctx, &inferred)?;
+            Ok(level::is_def_eq(&universe, &level::zero()))
+        })
     }
 
     /// InferOnly typeof. Check-mode infer here re-entered PI on huge type
@@ -3982,7 +3993,7 @@ impl<'e> Checker<'e> {
         crate::stats::defeq_call();
         // Speculative alias congruence must not rescue an aborted core
         // normalization or bypass the existing core depth guard. Check
-        // before identity/cache hits too; a prior abort is sticky per decl.
+        // before identity/cache hits too; whnf clears its own abort flag.
         if self.lazy_head_enabled.get()
             && (CORE_ABORTED.with(Cell::get) || CORE_DEPTH.with(|d| d.get() >= CONV_DEPTH))
         {
@@ -13921,6 +13932,30 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             assert!(matches!(r, Err(TcError::Decline(_))), "lost abort: {r:?}");
         }
         assert!(tc.with_forced_eager_defeq(|| tc.is_def_eq(&Ctx::new(), &zero, &zero)).unwrap());
+    }
+
+    #[test]
+    fn regression_435_projection_prop_check_requires_an_actual_sort() {
+        use crate::env::{ConstantInfo as CI, Environment};
+        let mut env = Environment::default();
+        let type0 = expr::sort(level::succ(level::zero()));
+        let prop = expr::sort(level::zero());
+        for (id, typ) in [(0, type0), (1, expr::const_(0, vec![])), (2, prop)] {
+            env.insert(id, CI::Axiom {level_params: vec![], typ, is_unsafe: false});
+        }
+        let names = test_names(&["A", "a", "P"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let ctx = Ctx::new();
+        // A : Type, a : A, P : Prop are valid declarations. a itself is
+        // a value, not a type; its inferred type A is stuck, not a Sort.
+        for id in [0, 1, 2] {
+            let inferred = tc.infer_type(&ctx, &expr::const_(id, vec![])).unwrap();
+            assert_eq!(inferred, env.get(id).unwrap().typ().clone());
+        }
+        assert!(!tc.is_prop_checked(&ctx, &expr::const_(0, vec![])).unwrap());
+        assert!(tc.is_prop_checked(&ctx, &expr::const_(2, vec![])).unwrap());
+        let r = tc.is_prop_checked(&ctx, &expr::const_(1, vec![]));
+        assert!(matches!(r, Err(TcError::Reject(_))), "stuck inferred sort is not non-Prop: {r:?}");
     }
 
 }

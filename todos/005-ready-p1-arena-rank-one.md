@@ -96,3 +96,9 @@ snapshot now pins SHA549477be6e17e6fc32b1c744822bfb2580be1faa10bdfc76d5154d18a3c
 (194cases; all193 prior hashes unchanged). Exact Init next replays immutable
 checker3260d92 with the original6GiB/no-swap/600s gate. Official pin2d2a9fa
 remains unchanged; rank-one goal stays active and all full-corpus gates open.
+
+### 2026-09-30 - Current rank-one ledger and rejected experiment
+
+Official board and raw publication4c30c4ac agree on position20/25, now125validaccepts (new proj-stuck-struct),71invalidrejects,oneMathlibfalse rejection,sixvaliddeclines; pin2d2a9fa unchanged. This extra accepted new input is not a rank gain. Leader now sokonanoda acceptsMathlib at753587633924 instructions; mathgraph776338011558. No candidate fullMathlib acceptance. Rank-one objective stays active.
+
+Remote arithmetic fixes pass204 Rust tests; latest abort guard206+33. Lazy-head full matrix reveals an actual false acceptance (proj-of-subst-prop); default remains safe on71negatives but193/194 duepair5GiBRSS. ExactInit opt-in timesout600s. Strict projection sort validation is the next diagnostic, not a promoted fix. Retention-only also remains unpromoted (deep-n36timeout). Do not change official pin/draftPR or relaxcaps.
