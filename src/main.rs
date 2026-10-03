@@ -72,7 +72,10 @@ fn main() {
                     let stdin = std::io::stdin();
                     p.run(BufReader::new(stdin.lock()))
                 } else {
-                    let file = std::fs::File::open(path.unwrap()).expect("open input");
+                    let path = path.as_deref().unwrap();
+                    let file = std::fs::File::open(path).map_err(|error| {
+                        tc::TcError::Other(format!("open input `{path}`: {error}"))
+                    })?;
                     p.run(BufReader::new(file))
                 }
             });
