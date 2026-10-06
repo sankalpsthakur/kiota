@@ -1,0 +1,172 @@
+name: regenerate-arena-corpus
+
+# Rebuilds the Lean Kernel Arena's five large exports with the arena's own
+# recipe (lka.py: setup_source_directory / setup_lean4export / create_test)
+# and proves byte identity against the hashes the live board publishes.
+# Heavy work runs here, never on a developer machine.
+on:
+  push:
+    branches: ['remote/corpus-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Arena revision that produced the board these hashes come from.
+  ARENA_REV: b1d6e91d6de351f9bcf21e6b039f4d51d6b9bb42
+
+jobs:
+  export:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: init
+            kind: leanfile
+            leanfile: tests/init_module.lean
+            sha256: 620502ac9e63ba4a2dea9d46386c2f6aebc49faf8848ea3aaa18a77a09491a6a
+            size: 347555345
+            lines: 6487065
+          - name: std
+            kind: leanfile
+            leanfile: tests/std_module.lean
+            sha256: 289ed65a367abdc7388a855d2acf59cc1f401f5e06295acbb8a420682d9f00bd
+            size: 596655086
+            lines: 10826639
+          - name: cedar
+            kind: module
+            url: https://github.com/cedar-policy/cedar-spec/
+            rev: 017c35c3d1f856a0f8b62a66660ee6628870bbcf
+            module: Cedar
+            prebuild: shopt -s dotglob && find . -mindepth 1 -maxdepth 1 ! -name cedar-lean -exec rm -rf {} + && mv cedar-lean/* . && rmdir cedar-lean
+            sha256: c675682320b1a3e84e0280ff431c89808258c636a91bc2539fe0f63c51182379
+            size: 872400673
+            lines: 15316788
+          - name: cslib
+            kind: module
+            url: https://github.com/leanprover/cslib
+            rev: 990e65a685bed413f43b139db900a36ad5322a10
+            module: Cslib
+            prebuild: lake exe cache get
+            sha256: bc5c88e028d02a3c0789de6efb9cd96e8506d1e96b3d26672d28ae3bb33d0b30
+            size: 2422584798
+            lines: 42689984
+          - name: mathlib
+            kind: module
+            url: https://github.com/leanprover-community/mathlib4
+            rev: d13f23b723b8a846827a245b89c10fc7d3f11612
+            module: Mathlib
+            prebuild: lake exe cache get
+            sha256: 22c5de83469408950005589a3bc5ef5157c65549b5a802f85d567c29151306a6
+            size: 6184415052
+            lines: 109790519
+    env:
+      NAME: ${{ matrix.name }}
+      KIND: ${{ matrix.kind }}
+      LEANFILE: ${{ matrix.leanfile }}
+      SRC_URL: ${{ matrix.url }}
+      SRC_REV: ${{ matrix.rev }}
+      MODULE: ${{ matrix.module }}
+      PREBUILD: ${{ matrix.prebuild }}
+      WANT_SHA256: ${{ matrix.sha256 }}
+      WANT_SIZE: ${{ matrix.size }}
+      WANT_LINES: ${{ matrix.lines }}
+    steps:
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install elan and zstd
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y zstd >/dev/null
+
+      - name: Fetch arena test spec at the board's revision
+        run: |
+          git init -q arena && cd arena
+          git remote add origin https://github.com/leanprover/lean-kernel-arena
+          git fetch -q --depth 1 origin "$ARENA_REV"
+          git checkout -q FETCH_HEAD
+
+      - name: Prepare source (lka.py setup_source_directory)
+        run: |
+          mkdir -p work/src && cd work/src
+          if [ "$KIND" = leanfile ]; then
+            cp "$GITHUB_WORKSPACE/arena/$LEANFILE" Test.lean
+            cp "$GITHUB_WORKSPACE/arena/tests/lean-toolchain" lean-toolchain
+            printf 'name = "test"\n\n[[lean_lib]]\nname = "Test"' > lakefile.toml
+          else
+            git init -q
+            git remote add origin "$SRC_URL"
+            git fetch -q --depth 1 origin "$SRC_REV"
+            git checkout -q FETCH_HEAD
+          fi
+          echo "toolchain: $(cat lean-toolchain)"
+
+      - name: Build lean4export for this toolchain (lka.py setup_lean4export)
+        run: |
+          git clone -q --branch master https://github.com/leanprover/lean4export lean4export
+          cp work/src/lean-toolchain lean4export/lean-toolchain
+          cd lean4export
+          echo "lean4export master: $(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+          lake build
+
+      - name: Pre-build
+        if: matrix.prebuild != ''
+        working-directory: work/src
+        run: bash -c "$PREBUILD"
+
+      - name: Build module
+        working-directory: work/src
+        run: |
+          MOD="${MODULE:-Test}"
+          lake build "$MOD"
+
+      - name: Export (lka.py run_lean4export)
+        working-directory: work/src
+        run: |
+          MOD="${MODULE:-Test}"
+          start=$(date +%s)
+          lake env "$GITHUB_WORKSPACE/lean4export/.lake/build/bin/lean4export" "$MOD" \
+            > "$GITHUB_WORKSPACE/$NAME.ndjson"
+          echo "EXPORT_SECONDS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+          df -h /
+
+      - name: Verify against the board
+        run: python3 "$GITHUB_WORKSPACE/scripts/remote/verify_export.py" "$NAME.ndjson" > "$NAME.verify.json"
+
+      - name: Report
+        if: always()
+        run: |
+          [ -f "$NAME.verify.json" ] && cat "$NAME.verify.json" | tee -a "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload verification record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-${{ matrix.name }}
+          path: ${{ matrix.name }}.verify.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Compress export
+        run: zstd -T0 -10 --rm "$NAME.ndjson" -o "$NAME.ndjson.zst" && ls -la "$NAME.ndjson.zst"
+
+      - name: Upload export
+        uses: actions/upload-artifact@v4
+        with:
+          name: export-${{ matrix.name }}
+          path: ${{ matrix.name }}.ndjson.zst
+          compression-level: 0
+          retention-days: 30
+
+      - name: Fail unless byte-identical
+        run: python3 -c "import json,sys; sys.exit(0 if json.load(open('$NAME.verify.json'))['byte_identical'] else 1)"
