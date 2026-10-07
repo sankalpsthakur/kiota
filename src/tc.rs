@@ -3405,6 +3405,15 @@ impl<'e> Checker<'e> {
                 );
             }
         }
+        // Diagnostic only (harness branches): dump the active comparisons
+        // once a cache passes KIOTA_CACHE_ALARM entries.
+        if let Some(n) = std::env::var("KIOTA_CACHE_ALARM").ok().and_then(|v| v.parse::<usize>().ok()) {
+            let (d, w, i) = (self.defeq_cache.borrow().len(), self.whnf_cache.borrow().len(), self.infer_cache.borrow().len());
+            if d > n || w > n || i > n {
+                eprintln!("CACHE_ALARM defeq={d} whnf={w} infer={i}");
+                self.dump_conversion_trace(a);
+            }
+        }
         if Rc::ptr_eq(a, b) || a == b {
             return Ok(true);
         }
