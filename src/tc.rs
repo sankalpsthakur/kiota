@@ -902,6 +902,8 @@ pub struct Checker<'e> {
     pub names: &'e [std::rc::Rc<String>],
     pub nat_ref: Option<u32>,
     pub string_ref: Option<u32>,
+    /// Cached once per environment by `native_string_projection_ok`.
+    native_string_ok: std::cell::Cell<Option<bool>>,
     /// `(ctx_key, ptr) → WHNF`. `ctx_key` is 0 for closed terms, `ctx.id` for open.
     whnf_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
     whnf_core_cache: RefCell<FxHashMap<(u64, usize), Expr>>,
@@ -1292,6 +1294,7 @@ impl<'e> Checker<'e> {
             names,
             nat_ref,
             string_ref,
+            native_string_ok: std::cell::Cell::new(None),
             whnf_cache: RefCell::new(FxHashMap::default()),
             whnf_core_cache: RefCell::new(FxHashMap::default()),
             defeq_cache: RefCell::new(FxHashMap::default()),
@@ -2993,7 +2996,7 @@ impl<'e> Checker<'e> {
                     }
                 }
                 if let ExprData::Lit(Lit::Str(s)) = &***major {
-                    if self.name_str(*sname) == "String" && *idx == 0 {
+                    if *idx == 0 && self.native_string_projection_ok(*sname) {
                         if let Some(bytes) = self.string_to_byte_array(s) {
                             return Ok(Some(expr::apps(bytes, &args)));
                         }
@@ -3405,7 +3408,7 @@ impl<'e> Checker<'e> {
                                 }
                             }
                             if let ExprData::Lit(Lit::Str(s)) = &**vw {
-                                if self.name_str(*sname) == "String" && *idx == 0 {
+                                if *idx == 0 && self.native_string_projection_ok(*sname) {
                                     if let Some(ba) = self.string_to_byte_array(s) {
                                         cur = expr::apps(ba, &args);
                                         continue;
@@ -3496,7 +3499,7 @@ impl<'e> Checker<'e> {
                         }
                     }
                     if let ExprData::Lit(Lit::Str(s)) = &**vw {
-                        if self.name_str(*sname) == "String" && *idx == 0 {
+                        if *idx == 0 && self.native_string_projection_ok(*sname) {
                             if let Some(ba) = self.string_to_byte_array(s) {
                                 cur = ba;
                                 continue;
@@ -8280,6 +8283,77 @@ impl<'e> Checker<'e> {
         Ok(None)
     }
 
+    /// May a projection of a string literal be reduced to the native
+    /// `ByteArray.mk (Array.mk UInt8 …)` representation?
+    ///
+    /// `string_to_byte_array` assembles that term from `ByteArray.mk`,
+    /// `Array.mk`, `List.nil`, `List.cons`, `UInt8` and `UInt8.ofNat`, each
+    /// found by name, for a structure recognised only by the name `String`.
+    /// An export can declare any of them, so a name match does not establish
+    /// that the reduct has the projected field's type; without `UInt8.ofNat`
+    /// the builder even falls back to raw `Nat` elements in a `List UInt8`.
+    ///
+    /// Require type preservation instead. The literal type must be a
+    /// parameterless single-constructor structure, and the reducts for `""`
+    /// and a one-byte string must have exactly the type of its first field.
+    /// Those two exercise every constant the builder uses; longer strings
+    /// repeat them in the same shape. Decided once per environment. When the
+    /// check fails or cannot finish, the projection stays unreduced, which
+    /// can only cost an accept.
+    fn native_string_projection_ok(&self, sname: u32) -> bool {
+        if self.string_ref != Some(sname) || self.name_str(sname) != "String" {
+            return false;
+        }
+        if let Some(ok) = self.native_string_ok.get() {
+            return ok;
+        }
+        match self.check_native_string_projection(sname) {
+            Ok(ok) => {
+                self.native_string_ok.set(Some(ok));
+                ok
+            }
+            // An abort says nothing about the environment, so it is not cached.
+            Err(_) => false,
+        }
+    }
+
+    fn check_native_string_projection(&self, sname: u32) -> R<bool> {
+        let ctor = match self.env.get(sname) {
+            Some(ConstantInfo::InductiveType {
+                num_params: 0,
+                num_indices: 0,
+                ctors,
+                is_unsafe: false,
+                ..
+            }) if ctors.len() == 1 => ctors[0],
+            _ => return Ok(false),
+        };
+        let field0 = match self.env.get(ctor) {
+            Some(ConstantInfo::Constructor {
+                typ,
+                num_params: 0,
+                num_fields,
+                ..
+            }) if *num_fields >= 1 => match &***typ {
+                ExprData::Pi(_, dom, _) if expr::loose_bvar_range(dom) == 0 => dom.clone(),
+                _ => return Ok(false),
+            },
+            _ => return Ok(false),
+        };
+        let ctx = Ctx::new();
+        for sample in ["", "a"].iter() {
+            let reduct = match self.string_to_byte_array(sample) {
+                Some(r) => r,
+                None => return Ok(false),
+            };
+            let ty = self.infer_type(&ctx, &reduct)?;
+            if !self.is_def_eq(&ctx, &ty, &field0)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn string_to_byte_array(&self, s: &str) -> Option<Expr> {
         let ba_mk = self.find_name("ByteArray.mk")?;
         let arr_mk = self.find_name("Array.mk")?;
@@ -10757,6 +10831,104 @@ mod tests {
 
     fn test_names(ss: &[&str]) -> Vec<std::rc::Rc<String>> {
         ss.iter().map(|s| std::rc::Rc::new((*s).into())).collect()
+    }
+
+    /// A `String` whose only field is `Nat`, with the rest of the native
+    /// representation chain (`ByteArray`, `Array`, `List`, `UInt8`) declared
+    /// correctly. The check must reach the type comparison and answer
+    /// `false` there; asserting `Ok(false)` rather than "not true" catches a
+    /// fixture that merely errors out before the comparison.
+    #[test]
+    fn string_literal_projection_requires_matching_field_type() {
+        use crate::expr::BinderInfo as BI;
+        let mut env = Environment::default();
+        let names = test_names(&[
+            "String", "String.mk", "Nat", "ByteArray", "ByteArray.mk", "Array", "Array.mk",
+            "List", "List.nil", "List.cons", "UInt8", "UInt8.ofNat", "u",
+        ]);
+        let c = |n: u32, us: Vec<Level>| expr::const_(n, us);
+        let u = level::param(12);
+        let type_u = expr::sort(level::succ(u.clone()));
+        let type0 = expr::sort(level::succ(level::zero()));
+        let inductive = |lps: Vec<u32>, typ: Expr, np: u32, all: u32, ctors: Vec<u32>| {
+            ConstantInfo::InductiveType {
+                level_params: lps,
+                typ,
+                num_params: np,
+                num_indices: 0,
+                all: vec![all],
+                ctors,
+                is_rec: false,
+                is_unsafe: false,
+            }
+        };
+        let ctor = |lps: Vec<u32>, typ: Expr, induct: u32, np: u32, nf: u32| {
+            ConstantInfo::Constructor {
+                level_params: lps,
+                typ,
+                induct,
+                cidx: 0,
+                num_params: np,
+                num_fields: nf,
+                is_unsafe: false,
+            }
+        };
+        // String's single field is Nat, not ByteArray.
+        env.insert(0, inductive(vec![], type0.clone(), 0, 0, vec![1]));
+        env.insert(1, ctor(vec![], expr::pi(BI::Default, c(2, vec![]), c(0, vec![])), 0, 0, 1));
+        env.insert(2, inductive(vec![], type0.clone(), 0, 2, vec![]));
+        env.insert(10, inductive(vec![], type0.clone(), 0, 10, vec![]));
+        // List.{u}; List.nil.{u} : {α : Type u} → List α
+        env.insert(7, inductive(vec![12], expr::pi(BI::Default, type_u.clone(), type_u.clone()), 1, 7, vec![8]));
+        env.insert(
+            8,
+            ctor(
+                vec![12],
+                expr::pi(BI::Implicit, type_u.clone(), expr::app(c(7, vec![u.clone()]), expr::bvar(0))),
+                7,
+                1,
+                0,
+            ),
+        );
+        // Array.{u}; Array.mk.{u} : {α : Type u} → List α → Array α
+        env.insert(5, inductive(vec![12], expr::pi(BI::Default, type_u.clone(), type_u.clone()), 1, 5, vec![6]));
+        env.insert(
+            6,
+            ctor(
+                vec![12],
+                expr::pi(
+                    BI::Implicit,
+                    type_u.clone(),
+                    expr::pi(
+                        BI::Default,
+                        expr::app(c(7, vec![u.clone()]), expr::bvar(0)),
+                        expr::app(c(5, vec![u.clone()]), expr::bvar(1)),
+                    ),
+                ),
+                5,
+                1,
+                1,
+            ),
+        );
+        // ByteArray; ByteArray.mk : Array UInt8 → ByteArray
+        env.insert(3, inductive(vec![], type0.clone(), 0, 3, vec![4]));
+        env.insert(
+            4,
+            ctor(
+                vec![],
+                expr::pi(BI::Default, expr::app(c(5, vec![level::zero()]), c(10, vec![])), c(3, vec![])),
+                3,
+                0,
+                1,
+            ),
+        );
+        let tc = Checker::new(&env, &names, None, Some(0));
+        let decided = tc.check_native_string_projection(0);
+        assert!(
+            matches!(decided, Ok(false)),
+            "a String whose field is not ByteArray must be decided false, got {decided:?}"
+        );
+        assert!(!tc.native_string_projection_ok(0));
     }
 
     /// `False` / `True` as inductives (not axioms). `True.intro` is a ctor.
