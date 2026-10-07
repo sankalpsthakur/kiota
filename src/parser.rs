@@ -1126,9 +1126,17 @@ impl Parser {
         }
         let nat_ref = self.name_by_str.get("Nat").copied();
         let string_ref = self.name_by_str.get("String").copied();
-        Checker::new(&self.env, &self.names, nat_ref, string_ref)
+        let r = Checker::new(&self.env, &self.names, nat_ref, string_ref)
             .check_decl(name, kind)
-            .map_err(|e| self.annotate(name, e))
+            .map_err(|e| self.annotate(name, e));
+        // Diagnostic only (harness branches): report and keep going.
+        if std::env::var_os("KIOTA_CONTINUE").is_some() {
+            if let Err(e) = &r {
+                eprintln!("CONTINUE_PAST #{} {:?}", self.decl_count, e);
+                return Ok(());
+            }
+        }
+        r
     }
 
     fn annotate(&self, name: u32, e: TcError) -> TcError {
