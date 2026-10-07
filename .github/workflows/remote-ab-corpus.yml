@@ -1,0 +1,119 @@
+name: remote-ab-corpus
+
+# A/B a checker change against its baseline on the arena's real large
+# exports (byte-verified Lean 4.34.1 builds from regenerate-arena-corpus),
+# with the arena's own per-test timeouts. Unit tests cannot show that a
+# soundness guard still admits genuine Lean input; these corpora can.
+on:
+  push:
+    branches: ['remote/ab-proj-17']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  BASELINE_SHA: 604e96646218585a441e1e6068483225f8548008
+  EXPORTS_RUN: '37534509955'
+
+jobs:
+  run:
+    name: ${{ matrix.corpus }} / ${{ matrix.side }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [init, std, mathlib, cslib, cedar]
+        side: [candidate, baseline]
+        include:
+          - corpus: init
+            limit: 500
+          - corpus: std
+            limit: 590
+          - corpus: mathlib
+            limit: 5680
+          - corpus: cslib
+            limit: 1800
+          - corpus: cedar
+            limit: 940
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select source
+        run: |
+          if [ "${{ matrix.side }}" = baseline ]; then git checkout -q "$BASELINE_SHA"; fi
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Fetch verified export
+        uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check
+        env:
+          CORPUS: ${{ matrix.corpus }}
+          LIMIT: ${{ matrix.limit }}
+          SIDE: ${{ matrix.side }}
+        run: |
+          sudo apt-get install -y zstd >/dev/null
+          zstd -d --rm "$CORPUS.ndjson.zst" -o "$CORPUS.ndjson"
+          set +e
+          start=$(date +%s.%N)
+          /usr/bin/time -v timeout "$LIMIT" ./target/release/kiota "$CORPUS.ndjson" \
+            > out.txt 2> err.txt
+          rc=$?
+          end=$(date +%s.%N)
+          set -e
+          rss_kb=$(grep "Maximum resident set size" err.txt | awk '{print $NF}')
+          cat out.txt err.txt | grep -m1 -E "^(REJECT|DECLINE)" | cut -c1-300 > verdict.txt || true
+          python3 - <<PY > "result-$CORPUS-$SIDE.json"
+          import json
+          rc = $rc
+          outcome = {0: "accept", 1: "reject", 2: "decline", 124: "timeout", 137: "killed"}.get(rc, f"exit-{rc}")
+          print(json.dumps({
+              "corpus": "$CORPUS", "side": "$SIDE", "source": "$SOURCE_SHA",
+              "outcome": outcome, "exit_code": rc,
+              "wall_seconds": round($end - $start, 2), "limit_seconds": $LIMIT,
+              "peak_rss_mib": int(("${rss_kb:-0}" or "0")) // 1024,
+              "first_verdict_line": open("verdict.txt", errors="replace").read().strip(),
+          }, indent=2))
+          PY
+          cat "result-$CORPUS-$SIDE.json" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.corpus }}-${{ matrix.side }}
+          path: result-${{ matrix.corpus }}-${{ matrix.side }}.json
+
+  compare:
+    needs: run
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          merge-multiple: true
+      - name: Candidate must not be worse than baseline
+        run: |
+          python3 - <<'PY'
+          import json, glob, sys
+          rank = {"accept": 3, "decline": 2, "timeout": 1, "killed": 1, "reject": 0}
+          rows = {}
+          for f in glob.glob("result-*.json"):
+              r = json.load(open(f)); rows[(r["corpus"], r["side"])] = r
+          worse = []
+          for corpus in ("init", "std", "mathlib", "cslib", "cedar"):
+              b, c = rows.get((corpus, "baseline")), rows.get((corpus, "candidate"))
+              if not b or not c:
+                  print(f"{corpus}: missing result"); worse.append(corpus); continue
+              print(f"{corpus:8} baseline={b['outcome']:8} {b['wall_seconds']:>8}s {b['peak_rss_mib']:>6}MiB | "
+                    f"candidate={c['outcome']:8} {c['wall_seconds']:>8}s {c['peak_rss_mib']:>6}MiB")
+              if rank.get(c["outcome"], -1) < rank.get(b["outcome"], -1):
+                  worse.append(corpus)
+          sys.exit(1 if worse else 0)
+          PY
