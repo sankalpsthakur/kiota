@@ -24,13 +24,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # con-leche from the extra-corpus export run (byte-identical to the
+        # navier-stokes-euler from the extra-corpus export run (byte-identical to the
         # board); candidate = #19 head, baseline = main 512adbd.
         side: [candidate, baseline]
-        corpus: [con-leche]
+        corpus: [navier-stokes-euler]
         include:
-          - corpus: con-leche
-            limit: 720
+          - corpus: navier-stokes-euler
+            limit: 2400
     steps:
       - uses: actions/checkout@v4
         with:
