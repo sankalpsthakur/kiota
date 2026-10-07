@@ -4247,6 +4247,13 @@ impl<'e> Checker<'e> {
             ) {
                 return Ok(x == y);
             }
+            // Lean's `is_def_eq_offset`: a positive literal or `succ x` on both
+            // sides compares by predecessors. `try_nat_extension` no longer
+            // folds `succ` of an open term, so `succ ((λ _, 5) x)` still has to
+            // meet `6` this way. Two literals were decided just above.
+            if let (Some(pa), Some(pb)) = (nat::pred(a, zero, succ), nat::pred(b, zero, succ)) {
+                return self.is_def_eq(ctx, &pa, &pb);
+            }
         }
         // Structural match without delta.
         match (&***a, &***b) {
@@ -5573,6 +5580,17 @@ impl<'e> Checker<'e> {
         let name = self.name_str(n);
         match name {
             "Nat.succ" if !args.is_empty() => {
+                // Like Lean's `reduce_nat`, leave a term with free variables
+                // alone: `succ x` is already weak head normal. Normalizing an
+                // open argument recursed once per unit of a literal, since
+                // `x + k` unfolds (`Nat.add` is `brecOn` over `k`) to
+                // `succ (x + (k-1))` and this arm normalized that argument in
+                // turn. Batteries `Char.all._proof_1` counted `c + 57344` down
+                // to the depth limit. `is_def_eq_core` compares such a `succ`
+                // with a literal by predecessors instead.
+                if expr::loose_bvar_range(&args[0]) > 0 {
+                    return Ok(None);
+                }
                 let a = self.reduce_nat_arg(ctx, &args[0])?;
                 if let Some(v) = nat::as_lit(&a) {
                     let r = nat::mk_lit(nat::succ_value(v));
@@ -14207,6 +14225,35 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
         assert!(!SPECULATING.with(Cell::get));
         assert!(!CORE_ABORTED.with(Cell::get));
+    }
+
+    #[test]
+    fn open_succ_is_not_normalized_and_meets_literals_by_predecessor() {
+        // Batteries `Char.all._proof_1`: `c + 57345` vs `c + 57344 + 1`.
+        // `Nat.add x k` unfolds to `succ (Nat.rec … (k-1))`; normalizing
+        // that open `succ` argument recursed once per unit of `k`.
+        let env = regression_429_nat_add_env();
+        let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let nat = expr::const_(0, vec![]);
+        let succ = |e| expr::app(expr::const_(2, vec![]), e);
+        let add = |a, b| expr::apps(expr::const_(4, vec![]), &[a, b]);
+        let lit = |n: u32| expr::lit_nat(BigUint::from(n));
+        let mut ctx = Ctx::new();
+        ctx.push(nat.clone());
+        let x = expr::bvar(0);
+        let eq = |a: &Expr, b: &Expr| tc.with_forced_eager_defeq(|| tc.is_def_eq(&ctx, a, b));
+
+        let r = eq(&add(x.clone(), lit(57345)), &succ(add(x.clone(), lit(57344))));
+        assert!(matches!(r, Ok(true)), "{r:?}");
+
+        // The literal fold for `succ` of an open term is gone; the offset rule
+        // still identifies `succ ((λ _, 5) x)` with `6`.
+        let five_of_x = expr::app(expr::lam(expr::BinderInfo::Default, nat.clone(), lit(5)), x.clone());
+        assert!(matches!(eq(&succ(five_of_x.clone()), &lit(6)), Ok(true)));
+        assert!(matches!(eq(&lit(6), &succ(five_of_x.clone())), Ok(true)));
+        assert!(matches!(eq(&succ(five_of_x), &lit(7)), Ok(false)));
+        assert!(matches!(eq(&succ(x), &lit(6)), Ok(false)));
     }
 
     #[test]
