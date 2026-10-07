@@ -1191,6 +1191,28 @@ impl<'e> Checker<'e> {
             }
             ExprData::Sort(l) => Ok(expr::sort(level::succ(l.clone()))),
             ExprData::Const(n, us) => self.infer_const(*n, us),
+            ExprData::App(..) if self.infer_only.get() => {
+                // Lean `infer_app` with `infer_only`: walk the head's Pi
+                // telescope and substitute the pending arguments in one pass,
+                // only where a binder is not already syntactically a Pi.
+                // Inferring each prefix and instantiating one argument at a
+                // time rebuilt the rest of the telescope per argument.
+                let (head, args) = expr::unfold_apps(e);
+                let mut ft = self.infer_type(ctx, &head)?;
+                let mut j = 0;
+                for i in 0..args.len() {
+                    if let ExprData::Pi(_, _, body) = &**ft {
+                        ft = body.clone();
+                        continue;
+                    }
+                    let pending: Vec<Expr> = args[j..i].iter().rev().cloned().collect();
+                    let (_, _, body) = self.ensure_pi(ctx, &expr::instantiate(&ft, &pending))?;
+                    ft = body;
+                    j = i;
+                }
+                let pending: Vec<Expr> = args[j..].iter().rev().cloned().collect();
+                Ok(expr::instantiate(&ft, &pending))
+            }
             ExprData::App(f, a) => {
                 let ft = self.infer_type(ctx, f)?;
                 let (_, dom, body) = self.ensure_pi(ctx, &ft)?;
@@ -11611,6 +11633,52 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         // accepted, and still a decline.
         let r = eq(&h_slow(&big), &k(&(&big + 1u32)));
         assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+    }
+
+    #[test]
+    fn infer_only_application_matches_checked_inference() {
+        // The infer-only path substitutes a spine's arguments in one pass;
+        // it must give the same type as the checked path, which instantiates
+        // one argument at a time: across a dependent telescope (`Nat.rec`),
+        // and where a binder is reached only by unfolding (`T := Nat → Nat`).
+        use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+        let mut env = regression_429_nat_add_env();
+        let c = |i| expr::const_(i, vec![]);
+        let v = expr::bvar;
+        let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
+        let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+        let nat = c(0);
+        env.insert(5, CI::Def {
+            level_params: vec![],
+            typ: expr::sort(level::succ(level::zero())),
+            value: pi(nat.clone(), nat.clone()),
+            hints: RH::Regular(1),
+            is_unsafe: false,
+        });
+        env.insert(6, CI::Axiom {
+            level_params: vec![],
+            typ: pi(nat.clone(), c(5)),
+            is_unsafe: false,
+        });
+        let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add", "T", "f"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+        let lit = |n: u32| expr::lit_nat(BigUint::from(n));
+        let rec = expr::apps(c(3), &[
+            lam(nat.clone(), nat.clone()),
+            c(1),
+            lam(nat.clone(), lam(nat.clone(), expr::app(c(2), v(0)))),
+            lit(5),
+        ]);
+        let through_def = expr::apps(c(6), &[lit(1), lit(2)]);
+        // Infer-only first: a checked cache entry would answer it instead.
+        for term in [&rec, &through_def, &expr::apps(c(4), &[lit(1), lit(2)])] {
+            let only = tc.with_infer_only(|| tc.infer_type(&ctx, term)).unwrap();
+            let checked = tc.infer_type(&ctx, term).unwrap();
+            assert!(Rc::ptr_eq(&checked, &only), "{} vs {}", tc.pp(&checked), tc.pp(&only));
+        }
+        let ty = tc.with_infer_only(|| tc.infer_type(&ctx, &through_def)).unwrap();
+        assert!(Rc::ptr_eq(&ty, &nat), "{}", tc.pp(&ty));
     }
 
     #[test]
