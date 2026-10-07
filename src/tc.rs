@@ -2907,6 +2907,9 @@ impl<'e> Checker<'e> {
             self.dump_conversion_trace(e);
             return decline("WHNF depth limit");
         }
+        if expr::node_alarm() {
+            self.dump_conversion_trace(e);
+        }
         let r = self.whnf_inner(ctx, e);
         WHNF_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         r

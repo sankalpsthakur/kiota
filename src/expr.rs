@@ -394,11 +394,30 @@ pub fn intern(d: ExprData) -> Expr {
         eprintln!("INTERN_CALLS {n} nodes={}", intern_node_count());
         let _ = std::io::Write::flush(&mut std::io::stderr());
     }
+    // Diagnostic: KIOTA_NODE_ALARM=N raises node_alarm() once the interner
+    // holds more than N nodes (checked every 2^16 calls).
+    if n & 0xFFFF == 0 {
+        thread_local! {
+            static LIMIT: Option<usize> =
+                std::env::var("KIOTA_NODE_ALARM").ok().and_then(|v| v.parse().ok());
+        }
+        if LIMIT.with(|l| l.is_some_and(|l| intern_node_count() > l)) {
+            NODE_ALARM.with(|a| a.set(true));
+        }
+    }
     if reclamation_enabled() {
         WEAK_INTERN.with(|t| t.borrow_mut().intern(d))
     } else {
         INTERN.with(|t| t.borrow_mut().intern(d))
     }
+}
+
+thread_local! {
+    static NODE_ALARM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn node_alarm() -> bool {
+    NODE_ALARM.with(|a| a.get())
 }
 
 pub fn intern_node_count() -> usize {
