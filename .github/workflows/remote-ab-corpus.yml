@@ -1,0 +1,127 @@
+name: remote-ab-corpus
+
+# A/B a checker change against its baseline on the arena's real large
+# exports (byte-verified Lean 4.34.1 builds from regenerate-arena-corpus),
+# with the arena's own per-test timeouts. Unit tests cannot show that a
+# soundness guard still admits genuine Lean input; these corpora can.
+on:
+  push:
+    branches: ['remote/continue-ld']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  BASELINE_SHA: 98141dc878a9a14a8a3b7314fea99d57253cb039
+  EXPORTS_RUN: '37534509955'
+
+jobs:
+  run:
+    name: ${{ matrix.corpus }} / ${{ matrix.side }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both sides keep going past a failed declaration (KIOTA_CONTINUE).
+        # Candidate: fix/lazy-delta-lean-step. Baseline: fix/library-interpreters
+        # (98141dc = 7f9ab37 + the diagnostic patch).
+        side: [baseline, candidate]
+        corpus: [init, std]
+        include:
+          - corpus: init
+            limit: 500
+          - corpus: std
+            limit: 590
+          - corpus: mathlib
+            limit: 5680
+          - corpus: cslib
+            limit: 1800
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select source
+        run: |
+          if [ "${{ matrix.side }}" = baseline ]; then git checkout -q "$BASELINE_SHA"; fi
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Fetch verified export
+        uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check
+        env:
+          CORPUS: ${{ matrix.corpus }}
+          LIMIT: ${{ matrix.limit }}
+          SIDE: ${{ matrix.side }}
+        run: |
+          sudo apt-get install -y zstd >/dev/null
+          zstd -d --rm "$CORPUS.ndjson.zst" -o "$CORPUS.ndjson"
+          set +e
+          start=$(date +%s.%N)
+          cat > stamp.py <<'PY'
+          import sys, time
+          t0 = time.monotonic()
+          for line in sys.stdin:
+              sys.stdout.write(f"{time.monotonic() - t0:.3f} {line}")
+              sys.stdout.flush()
+          PY
+          # KIOTA_TRACE_CONVERSION dumps the active comparison stack at any
+          # depth limit (first per declaration), recovered or not.
+          KIOTA_CONTINUE=1 KIOTA_PROGRESS=1 /usr/bin/time -v -o time.txt timeout "$LIMIT" ./target/release/kiota "$CORPUS.ndjson" \
+            2>&1 > out.txt | python3 -u stamp.py > stamped.txt
+          rc=${PIPESTATUS[0]}
+          end=$(date +%s.%N)
+          sed -E 's/^[0-9.]+ //' stamped.txt > err.txt
+          cat time.txt >> err.txt
+          python3 scripts/remote/decl_profile.py stamped.txt "$LIMIT" > "profile-$CORPUS-$SIDE.txt" || true
+          grep "CONTINUE_PAST" stamped.txt | cut -c1-600 > "failures-$CORPUS-$SIDE.txt" || true
+          echo "failures: $(wc -l < failures-$CORPUS-$SIDE.txt)"; head -40 "failures-$CORPUS-$SIDE.txt"
+          gzip -9 stamped.txt
+          set -e
+          rss_kb=$(grep "Maximum resident set size" err.txt | awk '{print $NF}')
+          cat out.txt err.txt | grep -m1 -E "^(REJECT|DECLINE)" | cut -c1-300 > verdict.txt || true
+          python3 - <<PY > "result-$CORPUS-$SIDE.json"
+          import json
+          rc = $rc
+          outcome = {0: "accept", 1: "reject", 2: "decline", 124: "timeout", 137: "killed"}.get(rc, f"exit-{rc}")
+          print(json.dumps({
+              "corpus": "$CORPUS", "side": "$SIDE", "source": "$SOURCE_SHA",
+              "outcome": outcome, "exit_code": rc,
+              "wall_seconds": round($end - $start, 2), "limit_seconds": $LIMIT,
+              "peak_rss_mib": int(("${rss_kb:-0}" or "0")) // 1024,
+              "first_verdict_line": open("verdict.txt", errors="replace").read().strip(),
+          }, indent=2))
+          PY
+          cat "result-$CORPUS-$SIDE.json" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.corpus }}-${{ matrix.side }}
+          path: result-${{ matrix.corpus }}-${{ matrix.side }}.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: profile-${{ matrix.corpus }}-${{ matrix.side }}
+          path: |
+            profile-${{ matrix.corpus }}-${{ matrix.side }}.txt
+            failures-${{ matrix.corpus }}-${{ matrix.side }}.txt
+            stamped.txt.gz
+
+  report:
+    needs: run
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          merge-multiple: true
+      - name: Candidate results (compare against the baseline runs named above)
+        run: |
+          for f in result-*.json; do cat "$f"; done | tee -a "$GITHUB_STEP_SUMMARY"
