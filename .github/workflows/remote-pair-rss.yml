@@ -1,0 +1,40 @@
+name: remote-pair-rss
+
+# Peak RSS of the two memory-heavy small-suite cases without the arena-gate's
+# 8 GiB address-space cap (the board ran the live pin uncapped: pair-n21
+# accepted at 6.9 GiB). Diagnostic only.
+on:
+  push:
+    branches: ['remote/pair-rss']
+
+permissions:
+  contents: read
+
+jobs:
+  rss:
+    name: ${{ matrix.rev }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        rev: ['512adbda3dabc22c3bed5dac40376b3647f5a11d', 'ba9f61bc222c687a01c530d356847c0509d7a00b']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.rev }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Measure
+        run: |
+          curl -sSfL --retry 3 https://arena.lean-lang.org/lean-arena-tests.tar.gz -o tests.tar.gz
+          mkdir t && tar -xzf tests.tar.gz -C t
+          for c in $(find t -name 'magma-list-pair-n21.ndjson' -o -name 'magma-list-deep-n36.ndjson'); do
+            set +e
+            /usr/bin/time -v -o time.txt timeout 300 ./target/release/kiota "$c" >/dev/null 2>err.txt
+            rc=$?
+            set -e
+            echo "$(basename "$c") rev=${{ matrix.rev }} exit=$rc $(grep -E 'Maximum resident' time.txt) $(grep -E 'Elapsed' time.txt)" | tee -a "$GITHUB_STEP_SUMMARY"
+            tail -1 err.txt
+          done
