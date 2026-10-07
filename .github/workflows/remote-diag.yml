@@ -1,0 +1,41 @@
+name: remote-diag
+
+# Where Init's new peel-budget decline comes from once the library
+# interpreters are gone: the conversion stack at the decline (diagnostic
+# only, not for main).
+on:
+  push:
+    branches: ['remote/diag-peel']
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: '37534509955'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Trace the declaration
+        run: |
+          sudo apt-get install -y zstd >/dev/null
+          zstd -d --rm init.ndjson.zst -o init.ndjson
+          set +e
+          KIOTA_MIN_DECL=42960 KIOTA_MAX_DECL=42960 KIOTA_TRACE_CONVERSION=1 KIOTA_PP_BUDGET=4000 \
+            timeout 600 ./target/release/kiota init.ndjson > out.txt 2> err.txt
+          echo "rc=$?"
+          grep -v "^\[decl #" err.txt | cut -c1-6000 > trace.txt
+          wc -l trace.txt; head -c 60000 trace.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diag-peel
+          path: trace.txt

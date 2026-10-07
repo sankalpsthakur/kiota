@@ -4004,6 +4004,8 @@ impl<'e> Checker<'e> {
                                 let peels = self.fuel_nat_peels.get() + 1;
                                 self.fuel_nat_peels.set(peels);
                                 if peels > MAX_HUGE_NAT_PEELS {
+                                    eprintln!("PEEL_DECLINE rec={} major={}", self.name_str(rname), self.pp_budget(&major_w, 6));
+                                    self.dump_conversion_trace(&expr::apps(head.clone(), args));
                                     return decline("Nat literal countdown from 2^29 or more exceeds the peel budget");
                                 }
                             }
