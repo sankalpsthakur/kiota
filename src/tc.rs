@@ -73,6 +73,11 @@ thread_local! {
     /// intern DAG — 7^15 at std `#18000` (`LawfulVecOperator.mk`). One level
     /// keeps Acc.rec unreduced majors; nested Apps WHNF then delta.
     static APP_CONG_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// Set while `try_speculative_congruence` runs. Only the outermost
+    /// attempt retries the main path after a `Decline`; nested attempts
+    /// propagate it. Retrying at every level would redo the declining
+    /// subterm once per enclosing frame and per path, exponentially.
+    static SPECULATING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Recursion guard for `whnf` / `is_def_eq`, not a completeness fingerprint.
@@ -3060,6 +3065,32 @@ impl<'e> Checker<'e> {
         Ok(false)
     }
 
+    /// Congruence before full reduction: unreduced, lazy-head, then after a
+    /// cheap `whnf_core`. `Ok(true)` proves equality; `Ok(false)` and a
+    /// `Decline` both mean "not proved this way" (see `is_def_eq_inner_body`).
+    fn try_speculative_congruence(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        if self.try_unreduced_const_congruence(ctx, a, b)? {
+            return Ok(true);
+        }
+        if self.lazy_head_enabled.get() && self.try_lazy_head_congruence(ctx, a, b)? {
+            return Ok(true);
+        }
+        // Lean's own `is_def_eq_core`: a cheap `whnf_core(t, false, true)`
+        // pass (β/ι/proj, no δ, no normalizer extensions) before trying
+        // congruence again — see `try_unreduced_const_congruence_ex`'s own
+        // comment. `a`/`b` here can be β-redexes (`(fun h => Nat.rec …) v`)
+        // whose *bodies* are the same-shape, same-arity recursor spine
+        // `try_unreduced_const_congruence` above never got to see (its own
+        // `unfold_apps` saw the outer `Lam`, not `Nat.rec`). `whnf_core`
+        // (unlike `whnf`) never δ-unfolds a named constant, so this cannot
+        // itself force the full, depth-capped recursor unfold this exists
+        // to avoid.
+        let a_core = self.whnf_core(ctx, a)?;
+        let b_core = self.whnf_core(ctx, b)?;
+        Ok((!Rc::ptr_eq(&a_core, a) || !Rc::ptr_eq(&b_core, b))
+            && self.try_unreduced_const_congruence_ex(ctx, &a_core, &b_core, true)?)
+    }
+
     fn try_unreduced_const_congruence(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         self.try_unreduced_const_congruence_ex(ctx, a, b, false)
     }
@@ -4076,32 +4107,40 @@ impl<'e> Checker<'e> {
             self.defeq_cache_insert(force_eager, key, true);
             return Ok(true);
         }
-        if self.try_unreduced_const_congruence(ctx, a, b)? {
-            self.defeq_cache_insert(force_eager, key, true);
-            return Ok(true);
-        }
-        if self.lazy_head_enabled.get() && self.try_lazy_head_congruence(ctx, a, b)? {
-            self.defeq_cache_insert(force_eager, key, true);
-            return Ok(true);
-        }
-        // Lean's own `is_def_eq_core`: a cheap `whnf_core(t, false, true)`
-        // pass (β/ι/proj, no δ, no normalizer extensions) before trying
-        // congruence again — see `try_unreduced_const_congruence_ex`'s own
-        // comment. `a`/`b` here can be β-redexes (`(fun h => Nat.rec …) v`)
-        // whose *bodies* are the same-shape, same-arity recursor spine
-        // `try_unreduced_const_congruence` above never got to see (its own
-        // `unfold_apps` saw the outer `Lam`, not `Nat.rec`). `whnf_core`
-        // (unlike `whnf`) never δ-unfolds a named constant, so this cannot
-        // itself force the full, depth-capped recursor unfold this exists
-        // to avoid.
-        let a_core = self.whnf_core(ctx, a)?;
-        let b_core = self.whnf_core(ctx, b)?;
-        if (!Rc::ptr_eq(&a_core, a) || !Rc::ptr_eq(&b_core, b))
-            && self.try_unreduced_const_congruence_ex(ctx, &a_core, &b_core, true)?
-        {
-            self.defeq_cache_insert(force_eager, key, true);
-            return Ok(true);
-        }
+        // Speculative congruence only ever proves equality, so a `Decline`
+        // there means "not proved this way", like `false`. Comparing the
+        // arguments whole can need far more budget than reducing both sides
+        // (perf/proj-lazy-struct: `(P (slow n)).1` vs `(Q (slow m)).1`
+        // compares the structs, so `slow n` with `slow m`, where the main
+        // path only projects `0` and `0`). After a decline the main path
+        // still runs, but only a proof of equality overrides the decline.
+        let speculative_decline = if SPECULATING.with(Cell::get) {
+            if self.try_speculative_congruence(ctx, a, b)? {
+                self.defeq_cache_insert(force_eager, key, true);
+                return Ok(true);
+            }
+            None
+        } else {
+            let abort_before = CORE_ABORTED.with(Cell::get);
+            SPECULATING.with(|s| s.set(true));
+            let r = self.try_speculative_congruence(ctx, a, b);
+            SPECULATING.with(|s| s.set(false));
+            match r {
+                Ok(true) => {
+                    self.defeq_cache_insert(force_eager, key, true);
+                    return Ok(true);
+                }
+                Ok(false) => None,
+                Err(TcError::Decline(msg)) => {
+                    // A `Decline` raised by `whnf_core` leaves CORE_ABORTED
+                    // set; the main path's next `whnf` would read it as its
+                    // own abort.
+                    CORE_ABORTED.with(|c| c.set(abort_before));
+                    Some(msg)
+                }
+                Err(e) => return Err(e),
+            }
+        };
         let aw = self.whnf_for_defeq(ctx, a)?;
         let bw = self.whnf_for_defeq(ctx, b)?;
         if std::env::var_os("KIOTA_TRACE_EQ").is_some() {
@@ -4138,10 +4177,16 @@ impl<'e> Checker<'e> {
         }
         if let (Ok(Some(x)), Ok(Some(y))) = (self.closed_int_value(ctx, &aw), self.closed_int_value(ctx, &bw)) {
             let r = x == y;
+            if let (false, Some(msg)) = (r, speculative_decline) {
+                return decline(msg);
+            }
             self.defeq_cache_insert(force_eager, key, r);
             return Ok(r);
         }
         let r = self.is_def_eq_core(ctx, &aw, &bw)?;
+        if let (false, Some(msg)) = (r, speculative_decline) {
+            return decline(msg);
+        }
         // CONV_DEPTH / CORE_DEPTH abort as Decline, not Ok(false), so a stored
         // false is a completed answer. True-only left std `#18000` retrying the
         // same failing pair — 1e9 intern hits, intern size unchanged.
@@ -14051,6 +14096,117 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             assert!(matches!(r, Err(TcError::Decline(_))), "lost abort: {r:?}");
         }
         assert!(tc.with_forced_eager_defeq(|| tc.is_def_eq(&Ctx::new(), &zero, &zero)).unwrap());
+    }
+
+    #[test]
+    fn speculative_decline_falls_back_to_projection() {
+        // perf/proj-lazy-struct: `(P (slow n)).1` vs `(Q (slow m)).1`.
+        // Congruence on `Pair.fst` compares the structs, and so `slow n`
+        // with `slow m`, which declines here (`Nat.rec` on a literal past
+        // the byte cap). Unfolding the projections compares `0` and `0`.
+        use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+        let mut env = regression_429_nat_add_env();
+        let c = |i| expr::const_(i, vec![]);
+        let v = expr::bvar;
+        let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
+        let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+        let lit = |n: &BigUint| expr::lit_nat(n.clone());
+        let nat = c(0);
+        let pair = c(5);
+        let zero = BigUint::from(0u32);
+        let one = BigUint::from(1u32);
+        env.insert(5, CI::InductiveType {
+            level_params: vec![],
+            typ: expr::sort(level::succ(level::zero())),
+            num_params: 0,
+            num_indices: 0,
+            all: vec![5],
+            ctors: vec![6],
+            is_rec: false,
+            is_unsafe: false,
+        });
+        env.insert(6, CI::Constructor {
+            level_params: vec![],
+            typ: pi(nat.clone(), pi(nat.clone(), pair.clone())),
+            induct: 5,
+            cidx: 0,
+            num_params: 0,
+            num_fields: 2,
+            is_unsafe: false,
+        });
+        env.insert(7, CI::Def {
+            level_params: vec![],
+            typ: pi(pair.clone(), nat.clone()),
+            value: lam(pair.clone(), expr::proj(5, 0, v(0))),
+            hints: RH::Abbrev,
+            is_unsafe: false,
+        });
+        // P a := ⟨0, a⟩ and Q a := ⟨0, a⟩.
+        for i in [8, 9] {
+            env.insert(i, CI::Def {
+                level_params: vec![],
+                typ: pi(nat.clone(), pair.clone()),
+                value: lam(nat.clone(), expr::apps(c(6), &[lit(&zero), v(0)])),
+                hints: RH::Regular(1),
+                is_unsafe: false,
+            });
+        }
+        // Mk a x := ⟨x, a⟩.
+        env.insert(10, CI::Def {
+            level_params: vec![],
+            typ: pi(nat.clone(), pi(nat.clone(), pair.clone())),
+            value: lam(nat.clone(), lam(nat.clone(), expr::apps(c(6), &[v(0), v(1)]))),
+            hints: RH::Regular(1),
+            is_unsafe: false,
+        });
+        // slow n := Nat.rec 0 (fun _ ih => succ ih) n.
+        env.insert(11, CI::Def {
+            level_params: vec![],
+            typ: pi(nat.clone(), nat.clone()),
+            value: lam(
+                nat.clone(),
+                expr::apps(c(3), &[
+                    lam(nat.clone(), nat.clone()),
+                    lit(&zero),
+                    lam(nat.clone(), lam(nat, expr::app(c(2), v(0)))),
+                    v(0),
+                ]),
+            ),
+            hints: RH::Regular(1),
+            is_unsafe: false,
+        });
+        let names = test_names(&[
+            "Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add",
+            "Pair", "Pair.mk", "Pair.fst", "P", "Q", "Mk", "slow",
+        ]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+        let big = BigUint::from(1u32) << 300usize;
+        let big1 = &big + 1u32;
+        let slow = |n: &BigUint| expr::app(c(11), lit(n));
+        let fst = |s: Expr| expr::app(c(7), s);
+
+        // Eager path: the one the arena runs (`KIOTA_NBE` unset).
+        let eq = |a: &Expr, b: &Expr| tc.with_forced_eager_defeq(|| tc.is_def_eq(&ctx, a, b));
+
+        // The struct comparison alone cannot finish.
+        let r = eq(&slow(&big), &slow(&big1));
+        assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+
+        let lhs = fst(expr::app(c(8), slow(&big)));
+        let rhs = fst(expr::app(c(9), slow(&big1)));
+        let r = eq(&lhs, &rhs);
+        assert!(matches!(r, Ok(true)), "{r:?}");
+
+        // Different projected fields behind the same declining comparison:
+        // never accepted, and the decline stands rather than becoming a
+        // `false` the struct comparison never established.
+        let lhs = fst(expr::apps(c(10), &[slow(&big), lit(&zero)]));
+        let rhs = fst(expr::apps(c(10), &[slow(&big1), lit(&one)]));
+        let r = eq(&lhs, &rhs);
+        assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+        assert!(!SPECULATING.with(Cell::get));
+        assert!(!CORE_ABORTED.with(Cell::get));
     }
 
     #[test]
