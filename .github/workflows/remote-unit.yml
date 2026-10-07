@@ -1,0 +1,28 @@
+name: remote-unit
+
+# The three library-interpreter regression tests on main 01f05ae, without
+# the fix: each must fail there (harness only, not for main).
+on:
+  push:
+    branches: ['remote/ldstep-test-on-base']
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run the new tests on the old code
+        run: |
+          for t in lazy_delta_steps_through_a_definition_and_its_beta_redexes_at_once; do
+            set +e
+            cargo test --release --locked "$t" > "$t.log" 2>&1
+            rc=$?
+            set -e
+            echo "== $t rc=$rc"
+            grep -E "panicked at|^Err|read as|test result" "$t.log" | head -6
+          done

@@ -11593,6 +11593,73 @@ fn regression_432_defining_equations_and_closed_values_convert() {
     }
 
     #[test]
+    fn lazy_delta_steps_through_a_definition_and_its_beta_redexes_at_once() {
+        // `W1 a a a big` against `H (slow big)`, where `Wk a b c d := W(k+1) a b c d`
+        // and `W6 a b c d := H (slow d)`. Each layer is one unfolding plus four
+        // β-reductions: one Lean lazy-delta step (unfold, then `whnf_core`),
+        // but five single head steps, so six layers outran both the 16-step
+        // lazy delta and the 24-step lazy-head fallback. Normalizing either
+        // side declines (`H` cases on `slow big`, a 301-bit literal).
+        use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+        let mut env = regression_429_nat_add_env();
+        let c = |i| expr::const_(i, vec![]);
+        let v = expr::bvar;
+        let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
+        let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+        let nat = c(0);
+        // slow, H: n ↦ Nat.rec 0 (fun _ ih => succ ih) n, the identity.
+        let ident = lam(
+            nat.clone(),
+            expr::apps(c(3), &[
+                lam(nat.clone(), nat.clone()),
+                expr::lit_nat(BigUint::from(0u32)),
+                lam(nat.clone(), lam(nat.clone(), expr::app(c(2), v(0)))),
+                v(0),
+            ]),
+        );
+        let four = |body: Expr| (0..4).fold(body, |acc, _| lam(nat.clone(), acc));
+        let four_ty = (0..4).fold(nat.clone(), |acc, _| pi(nat.clone(), acc));
+        let mut defs = vec![(5, ident.clone(), pi(nat.clone(), nat.clone()), 1), (6, ident, pi(nat.clone(), nat.clone()), 2)];
+        // 7..=12 are W1..W6; W(k) has height 20 - k.
+        for k in 0..6u32 {
+            let body = if k < 5 {
+                expr::apps(c(8 + k), &[v(3), v(2), v(1), v(0)])
+            } else {
+                expr::app(c(6), expr::app(c(5), v(0)))
+            };
+            defs.push((7 + k, four(body), four_ty.clone(), 20 - k));
+        }
+        for (i, value, typ, height) in defs {
+            env.insert(i, CI::Def {
+                level_params: vec![],
+                typ,
+                value,
+                hints: RH::Regular(height),
+                is_unsafe: false,
+            });
+        }
+        let names = test_names(&[
+            "Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add", "slow", "H",
+            "W1", "W2", "W3", "W4", "W5", "W6",
+        ]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+        let eq = |a: &Expr, b: &Expr| tc.with_forced_eager_defeq(|| tc.is_def_eq(&ctx, a, b));
+        let big = BigUint::from(1u32) << 300usize;
+        let h_slow = |n: &BigUint| expr::app(c(6), expr::app(c(5), expr::lit_nat(n.clone())));
+        let a = expr::lit_nat(BigUint::from(1u32));
+        let w = expr::apps(c(7), &[a.clone(), a.clone(), a, expr::lit_nat(big.clone())]);
+
+        let r = tc.with_forced_eager_defeq(|| tc.whnf(&ctx, &w));
+        assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+        let r = eq(&w, &h_slow(&big));
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        // Against `H (slow (big + 1))` the sides differ: never accepted.
+        let r = eq(&w, &h_slow(&(&big + 1u32)));
+        assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+    }
+
+    #[test]
     fn declining_main_path_falls_back_to_lazy_heads() {
         // `S big` vs `R big`, with `R n := S n`. `S` reaches `H (slow n)`
         // through the aliases `D1 … D12`, and normalizing `S big` needs `H`
