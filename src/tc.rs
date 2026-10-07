@@ -94,6 +94,10 @@ const CONV_DEPTH: u32 = 8_192;
 /// it exhausts memory instead of declining.
 const MAX_HUGE_NAT_PEELS: u32 = 1 << 16;
 
+/// Head steps `try_lazy_delta` takes before leaving a comparison to the main
+/// path.
+const LAZY_DELTA_STEPS: usize = 16;
+
 #[derive(Debug)]
 pub enum TcError {
     Reject(String),
@@ -3096,8 +3100,75 @@ impl<'e> Checker<'e> {
         // to avoid.
         let a_core = self.whnf_core(ctx, a)?;
         let b_core = self.whnf_core(ctx, b)?;
-        Ok((!Rc::ptr_eq(&a_core, a) || !Rc::ptr_eq(&b_core, b))
-            && self.try_unreduced_const_congruence_ex(ctx, &a_core, &b_core, true)?)
+        if (!Rc::ptr_eq(&a_core, a) || !Rc::ptr_eq(&b_core, b))
+            && self.try_unreduced_const_congruence_ex(ctx, &a_core, &b_core, true)?
+        {
+            return Ok(true);
+        }
+        self.try_lazy_delta(ctx, &a_core, &b_core)
+    }
+
+    /// Lean's lazy delta, bounded: step only the side whose head ranks higher
+    /// (`lazy_delta_rank`; both when equal), one `lazy_head_step` at a time,
+    /// and stop as soon as the sides are the same term or same-head
+    /// congruent. Arguments are never normalized. The main path normalizes
+    /// both sides completely, and for `Char.all p` against its own body
+    /// (Batteries `Char.exists_eq_false_of_all_eq_false`) that evaluates
+    /// `Nat.all` over 55296 values, caching a growing term at each step,
+    /// where one unfolding of `Char.all` makes the sides identical.
+    fn try_lazy_delta(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        // Opt-in lazy-head mode's rule (top of `is_def_eq_inner_body`) holds
+        // here too: no alias comparison after a core abort or at the core
+        // depth cap.
+        if Self::lazy_same_head(a, b)
+            || CORE_ABORTED.with(Cell::get)
+            || CORE_DEPTH.with(Cell::get) >= CONV_DEPTH
+        {
+            return Ok(false);
+        }
+        let (mut x, mut y) = (a.clone(), b.clone());
+        for _ in 0..LAZY_DELTA_STEPS {
+            let (step_x, step_y) = match (self.lazy_delta_rank(&x), self.lazy_delta_rank(&y)) {
+                (None, None) => return Ok(false),
+                (Some(_), None) => (true, false),
+                (None, Some(_)) => (false, true),
+                (Some(rx), Some(ry)) => (rx >= ry, ry >= rx),
+            };
+            if step_x {
+                match self.lazy_head_step(&x, 16)? {
+                    Some(next) => x = next,
+                    None => return Ok(false),
+                }
+            }
+            if step_y {
+                match self.lazy_head_step(&y, 16)? {
+                    Some(next) => y = next,
+                    None => return Ok(false),
+                }
+            }
+            if Rc::ptr_eq(&x, &y) || x == y {
+                return Ok(true);
+            }
+            if Self::lazy_same_head(&x, &y) && self.try_unreduced_const_congruence_ex(ctx, &x, &y, true)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Which side `try_lazy_delta` steps: a pending β/ζ/projection redex
+    /// first, then the definition with the greater height. `None` when the
+    /// head cannot be stepped.
+    fn lazy_delta_rank(&self, e: &Expr) -> Option<i64> {
+        let (head, args) = expr::unfold_apps(e);
+        match &**head {
+            ExprData::Lam(_, _, _) if !args.is_empty() => Some(i64::MAX),
+            ExprData::Let(_, _, _) | ExprData::Proj(_, _, _) => Some(i64::MAX),
+            ExprData::Const(n, _) if matches!(self.env.get(*n), Some(ConstantInfo::Def { .. })) => {
+                Some(self.def_height(*n))
+            }
+            _ => None,
+        }
     }
 
     fn try_unreduced_const_congruence(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
@@ -14290,6 +14361,56 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         assert!(matches!(&r, Ok(e) if nat::as_lit(e) == Some(&BigUint::from(9u32))), "{r:?}");
         // Counting it down one `succ` at a time cannot finish: decline.
         let r = whnf(&rec(lit(0), lam(nat.clone(), lam(nat.clone(), expr::bvar(0)))));
+        assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+    }
+
+    #[test]
+    fn lazy_delta_unfolds_the_higher_definition_instead_of_normalizing() {
+        // `K y := H (slow y)` against `H (slow big)`: one unfolding of the
+        // higher `K` makes the sides identical. Normalizing `H (slow big)`
+        // declines instead (`H` cases on `slow big`, a 301-bit countdown).
+        use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+        let mut env = regression_429_nat_add_env();
+        let c = |i| expr::const_(i, vec![]);
+        let v = expr::bvar;
+        let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
+        let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+        let nat = c(0);
+        // slow, H: n ↦ Nat.rec 0 (fun _ ih => succ ih) n, the identity.
+        let ident = lam(
+            nat.clone(),
+            expr::apps(c(3), &[
+                lam(nat.clone(), nat.clone()),
+                expr::lit_nat(BigUint::from(0u32)),
+                lam(nat.clone(), lam(nat.clone(), expr::app(c(2), v(0)))),
+                v(0),
+            ]),
+        );
+        let k_body = lam(nat.clone(), expr::app(c(6), expr::app(c(5), v(0))));
+        for (i, value, height) in [(5, ident.clone(), 1), (6, ident, 1), (7, k_body, 3)] {
+            env.insert(i, CI::Def {
+                level_params: vec![],
+                typ: pi(nat.clone(), nat.clone()),
+                value,
+                hints: RH::Regular(height),
+                is_unsafe: false,
+            });
+        }
+        let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add", "slow", "H", "K"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+        let eq = |a: &Expr, b: &Expr| tc.with_forced_eager_defeq(|| tc.is_def_eq(&ctx, a, b));
+        let big = BigUint::from(1u32) << 300usize;
+        let h_slow = |n: &BigUint| expr::app(c(6), expr::app(c(5), expr::lit_nat(n.clone())));
+        let k = |n: &BigUint| expr::app(c(7), expr::lit_nat(n.clone()));
+
+        let r = tc.with_forced_eager_defeq(|| tc.whnf(&ctx, &h_slow(&big)));
+        assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+        let r = eq(&h_slow(&big), &k(&big));
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        // `K (big + 1)` unfolds to `H (slow (big + 1))`, which differs: never
+        // accepted, and still a decline.
+        let r = eq(&h_slow(&big), &k(&(&big + 1u32)));
         assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
     }
 
