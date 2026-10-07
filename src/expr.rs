@@ -565,8 +565,25 @@ pub fn instantiate(e: &Expr, args: &[Expr]) -> Expr {
     // full traversal. The grind perf tests amplify a shared simp-lemma
     // application thousands of times; keying on (node, depth) — args are
     // fixed within one call — visits each unique node once.
-    let mut memo = rustc_hash::FxHashMap::default();
-    instantiate_core(e, args, 0, &mut memo)
+    // The table is reused across calls: allocating and regrowing a fresh one
+    // per call took ~9% of std's time (rehash, alloc, free). One grown past
+    // INST_SCRATCH_MAX_BUCKETS is dropped afterwards, since clearing costs a
+    // pass over every bucket. Taken rather than borrowed, so a nested call
+    // would just start from an empty table.
+    let mut memo = INST_SCRATCH.with(|m| std::mem::take(&mut *m.borrow_mut()));
+    let r = instantiate_core(e, args, 0, &mut memo);
+    if memo.capacity() <= INST_SCRATCH_MAX_BUCKETS {
+        memo.clear();
+        INST_SCRATCH.with(|m| *m.borrow_mut() = memo);
+    }
+    r
+}
+
+const INST_SCRATCH_MAX_BUCKETS: usize = 1 << 14;
+
+thread_local! {
+    static INST_SCRATCH: RefCell<rustc_hash::FxHashMap<(usize, u32), Expr>> =
+        RefCell::new(rustc_hash::FxHashMap::default());
 }
 
 fn instantiate_core(
