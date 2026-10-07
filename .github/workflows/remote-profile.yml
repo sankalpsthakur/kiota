@@ -1,0 +1,83 @@
+name: remote-profile
+
+# Where does each large corpus spend its time? Per-declaration wall-clock
+# from KIOTA_PROGRESS markers, with a budget longer than the arena's so the
+# tail is visible. Diagnostic only; never a rank gate.
+on:
+  push:
+    branches: ['remote/profile-main']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: '37534509955'
+
+jobs:
+  profile:
+    name: ${{ matrix.corpus }} / ${{ matrix.mode }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {corpus: std, mode: profile, limit: 3600}
+          - {corpus: init, mode: profile, limit: 600}
+          # Parse and build the environment only (KIOTA_SIZE_ONLY): the floor
+          # under any checking speedup.
+          - {corpus: init, mode: parse, limit: 3600}
+          - {corpus: std, mode: parse, limit: 3600}
+          - {corpus: mathlib, mode: parse, limit: 5400}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Fetch verified export
+        uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Profile
+        env:
+          CORPUS: ${{ matrix.corpus }}
+          LIMIT: ${{ matrix.limit }}
+        run: |
+          sudo apt-get install -y zstd >/dev/null
+          zstd -d --rm "$CORPUS.ndjson.zst" -o "$CORPUS.ndjson"
+          cat > stamp.py <<'PY'
+          import sys, time
+          t0 = time.monotonic()
+          for line in sys.stdin:
+              sys.stdout.write(f"{time.monotonic() - t0:.3f} {line}")
+              sys.stdout.flush()
+          PY
+          set +e
+          if [ "${{ matrix.mode }}" = parse ]; then
+            export KIOTA_SIZE_ONLY=1
+          else
+            export KIOTA_PROGRESS=1 KIOTA_DECL_STATS=1
+          fi
+          /usr/bin/time -v -o time.txt \
+            timeout "$LIMIT" ./target/release/kiota "$CORPUS.ndjson" 2>&1 >out.txt \
+            | python3 -u stamp.py > err.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "exit=$rc" | tee summary.txt
+          grep -m1 -hE "^(REJECT|DECLINE)" out.txt err.txt | cut -c1-400 | tee -a summary.txt || true
+          grep -E "Maximum resident|Elapsed" time.txt | tee -a summary.txt || true
+          python3 scripts/remote/decl_profile.py err.txt "$LIMIT" | tee -a summary.txt
+          cat summary.txt >> "$GITHUB_STEP_SUMMARY"
+          gzip -9 err.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: profile-${{ matrix.corpus }}-${{ matrix.mode }}
+          path: |
+            summary.txt
+            err.txt.gz
+            out.txt
+            time.txt
