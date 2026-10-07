@@ -1,0 +1,28 @@
+name: remote-unit
+
+# The three library-interpreter regression tests on main 01f05ae, without
+# the fix: each must fail there (harness only, not for main).
+on:
+  push:
+    branches: ['remote/libinterp-tests-on-main']
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run the new tests on the old code
+        run: |
+          for t in custom_int_nat_abs_is_not_read_natively custom_int_neg_is_not_read_natively user_decide_is_an_ordinary_definition user_is_true_is_not_a_decision_constructor library_names_do_not_select_a_reduction; do
+            set +e
+            cargo test --release --locked "$t" > "$t.log" 2>&1
+            rc=$?
+            set -e
+            echo "== $t rc=$rc"
+            grep -E "panicked at|^Err|read as|test result" "$t.log" | head -6
+          done

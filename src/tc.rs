@@ -13975,6 +13975,208 @@ fn regression_429_closed_int_value_respects_custom_ofnat_instance() {
 }
 
 
+/// Only `Init.Prelude` declarations are guaranteed to be Lean's own (arena
+/// README, "On `Init.Prelude`"). `Int` is not among them, so an export may
+/// define `Int` and its operations however it likes, and conversion must
+/// follow those definitions. Here `Int.natAbs` is constantly zero and
+/// `Int.neg` is the identity.
+fn custom_int_fixture() -> (Environment, Vec<Rc<String>>) {
+    use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+    let mut env = regression_429_nat_add_env();
+    let c = |i| expr::const_(i, vec![]);
+    let v = expr::bvar;
+    let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
+    let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+    let (nat, int) = (c(0), c(5));
+    env.insert(5, CI::InductiveType {
+        level_params: vec![],
+        typ: expr::sort(level::succ(level::zero())),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![5],
+        ctors: vec![6, 7],
+        is_rec: false,
+        is_unsafe: false,
+    });
+    for (ctor, cidx) in [(6, 0), (7, 1)] {
+        env.insert(ctor, CI::Constructor {
+            level_params: vec![],
+            typ: pi(nat.clone(), int.clone()),
+            induct: 5,
+            cidx,
+            num_params: 0,
+            num_fields: 1,
+            is_unsafe: false,
+        });
+    }
+    for (i, typ, value) in [
+        (8, pi(int.clone(), nat.clone()), lam(int.clone(), c(1))),
+        (9, pi(int.clone(), int.clone()), lam(int.clone(), v(0))),
+    ] {
+        env.insert(i, CI::Def {
+            level_params: vec![],
+            typ,
+            value,
+            hints: RH::Regular(1),
+            is_unsafe: false,
+        });
+    }
+    let names = test_names(&[
+        "Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add",
+        "Int", "Int.ofNat", "Int.negSucc", "Int.natAbs", "Int.neg",
+    ]);
+    (env, names)
+}
+
+#[test]
+fn custom_int_nat_abs_is_not_read_natively() {
+    let (env, names) = custom_int_fixture();
+    let tc = Checker::new(&env, &names, Some(0), None);
+    let ctx = Ctx::new();
+    let c = |i| expr::const_(i, vec![]);
+    let lit = |n: u32| expr::lit_nat(BigUint::from(n));
+    let abs = expr::app(c(8), expr::app(c(6), lit(5)));
+    tc.with_forced_eager_defeq(|| {
+        let r = tc.is_def_eq(&ctx, &abs, &lit(5));
+        assert!(matches!(r, Ok(false)), "natAbs read as |5|: {r:?}");
+        assert!(matches!(tc.is_def_eq(&ctx, &abs, &c(1)), Ok(true)));
+    });
+}
+
+#[test]
+fn custom_int_neg_is_not_read_natively() {
+    let (env, names) = custom_int_fixture();
+    let tc = Checker::new(&env, &names, Some(0), None);
+    let ctx = Ctx::new();
+    let c = |i| expr::const_(i, vec![]);
+    let lit = |n: u32| expr::lit_nat(BigUint::from(n));
+    let five = expr::app(c(6), lit(5));
+    let neg = expr::app(c(9), five.clone());
+    tc.with_forced_eager_defeq(|| {
+        let r = tc.is_def_eq(&ctx, &neg, &expr::app(c(7), lit(4)));
+        assert!(matches!(r, Ok(false)), "neg read as -5: {r:?}");
+        assert!(matches!(tc.is_def_eq(&ctx, &neg, &five), Ok(true)));
+    });
+}
+
+/// `decide` and `isTrue` are not `Init.Prelude` names; `Decidable.decide`
+/// and `Decidable.isTrue` are. A user `decide` is an ordinary definition,
+/// and a user `isTrue` is not a decision constructor.
+fn user_decision_fixture() -> (Environment, Vec<Rc<String>>) {
+    use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+    let mut env = regression_429_nat_add_env();
+    let c = |i| expr::const_(i, vec![]);
+    let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
+    let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+    let b = c(5);
+    env.insert(5, CI::InductiveType {
+        level_params: vec![],
+        typ: expr::sort(level::succ(level::zero())),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![5],
+        ctors: vec![6, 7],
+        is_rec: false,
+        is_unsafe: false,
+    });
+    for (ctor, cidx) in [(6, 0), (7, 1)] {
+        env.insert(ctor, CI::Constructor {
+            level_params: vec![],
+            typ: b.clone(),
+            induct: 5,
+            cidx,
+            num_params: 0,
+            num_fields: 0,
+            is_unsafe: false,
+        });
+    }
+    // isTrue : Bool → Bool, and ite : five Bools → Bool, both opaque.
+    let arrows = |n: usize| (0..n).fold(b.clone(), |acc, _| pi(b.clone(), acc));
+    env.insert(8, CI::Axiom { level_params: vec![], typ: arrows(1), is_unsafe: false });
+    env.insert(10, CI::Axiom { level_params: vec![], typ: arrows(5), is_unsafe: false });
+    // decide _ _ := Bool.false
+    env.insert(9, CI::Def {
+        level_params: vec![],
+        typ: arrows(2),
+        value: lam(b.clone(), lam(b, c(6))),
+        hints: RH::Regular(1),
+        is_unsafe: false,
+    });
+    let names = test_names(&[
+        "Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add",
+        "Bool", "Bool.false", "Bool.true", "isTrue", "decide", "ite",
+    ]);
+    (env, names)
+}
+
+#[test]
+fn user_decide_is_an_ordinary_definition() {
+    let (env, names) = user_decision_fixture();
+    let tc = Checker::new(&env, &names, Some(0), None);
+    let ctx = Ctx::new();
+    let c = |i| expr::const_(i, vec![]);
+    let dec = expr::apps(c(9), &[c(7), expr::app(c(8), c(7))]);
+    tc.with_forced_eager_defeq(|| {
+        let r = tc.is_def_eq(&ctx, &dec, &c(7));
+        assert!(matches!(r, Ok(false)), "user decide read as Decidable.decide: {r:?}");
+        assert!(matches!(tc.is_def_eq(&ctx, &dec, &c(6)), Ok(true)));
+    });
+}
+
+#[test]
+fn user_is_true_is_not_a_decision_constructor() {
+    let (env, names) = user_decision_fixture();
+    let tc = Checker::new(&env, &names, Some(0), None);
+    let ctx = Ctx::new();
+    let c = |i| expr::const_(i, vec![]);
+    let ite = expr::apps(c(10), &[c(5), c(7), expr::app(c(8), c(7)), c(7), c(6)]);
+    tc.with_forced_eager_defeq(|| {
+        let r = tc.is_def_eq(&ctx, &ite, &c(7));
+        assert!(matches!(r, Ok(false)), "user isTrue read as Decidable.isTrue: {r:?}");
+    });
+}
+
+/// A name that merely contains `LinearCombo` is not Lean's omega
+/// `LinearCombo`: `Foo.LinearCombo.eval` here is constantly zero.
+#[test]
+fn library_names_do_not_select_a_reduction() {
+    use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+    let mut env = regression_429_nat_add_env();
+    let c = |i| expr::const_(i, vec![]);
+    let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
+    let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+    let nat = c(0);
+    let type0 = expr::sort(level::succ(level::zero()));
+    env.insert(5, CI::Axiom { level_params: vec![], typ: type0, is_unsafe: false });
+    env.insert(6, CI::Axiom {
+        level_params: vec![],
+        typ: pi(nat.clone(), pi(nat.clone(), c(5))),
+        is_unsafe: false,
+    });
+    env.insert(7, CI::Axiom { level_params: vec![], typ: nat.clone(), is_unsafe: false });
+    env.insert(8, CI::Def {
+        level_params: vec![],
+        typ: pi(c(5), pi(nat.clone(), nat.clone())),
+        value: lam(c(5), lam(nat, c(1))),
+        hints: RH::Regular(1),
+        is_unsafe: false,
+    });
+    let names = test_names(&[
+        "Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add",
+        "Foo.LinearCombo", "Foo.LinearCombo.mk", "Foo.List.nil", "Foo.LinearCombo.eval",
+    ]);
+    let tc = Checker::new(&env, &names, Some(0), None);
+    let ctx = Ctx::new();
+    let seven = expr::lit_nat(BigUint::from(7u32));
+    let combo = expr::apps(c(6), &[seven.clone(), c(7)]);
+    let eval = expr::apps(c(8), &[combo, expr::lit_nat(BigUint::from(3u32))]);
+    tc.with_forced_eager_defeq(|| {
+        let r = tc.is_def_eq(&ctx, &eval, &seven);
+        assert!(matches!(r, Ok(false)), "eval read as the combo's constant: {r:?}");
+        assert!(matches!(tc.is_def_eq(&ctx, &eval, &c(1)), Ok(true)));
+    });
+}
+
 #[test]
 fn regression_430_iota_propagates_constructor_telescope_decline() {
     let env = regression_429_nat_add_env();
