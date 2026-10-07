@@ -6,14 +6,14 @@ name: remote-ab-corpus
 # soundness guard still admits genuine Lean input; these corpora can.
 on:
   push:
-    branches: ['remote/continue-ld']
+    branches: ['remote/ab-extra-2']
 
 permissions:
   contents: read
   actions: read
 
 env:
-  BASELINE_SHA: 98141dc878a9a14a8a3b7314fea99d57253cb039
+  BASELINE_SHA: 5788b65dec44feb79c3cd4516e1066e640bba62b
   EXPORTS_RUN: '37534509955'
 
 jobs:
@@ -24,20 +24,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Both sides keep going past a failed declaration (KIOTA_CONTINUE).
-        # Candidate: fix/lazy-delta-lean-step. Baseline: fix/library-interpreters
-        # (98141dc = 7f9ab37 + the diagnostic patch).
-        side: [baseline, candidate]
-        corpus: [init, std]
+        # The remaining large tests on fix/lazy-delta-lean-step (0dbc0d8) with
+        # the keep-going diagnostic (KIOTA_CONTINUE), the arena's limits, and
+        # the conversion stack at the first depth-limit decline per declaration.
+        # Cedar runs under a 14 GB address-space cap instead of killing the runner.
+        side: [candidate]
+        corpus: [navier-stokes-euler, con-leche, cedar]
         include:
-          - corpus: init
-            limit: 500
-          - corpus: std
-            limit: 590
-          - corpus: mathlib
-            limit: 5680
-          - corpus: cslib
-            limit: 1800
+          - corpus: navier-stokes-euler
+            limit: 2400
+            run: '37567635092'
+            cap: 0
+          - corpus: con-leche
+            limit: 720
+            run: '37567635092'
+            cap: 0
+          - corpus: cedar
+            limit: 940
+            run: '37534509955'
+            cap: 14000000
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,13 +58,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: export-${{ matrix.corpus }}
-          run-id: ${{ env.EXPORTS_RUN }}
+          run-id: ${{ matrix.run }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Check
         env:
           CORPUS: ${{ matrix.corpus }}
           LIMIT: ${{ matrix.limit }}
           SIDE: ${{ matrix.side }}
+          CAP: ${{ matrix.cap }}
         run: |
           sudo apt-get install -y zstd >/dev/null
           zstd -d --rm "$CORPUS.ndjson.zst" -o "$CORPUS.ndjson"
@@ -74,7 +80,8 @@ jobs:
           PY
           # KIOTA_TRACE_CONVERSION dumps the active comparison stack at any
           # depth limit (first per declaration), recovered or not.
-          KIOTA_CONTINUE=1 KIOTA_PROGRESS=1 /usr/bin/time -v -o time.txt timeout "$LIMIT" ./target/release/kiota "$CORPUS.ndjson" \
+          if [ "$CAP" != 0 ]; then ulimit -v "$CAP"; fi
+          KIOTA_CONTINUE=1 KIOTA_PROGRESS=1 KIOTA_TRACE_CONVERSION=1 /usr/bin/time -v -o time.txt timeout "$LIMIT" ./target/release/kiota "$CORPUS.ndjson" \
             2>&1 > out.txt | python3 -u stamp.py > stamped.txt
           rc=${PIPESTATUS[0]}
           end=$(date +%s.%N)
