@@ -1,0 +1,58 @@
+name: remote-perf
+
+# Sampling profile of kiota on the first 160s of the byte-verified std export,
+# which covers the DHashMap model-lemma cluster (declarations 2000-2999, 26% of
+# std's time on a runner). Diagnostic only.
+on:
+  push:
+    branches: ['remote/perf-std']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: '37534509955'
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build (release, with line tables for attribution)
+        run: CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-std
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install perf
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" >/dev/null \
+            || sudo apt-get install -y -qq zstd linux-tools-common linux-tools-generic >/dev/null
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf | head -1); echo "PERF=$PERF" >> "$GITHUB_ENV"; "$PERF" --version
+      - name: Profile
+        run: |
+          zstd -d --rm std.ndjson.zst -o std.ndjson
+          set +e
+          "$PERF" record -F 199 -g --call-graph dwarf,8192 -o perf.data -- \
+            timeout 160 ./target/release/kiota std.ndjson > out.txt 2> err.txt
+          echo "rc=$?"
+          set -e
+          tail -3 err.txt
+          "$PERF" report -i perf.data --stdio --no-children --sort symbol --percent-limit 0.3 2>/dev/null | head -150 > flat.txt
+          "$PERF" report -i perf.data --stdio --children --sort symbol --percent-limit 1.5 -g none 2>/dev/null | head -150 > children.txt
+          head -80 flat.txt >> "$GITHUB_STEP_SUMMARY"
+          head -80 children.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-std
+          path: |
+            flat.txt
+            children.txt
+            err.txt
