@@ -1,0 +1,58 @@
+name: remote-decl-count
+
+# Count the declarations kiota's progress counter sees (axiom, def, thm,
+# opaque) and the other top-level records in each verified arena export, so
+# a timed-out run's position can be read as a fraction of the whole corpus.
+on:
+  push:
+    branches: ['remote/decl-count']
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  count:
+    name: ${{ matrix.corpus }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - corpus: mathlib
+            run: '37534509955'
+          - corpus: std
+            run: '37534509955'
+          - corpus: cslib
+            run: '37534509955'
+          - corpus: init
+            run: '37534509955'
+          - corpus: navier-stokes-euler
+            run: '37567635092'
+    steps:
+      - name: Fetch verified export
+        uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ matrix.run }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Count
+        env:
+          CORPUS: ${{ matrix.corpus }}
+        run: |
+          sudo apt-get install -y zstd >/dev/null
+          ls -la
+          zstd -dc "$CORPUS.ndjson.zst" | python3 -c '
+          import sys, collections, json
+          kinds = collections.Counter()
+          checked = 0
+          for line in sys.stdin.buffer:
+              if line.startswith(b"{\""):
+                  key = line[2:line.index(b"\"", 2)].decode()
+                  if key in ("axiom", "def", "thm", "opaque"):
+                      checked += 1
+                  if key not in ("in", "il", "ie"):
+                      kinds[key] += 1
+          print(json.dumps({"corpus": sys.argv[1], "progress_counted": checked, "kinds": kinds}, indent=1))
+          ' "$CORPUS" | tee "count-$CORPUS.json"
