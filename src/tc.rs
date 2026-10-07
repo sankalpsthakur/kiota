@@ -86,6 +86,14 @@ thread_local! {
 /// Kept well under typical C-stack (~8MB) so this is a decline, not a segfault.
 const CONV_DEPTH: u32 = 8_192;
 
+/// Iota peels of a literal of at least 2^29 that one declaration may make.
+/// Each peel takes off one `succ`, so a countdown from there needs at least
+/// 2^29 steps and cannot finish inside any of the arena's limits. A `match` on
+/// a huge literal peels it once. Without this an iterative countdown (Init
+/// `Int32.instRxcHasSize_eq` counting 2^31 down on an open term) runs until
+/// it exhausts memory instead of declining.
+const MAX_HUGE_NAT_PEELS: u32 = 1 << 16;
+
 #[derive(Debug)]
 pub enum TcError {
     Reject(String),
@@ -991,7 +999,8 @@ pub struct Checker<'e> {
     /// process-wide `KIOTA_NO_IOTA_MEMO` env var (which `cargo test`'s
     /// parallel test threads would otherwise race on).
     iota_memo_override: std::cell::Cell<Option<bool>>,
-    /// Consecutive `Nat.rec` peels of one `bits() >= 20` literal countdown.
+    /// Peels of literals of at least 2^29 in this declaration
+    /// (`MAX_HUGE_NAT_PEELS`).
     fuel_nat_peels: std::cell::Cell<u32>,
     /// Last bits≥20 literal peeled; used to detect one hugeFuel countdown.
     fuel_nat_last: std::cell::RefCell<Option<num_bigint::BigUint>>,
@@ -4642,6 +4651,13 @@ impl<'e> Checker<'e> {
                         } else {
                             // One succ peel per iota (C++ natLit). WHNF-core
                             // may continue; uniform WHNF_DEPTH declines.
+                            if n.bits() >= 30 {
+                                let peels = self.fuel_nat_peels.get() + 1;
+                                self.fuel_nat_peels.set(peels);
+                                if peels > MAX_HUGE_NAT_PEELS {
+                                    return decline("Nat literal countdown from 2^29 or more exceeds the peel budget");
+                                }
+                            }
                             let pred = n - 1u32;
                             Some((succ, 0, vec![expr::lit_nat(pred)], None))
                         }
@@ -14254,6 +14270,27 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         assert!(matches!(eq(&lit(6), &succ(five_of_x.clone())), Ok(true)));
         assert!(matches!(eq(&succ(five_of_x), &lit(7)), Ok(false)));
         assert!(matches!(eq(&succ(x), &lit(6)), Ok(false)));
+    }
+
+    #[test]
+    fn countdown_from_a_huge_literal_declines_instead_of_exhausting_memory() {
+        let env = regression_429_nat_add_env();
+        let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let nat = expr::const_(0, vec![]);
+        let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+        let lit = |n: u64| expr::lit_nat(BigUint::from(n));
+        let rec = |base: Expr, step: Expr| {
+            expr::apps(expr::const_(3, vec![]), &[lam(nat.clone(), nat.clone()), base, step, lit(1 << 31)])
+        };
+        let ctx = Ctx::new();
+        let whnf = |e: &Expr| tc.with_forced_eager_defeq(|| tc.whnf(&ctx, e));
+        // A `match` on a huge literal peels it once.
+        let r = whnf(&rec(lit(7), lam(nat.clone(), lam(nat.clone(), lit(9)))));
+        assert!(matches!(&r, Ok(e) if nat::as_lit(e) == Some(&BigUint::from(9u32))), "{r:?}");
+        // Counting it down one `succ` at a time cannot finish: decline.
+        let r = whnf(&rec(lit(0), lam(nat.clone(), lam(nat.clone(), expr::bvar(0)))));
+        assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
     }
 
     #[test]
