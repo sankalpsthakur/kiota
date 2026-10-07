@@ -4191,7 +4191,14 @@ impl<'e> Checker<'e> {
             (s, n) if s == serial => n,
             _ => 0,
         };
-        if !self.lazy_head_enabled.get() && tries < MAX_FALLBACK_TRIES {
+        // Opt-in lazy-head mode's rule (top of this function) holds here too:
+        // no alias comparison after a core abort or at the core depth cap.
+        if !self.lazy_head_enabled.get()
+            && tries < MAX_FALLBACK_TRIES
+            && !abort_before
+            && !CORE_ABORTED.with(Cell::get)
+            && CORE_DEPTH.with(Cell::get) < CONV_DEPTH
+        {
             CORE_ABORTED.with(|c| c.set(abort_before));
             SPECULATING.with(|s| s.set(true));
             let r = self.try_lazy_head_congruence(ctx, a, b);
