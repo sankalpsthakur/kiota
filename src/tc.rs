@@ -11680,6 +11680,84 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
     }
 
+    /// `PUnit.{u} : Sort u` with the constructor `PUnit.unit.{u}`.
+    fn punit_fixture() -> (Environment, Vec<Rc<String>>) {
+        use crate::env::ConstantInfo as CI;
+        let mut env = regression_429_nat_add_env();
+        env.insert(5, CI::InductiveType {
+            level_params: vec![0],
+            typ: expr::sort(level::param(0)),
+            num_params: 0,
+            num_indices: 0,
+            all: vec![5],
+            ctors: vec![6],
+            is_rec: false,
+            is_unsafe: false,
+        });
+        env.insert(6, CI::Constructor {
+            level_params: vec![0],
+            typ: expr::const_(5, vec![level::param(0)]),
+            induct: 5,
+            cidx: 0,
+            num_params: 0,
+            num_fields: 0,
+            is_unsafe: false,
+        });
+        let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add", "PUnit", "PUnit.unit"]);
+        (env, names)
+    }
+
+    #[test]
+    fn structure_eta_requires_equal_types() {
+        // Lean's `try_eta_struct_core` and `is_def_eq_unit_like` both compare
+        // the types first: `PUnit.unit.{1} : PUnit.{1}` and
+        // `PUnit.unit.{2} : PUnit.{2}` are not definitionally equal.
+        let (env, names) = punit_fixture();
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+        let unit = |n: u32| expr::const_(6, vec![(0..n).fold(level::zero(), |l, _| level::succ(l))]);
+        let r = tc.with_forced_eager_defeq(|| tc.is_def_eq(&ctx, &unit(1), &unit(2)));
+        assert!(matches!(r, Ok(false)), "{r:?}");
+        let r = tc.with_forced_eager_defeq(|| tc.is_def_eq(&ctx, &unit(2), &unit(2)));
+        assert!(matches!(r, Ok(true)), "{r:?}");
+    }
+
+    #[test]
+    fn structure_eta_still_identifies_a_term_with_its_constructor_of_projections() {
+        // `S.mk x.1` against `x` for a one-field structure `S` with `x : S`
+        // in the context: the types agree and eta applies.
+        use crate::env::ConstantInfo as CI;
+        let mut env = regression_429_nat_add_env();
+        let (nat, s_ty) = (expr::const_(0, vec![]), expr::const_(5, vec![]));
+        env.insert(5, CI::InductiveType {
+            level_params: vec![],
+            typ: expr::sort(level::succ(level::zero())),
+            num_params: 0,
+            num_indices: 0,
+            all: vec![5],
+            ctors: vec![6],
+            is_rec: false,
+            is_unsafe: false,
+        });
+        env.insert(6, CI::Constructor {
+            level_params: vec![],
+            typ: expr::pi(expr::BinderInfo::Default, nat, s_ty.clone()),
+            induct: 5,
+            cidx: 0,
+            num_params: 0,
+            num_fields: 1,
+            is_unsafe: false,
+        });
+        let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add", "S", "S.mk"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let mut ctx = Ctx::new();
+        ctx.push(s_ty);
+        let x = expr::bvar(0);
+        let rebuilt = expr::app(expr::const_(6, vec![]), expr::proj(5, 0, x.clone()));
+        let r = tc.with_forced_eager_defeq(|| tc.is_def_eq(&ctx, &rebuilt, &x));
+        assert!(matches!(r, Ok(true)), "{r:?}");
+    }
+
     #[test]
     fn declining_main_path_falls_back_to_lazy_heads() {
         // `S big` vs `R big`, with `R n := S n`. `S` reaches `H (slow n)`
