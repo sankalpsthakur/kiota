@@ -89,7 +89,7 @@ thread_local! {
 /// Lazy-head fallbacks per unwinding decline. Every main-path frame is
 /// outermost, so without a cap a defeq-depth decline would retry at each of
 /// thousands of frames.
-const MAX_FALLBACK_TRIES: u32 = 4;
+const MAX_FALLBACK_TRIES: u32 = 0;
 
 /// Recursion guard for `whnf` / `is_def_eq`, not a completeness fingerprint.
 /// Lean has no 2048 cap; `WellFounded.Nat.fix` / UTF-8 decode proofs nest

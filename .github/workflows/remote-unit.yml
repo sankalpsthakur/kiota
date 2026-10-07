@@ -1,0 +1,27 @@
+name: remote-unit
+
+# Mutation check (harness only, not for main): with the lazy-head fallback
+# disabled (MAX_FALLBACK_TRIES = 0) the new regression test must fail.
+on:
+  push:
+    branches: ['remote/mut-lhf']
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run the regression test with the fallback disabled
+        run: |
+          set +e
+          cargo test --release --locked declining_main_path_falls_back_to_lazy_heads 2>&1 | tee test.log
+          rc=${PIPESTATUS[0]}
+          echo "cargo test exit code: $rc"
+          if [ "$rc" -eq 0 ]; then echo "MUTANT SURVIVED: the test passes without the fallback"; exit 1; fi
+          grep -n "panicked\|assertion" test.log | head -5
+          echo "MUTANT KILLED"
