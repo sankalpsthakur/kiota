@@ -4194,14 +4194,15 @@ impl<'e> Checker<'e> {
         // compares the structs, so `slow n` with `slow m`, where the main
         // path only projects `0` and `0`). After a decline the main path
         // still runs, but only a proof of equality overrides the decline.
-        let speculative_decline = if SPECULATING.with(Cell::get) {
+        let outermost = !SPECULATING.with(Cell::get);
+        let abort_before = CORE_ABORTED.with(Cell::get);
+        let speculative_decline = if !outermost {
             if self.try_speculative_congruence(ctx, a, b)? {
                 self.defeq_cache_insert(force_eager, key, true);
                 return Ok(true);
             }
             None
         } else {
-            let abort_before = CORE_ABORTED.with(Cell::get);
             SPECULATING.with(|s| s.set(true));
             let r = self.try_speculative_congruence(ctx, a, b);
             SPECULATING.with(|s| s.set(false));
@@ -4221,6 +4222,49 @@ impl<'e> Checker<'e> {
                 Err(e) => return Err(e),
             }
         };
+        let main = self.def_eq_main_path(ctx, a, b);
+        let declined = match (main, speculative_decline) {
+            (Ok((r, cacheable)), None) | (Ok((r @ true, cacheable)), Some(_)) => {
+                if cacheable {
+                    self.defeq_cache_insert(force_eager, key, r);
+                }
+                return Ok(r);
+            }
+            (Ok((false, _)), Some(msg)) => msg,
+            (Err(TcError::Decline(msg)), _) if outermost => msg,
+            (Err(e), _) => return Err(e),
+        };
+        // Last resort before declining: expose folded heads on both sides
+        // and compare same-head pairs (`try_lazy_head_congruence`). The main
+        // path normalizes each side completely, which on open arithmetic can
+        // count a literal down one `succ` at a time. Init
+        // `Int32.instRxcHasSize_eq` compares `toNat (rotate hi) + 1 - …`
+        // with the `HasSize.size` instance and declines at depth 2^31-8187;
+        // Lean's lazy delta meets both sides at `HSub.hSub` and compares
+        // arguments. Opt-in lazy-head mode already tried this above. Runs as
+        // a speculative frame, so nested comparisons propagate a decline
+        // rather than falling back in turn.
+        if !self.lazy_head_enabled.get() {
+            CORE_ABORTED.with(|c| c.set(abort_before));
+            SPECULATING.with(|s| s.set(true));
+            let r = self.try_lazy_head_congruence(ctx, a, b);
+            SPECULATING.with(|s| s.set(false));
+            CORE_ABORTED.with(|c| c.set(abort_before));
+            match r {
+                Ok(true) => {
+                    self.defeq_cache_insert(force_eager, key, true);
+                    return Ok(true);
+                }
+                Ok(false) | Err(TcError::Decline(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        decline(declined)
+    }
+
+    /// The main path: normalize both sides and compare. Returns
+    /// `(result, cacheable)`.
+    fn def_eq_main_path(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<(bool, bool)> {
         let aw = self.whnf_for_defeq(ctx, a)?;
         let bw = self.whnf_for_defeq(ctx, b)?;
         if std::env::var_os("KIOTA_TRACE_EQ").is_some() {
@@ -4256,26 +4300,15 @@ impl<'e> Checker<'e> {
             }
         }
         if let (Ok(Some(x)), Ok(Some(y))) = (self.closed_int_value(ctx, &aw), self.closed_int_value(ctx, &bw)) {
-            let r = x == y;
-            if let (false, Some(msg)) = (r, speculative_decline) {
-                return decline(msg);
-            }
-            self.defeq_cache_insert(force_eager, key, r);
-            return Ok(r);
+            return Ok((x == y, true));
         }
         let r = self.is_def_eq_core(ctx, &aw, &bw)?;
-        if let (false, Some(msg)) = (r, speculative_decline) {
-            return decline(msg);
-        }
         // CONV_DEPTH / CORE_DEPTH abort as Decline, not Ok(false), so a stored
         // false is a completed answer. True-only left std `#18000` retrying the
         // same failing pair — 1e9 intern hits, intern size unchanged.
         // Do not cache a result produced under a CORE_DEPTH stuck WHNF
         // (still true regardless of the eager-rescue namespace).
-        if !CORE_ABORTED.with(|a| a.get()) {
-            self.defeq_cache_insert(force_eager, key, r);
-        }
-        Ok(r)
+        Ok((r, !CORE_ABORTED.with(|a| a.get())))
     }
 
     fn is_def_eq_core(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
@@ -14412,6 +14445,71 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         // accepted, and still a decline.
         let r = eq(&h_slow(&big), &k(&(&big + 1u32)));
         assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+    }
+
+    #[test]
+    fn declining_main_path_falls_back_to_lazy_heads() {
+        // `A n := H (slow n)` vs `B n := H (slow n)`: normalizing `A big`
+        // needs `H` to case on `slow big`, which declines (byte cap). One
+        // unfolding on each side meets at `H (slow big)`.
+        use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+        let mut env = regression_429_nat_add_env();
+        let c = |i| expr::const_(i, vec![]);
+        let v = expr::bvar;
+        let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
+        let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+        let nat = c(0);
+        // slow, H: n ↦ Nat.rec 0 (fun _ ih => succ ih) n, the identity.
+        let ident = lam(
+            nat.clone(),
+            expr::apps(c(3), &[
+                lam(nat.clone(), nat.clone()),
+                expr::lit_nat(BigUint::from(0u32)),
+                lam(nat.clone(), lam(nat.clone(), expr::app(c(2), v(0)))),
+                v(0),
+            ]),
+        );
+        // A, B: n ↦ H (slow n). C: n ↦ H (slow (succ n)).
+        let via_h = |arg: Expr| lam(nat.clone(), expr::app(c(6), expr::app(c(5), arg)));
+        let defs = [
+            (5, ident.clone()),
+            (6, ident),
+            (7, via_h(v(0))),
+            (8, via_h(v(0))),
+            (9, via_h(expr::app(c(2), v(0)))),
+        ];
+        for (i, value) in defs {
+            env.insert(i, CI::Def {
+                level_params: vec![],
+                typ: pi(nat.clone(), nat.clone()),
+                value,
+                hints: RH::Regular(1),
+                is_unsafe: false,
+            });
+        }
+        let names = test_names(&[
+            "Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add",
+            "slow", "H", "A", "B", "C",
+        ]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+        let eq = |a: &Expr, b: &Expr| tc.with_forced_eager_defeq(|| tc.is_def_eq(&ctx, a, b));
+        let big = expr::lit_nat(BigUint::from(1u32) << 300usize);
+        let at = |f: u32| expr::app(c(f), big.clone());
+
+        // Normalizing either side alone cannot finish.
+        let r = tc.with_forced_eager_defeq(|| tc.whnf(&ctx, &at(7)));
+        assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+
+        let r = eq(&at(7), &at(8));
+        assert!(matches!(r, Ok(true)), "{r:?}");
+
+        // `H (slow big)` vs `H (slow (succ big))` differ (`H` and `slow` are
+        // the identity): never accepted, and still a decline.
+        let r = eq(&at(7), &at(9));
+        assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+        assert!(!SPECULATING.with(Cell::get));
+        assert!(!CORE_ABORTED.with(Cell::get));
     }
 
     #[test]
