@@ -3086,8 +3086,26 @@ impl<'e> Checker<'e> {
     ) -> R<bool> {
         match (&***a, &***b) {
             (ExprData::Proj(s1, i1, v1), ExprData::Proj(s2, i2, v2)) if s1 == s2 && i1 == i2 => {
-                if self.is_def_eq(ctx, v1, v2)? {
-                    return Ok(true);
+                // Speculative: equal structures give equal projections. But
+                // comparing the structures whole also compares every other
+                // field, which need not terminate in budget
+                // (perf/proj-lazy-struct: `(P (slow n)).1` vs `(Q (slow m)).1`).
+                // If this cannot finish, fall through: the main path reduces
+                // each projection on its own and compares only the projected
+                // fields. A decline here means "not proved this way", the
+                // same as `false`; only a completed comparison returns `true`.
+                let abort_before = CORE_ABORTED.with(Cell::get);
+                match self.is_def_eq(ctx, v1, v2) {
+                    Ok(true) => return Ok(true),
+                    Ok(false) => {}
+                    Err(TcError::Decline(_)) => {
+                        // The abort belongs to the abandoned speculative
+                        // comparison. A `Decline` raised by `whnf_core` leaves
+                        // CORE_ABORTED set, and the main path's next `whnf`
+                        // would read it as its own abort.
+                        CORE_ABORTED.with(|a| a.set(abort_before));
+                    }
+                    Err(e) => return Err(e),
                 }
             }
             _ => {}
