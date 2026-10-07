@@ -90,6 +90,8 @@ thread_local! {
 /// outermost, so without a cap a defeq-depth decline would retry at each of
 /// thousands of frames.
 const MAX_FALLBACK_TRIES: u32 = 4;
+/// Experiment: no Int / omega / Int.Linear / CommRing / Rat interpreters.
+const NO_LIBRARY_ORACLES: bool = true;
 
 /// Recursion guard for `whnf` / `is_def_eq`, not a completeness fingerprint.
 /// Lean has no 2048 cap; `WellFounded.Nat.fix` / UTF-8 decode proofs nest
@@ -6285,6 +6287,10 @@ impl<'e> Checker<'e> {
     /// rfl` needs `1⁻¹ = 1`; `Rat.inv` is a `dite` on `a.num < 0` whose
     /// `Decidable` stays stuck unless `.num`/`.den` of `OfNat Rat n` reduce.
     fn try_rat(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
+        let _ = (ctx, head, args);
+        if NO_LIBRARY_ORACLES {
+            return Ok(None);
+        }
         let n = match &***head {
             ExprData::Const(n, _) => *n,
             _ => return Ok(None),
@@ -6490,6 +6496,10 @@ impl<'e> Checker<'e> {
     /// `Nat.rec hugeFuel` (1e8); peeling it hits the rec cap and Init
     /// `#17742` (`diseq_eq_subst_cert`) cannot reduce to `true`.
     fn try_int_linear(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
+        let _ = (ctx, head, args);
+        if NO_LIBRARY_ORACLES {
+            return Ok(None);
+        }
         let n = match &***head {
             ExprData::Const(n, _) => *n,
             _ => return Ok(None),
@@ -7444,6 +7454,10 @@ impl<'e> Checker<'e> {
     /// are `Expr.rec` / `Nat.rec hugeFuel`; peeling them dies at Init
     /// `#17755` (`norm_cnstr_cert`). Do not intercept `Poly.beq'`.
     fn try_comm_ring(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
+        let _ = (ctx, head, args);
+        if NO_LIBRARY_ORACLES {
+            return Ok(None);
+        }
         let n = match &***head {
             ExprData::Const(n, _) => *n,
             _ => return Ok(None),
@@ -7588,6 +7602,10 @@ impl<'e> Checker<'e> {
     }
 
     fn try_intlist(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
+        let _ = (ctx, head, args);
+        if NO_LIBRARY_ORACLES {
+            return Ok(None);
+        }
         let n = match &***head {
             ExprData::Const(n, _) => *n,
             _ => return Ok(None),
@@ -7709,6 +7727,10 @@ impl<'e> Checker<'e> {
 
     /// `Constraint.combine` on closed `mk`s: `max` of lower bounds, `min` of uppers.
     fn try_omega_constraint(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
+        let _ = (ctx, head, args);
+        if NO_LIBRARY_ORACLES {
+            return Ok(None);
+        }
         let n = match &***head {
             ExprData::Const(n, _) => *n,
             _ => return Ok(None),
@@ -8016,6 +8038,9 @@ impl<'e> Checker<'e> {
     }
 
     fn closed_int_value(&self, ctx: &Ctx, e: &Expr) -> R<Option<BigInt>> {
+        if NO_LIBRARY_ORACLES {
+            return Ok(None);
+        }
         let (h, args) = expr::unfold_apps(e);
         let name = match &**h {
             ExprData::Const(n, _) => self.name_str(*n),
@@ -8383,6 +8408,10 @@ impl<'e> Checker<'e> {
     /// proofs (e.g. utf8DecodeChar assemble) can see `eval (a - b)` as
     /// `a.const - b.const + dot …`.
     fn try_omega_combo(&self, ctx: &Ctx, head: &Expr, args: &[Expr]) -> R<Option<Expr>> {
+        let _ = (ctx, head, args);
+        if NO_LIBRARY_ORACLES {
+            return Ok(None);
+        }
         let n = match &***head {
             ExprData::Const(n, _) => *n,
             _ => return Ok(None),
