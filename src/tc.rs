@@ -78,7 +78,18 @@ thread_local! {
     /// propagate it. Retrying at every level would redo the declining
     /// subterm once per enclosing frame and per path, exponentially.
     static SPECULATING: Cell<bool> = const { Cell::new(false) };
+    /// Bumped by every `decline`. Nothing else bumps it while a decline
+    /// propagates through `?`, so enclosing frames can tell it is the same one.
+    static DECLINE_SERIAL: Cell<u64> = const { Cell::new(0) };
+    /// `(serial, attempts)`: lazy-head fallbacks already spent on the decline
+    /// with that serial while it unwinds through enclosing frames.
+    static FALLBACK_TRIES: Cell<(u64, u32)> = const { Cell::new((u64::MAX, 0)) };
 }
+
+/// Lazy-head fallbacks per unwinding decline. Every main-path frame is
+/// outermost, so without a cap a defeq-depth decline would retry at each of
+/// thousands of frames.
+const MAX_FALLBACK_TRIES: u32 = 4;
 
 /// Recursion guard for `whnf` / `is_def_eq`, not a completeness fingerprint.
 /// Lean has no 2048 cap; `WellFounded.Nat.fix` / UTF-8 decode proofs nest
@@ -893,6 +904,7 @@ fn num_bigint_gcd(a: &BigUint, b: &BigUint) -> BigUint {
     x
 }
 fn decline<T>(msg: impl Into<String>) -> R<T> {
+    DECLINE_SERIAL.with(|s| s.set(s.get() + 1));
     Err(TcError::Decline(msg.into()))
 }
 
@@ -4243,8 +4255,14 @@ impl<'e> Checker<'e> {
         // Lean's lazy delta meets both sides at `HSub.hSub` and compares
         // arguments. Opt-in lazy-head mode already tried this above. Runs as
         // a speculative frame, so nested comparisons propagate a decline
-        // rather than falling back in turn.
-        if !self.lazy_head_enabled.get() {
+        // rather than falling back in turn, and at most MAX_FALLBACK_TRIES
+        // frames try it for one unwinding decline.
+        let serial = DECLINE_SERIAL.with(Cell::get);
+        let tries = match FALLBACK_TRIES.with(Cell::get) {
+            (s, n) if s == serial => n,
+            _ => 0,
+        };
+        if !self.lazy_head_enabled.get() && tries < MAX_FALLBACK_TRIES {
             CORE_ABORTED.with(|c| c.set(abort_before));
             SPECULATING.with(|s| s.set(true));
             let r = self.try_lazy_head_congruence(ctx, a, b);
@@ -4258,8 +4276,12 @@ impl<'e> Checker<'e> {
                 Ok(false) | Err(TcError::Decline(_)) => {}
                 Err(e) => return Err(e),
             }
+            // Declines raised and caught inside the attempt are not the one
+            // unwinding; keep its serial so enclosing frames count against it.
+            DECLINE_SERIAL.with(|s| s.set(serial));
+            FALLBACK_TRIES.with(|t| t.set((serial, tries + 1)));
         }
-        decline(declined)
+        Err(TcError::Decline(declined))
     }
 
     /// The main path: normalize both sides and compare. Returns
@@ -14508,6 +14530,9 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         // the identity): never accepted, and still a decline.
         let r = eq(&at(7), &at(9));
         assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+        // One attempt, charged to the decline that unwound, not to the ones
+        // raised and caught inside the attempt.
+        assert_eq!(FALLBACK_TRIES.with(Cell::get), (DECLINE_SERIAL.with(Cell::get), 1));
         assert!(!SPECULATING.with(Cell::get));
         assert!(!CORE_ABORTED.with(Cell::get));
     }
