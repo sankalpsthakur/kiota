@@ -1,6 +1,6 @@
 name: regenerate-arena-corpus
 
-# Rebuilds the Lean Kernel Arena's five large exports with the arena's own
+# Rebuilds Lean Kernel Arena exports with the arena's own
 # recipe (lka.py: setup_source_directory / setup_lean4export / create_test)
 # and proves byte identity against the hashes the live board publishes.
 # Heavy work runs here, never on a developer machine.
@@ -25,45 +25,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: init
-            kind: leanfile
-            leanfile: tests/init_module.lean
-            sha256: 620502ac9e63ba4a2dea9d46386c2f6aebc49faf8848ea3aaa18a77a09491a6a
-            size: 347555345
-            lines: 6487065
-          - name: std
-            kind: leanfile
-            leanfile: tests/std_module.lean
-            sha256: 289ed65a367abdc7388a855d2acf59cc1f401f5e06295acbb8a420682d9f00bd
-            size: 596655086
-            lines: 10826639
-          - name: cedar
+          - name: con-leche
             kind: module
-            url: https://github.com/cedar-policy/cedar-spec/
-            rev: 017c35c3d1f856a0f8b62a66660ee6628870bbcf
-            module: Cedar
-            prebuild: shopt -s dotglob && find . -mindepth 1 -maxdepth 1 ! -name cedar-lean -exec rm -rf {} + && mv cedar-lean/* . && rmdir cedar-lean
-            sha256: c675682320b1a3e84e0280ff431c89808258c636a91bc2539fe0f63c51182379
-            size: 872400673
-            lines: 15316788
-          - name: cslib
+            url: https://github.com/leanprover/con-leche
+            rev: 78ded4b6fc9a4d9ab809e8ca2c75c56537c41bff
+            module: ConLecheTests
+            decls: ConLeche.model_exists ConLeche.no_proof_of_False ConLeche.Frontend.scanLineSpec_eq_scanLineFwd
+            sha256: b9ad1d958705760c6eb1c5cf3974ec0a4a3eb9dd765ff0648782fa49dee94a7f
+            size: 551412545
+            lines: 10043114
+          - name: navier-stokes-euler
             kind: module
-            url: https://github.com/leanprover/cslib
-            rev: 990e65a685bed413f43b139db900a36ad5322a10
-            module: Cslib
-            prebuild: lake exe cache get
-            sha256: bc5c88e028d02a3c0789de6efb9cd96e8506d1e96b3d26672d28ae3bb33d0b30
-            size: 2422584798
-            lines: 42689984
-          - name: mathlib
-            kind: module
-            url: https://github.com/leanprover-community/mathlib4
-            rev: d13f23b723b8a846827a245b89c10fc7d3f11612
-            module: Mathlib
-            prebuild: lake exe cache get
-            sha256: 22c5de83469408950005589a3bc5ef5157c65549b5a802f85d567c29151306a6
-            size: 6184415052
-            lines: 109790519
+            url: https://github.com/openai/NavierStokesAndEuler/
+            rev: f9e8bc5b38b6e212696e8a30e3e91517af887bbd
+            module: NavierStokes.Arena
+            prebuild: lake exe cache get && printf 'import NavierStokes.ComparatorSolution\nimport Euler.Solution\n' > NavierStokes/Arena.lean
+            decls: NavierStokes.Comparator.navier_stokes_breakdown_R3 NavierStokes.Comparator.navier_stokes_breakdown_periodic Euler.euler_breakdown_R3 Euler.exists_compact_smooth_euler_singularity
+            sha256: 632943fca6795d48bc13e703aabfaef39931f9445f1275d2150a44f4de7b55e6
+            size: 1559685706
+            lines: 28569038
     env:
       NAME: ${{ matrix.name }}
       KIND: ${{ matrix.kind }}
@@ -72,6 +52,7 @@ jobs:
       SRC_REV: ${{ matrix.rev }}
       MODULE: ${{ matrix.module }}
       PREBUILD: ${{ matrix.prebuild }}
+      EXPORT_DECLS: ${{ matrix.decls }}
       WANT_SHA256: ${{ matrix.sha256 }}
       WANT_SIZE: ${{ matrix.size }}
       WANT_LINES: ${{ matrix.lines }}
@@ -140,8 +121,9 @@ jobs:
         run: |
           MOD="${MODULE:-Test}"
           start=$(date +%s)
+          # lka.py run_lean4export: `-- decl...` when the test lists export-decls.
           lake env "$GITHUB_WORKSPACE/lean4export/.lake/build/bin/lean4export" "$MOD" \
-            > "$GITHUB_WORKSPACE/$NAME.ndjson"
+            ${EXPORT_DECLS:+-- $EXPORT_DECLS} > "$GITHUB_WORKSPACE/$NAME.ndjson"
           echo "EXPORT_SECONDS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
           df -h /
 
