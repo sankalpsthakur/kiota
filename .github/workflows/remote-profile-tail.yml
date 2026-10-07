@@ -1,0 +1,108 @@
+name: remote-profile-tail
+
+# Sampling profiles of kiota on windows of the byte-verified mathlib export
+# that dominate its slow tail. Earlier windows are added to the environment
+# unchecked (KIOTA_MIN_DECL), the run stops after the window (KIOTA_MAX_DECL),
+# and the report is restricted to the window's own time span. Frame pointers
+# give usable call chains. Diagnostic only, not for main.
+on:
+  push:
+    branches: ['remote/profile-tail-3']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: '37534509955'
+
+jobs:
+  profile:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: dhashmap-raw0, min: 31900, max: 32499}
+          - {name: bvdecide, min: 143500, max: 143999}
+          - {name: bitvec-lemmas, min: 193500, max: 193999}
+          - {name: commalgcat, min: 191000, max: 191499}
+          - {name: pushout-section, min: 180330, max: 180345}
+          - {name: lie-cartan, min: 198945, max: 198955}
+          - {name: string-pattern, min: 250500, max: 250999}
+          - {name: dyadic, min: 243300, max: 243799}
+    env:
+      MIN: ${{ matrix.min }}
+      MAX: ${{ matrix.max }}
+      NAME: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build (release, frame pointers, line tables)
+        run: RUSTFLAGS="-C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-mathlib
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install perf
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" >/dev/null \
+            || sudo apt-get install -y -qq zstd linux-tools-common linux-tools-generic >/dev/null
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf | head -1); echo "PERF=$PERF" >> "$GITHUB_ENV"; "$PERF" --version
+      - name: Profile the window
+        run: |
+          zstd -d --rm mathlib.ndjson.zst -o mathlib.ndjson
+          # Stamp each stderr line with CLOCK_MONOTONIC, the clock perf records with (-k mono).
+          cat > stamp.py <<'PY'
+          import sys, time
+          for line in sys.stdin:
+              sys.stdout.write(f"{time.clock_gettime(time.CLOCK_MONOTONIC):.6f} {line}")
+              sys.stdout.flush()
+          PY
+          set +e
+          KIOTA_MIN_DECL=$MIN KIOTA_MAX_DECL=$MAX KIOTA_PROGRESS=1 KIOTA_STATS=1 KIOTA_DECL_STATS=1 \
+            "$PERF" record -k mono -F 499 -g --call-graph fp -o perf.data -- \
+            timeout 2400 ./target/release/kiota mathlib.ndjson 2>&1 >out.txt | python3 -u stamp.py > stamped.txt
+          echo "kiota/perf rc=${PIPESTATUS[0]}"
+          set -e
+          tail -3 stamped.txt
+          start=$(grep -m1 "\[decl #$MIN\]" stamped.txt | cut -d' ' -f1)
+          end=$(tail -1 stamped.txt | cut -d' ' -f1)
+          echo "window $MIN..$MAX: monotonic $start .. $end ($(python3 -c "print(round($end-$start,1))")s)" | tee window.txt
+          # Per-declaration times inside the window, slowest first.
+          python3 - "$MIN" <<'PY' > decls.txt
+          import re, sys
+          lo = int(sys.argv[1]); rows = []; prev = None
+          for line in open("stamped.txt"):
+              m = re.match(r"(\S+) \[decl #(\d+)\] (\S+) (.+)", line)
+              if not m: continue
+              t, n = float(m.group(1)), int(m.group(2))
+              if prev and prev[1] >= lo: rows.append((t - prev[0], prev[1], prev[2]))
+              prev = (t, n, m.group(4))
+          rows.sort(reverse=True)
+          print(f"{len(rows)} decls, {sum(r[0] for r in rows):.1f}s")
+          for d, n, name in rows[:40]: print(f"{d:8.2f}s #{n} {name}")
+          PY
+          head -15 decls.txt
+          grep "DECLSTATS" stamped.txt | head -60 > declstats.txt || true
+          T="--time $start,$end"
+          "$PERF" report -i perf.data $T --stdio --no-children --sort symbol --percent-limit 0.5 -g none 2>/dev/null | head -120 > flat.txt
+          "$PERF" report -i perf.data $T --stdio --children --sort symbol --percent-limit 2 -g none 2>/dev/null | head -150 > children.txt
+          "$PERF" report -i perf.data $T --stdio --no-children --sort symbol --percent-limit 3 -g caller,0.5,callee,function,percent --max-stack 24 2>/dev/null | head -900 > callers.txt
+          { cat window.txt; head -15 decls.txt; echo; head -60 flat.txt; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: profile-${{ matrix.name }}
+          path: |
+            window.txt
+            decls.txt
+            declstats.txt
+            flat.txt
+            children.txt
+            callers.txt
