@@ -2331,10 +2331,6 @@ impl<'e> Checker<'e> {
         Ok(r)
     }
 
-    /// Same as `whnf`: small defs unfold, huge Regular defs stay folded.
-    fn whnf_for_defeq(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
-        self.whnf(ctx, e)
-    }
 
     /// Congruence on unreduced matching Proj / same-const apps.
     /// Full WHNF of `f 1 a` vs `f 1 (Acc.intro …)` unfolds `f` and iotas
@@ -3654,49 +3650,81 @@ impl<'e> Checker<'e> {
         Err(TcError::Decline(declined))
     }
 
-    /// The main path: normalize both sides and compare. Returns
-    /// `(result, cacheable)`.
+    /// The main path, Lean's `is_def_eq_core` after the quick checks:
+    /// `whnf_core` both sides, then lazy delta — unfold the side whose head
+    /// definition ranks higher (`lazy_delta_rank`; both when equal), one
+    /// `lazy_delta_step` at a time, comparing the arguments of a shared
+    /// definition head before unfolding it — and only once no definition
+    /// head is left, the structural comparison (`is_def_eq_core`: proof
+    /// irrelevance, eta, structure eta, unit-like, theorem unfolding).
+    ///
+    /// Normalizing both sides fully first (the previous main path) unfolded
+    /// `Nat.add x 4294967264` into a `succ` chain before its arguments were
+    /// ever compared, and the comparison then counted the literal down
+    /// (Batteries `Char.isLower_toUpper_eq_false._proof_1_3`); re-running the
+    /// whole structural comparison at every unfolding step instead inferred
+    /// the types of every partially unfolded pair (std +36%, cslib 2x).
+    /// Returns `(result, cacheable)`.
     fn def_eq_main_path(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<(bool, bool)> {
-        let aw = self.whnf_for_defeq(ctx, a)?;
-        let bw = self.whnf_for_defeq(ctx, b)?;
+        let mut x = self.whnf_core(ctx, a)?;
+        let mut y = self.whnf_core(ctx, b)?;
+        loop {
+            if Rc::ptr_eq(&x, &y) || x == y {
+                return Ok((true, !CORE_ABORTED.with(|c| c.get())));
+            }
+            let (step_x, step_y) = match (self.lazy_delta_rank(&x), self.lazy_delta_rank(&y)) {
+                (None, None) => break,
+                (Some(_), None) => (true, false),
+                (None, Some(_)) => (false, true),
+                (Some(hx), Some(hy)) => {
+                    if hx == hy && Self::lazy_same_head(&x, &y) {
+                        // The same definition on both sides: Lean compares
+                        // the arguments first. A decline inside an argument
+                        // is "not proved this way" (`slow n` against
+                        // `slow m` under `(P (slow n)).1`); unfolding the
+                        // head may still prove the sides equal.
+                        let abort_before = CORE_ABORTED.with(Cell::get);
+                        match self.app_spines_congruent(ctx, &x, &y) {
+                            Ok(true) => return Ok((true, !CORE_ABORTED.with(|c| c.get()))),
+                            Ok(false) => {}
+                            Err(TcError::Decline(_)) => CORE_ABORTED.with(|c| c.set(abort_before)),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    (hx >= hy, hy >= hx)
+                }
+            };
+            let mut moved = false;
+            if step_x {
+                if let Some(next) = self.lazy_delta_step(ctx, &x)? {
+                    x = next;
+                    moved = true;
+                }
+            }
+            if step_y {
+                if let Some(next) = self.lazy_delta_step(ctx, &y)? {
+                    y = next;
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
         if std::env::var_os("KIOTA_TRACE_EQ").is_some() {
             let ha = expr::unfold_apps(a).0;
             if let ExprData::Const(n, _) = &**ha {
                 let nm = self.name_str(*n);
                 if nm.contains("casesOn") || nm.ends_with(".rec") || nm.contains("match_1") {
-                    let hb = expr::unfold_apps(&aw).0;
-                    let hbn = match &**hb {
-                        ExprData::Const(m, _) => self.name_str(*m).to_string(),
-                        ExprData::Lam(_, _, _) => "lam".into(),
-                        ExprData::Let(_, _, _) => "let".into(),
-                        ExprData::BVar(i) => format!("#{i}"),
-                        ExprData::Proj(s, i, _) => format!("proj {}.{}", self.name_str(*s), i),
-                        ExprData::Pi(_, _, _) => "pi".into(),
-                        _ => format!("{hb:?}"),
-                    };
-                    eprintln!("WHNFHEAD {nm} -> {hbn}");
+                    eprintln!("WHNFHEAD {nm} -> {}", self.pp_budget(&x, 12));
                 }
             }
         }
-        if std::env::var_os("KIOTA_TRACE_LINEAR").is_some() {
-            let pa = self.pp_budget(a, 24);
-            let pb = self.pp_budget(b, 24);
-            if pa.contains("norm_eq_cert") || pb.contains("norm_eq_cert") {
-                eprintln!(
-                    "DEFEQ_WHNF a={} b={} aw={} bw={}",
-                    pa,
-                    pb,
-                    self.pp_budget(&aw, 24),
-                    self.pp_budget(&bw, 24)
-                );
-            }
-        }
-        let r = self.is_def_eq_core(ctx, &aw, &bw)?;
+        let r = self.is_def_eq_core(ctx, &x, &y)?;
         // CONV_DEPTH / CORE_DEPTH abort as Decline, not Ok(false), so a stored
         // false is a completed answer. True-only left std `#18000` retrying the
         // same failing pair — 1e9 intern hits, intern size unchanged.
-        // Do not cache a result produced under a CORE_DEPTH stuck WHNF
-        // (still true regardless of the eager-rescue namespace).
+        // Do not cache a result produced under a CORE_DEPTH stuck WHNF.
         Ok((r, !CORE_ABORTED.with(|a| a.get())))
     }
 
@@ -3734,6 +3762,10 @@ impl<'e> Checker<'e> {
         if Rc::ptr_eq(a, b) || a == b {
             return Ok(true);
         }
+        // A decline raised while comparing same-head arguments (below); the
+        // delta step may still prove equality without that argument, and
+        // only then does the verdict change (decline → accept, never → false).
+        let mut args_declined: Option<String> = None;
         // Proof irrelevance for distinct bvars (`HetT.ext`: `x.small` vs
         // `y.small` after `cases h : Property_x = Property_y`). Lean treats
         // any two inhabitants of the same Prop as defeq; we used to wait
@@ -3794,8 +3826,20 @@ impl<'e> Checker<'e> {
                 if let Some(r) = self.iterated_app_congruent(ctx, a, b)? {
                     return Ok(r);
                 }
-                if self.app_spines_congruent(ctx, a, b)? {
-                    return Ok(true);
+                // Lean compares same-head arguments before unfolding. A
+                // decline inside an argument (a budget on `slow n` against
+                // `slow m`) is "not proved this way": unfolding the head may
+                // prove the sides equal without it (`(P (slow n)).1` and
+                // `(Q (slow m)).1` both project `0`).
+                let abort_before = CORE_ABORTED.with(Cell::get);
+                match self.app_spines_congruent(ctx, a, b) {
+                    Ok(true) => return Ok(true),
+                    Ok(false) => {}
+                    Err(TcError::Decline(msg)) => {
+                        CORE_ABORTED.with(|c| c.set(abort_before));
+                        args_declined = Some(msg);
+                    }
+                    Err(e) => return Err(e),
                 }
             }
             (ExprData::Proj(s1, i1, v1), ExprData::Proj(s2, i2, v2)) => {
@@ -3963,6 +4007,9 @@ impl<'e> Checker<'e> {
             }
         }
 
+        if let Some(msg) = args_declined {
+            return Err(TcError::Decline(msg));
+        }
         Ok(false)
     }
 
@@ -11753,6 +11800,36 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         // The run check declines the (HUGE_LIT_RUN + 1)th consecutive literal
         // before it is peeled (and counted), so exactly HUGE_LIT_RUN peels.
         assert_eq!(tc.fuel_nat_peels.get() - peels_before, HUGE_LIT_RUN, "the run budget stopped it, not the peel budget");
+    }
+
+    /// `Nat.add x 4294967296` against `Nat.add x (Nat.add 4294967296 0)`
+    /// with `x` a bound variable: same head, equal arguments once the inner
+    /// `Nat.add` reduces. Normalizing each side first unfolded `Nat.add` into
+    /// `succ (Nat.add x 4294967295)` and compared the predecessors one `succ`
+    /// at a time, a 2^32 countdown that only the peel budget stopped
+    /// (Batteries `Char.isLower_toUpper_eq_false._proof_1_3`).
+    #[test]
+    fn same_head_arguments_are_compared_before_a_literal_is_counted_down() {
+        let env = regression_429_nat_add_env();
+        let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let nat = expr::const_(0, vec![]);
+        let add = |a: Expr, b: Expr| expr::apps(expr::const_(4, vec![]), &[a, b]);
+        let big = expr::lit_nat(BigUint::from(1u64 << 32));
+        let mut ctx = Ctx::new();
+        ctx.push(nat.clone());
+        let x = expr::bvar(0);
+        let lhs = add(x.clone(), big.clone());
+        let rhs = add(x.clone(), add(big.clone(), expr::lit_nat(0u32.into())));
+        assert!(!Rc::ptr_eq(&lhs, &rhs));
+        let r = tc.is_def_eq(&ctx, &lhs, &rhs);
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        assert!(tc.fuel_nat_peels.get() < 8, "no countdown: {} peels", tc.fuel_nat_peels.get());
+        // Different arguments are still told apart without a countdown when
+        // the literals differ by more than any unfolding can bridge quickly:
+        // `x + 2^32` against `x + 0` reduces the right side to `x`.
+        let r = tc.is_def_eq(&ctx, &lhs, &add(x.clone(), expr::lit_nat(0u32.into())));
+        assert!(matches!(r, Ok(false) | Err(TcError::Decline(_))), "{r:?}");
     }
 
     #[test]
