@@ -302,3 +302,57 @@ Open:
   on the keys fix.
 - Kaggle gate22/gate24 kernels stall on #314513 (no keys fix) until their
   20000 s limits; deleting them is Sankalp's call.
+
+### 2026-10-19 (night) - Literal peel and the lazy-delta re-check landed; mathlib has no known decline left
+
+Two follow-ups to the evening's landing close the literal declines:
+- #27 (d378235): a literal over 256 bits is peeled in iota like any other
+  (Lean turns a literal major into `succ (n - 1)` whatever its size); only a
+  run of more than 16 consecutive peels of such literals, each one less than
+  the last, declines. `Real.log_three_near_10`, `log_five_near_10`,
+  `pi_gt_d20` and `pi_lt_d20` accept in windowed mathlib runs (runs 39318667454
+  and 39320886792).
+- #28 (c064ab6): a declaration the eager pass declines or rejects is checked
+  once more with Lean's lazy delta as the main path (`whnf_core` both sides,
+  unfold one definition head at a time, compare a shared head's arguments
+  before unfolding it, structural comparison once at the end). The eager
+  path stays the default because it is faster everywhere measured (the lazy
+  loop as the main path cost 5-6% on init and std on one runner, run
+  39325232410, and 17% on cslib across runners); the retry costs nothing on
+  declarations the eager pass accepts. Batteries
+  `Char.isLower_toUpper_eq_false._proof_1_3`, the last mathlib decline (an
+  `Int.Linear` certificate whose `Nat.add x 4294967264` the eager path turned
+  into a 2^32 countdown), accepts under the retry (run 39329552641, the declaration alone over #25 +
+  #26 + #27: zero failures).
+- Small suite in default mode under the gate's own limits, with the retry: the
+  known pair-n21 cap crash only (runs 39329552641 and 39335086763); reclaim and
+  NbE modes as on main.
+- init/std/cslib keep-going A/B of the retry against #25 + #26 (run
+  39329552641, cross-runner): init 127.3 s → 141.3 s, std 233.0 s → 262.1 s,
+  cslib 1680.9 s → 1651.3 s, all accepted with zero failures; the eager path is
+  unchanged, so the small corpora see runner noise only.
+- Mathlib curves (from the start and from declaration 440,000, keep-going,
+  14.5 GB cap): on #27 (run 39324323638), 480,045 declarations in 5680 s from the start with
+  the Batteries decline as the only failure and no reject (6.1 GB peak), and
+  from 440,000 to the end of the corpus in 2256 s with no failure (7.6 GB
+  peak); on #28 (run 39329659992), from 440,000 to the end in 2711 s with no failure
+  (7.5 GB peak) and from the start 5680 s past declaration 442,000 with no
+  failure (6.1 GB peak): the whole corpus with no decline and no reject.
+
+Pin PR: leanprover/lean-kernel-arena#277 (fork branch bump-kiota-2026-10-19):
+rev c064ab6, timeout 5680, cslib decline dropped. Opened 2026-10-19 23:30Z on
+Sankalp's go.
+
+Open:
+- The lazy loop as the main path (not the retry) checked 576,677 mathlib
+  declarations in 5680 s with no failure against 480,045 for the eager path on
+  another runner (run 39324815356 against 39324323638), at about 1.5 GB more
+  resident memory; a same-runner paired comparison decides whether it should
+  be the default for mathlib speed.
+- kiota.yaml's 3600 s timeout and the cslib decline are addressed by the pin
+  PR; on the arena machine the whole of mathlib is expected at about 4400 s.
+- cedar `pe_duration_toMinutes` and con-leche `defeqLoop_shift` are the same
+  countdown family and should now be re-measured on main.
+- Kaggle gate26 (keys + store, whole corpus, 30 GB, no time cap short of the
+  session's) was still running at 23:30Z; its number is the single-process
+  full-mathlib measurement.
