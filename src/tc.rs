@@ -3625,7 +3625,9 @@ impl<'e> Checker<'e> {
         // any two inhabitants of the same Prop as defeq; we used to wait
         // until after congruence, which left `USquash α s₁`  confusable
         // with `USquash α s₂`.
-        if self.proofs_of_same_prop(ctx, a, b)? {
+        // Experiment E1: no proof-irrelevance type inference for terms that
+        // are obviously not proofs (the end of this function still tries it).
+        if !self.obviously_not_proof(a) && !self.obviously_not_proof(b) && self.proofs_of_same_prop(ctx, a, b)? {
             return Ok(true);
         }
         if let Some((zero, succ)) = self.nat_ctors() {
