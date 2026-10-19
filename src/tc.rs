@@ -4230,6 +4230,9 @@ impl<'e> Checker<'e> {
                                 let peels = self.fuel_nat_peels.get() + 1;
                                 self.fuel_nat_peels.set(peels);
                                 if peels > MAX_HUGE_NAT_PEELS {
+                                    // Diagnostic only (harness branches).
+                                    self.dump_conversion_trace(major);
+                                    eprintln!("PEEL_BUDGET rec={} major={}", self.name_str(rname), self.pp_budget(major, 60));
                                     return decline("Nat literal countdown from 2^29 or more exceeds the peel budget");
                                 }
                             }
