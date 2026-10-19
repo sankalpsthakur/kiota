@@ -6,7 +6,7 @@ name: remote-ab-corpus
 # soundness guard still admits genuine Lean input; these corpora can.
 on:
   push:
-    branches: ['remote/diag-reallog']
+    branches: ['remote/diag-pi']
 
 permissions:
   contents: read
@@ -35,7 +35,7 @@ jobs:
             limit: 2400
             run: '37534509955'
             cap: 15000000
-            extra: 'KIOTA_MIN_DECL=443107 KIOTA_MAX_DECL=443678 KIOTA_STATS=1 KIOTA_PP_BUDGET=400'
+            extra: 'KIOTA_MIN_DECL=663957 KIOTA_MAX_DECL=690704 KIOTA_STATS=1 KIOTA_PP_BUDGET=400'
     steps:
       - uses: actions/checkout@v4
         with:
