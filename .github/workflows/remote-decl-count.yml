@@ -1,11 +1,11 @@
-name: remote-decl-count
+name: remote-line-count
 
 # Count the declarations kiota's progress counter sees (axiom, def, thm,
 # opaque) and the other top-level records in each verified arena export, so
 # a timed-out run's position can be read as a fraction of the whole corpus.
 on:
   push:
-    branches: ['remote/decl-count']
+    branches: ['remote/line-count']
 
 permissions:
   contents: read
@@ -22,14 +22,6 @@ jobs:
         include:
           - corpus: mathlib
             run: '37534509955'
-          - corpus: std
-            run: '37534509955'
-          - corpus: cslib
-            run: '37534509955'
-          - corpus: init
-            run: '37534509955'
-          - corpus: navier-stokes-euler
-            run: '37567635092'
     steps:
       - name: Fetch verified export
         uses: actions/download-artifact@v4
@@ -42,17 +34,20 @@ jobs:
           CORPUS: ${{ matrix.corpus }}
         run: |
           sudo apt-get install -y zstd >/dev/null
-          ls -la
           zstd -dc "$CORPUS.ndjson.zst" | python3 -c '
-          import sys, collections, json
-          kinds = collections.Counter()
-          checked = 0
+          import sys, json
+          ie = il = inn = decl = 0; rows = []; bytes_ = 0
           for line in sys.stdin.buffer:
-              if line.startswith(b"{\""):
-                  key = line[2:line.index(b"\"", 2)].decode()
-                  if key in ("axiom", "def", "thm", "opaque"):
-                      checked += 1
-                  if key not in ("in", "il", "ie"):
-                      kinds[key] += 1
-          print(json.dumps({"corpus": sys.argv[1], "progress_counted": checked, "kinds": kinds}, indent=1))
-          ' "$CORPUS" | tee "count-$CORPUS.json"
+              bytes_ += len(line)
+              if not line.startswith(b"{\""): continue
+              key = line[2:line.index(b"\"", 2)]
+              if key == b"ie": ie += 1
+              elif key == b"il": il += 1
+              elif key == b"in": inn += 1
+              elif key in (b"axiom", b"def", b"thm", b"opaque"):
+                  decl += 1
+                  if decl % 10000 == 0 or decl == 1:
+                      rows.append({"decl": decl, "ie": ie, "il": il, "in": inn, "mb": bytes_ // 1048576})
+          rows.append({"decl": decl, "ie": ie, "il": il, "in": inn, "mb": bytes_ // 1048576, "end": True})
+          print(json.dumps({"corpus": sys.argv[1], "rows": rows}))
+          ' "$CORPUS" | tee "count-$CORPUS.json" | python3 -c "import sys,json; d=json.load(sys.stdin); [print(r) for r in d[\"rows\"][::5]]"
