@@ -1238,9 +1238,12 @@ impl Parser {
         if let Ok(min) = std::env::var("KIOTA_MIN_DECL") {
             if let Ok(min_n) = min.parse::<usize>() {
                 if self.decl_count < min_n {
-                    // A skipped declaration still releases its proof, so a
+                    // A skipped declaration still releases its proof and
+                    // resets the interner as `check_decl` would, so a
                     // windowed run's memory is the real run's.
                     self.release_theorem_value(name);
+                    crate::expr::clear_subst_memos();
+                    crate::expr::intern_clear_if_large(4_000_000);
                     return Ok(());
                 }
             }
