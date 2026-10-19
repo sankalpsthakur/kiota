@@ -313,6 +313,10 @@ pub struct Checker<'e> {
 }
 
 thread_local! {
+    // Diagnostic only (harness branches): context-key computations on open
+    // terms, and how many of them fell back to the full context id.
+    static CTXKEY_CALLS: Cell<u64> = const { Cell::new(0) };
+    static CTXKEY_FALLBACKS: Cell<u64> = const { Cell::new(0) };
     /// Maps `(parent id, pushed type)` to the id of the extended context, so
     /// that two contexts built from the same sequence of types share an id.
     static CTX_IDS: RefCell<FxHashMap<(u64, u32, usize), u64>> = RefCell::new(FxHashMap::default());
@@ -397,22 +401,121 @@ impl Ctx {
     /// bindings lets a checked Prop-only conversion leak into a Type context.
     /// The 64-bit occurrence summary is conservative: overflow uses full id.
     fn term_ctx_key(&self, e: &Expr) -> u64 {
-        self.used_bvar_key(expr::used_bvars(e), expr::loose_bvar_range(e))
-    }
-
-    fn pair_ctx_key(&self, a: &Expr, b: &Expr) -> u64 {
-        let used = expr::used_bvars(a) | expr::used_bvars(b);
-        let overflow = expr::used_bvars(a) == u64::MAX || expr::used_bvars(b) == u64::MAX;
-        let used = if overflow { u64::MAX } else { used };
-        let loose = expr::loose_bvar_range(a).max(expr::loose_bvar_range(b));
-        self.used_bvar_key(used, loose)
-    }
-
-    fn used_bvar_key(&self, used: u64, loose: u32) -> u64 {
+        let (used, loose) = (expr::used_bvars(e), expr::loose_bvar_range(e));
         if loose == 0 {
             return 0;
         }
-        if used == 0 || used == u64::MAX {
+        if used == u64::MAX {
+            return self.used_bvar_key_wide(&[&expr::used_bvar_set(e)], loose);
+        }
+        self.used_bvar_key(used, loose)
+    }
+
+    fn pair_ctx_key(&self, a: &Expr, b: &Expr) -> u64 {
+        let (ua, ub) = (expr::used_bvars(a), expr::used_bvars(b));
+        let loose = expr::loose_bvar_range(a).max(expr::loose_bvar_range(b));
+        if loose == 0 {
+            return 0;
+        }
+        if ua == u64::MAX || ub == u64::MAX {
+            let wide = |e: &Expr, u: u64| -> Rc<[u64]> {
+                if u == u64::MAX {
+                    expr::used_bvar_set(e)
+                } else {
+                    Rc::from(vec![u])
+                }
+            };
+            let (sa, sb) = (wide(a, ua), wide(b, ub));
+            return self.used_bvar_key_wide(&[&sa, &sb], loose);
+        }
+        self.used_bvar_key(ua | ub, loose)
+    }
+
+    /// `used_bvar_key` for occurrence sets wider than one word: the same
+    /// closure (every used binder plus the transitive dependencies of its
+    /// raw type) and the same binding-by-binding id, over a bitset the
+    /// length of the context. Only an ill-scoped index falls back to the
+    /// whole telescope.
+    fn used_bvar_key_wide(&self, sets: &[&[u64]], loose: u32) -> u64 {
+        let n = self.tys.len();
+        if loose as usize > n {
+            return self.id;
+        }
+        let mut closure = vec![0u64; n.div_ceil(64)];
+        for s in sets {
+            for (w, x) in closure.iter_mut().zip(s.iter()) {
+                *w |= x;
+            }
+        }
+        // Inner-to-outer: a binder's type depends only on binders outside it,
+        // so every dependency this pass adds is visited later in the same pass.
+        for i in 0..n {
+            if closure[i / 64] & (1u64 << (i % 64)) == 0 {
+                continue;
+            }
+            let ty = &self.tys[n - 1 - i];
+            let raw_loose = expr::loose_bvar_range(ty) as usize;
+            if raw_loose == 0 {
+                continue;
+            }
+            if i + 1 + raw_loose > n {
+                return self.id;
+            }
+            let deps = expr::used_bvars(ty);
+            if deps != u64::MAX {
+                Self::or_shifted(&mut closure, deps, i + 1);
+            } else {
+                for (k, word) in expr::used_bvar_set(ty).iter().enumerate() {
+                    Self::or_shifted(&mut closure, *word, i + 1 + 64 * k);
+                }
+            }
+        }
+        let mut id = 0u64;
+        for i in (0..n).rev() {
+            if closure[i / 64] & (1u64 << (i % 64)) == 0 {
+                continue;
+            }
+            let ty_ptr = expr::identity(&self.tys[n - 1 - i]);
+            id = intern_ctx_binding_id(id, i as u32, ty_ptr);
+        }
+        id
+    }
+
+    /// `bits |= word << shift` over a multi-word bitset. Bits shifted past the
+    /// end are dropped; callers bound the source so none are set there.
+    fn or_shifted(bits: &mut [u64], word: u64, shift: usize) {
+        if word == 0 {
+            return;
+        }
+        let (w, b) = (shift / 64, shift % 64);
+        if w < bits.len() {
+            bits[w] |= word << b;
+        }
+        if b != 0 && w + 1 < bits.len() {
+            bits[w + 1] |= word >> (64 - b);
+        }
+    }
+
+    fn used_bvar_key(&self, used: u64, loose: u32) -> u64 {
+        let r = self.used_bvar_key_go(used, loose);
+        if loose > 0 {
+            CTXKEY_CALLS.with(|c| c.set(c.get() + 1));
+            if r == self.id {
+                CTXKEY_FALLBACKS.with(|c| c.set(c.get() + 1));
+            }
+        }
+        r
+    }
+
+    fn used_bvar_key_go(&self, used: u64, loose: u32) -> u64 {
+        if loose == 0 {
+            return 0;
+        }
+        if used == u64::MAX {
+            // Occurrence summary overflowed: the exact set is available.
+            return self.used_bvar_key_wide(&[&[used]], loose);
+        }
+        if used == 0 {
             // A suffix alone still omits dependencies outside that suffix.
             return self.id;
         }
@@ -434,11 +537,11 @@ impl Ctx {
                 continue;
             }
             if i + 1 + raw_loose.min(64) > 64 || raw_loose > 64 {
-                return self.id;
+                return self.used_bvar_key_wide(&[&[used]], loose);
             }
             let deps = expr::used_bvars(ty);
             if deps == 0 || deps == u64::MAX {
-                return self.id;
+                return self.used_bvar_key_wide(&[&[used]], loose);
             }
             closure |= deps << (i + 1);
         }
@@ -612,10 +715,13 @@ impl<'e> Checker<'e> {
     }
 
     fn whnf_cache_key(ctx: &Ctx, e: &Expr) -> (u64, usize) {
-        // Closed terms are context-free. Open terms (K-like `Eq.rec`/`True.rec`
-        // of a bvar major) infer the major's type, so the key includes `ctx.id`.
-        let ctx_key = if expr::is_closed(e) { 0 } else { ctx.id };
-        (ctx_key, Self::ptr_key(e))
+        // Closed terms are context-free. An open term's reduction consults
+        // the context only through the types of the binders it mentions
+        // (K-like `Eq.rec`/`True.rec` of a bvar major infer the major's
+        // type), so it is keyed like inference: those binders and the
+        // transitive dependencies of their types (`term_ctx_key`), not the
+        // whole telescope.
+        (ctx.term_ctx_key(e), Self::ptr_key(e))
     }
 
     fn name_str(&self, n: u32) -> &str {
@@ -3371,6 +3477,57 @@ impl<'e> Checker<'e> {
         result
     }
 
+    // Diagnostic only (harness branches): how many distinct terms and
+    // distinct context keys each cache holds, against its entry count.
+    fn dump_cache_histograms(&self) {
+        fn hist(name: &str, it: impl Iterator<Item = (u64, usize)>) {
+            let mut terms = rustc_hash::FxHashSet::default();
+            let mut ctxs = rustc_hash::FxHashSet::default();
+            let (mut n, mut closed) = (0usize, 0usize);
+            for (c, t) in it {
+                n += 1;
+                if c == 0 {
+                    closed += 1;
+                }
+                terms.insert(t);
+                ctxs.insert(c);
+            }
+            eprintln!(
+                "CACHE_HIST {name} entries={n} closed={closed} distinct_terms={} distinct_ctx={}",
+                terms.len(),
+                ctxs.len()
+            );
+        }
+        hist("whnf_core", self.whnf_core_cache.borrow().keys().copied());
+        hist("whnf", self.whnf_cache.borrow().keys().copied());
+        hist("infer", self.infer_cache.borrow().keys().copied());
+        {
+            let m = self.defeq_cache.borrow();
+            let mut pairs = rustc_hash::FxHashSet::default();
+            let mut ctxs = rustc_hash::FxHashSet::default();
+            let mut closed = 0usize;
+            for (c, x, y) in m.keys() {
+                if *c == 0 {
+                    closed += 1;
+                }
+                pairs.insert((*x, *y));
+                ctxs.insert(*c);
+            }
+            eprintln!(
+                "CACHE_HIST defeq entries={} closed={closed} distinct_pairs={} distinct_ctx={}",
+                m.len(),
+                pairs.len(),
+                ctxs.len()
+            );
+        }
+        eprintln!(
+            "CTXKEY calls={} fallbacks={} ctx_ids={}",
+            CTXKEY_CALLS.with(Cell::get),
+            CTXKEY_FALLBACKS.with(Cell::get),
+            CTX_IDS.with(|m| m.borrow().len())
+        );
+    }
+
     fn dump_conversion_trace(&self, e: &Expr) {
         if !self.conversion_trace_enabled || self.conversion_trace_reported.replace(true) {
             return;
@@ -3411,6 +3568,7 @@ impl<'e> Checker<'e> {
             let (d, w, i) = (self.defeq_cache.borrow().len(), self.whnf_cache.borrow().len(), self.infer_cache.borrow().len());
             if (d > n || w > n || i > n) && !self.conversion_trace_reported.get() {
                 eprintln!("CACHE_ALARM defeq={d} whnf={w} infer={i}");
+                self.dump_cache_histograms();
                 self.dump_conversion_trace(a);
             }
         }

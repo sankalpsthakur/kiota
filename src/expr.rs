@@ -382,6 +382,73 @@ thread_local! {
         RefCell::new(FxHashMap::default());
     static INST1_MEMO: RefCell<FxHashMap<(usize, usize), Expr>> =
         RefCell::new(FxHashMap::default());
+    /// `(node, drop)` → exact bitset of the node's loose bvars at or above
+    /// `drop`, re-based to `drop` (see `used_bvar_set_at`).
+    static USED_SET_MEMO: RefCell<FxHashMap<(usize, u32), Rc<[u64]>>> =
+        RefCell::new(FxHashMap::default());
+}
+
+/// Exact bitset of every loose bvar index of `e` (bit `i` of word `i / 64`),
+/// for terms whose 64-bit `used_bvars` summary overflowed. The summary
+/// cannot tell *which* indices a term under 64 or more binders uses, and a
+/// context key that falls back to the whole telescope then differs for every
+/// binder pushed, so nothing computed about the term is ever found again.
+/// Memoized per node for the current declaration (`clear_subst_memos`).
+pub fn used_bvar_set(e: &Expr) -> Rc<[u64]> {
+    used_bvar_set_at(e, 0)
+}
+
+/// Bitset of `i - drop` for every loose bvar `i >= drop` of `e`. Words:
+/// `ceil((loose - drop) / 64)`; the caller checks `loose > drop`.
+fn used_bvar_set_at(e: &Expr, drop: u32) -> Rc<[u64]> {
+    let key = (identity(e), drop);
+    if let Some(r) = USED_SET_MEMO.with(|m| m.borrow().get(&key).cloned()) {
+        return r;
+    }
+    let words = ((e.loose - drop) as usize).div_ceil(64);
+    let mut bits = vec![0u64; words];
+    match &e.data {
+        ExprData::BVar(i) => {
+            if *i >= drop {
+                let j = (*i - drop) as usize;
+                bits[j / 64] |= 1u64 << (j % 64);
+            }
+        }
+        ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => {}
+        ExprData::App(f, a) => {
+            or_used_child(&mut bits, f, drop);
+            or_used_child(&mut bits, a, drop);
+        }
+        ExprData::Lam(_, ty, body) | ExprData::Pi(_, ty, body) => {
+            or_used_child(&mut bits, ty, drop);
+            or_used_child(&mut bits, body, drop + 1);
+        }
+        ExprData::Let(ty, val, body) => {
+            or_used_child(&mut bits, ty, drop);
+            or_used_child(&mut bits, val, drop);
+            or_used_child(&mut bits, body, drop + 1);
+        }
+        ExprData::Proj(_, _, v) => or_used_child(&mut bits, v, drop),
+    }
+    let r: Rc<[u64]> = Rc::from(bits);
+    USED_SET_MEMO.with(|m| m.borrow_mut().insert(key, r.clone()));
+    r
+}
+
+fn or_used_child(bits: &mut [u64], c: &Expr, drop: u32) {
+    if c.loose <= drop {
+        return;
+    }
+    if c.used_bvars != USED_OVERFLOW {
+        // Exact already, and `loose <= 64` with `loose > drop` keeps the
+        // shift in range.
+        bits[0] |= c.used_bvars >> drop;
+        return;
+    }
+    let sub = used_bvar_set_at(c, drop);
+    for (w, s) in bits.iter_mut().zip(sub.iter()) {
+        *w |= s;
+    }
 }
 
 pub fn intern(d: ExprData) -> Expr {
@@ -468,6 +535,7 @@ pub fn clear_subst_memos() {
     LEVEL_SUBST_IDS.with(|m| m.borrow_mut().clear());
     SHIFT_MEMO.with(|m| m.borrow_mut().clear());
     INST1_MEMO.with(|m| m.borrow_mut().clear());
+    USED_SET_MEMO.with(|m| m.borrow_mut().clear());
 }
 
 pub fn bvar(i: u32) -> Expr {

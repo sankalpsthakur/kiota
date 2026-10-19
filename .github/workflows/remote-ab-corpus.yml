@@ -6,7 +6,7 @@ name: remote-ab-corpus
 # soundness guard still admits genuine Lean input; these corpora can.
 on:
   push:
-    branches: ['remote/diag-314513-full']
+    branches: ['remote/fix-keys-314513']
 
 permissions:
   contents: read
