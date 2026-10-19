@@ -30,6 +30,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Alternate runs
         run: |
+          set +e
           sudo apt-get install -y zstd >/dev/null
           zstd -d --rm mathlib.ndjson.zst -o mathlib.ndjson
           for round in 1 2; do
