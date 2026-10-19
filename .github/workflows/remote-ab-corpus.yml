@@ -6,7 +6,7 @@ name: remote-ab-corpus
 # soundness guard still admits genuine Lean input; these corpora can.
 on:
   push:
-    branches: ['remote/ab-extra-4']
+    branches: ['remote/diag-314513']
 
 permissions:
   contents: read
@@ -29,13 +29,13 @@ jobs:
         # the conversion stack at the first depth-limit decline per declaration.
         # Cedar runs under a 14 GB address-space cap instead of killing the runner.
         side: [candidate]
-        corpus: [con-leche]
+        corpus: [mathlib]
         include:
-          - corpus: con-leche
-            limit: 720
-            run: '37567635092'
+          - corpus: mathlib
+            limit: 2400
+            run: '37534509955'
             cap: 12000000
-            extra: 'KIOTA_CACHE_ALARM=5000000 KIOTA_PP_BUDGET=300'
+            extra: 'KIOTA_MIN_DECL=314513 KIOTA_MAX_DECL=314513 KIOTA_STATS=1 KIOTA_CACHE_ALARM=3000000 KIOTA_PP_BUDGET=400'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -83,7 +83,8 @@ jobs:
           cat time.txt >> err.txt
           python3 scripts/remote/decl_profile.py stamped.txt "$LIMIT" > "profile-$CORPUS-$SIDE.txt" || true
           grep "CONTINUE_PAST" stamped.txt | cut -c1-600 > "failures-$CORPUS-$SIDE.txt" || true
-          grep -E "^[0-9.]+ (MEM |CACHE_ALARM|CONVERSION_|INTERN_CALLS|memory alloc)" stamped.txt | cut -c1-3000 | tail -4000 > "diag-$CORPUS-$SIDE.txt" || true
+          grep -E "^[0-9.]+ (MEM |CACHE_ALARM|CONVERSION_|INTERN_CALLS|memory alloc)" stamped.txt | cut -c1-3000 | tail -4000 > "diag-$CORPUS-$SIDE.txt"
+          grep -E "CACHE_ALARM|CONVERSION_DEPTH|memory allocation" stamped.txt | cut -c1-2500 | head -40; grep -E "CONVERSION_FRAME [0-9] " stamped.txt | cut -c1-2500 | head -10; grep -E "^[0-9.]+ MEM " stamped.txt | tail -5 || true
           echo "failures: $(wc -l < failures-$CORPUS-$SIDE.txt)"; head -40 "failures-$CORPUS-$SIDE.txt"
           gzip -9 stamped.txt
           set -e
