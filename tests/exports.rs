@@ -1503,11 +1503,22 @@ fn proofs_of_theorems_no_expression_mentions_are_released_after_checking() {
     let r = p.run_file(path.to_str().unwrap());
     let _ = std::fs::remove_file(&path);
     assert!(r.is_ok(), "{r:?}");
-    assert!(p.env.get(5).unwrap().value().is_none(), "`unused` is mentioned by no expression: released");
-    assert!(p.env.get(4).unwrap().value().is_some(), "`used` is mentioned by `user`: kept");
-    assert!(p.env.get(6).unwrap().value().is_none(), "`user` itself is mentioned by nothing: released");
-    // Without the pre-pass (stdin input) every proof is kept.
+    // With the proof store every proof is released after checking and can
+    // be read back as the same term.
+    assert!(p.env.get(5).unwrap().value().is_none(), "`unused`: released");
+    assert!(p.env.get(4).unwrap().value().is_none(), "`used`: released to the store");
+    assert!(p.env.get(6).unwrap().value().is_none(), "`user`: released");
+    let store = p.proofs.as_ref().expect("file input has a proof store");
+    assert_eq!(store.stored(), 3);
+    let used = store.load(4).unwrap().expect("stored");
+    assert!(matches!(&**used, kiota::expr::ExprData::Const(2, _)), "`used`'s proof is `p`");
+    let user = store.load(6).unwrap().expect("stored");
+    assert!(matches!(&**user, kiota::expr::ExprData::App(f, a)
+        if matches!(&***f, kiota::expr::ExprData::Const(3, _)) && matches!(&***a, kiota::expr::ExprData::Const(4, _))),
+        "`user`'s proof is `f used`");
+    // Without the pre-pass (stdin input) every proof is kept in memory.
     let mut q = Parser::new();
     q.run(Cursor::new(export.as_bytes())).unwrap();
     assert!(q.env.get(5).unwrap().value().is_some());
+    assert!(q.proofs.is_none());
 }

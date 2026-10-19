@@ -311,6 +311,9 @@ pub struct Checker<'e> {
     /// shared subterm of a hash-consed DAG and can blow up on a proof term
     /// with heavy sharing.
     declaring: std::cell::Cell<Option<u32>>,
+    /// Where the parser put the proofs it released after checking
+    /// (`Parser::release_theorem_value`); `unfold_delta` reads them back.
+    proofs: Option<&'e crate::proofstore::ProofStore>,
 }
 
 thread_local! {
@@ -679,6 +682,7 @@ impl<'e> Checker<'e> {
             eq_related_defs: RefCell::new(Vec::new()),
             eq_arg_heads: RefCell::new(Vec::new()),
             declaring: std::cell::Cell::new(None),
+            proofs: None,
         }
     }
 
@@ -3020,14 +3024,30 @@ impl<'e> Checker<'e> {
                 self.unfold_cache.borrow_mut().insert(key, r.clone());
                 Ok(Some(r))
             }
-            // The proof was released after checking because no expression in
-            // the export names this theorem; reaching it means the pre-pass
-            // missed a reference. Lean would unfold it here, so the
-            // comparison cannot be decided without it.
-            Some(ConstantInfo::Theorem { value: None, .. }) => decline(format!(
-                "theorem `{}` would be unfolded, but its proof was released after checking",
-                self.name_str(n)
-            )),
+            // The proof was released after checking. With a proof store it
+            // comes back from disk, the same term that was released. Without
+            // one (stdin input, or a store the parser could not write), Lean
+            // would unfold it here, so the comparison cannot be decided.
+            Some(ConstantInfo::Theorem { level_params, value: None, .. }) => {
+                let key = (n, us.to_vec());
+                if let Some(r) = self.unfold_cache.borrow().get(&key) {
+                    return Ok(Some(r.clone()));
+                }
+                let value = match self.proofs.map(|p| p.load(n)) {
+                    Some(Ok(Some(v))) => v,
+                    Some(Err(msg)) => return Err(TcError::Other(msg)),
+                    Some(Ok(None)) | None => {
+                        return decline(format!(
+                            "theorem `{}` would be unfolded, but its proof was released after checking",
+                            self.name_str(n)
+                        ))
+                    }
+                };
+                let subst = level::subst_map(level_params, us);
+                let r = expr::instantiate_level_params(&value, &subst);
+                self.unfold_cache.borrow_mut().insert(key, r.clone());
+                Ok(Some(r))
+            }
             _ => Ok(None),
         }
     }
@@ -3395,6 +3415,12 @@ impl<'e> Checker<'e> {
         let r = f();
         FORCE_EAGER_DEFEQ.with(|c| c.set(prev));
         r
+    }
+
+    /// Attach the parser's store of released theorem proofs.
+    pub fn with_proof_store(mut self, proofs: Option<&'e crate::proofstore::ProofStore>) -> Self {
+        self.proofs = proofs;
+        self
     }
 
     /// Route a cache read/write to the `FORCE_EAGER_DEFEQ`-namespaced map
@@ -11878,6 +11904,43 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         let r = tc.unfold_delta(3, &[], true);
         assert!(matches!(r, Ok(Some(_))), "{r:?}");
         assert!(matches!(tc.unfold_delta(2, &[], false), Ok(None)));
+    }
+
+    #[test]
+    fn a_released_theorem_proof_comes_back_from_the_store() {
+        // Same environment as above, with the released proof in a store:
+        // the delta path unfolds `released` to the stored term; a theorem
+        // the store never saw still declines, and a damaged blob is an
+        // error, not a term.
+        use crate::env::{ConstantInfo as CI, Environment};
+        use crate::proofstore::ProofStore;
+        let mut env = Environment::default();
+        let prop = expr::sort(level::zero());
+        env.insert(0, CI::Axiom { level_params: vec![], typ: prop.clone(), is_unsafe: false });
+        let p_ty = expr::const_(0, vec![]);
+        env.insert(1, CI::Axiom { level_params: vec![], typ: p_ty.clone(), is_unsafe: false });
+        env.insert(2, CI::Theorem { level_params: vec![], typ: p_ty.clone(), value: None });
+        env.insert(3, CI::Theorem { level_params: vec![], typ: p_ty, value: None });
+        let names = test_names(&["P", "p", "released", "lost"]);
+        let store = ProofStore::new();
+        let proof = expr::const_(1, vec![]);
+        store.store(2, &proof).unwrap();
+        let tc = Checker::new(&env, &names, None, None).with_proof_store(Some(&store));
+        let r = tc.unfold_delta(2, &[], true);
+        assert!(matches!(r, Ok(Some(ref v)) if Rc::ptr_eq(v, &proof)), "{r:?}");
+        assert!(matches!(tc.unfold_delta(2, &[], true), Ok(Some(_))), "cached unfold");
+        let r = tc.unfold_delta(3, &[], true);
+        assert!(matches!(r, Err(TcError::Decline(ref m)) if m.contains("released")), "{r:?}");
+        assert!(matches!(tc.unfold_delta(2, &[], false), Ok(None)), "theorems not in scope");
+        // Universe parameters are instantiated on the reloaded proof.
+        let mut env2 = Environment::default();
+        env2.insert(0, CI::Axiom { level_params: vec![], typ: expr::sort(level::succ(level::zero())), is_unsafe: false });
+        env2.insert(1, CI::Theorem { level_params: vec![9], typ: expr::const_(0, vec![]), value: None });
+        let store2 = ProofStore::new();
+        store2.store(1, &expr::sort(level::param(9))).unwrap();
+        let tc2 = Checker::new(&env2, &names, None, None).with_proof_store(Some(&store2));
+        let r = tc2.unfold_delta(1, &[level::succ(level::zero())], true).unwrap().unwrap();
+        assert!(matches!(&**r, ExprData::Sort(l) if level::is_def_eq(l, &level::succ(level::zero()))));
     }
 
     #[test]
