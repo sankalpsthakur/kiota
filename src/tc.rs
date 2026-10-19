@@ -397,22 +397,110 @@ impl Ctx {
     /// bindings lets a checked Prop-only conversion leak into a Type context.
     /// The 64-bit occurrence summary is conservative: overflow uses full id.
     fn term_ctx_key(&self, e: &Expr) -> u64 {
-        self.used_bvar_key(expr::used_bvars(e), expr::loose_bvar_range(e))
+        let (used, loose) = (expr::used_bvars(e), expr::loose_bvar_range(e));
+        if loose == 0 {
+            return 0;
+        }
+        if used == u64::MAX {
+            return self.used_bvar_key_wide(&[&expr::used_bvar_set(e)], loose);
+        }
+        self.used_bvar_key(used, loose)
     }
 
     fn pair_ctx_key(&self, a: &Expr, b: &Expr) -> u64 {
-        let used = expr::used_bvars(a) | expr::used_bvars(b);
-        let overflow = expr::used_bvars(a) == u64::MAX || expr::used_bvars(b) == u64::MAX;
-        let used = if overflow { u64::MAX } else { used };
+        let (ua, ub) = (expr::used_bvars(a), expr::used_bvars(b));
         let loose = expr::loose_bvar_range(a).max(expr::loose_bvar_range(b));
-        self.used_bvar_key(used, loose)
+        if loose == 0 {
+            return 0;
+        }
+        if ua == u64::MAX || ub == u64::MAX {
+            let wide = |e: &Expr, u: u64| -> Rc<[u64]> {
+                if u == u64::MAX {
+                    expr::used_bvar_set(e)
+                } else {
+                    Rc::from(vec![u])
+                }
+            };
+            let (sa, sb) = (wide(a, ua), wide(b, ub));
+            return self.used_bvar_key_wide(&[&sa, &sb], loose);
+        }
+        self.used_bvar_key(ua | ub, loose)
+    }
+
+    /// `used_bvar_key` for occurrence sets wider than one word: the same
+    /// closure (every used binder plus the transitive dependencies of its
+    /// raw type) and the same binding-by-binding id, over a bitset the
+    /// length of the context. Only an ill-scoped index falls back to the
+    /// whole telescope.
+    fn used_bvar_key_wide(&self, sets: &[&[u64]], loose: u32) -> u64 {
+        let n = self.tys.len();
+        if loose as usize > n {
+            return self.id;
+        }
+        let mut closure = vec![0u64; n.div_ceil(64)];
+        for s in sets {
+            for (w, x) in closure.iter_mut().zip(s.iter()) {
+                *w |= x;
+            }
+        }
+        // Inner-to-outer: a binder's type depends only on binders outside it,
+        // so every dependency this pass adds is visited later in the same pass.
+        for i in 0..n {
+            if closure[i / 64] & (1u64 << (i % 64)) == 0 {
+                continue;
+            }
+            let ty = &self.tys[n - 1 - i];
+            let raw_loose = expr::loose_bvar_range(ty) as usize;
+            if raw_loose == 0 {
+                continue;
+            }
+            if i + 1 + raw_loose > n {
+                return self.id;
+            }
+            let deps = expr::used_bvars(ty);
+            if deps != u64::MAX {
+                Self::or_shifted(&mut closure, deps, i + 1);
+            } else {
+                for (k, word) in expr::used_bvar_set(ty).iter().enumerate() {
+                    Self::or_shifted(&mut closure, *word, i + 1 + 64 * k);
+                }
+            }
+        }
+        let mut id = 0u64;
+        for i in (0..n).rev() {
+            if closure[i / 64] & (1u64 << (i % 64)) == 0 {
+                continue;
+            }
+            let ty_ptr = expr::identity(&self.tys[n - 1 - i]);
+            id = intern_ctx_binding_id(id, i as u32, ty_ptr);
+        }
+        id
+    }
+
+    /// `bits |= word << shift` over a multi-word bitset. Bits shifted past the
+    /// end are dropped; callers bound the source so none are set there.
+    fn or_shifted(bits: &mut [u64], word: u64, shift: usize) {
+        if word == 0 {
+            return;
+        }
+        let (w, b) = (shift / 64, shift % 64);
+        if w < bits.len() {
+            bits[w] |= word << b;
+        }
+        if b != 0 && w + 1 < bits.len() {
+            bits[w + 1] |= word >> (64 - b);
+        }
     }
 
     fn used_bvar_key(&self, used: u64, loose: u32) -> u64 {
         if loose == 0 {
             return 0;
         }
-        if used == 0 || used == u64::MAX {
+        if used == u64::MAX {
+            // Occurrence summary overflowed: the exact set is available.
+            return self.used_bvar_key_wide(&[&[used]], loose);
+        }
+        if used == 0 {
             // A suffix alone still omits dependencies outside that suffix.
             return self.id;
         }
@@ -434,11 +522,11 @@ impl Ctx {
                 continue;
             }
             if i + 1 + raw_loose.min(64) > 64 || raw_loose > 64 {
-                return self.id;
+                return self.used_bvar_key_wide(&[&[used]], loose);
             }
             let deps = expr::used_bvars(ty);
             if deps == 0 || deps == u64::MAX {
-                return self.id;
+                return self.used_bvar_key_wide(&[&[used]], loose);
             }
             closure |= deps << (i + 1);
         }
@@ -612,10 +700,13 @@ impl<'e> Checker<'e> {
     }
 
     fn whnf_cache_key(ctx: &Ctx, e: &Expr) -> (u64, usize) {
-        // Closed terms are context-free. Open terms (K-like `Eq.rec`/`True.rec`
-        // of a bvar major) infer the major's type, so the key includes `ctx.id`.
-        let ctx_key = if expr::is_closed(e) { 0 } else { ctx.id };
-        (ctx_key, Self::ptr_key(e))
+        // Closed terms are context-free. An open term's reduction consults
+        // the context only through the types of the binders it mentions
+        // (K-like `Eq.rec`/`True.rec` of a bvar major infer the major's
+        // type), so it is keyed like inference: those binders and the
+        // transitive dependencies of their types (`term_ctx_key`), not the
+        // whole telescope.
+        (ctx.term_ctx_key(e), Self::ptr_key(e))
     }
 
     fn name_str(&self, n: u32) -> &str {
@@ -12032,10 +12123,113 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         let e = expr::bvar(0);
         assert_ne!(a.term_ctx_key(&e), b.term_ctx_key(&e), "two-hop outer dependency differs");
         assert_eq!(a.term_ctx_key(&e), c.term_ctx_key(&e), "unreachable middle binder stays irrelevant");
-        let mut overflow = Ctx::new();
-        for _ in 0..65 { overflow.push(ty(1)); }
-        overflow.push(expr::bvar(64));
-        assert_eq!(overflow.term_ctx_key(&e), overflow.id, "overflow uses the full exact context");
+        // Past 64 binders the one-word occurrence summary overflows; the key
+        // stays sparse and transitive instead of becoming the whole telescope.
+        let deep = |outer, unused| {
+            let mut ctx = Ctx::new();
+            ctx.push(ty(outer));
+            for _ in 0..64 { ctx.push(ty(unused)); }
+            ctx.push(expr::bvar(64));
+            ctx
+        };
+        let (da, db, dc) = (deep(1, 7), deep(2, 7), deep(1, 8));
+        assert_ne!(da.term_ctx_key(&e), da.id, "not the whole telescope");
+        assert_ne!(da.term_ctx_key(&e), db.term_ctx_key(&e), "65-hop outer dependency differs");
+        assert_eq!(da.term_ctx_key(&e), dc.term_ctx_key(&e), "unreachable padding stays irrelevant");
+    }
+
+    /// Terms that mention a binder past index 63 keyed on the whole telescope
+    /// before, so every binder pushed by a Pi/Lam congruence or an eta
+    /// expansion made every cached WHNF, inference and comparison about them
+    /// unreachable (mathlib `exists_hom_hom_comp_eq_comp_of_isAffine_of_locallyOfFiniteType`,
+    /// 110 binders, ran out of memory re-normalizing the same instances).
+    #[test]
+    fn context_keys_stay_exact_past_64_binders() {
+        // 70 binders; the term uses #2 and #66 (summary overflowed).
+        let make = |at2, at66, pad| {
+            let mut ctx = Ctx::new();
+            for i in 0..70u32 {
+                let n = match 69 - i {
+                    2 => at2,
+                    66 => at66,
+                    _ => pad,
+                };
+                ctx.push(ty(n));
+            }
+            ctx
+        };
+        let e = expr::app(expr::bvar(66), expr::bvar(2));
+        assert_eq!(expr::used_bvars(&e), u64::MAX);
+        let a = make(1, 2, 7);
+        assert_eq!(a.term_ctx_key(&e), make(1, 2, 8).term_ctx_key(&e), "unused binders do not matter");
+        assert_ne!(a.term_ctx_key(&e), make(9, 2, 7).term_ctx_key(&e), "the used inner binder does");
+        assert_ne!(a.term_ctx_key(&e), make(1, 9, 7).term_ctx_key(&e), "so does the used outer one");
+        assert_ne!(a.term_ctx_key(&e), a.id);
+        // A one-word term paired with an overflowed one keys on both.
+        let small = expr::bvar(2);
+        assert_eq!(a.pair_ctx_key(&small, &e), a.pair_ctx_key(&e, &small));
+        assert_ne!(a.pair_ctx_key(&small, &e), make(1, 9, 7).pair_ctx_key(&small, &e));
+        assert_eq!(a.pair_ctx_key(&small, &e), make(1, 2, 8).pair_ctx_key(&small, &e));
+        // WHNF caches use the same key: closed terms 0, open terms their binders.
+        assert_eq!(Checker::whnf_cache_key(&a, &ty(3)).0, 0);
+        assert_eq!(Checker::whnf_cache_key(&a, &e), Checker::whnf_cache_key(&make(1, 2, 8), &e));
+        assert_ne!(Checker::whnf_cache_key(&a, &e), Checker::whnf_cache_key(&make(9, 2, 7), &e));
+        assert_eq!(Checker::whnf_cache_key(&a, &small), Checker::whnf_cache_key(&make(1, 9, 8), &small));
+    }
+
+    /// The Prop-or-Type dependency of `regression_437_checked_inference_cache_tracks_outer_type_dependencies`
+    /// with 64 closed binders between `P` and everything that depends on it,
+    /// so the occurrence summaries overflow and the wide key must carry the
+    /// transitive dependency on `P`'s sort itself.
+    #[test]
+    fn regression_437_prop_or_type_dependency_survives_64_padding_binders() {
+        let env = Environment::default();
+        let names = Vec::new();
+        let validator = Checker::new(&env, &names, None, None);
+        let make_ctx = |p_sort: Level| {
+            let mut ctx = Ctx::new();
+            // P, 64 unrelated binders, F : P -> Type, h1 h2 : P,
+            // f : F h1 -> Prop, x : F h2.
+            let mut domains = vec![expr::sort(p_sort)];
+            for _ in 0..64 {
+                domains.push(expr::sort(level::succ(level::zero())));
+            }
+            domains.extend([
+                expr::pi(expr::BinderInfo::Default, expr::bvar(64), expr::sort(level::succ(level::zero()))),
+                expr::bvar(65),
+                expr::bvar(66),
+                expr::pi(expr::BinderInfo::Default,
+                    expr::app(expr::bvar(2), expr::bvar(1)), expr::sort(level::zero())),
+                expr::app(expr::bvar(3), expr::bvar(1)),
+            ]);
+            for dom in domains {
+                let dom_ty = validator.infer_type(&ctx, &dom).expect("fixture binder is well typed");
+                validator.ensure_sort(&ctx, &dom_ty).expect("fixture binder type is a sort");
+                ctx.push(dom);
+            }
+            ctx
+        };
+        let prop_ctx = make_ctx(level::zero());
+        let type_ctx = make_ctx(level::succ(level::zero()));
+        assert_eq!(prop_ctx.len(), 70);
+        let term = expr::app(expr::bvar(1), expr::bvar(0));
+        assert_ne!(prop_ctx.term_ctx_key(&term), type_ctx.term_ctx_key(&term),
+            "the key reaches P's sort through F's type, 65 binders out");
+        assert_ne!(prop_ctx.term_ctx_key(&term), prop_ctx.id, "and is still not the whole telescope");
+        let cold = Checker::new(&env, &names, None, None);
+        assert!(matches!(cold.infer_type(&type_ctx, &term), Err(TcError::Reject(_))),
+            "distinct data indices h1/h2 must not convert without a warm cache");
+        let warm = Checker::new(&env, &names, None, None);
+        let result = warm.infer_type(&prop_ctx, &term).expect("proof indices convert by proof irrelevance");
+        assert!(matches!(&**result, ExprData::Sort(l) if level::is_def_eq(l, &level::zero())));
+        assert!(matches!(warm.infer_type(&type_ctx, &term), Err(TcError::Reject(_))),
+            "checked cache entry from P : Prop must not authorize f x under P : Type");
+        let lhs = expr::app(expr::bvar(4), expr::bvar(3));
+        let rhs = expr::app(expr::bvar(4), expr::bvar(2));
+        let equality = Checker::new(&env, &names, None, None);
+        assert!(equality.is_def_eq(&prop_ctx, &lhs, &rhs).unwrap());
+        assert!(!equality.is_def_eq(&type_ctx, &lhs, &rhs).unwrap(),
+            "defeq and WHNF caches must also carry the Prop/Type dependency");
     }
 
     #[test]
