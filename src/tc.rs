@@ -2239,8 +2239,10 @@ impl<'e> Checker<'e> {
     }
 
     /// Same as `whnf`: small defs unfold, huge Regular defs stay folded.
+    // Experiment E2: Lean's lazy delta instead of full normalization before
+    // the structural comparison; is_def_eq_core_go's delta step unfolds.
     fn whnf_for_defeq(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
-        self.whnf(ctx, e)
+        self.whnf_core(ctx, e)
     }
 
     /// Congruence on unreduced matching Proj / same-const apps.
