@@ -2331,9 +2331,18 @@ impl<'e> Checker<'e> {
         Ok(r)
     }
 
-    /// Same as `whnf`: small defs unfold, huge Regular defs stay folded.
+    /// Lean's `is_def_eq_core` never normalizes a side before comparing it:
+    /// `whnf_core` (β, ζ, ι, projections, the Nat extensions), then lazy
+    /// delta one head unfolding at a time, comparing same-head arguments
+    /// before unfolding anything. `is_def_eq_core_go` is that loop (its
+    /// delta step unfolds the higher-height head and `whnf_core`s). A full
+    /// `whnf` here unfolded `Nat.add x 4294967264` into a `succ` chain
+    /// before the arguments were ever compared, and the comparison then
+    /// counted the literal down (Batteries
+    /// `Char.isLower_toUpper_eq_false._proof_1_3`, an `Int.Linear`
+    /// certificate over an open variable).
     fn whnf_for_defeq(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
-        self.whnf(ctx, e)
+        self.whnf_core(ctx, e)
     }
 
     /// Congruence on unreduced matching Proj / same-const apps.
@@ -3734,6 +3743,10 @@ impl<'e> Checker<'e> {
         if Rc::ptr_eq(a, b) || a == b {
             return Ok(true);
         }
+        // A decline raised while comparing same-head arguments (below); the
+        // delta step may still prove equality without that argument, and
+        // only then does the verdict change (decline → accept, never → false).
+        let mut args_declined: Option<String> = None;
         // Proof irrelevance for distinct bvars (`HetT.ext`: `x.small` vs
         // `y.small` after `cases h : Property_x = Property_y`). Lean treats
         // any two inhabitants of the same Prop as defeq; we used to wait
@@ -3794,8 +3807,20 @@ impl<'e> Checker<'e> {
                 if let Some(r) = self.iterated_app_congruent(ctx, a, b)? {
                     return Ok(r);
                 }
-                if self.app_spines_congruent(ctx, a, b)? {
-                    return Ok(true);
+                // Lean compares same-head arguments before unfolding. A
+                // decline inside an argument (a budget on `slow n` against
+                // `slow m`) is "not proved this way": unfolding the head may
+                // prove the sides equal without it (`(P (slow n)).1` and
+                // `(Q (slow m)).1` both project `0`).
+                let abort_before = CORE_ABORTED.with(Cell::get);
+                match self.app_spines_congruent(ctx, a, b) {
+                    Ok(true) => return Ok(true),
+                    Ok(false) => {}
+                    Err(TcError::Decline(msg)) => {
+                        CORE_ABORTED.with(|c| c.set(abort_before));
+                        args_declined = Some(msg);
+                    }
+                    Err(e) => return Err(e),
                 }
             }
             (ExprData::Proj(s1, i1, v1), ExprData::Proj(s2, i2, v2)) => {
@@ -3963,6 +3988,9 @@ impl<'e> Checker<'e> {
             }
         }
 
+        if let Some(msg) = args_declined {
+            return Err(TcError::Decline(msg));
+        }
         Ok(false)
     }
 
@@ -11753,6 +11781,36 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         // The run check declines the (HUGE_LIT_RUN + 1)th consecutive literal
         // before it is peeled (and counted), so exactly HUGE_LIT_RUN peels.
         assert_eq!(tc.fuel_nat_peels.get() - peels_before, HUGE_LIT_RUN, "the run budget stopped it, not the peel budget");
+    }
+
+    /// `Nat.add x 4294967296` against `Nat.add x (Nat.add 4294967296 0)`
+    /// with `x` a bound variable: same head, equal arguments once the inner
+    /// `Nat.add` reduces. Normalizing each side first unfolded `Nat.add` into
+    /// `succ (Nat.add x 4294967295)` and compared the predecessors one `succ`
+    /// at a time, a 2^32 countdown that only the peel budget stopped
+    /// (Batteries `Char.isLower_toUpper_eq_false._proof_1_3`).
+    #[test]
+    fn same_head_arguments_are_compared_before_a_literal_is_counted_down() {
+        let env = regression_429_nat_add_env();
+        let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let nat = expr::const_(0, vec![]);
+        let add = |a: Expr, b: Expr| expr::apps(expr::const_(4, vec![]), &[a, b]);
+        let big = expr::lit_nat(BigUint::from(1u64 << 32));
+        let mut ctx = Ctx::new();
+        ctx.push(nat.clone());
+        let x = expr::bvar(0);
+        let lhs = add(x.clone(), big.clone());
+        let rhs = add(x.clone(), add(big.clone(), expr::lit_nat(0u32.into())));
+        assert!(!Rc::ptr_eq(&lhs, &rhs));
+        let r = tc.is_def_eq(&ctx, &lhs, &rhs);
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        assert!(tc.fuel_nat_peels.get() < 8, "no countdown: {} peels", tc.fuel_nat_peels.get());
+        // Different arguments are still told apart without a countdown when
+        // the literals differ by more than any unfolding can bridge quickly:
+        // `x + 2^32` against `x + 0` reduces the right side to `x`.
+        let r = tc.is_def_eq(&ctx, &lhs, &add(x.clone(), expr::lit_nat(0u32.into())));
+        assert!(matches!(r, Ok(false) | Err(TcError::Decline(_))), "{r:?}");
     }
 
     #[test]
