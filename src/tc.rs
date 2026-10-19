@@ -98,6 +98,13 @@ const MAX_FALLBACK_TRIES: u32 = 4;
 /// Kept well under typical C-stack (~8MB) so this is a decline, not a segfault.
 const CONV_DEPTH: u32 = 8_192;
 
+/// Consecutive iota peels of literals over 256 bits (each one less than the
+/// last) that one declaration may make: a countdown of such a literal cannot
+/// finish, while one `match` on it is an ordinary reduction
+/// (`Real.log_three_near_10`). Each peel of a major that a recursor's step
+/// cases on again nests one `whnf_major` deeper, so the run is kept short.
+const HUGE_LIT_RUN: u32 = 16;
+
 /// Iota peels of a literal of at least 2^29 that one declaration may make.
 /// Each peel takes off one `succ`, so a countdown from there needs at least
 /// 2^29 steps and cannot finish inside any of the arena's limits. A `match` on
@@ -268,8 +275,10 @@ pub struct Checker<'e> {
     /// Peels of literals of at least 2^29 in this declaration
     /// (`MAX_HUGE_NAT_PEELS`).
     fuel_nat_peels: std::cell::Cell<u32>,
-    /// Last bits≥20 literal peeled; used to detect one hugeFuel countdown.
+    /// Last literal over 256 bits peeled, and how many consecutive peels
+    /// (each one less than the last) that run has made (`HUGE_LIT_RUN`).
     fuel_nat_last: std::cell::RefCell<Option<num_bigint::BigUint>>,
+    fuel_nat_run: std::cell::Cell<u32>,
     /// Lean `infer_only`: skip app-arg checks. Only for PI
     /// (`proofs_of_same_prop`) on already-checked terms.
     infer_only: std::cell::Cell<bool>,
@@ -674,6 +683,7 @@ impl<'e> Checker<'e> {
             iota_memo_override: std::cell::Cell::new(None),
             fuel_nat_peels: std::cell::Cell::new(0),
             fuel_nat_last: std::cell::RefCell::new(None),
+            fuel_nat_run: std::cell::Cell::new(0),
             infer_only: std::cell::Cell::new(false),
             decl_value_size: std::cell::Cell::new(0),
             checking_prop_structure: std::cell::Cell::new(false),
@@ -857,6 +867,7 @@ impl<'e> Checker<'e> {
         }
         self.fuel_nat_peels.set(0);
         *self.fuel_nat_last.borrow_mut() = None;
+        self.fuel_nat_run.set(0);
         self.decl_value_size.set(
             ci.value()
                 .map(|v| expr_size_capped(v, 200_000))
@@ -4140,11 +4151,24 @@ impl<'e> Checker<'e> {
                     if nat_induct.map(|ind| all.contains(&ind)).unwrap_or(false) || rec_owns_ctor(zero) {
                         if n == &num_bigint::BigUint::from(0u32) {
                             Some((zero, 0, vec![], None))
-                        } else if n.bits() > 256 {
-                            // Lean `LEAN_NAT_MAX_SIZE`-style byte cap, not a
-                            // bits∈[20,24] fingerprint of hugeFuel vs 2^32.
-                            return decline("Nat literal exceeds byte cap");
                         } else {
+                            // Lean turns a literal major into `succ (n - 1)`
+                            // whatever its size. One `match` on a literal over
+                            // 256 bits is an ordinary reduction; counting one
+                            // down `succ` by `succ` cannot finish, so a run of
+                            // consecutive peels of such literals declines.
+                            if n.bits() > 256 {
+                                let consecutive = matches!(
+                                    &*self.fuel_nat_last.borrow(),
+                                    Some(prev) if *prev == n + 1u32
+                                );
+                                *self.fuel_nat_last.borrow_mut() = Some(n.clone());
+                                let run = if consecutive { self.fuel_nat_run.get() + 1 } else { 1 };
+                                self.fuel_nat_run.set(run);
+                                if run > HUGE_LIT_RUN {
+                                    return decline("Nat literal countdown from a literal over 256 bits");
+                                }
+                            }
                             // One succ peel per iota (C++ natLit). WHNF-core
                             // may continue; uniform WHNF_DEPTH declines.
                             if n.bits() >= 30 {
@@ -6712,8 +6736,8 @@ impl<'e> Checker<'e> {
                 if *n == BigUint::from(0u32) {
                     Some((zero, 0, Vec::new(), None))
                 } else if n.bits() > 256 {
-                    // Same byte cap as the eager path (`nat.rs`); stays
-                    // neutral so the fallback keeps the eager decline.
+                    // Stays neutral: the eager path peels such a literal and
+                    // declines a countdown of it (`HUGE_LIT_RUN`).
                     return Ok(None);
                 } else {
                     let pred = n - 1u32;
@@ -11687,6 +11711,48 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         // Counting it down one `succ` at a time cannot finish: decline.
         let r = whnf(&rec(lit(0), lam(nat.clone(), lam(nat.clone(), expr::bvar(0)))));
         assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+    }
+
+    #[test]
+    fn a_match_on_a_literal_over_256_bits_reduces_but_a_countdown_of_it_declines() {
+        // `Real.log_three_near_10` cases on literals past 256 bits once; the
+        // earlier byte cap declined every such peel. Counting such a literal
+        // down one `succ` at a time still declines, after HUGE_LIT_RUN peels.
+        let env = regression_429_nat_add_env();
+        let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let nat = expr::const_(0, vec![]);
+        let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+        let big = BigUint::from(1u8) << 300u32;
+        let rec = |base: Expr, step: Expr, major: Expr| {
+            expr::apps(expr::const_(3, vec![]), &[lam(nat.clone(), nat.clone()), base, step, major])
+        };
+        let ctx = Ctx::new();
+        let whnf = |e: &Expr| tc.with_forced_eager_defeq(|| tc.whnf(&ctx, e));
+        // A `match` on the literal peels it once and the step sees `n - 1`.
+        let pred = lam(nat.clone(), lam(nat.clone(), expr::bvar(1)));
+        let r = whnf(&rec(expr::lit_nat(0u32.into()), pred.clone(), expr::lit_nat(big.clone())));
+        let expected = &big - 1u32;
+        assert!(matches!(&r, Ok(e) if nat::as_lit(e) == Some(&expected)), "{r:?}");
+        // Independent matches on nearby literals are not a countdown.
+        let r = whnf(&rec(expr::lit_nat(0u32.into()), pred.clone(), expr::lit_nat(&big - 1u32)));
+        assert!(matches!(&r, Ok(e) if nat::as_lit(e) == Some(&(&big - 2u32))), "{r:?}");
+        let r = whnf(&rec(expr::lit_nat(0u32.into()), pred, expr::lit_nat(&big + 5u32)));
+        assert!(matches!(&r, Ok(e) if nat::as_lit(e) == Some(&(&big + 4u32))), "{r:?}");
+        // Counting the literal down one `succ` at a time (the step returns
+        // the recursive result, so `whnf_core` loops) declines after
+        // HUGE_LIT_RUN consecutive peels, long before the 2^29 peel budget.
+        let countdown = rec(
+            expr::lit_nat(0u32.into()),
+            lam(nat.clone(), lam(nat.clone(), expr::bvar(0))),
+            expr::lit_nat(big.clone()),
+        );
+        let peels_before = tc.fuel_nat_peels.get();
+        let r = whnf(&countdown);
+        assert!(matches!(&r, Err(TcError::Decline(m)) if m.contains("countdown from a literal over 256 bits")), "{r:?}");
+        // The run check declines the (HUGE_LIT_RUN + 1)th consecutive literal
+        // before it is peeled (and counted), so exactly HUGE_LIT_RUN peels.
+        assert_eq!(tc.fuel_nat_peels.get() - peels_before, HUGE_LIT_RUN, "the run budget stopped it, not the peel budget");
     }
 
     #[test]
