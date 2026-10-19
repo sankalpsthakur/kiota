@@ -317,6 +317,12 @@ pub struct Checker<'e> {
 }
 
 thread_local! {
+    // Diagnostic only (harness branches): context-key computations on open
+    // terms, how many keyed on the whole telescope, and how many of those
+    // because the term or a binder type mentions more than USED_SET_CAP binders.
+    static CTXKEY_CALLS: Cell<u64> = const { Cell::new(0) };
+    static CTXKEY_FALLBACKS: Cell<u64> = const { Cell::new(0) };
+    static CTXKEY_DENSE: Cell<u64> = const { Cell::new(0) };
     /// Maps `(parent id, pushed type)` to the id of the extended context, so
     /// that two contexts built from the same sequence of types share an id.
     static CTX_IDS: RefCell<FxHashMap<(u64, u32, usize), u64>> = RefCell::new(FxHashMap::default());
@@ -401,6 +407,20 @@ impl Ctx {
     /// bindings lets a checked Prop-only conversion leak into a Type context.
     /// The 64-bit occurrence summary is conservative: overflow uses full id.
     fn term_ctx_key(&self, e: &Expr) -> u64 {
+        let r = self.term_ctx_key_go(e);
+        if expr::loose_bvar_range(e) > 0 {
+            CTXKEY_CALLS.with(|c| c.set(c.get() + 1));
+            if r == self.id {
+                CTXKEY_FALLBACKS.with(|c| c.set(c.get() + 1));
+                if expr::used_bvars(e) == u64::MAX && expr::used_bvar_set(e).is_none() {
+                    CTXKEY_DENSE.with(|c| c.set(c.get() + 1));
+                }
+            }
+        }
+        r
+    }
+
+    fn term_ctx_key_go(&self, e: &Expr) -> u64 {
         let (used, loose) = (expr::used_bvars(e), expr::loose_bvar_range(e));
         if loose == 0 {
             return 0;
@@ -3483,6 +3503,55 @@ impl<'e> Checker<'e> {
         result
     }
 
+    // Diagnostic only (harness branches): how many distinct terms and
+    // distinct context keys each cache holds, against its entry count.
+    fn dump_cache_histograms(&self) {
+        fn hist(name: &str, it: impl Iterator<Item = (u64, usize)>) {
+            let mut terms = rustc_hash::FxHashSet::default();
+            let mut ctxs = rustc_hash::FxHashSet::default();
+            let (mut n, mut closed) = (0usize, 0usize);
+            for (c, t) in it {
+                n += 1;
+                if c == 0 {
+                    closed += 1;
+                }
+                terms.insert(t);
+                ctxs.insert(c);
+            }
+            eprintln!(
+                "CACHE_HIST {name} entries={n} closed={closed} distinct_terms={} distinct_ctx={}",
+                terms.len(),
+                ctxs.len()
+            );
+        }
+        hist("whnf_core", self.whnf_core_cache.borrow().keys().copied());
+        hist("whnf", self.whnf_cache.borrow().keys().copied());
+        hist("infer", self.infer_cache.borrow().keys().copied());
+        {
+            let m = self.defeq_cache.borrow();
+            let mut pairs = rustc_hash::FxHashSet::default();
+            let mut ctxs = rustc_hash::FxHashSet::default();
+            for (c, x, y) in m.keys() {
+                pairs.insert((*x, *y));
+                ctxs.insert(*c);
+            }
+            eprintln!(
+                "CACHE_HIST defeq entries={} distinct_pairs={} distinct_ctx={}",
+                m.len(),
+                pairs.len(),
+                ctxs.len()
+            );
+        }
+        eprintln!(
+            "CTXKEY calls={} fallbacks={} dense={} ctx_ids={} ctx_len={}",
+            CTXKEY_CALLS.with(Cell::get),
+            CTXKEY_FALLBACKS.with(Cell::get),
+            CTXKEY_DENSE.with(Cell::get),
+            CTX_IDS.with(|m| m.borrow().len()),
+            self.conversion_trace.borrow().last().map(|(l, _, _)| *l).unwrap_or(0)
+        );
+    }
+
     fn dump_conversion_trace(&self, e: &Expr) {
         if !self.conversion_trace_enabled || self.conversion_trace_reported.replace(true) {
             return;
@@ -3515,6 +3584,16 @@ impl<'e> Checker<'e> {
                     self.unfold_cache.borrow().len(),
                     self.infer_cache.borrow().len(),
                 );
+            }
+        }
+        // Diagnostic only (harness branches): dump the active comparisons
+        // once a cache passes KIOTA_CACHE_ALARM entries.
+        if let Some(n) = std::env::var("KIOTA_CACHE_ALARM").ok().and_then(|v| v.parse::<usize>().ok()) {
+            let (d, w, i) = (self.defeq_cache.borrow().len(), self.whnf_cache.borrow().len(), self.infer_cache.borrow().len());
+            if (d > n || w > n || i > n) && !self.conversion_trace_reported.get() {
+                eprintln!("CACHE_ALARM defeq={d} whnf={w} infer={i}");
+                self.dump_cache_histograms();
+                self.dump_conversion_trace(a);
             }
         }
         if Rc::ptr_eq(a, b) || a == b {
