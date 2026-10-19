@@ -808,6 +808,12 @@ impl<'e> Checker<'e> {
     /// decline for a decided verdict, and it costs nothing on declarations
     /// the eager pass accepts (every corpus but a handful of declarations).
     pub fn check_decl(&self, name: u32, kind: &str) -> R<()> {
+        // Diagnostic only (harness branches): the lazy loop as the main path
+        // for every declaration, to time it against the eager path.
+        if std::env::var_os("KIOTA_LAZY_MAIN").is_some() {
+            LAZY_MAIN_PATH.with(|l| l.set(true));
+            return self.check_decl_once(name, kind);
+        }
         match self.check_decl_once(name, kind) {
             Err(first @ (TcError::Decline(_) | TcError::Reject(_))) if !LAZY_MAIN_PATH.with(Cell::get) => {
                 if std::env::var_os("KIOTA_PROGRESS").is_some() {

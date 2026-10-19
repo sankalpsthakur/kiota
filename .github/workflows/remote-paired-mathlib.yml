@@ -1,0 +1,47 @@
+name: remote-paired-mathlib
+
+# Same-runner timing on mathlib: one binary, the eager main path against the
+# lazy loop as the main path (KIOTA_LAZY_MAIN=1), alternately, two rounds of
+# 2000 s each, declarations reached as the measure.
+on:
+  push:
+    branches: ['remote/paired-mathlib']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: '37534509955'
+
+jobs:
+  paired:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-mathlib
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Alternate runs
+        run: |
+          sudo apt-get install -y zstd >/dev/null
+          zstd -d --rm mathlib.ndjson.zst -o mathlib.ndjson
+          for round in 1 2; do
+            for side in eager lazy; do
+              if [ "$side" = lazy ]; then extra="KIOTA_LAZY_MAIN=1"; else extra=""; fi
+              start=$(date +%s.%N)
+              env $extra KIOTA_PROGRESS=1 timeout 2000 ./target/release/kiota mathlib.ndjson 2> err-$side-$round.txt > /dev/null; rc=$?
+              end=$(date +%s.%N)
+              decls=$(grep -c '\[decl #' err-$side-$round.txt)
+              last=$(grep -o '\[decl #[0-9]*\]' err-$side-$round.txt | tail -1)
+              verdict=$(grep -m1 -E "^(REJECT|DECLINE|ERROR)" err-$side-$round.txt | cut -c1-200 || true)
+              echo "PAIRED corpus=mathlib round=$round side=$side rc=$rc wall=$(python3 -c "print(round($end-$start,1))") decls=$decls last=$last $verdict"
+            done
+          done | tee paired.txt
+          cat paired.txt >> "$GITHUB_STEP_SUMMARY"
