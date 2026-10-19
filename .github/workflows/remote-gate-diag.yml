@@ -40,9 +40,9 @@ jobs:
         run: |
           curl --fail --location --retry 3 --max-time 120 --proto '=https' \
             https://arena.lean-lang.org/lean-arena-tests.tar.gz -o tests.tar.gz
-          mkdir tests && tar xzf tests.tar.gz -C tests
+          mkdir arena-tests && tar xzf tests.tar.gz -C arena-tests
           for t in app-lam shift-cascade proj-lazy-struct magma-list-pair-n21; do
-            f=tests/good/perf/$t.ndjson
+            f=arena-tests/good/perf/$t.ndjson
             echo "=== $t: $(wc -c < $f) bytes, $(wc -l < $f) lines"
             for side in base cand cand-oldwhnfkey; do
               ( ulimit -v 8388608; KIOTA_STATS=1 /usr/bin/time -v -o time-$t-$side.txt timeout 120 ./kiota-$side "$f" > out-$t-$side.txt 2> err-$t-$side.txt; echo $? > rc-$t-$side.txt )
