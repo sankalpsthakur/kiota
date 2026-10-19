@@ -40,7 +40,11 @@ pub enum ConstantInfo {
     Theorem {
         level_params: Vec<u32>,
         typ: Expr,
-        value: Expr,
+        /// `None` once the parser has checked a theorem that no expression
+        /// in the export refers to and released its proof. An unfold that
+        /// would need a released proof declines; see
+        /// `Parser::release_theorem_value`.
+        value: Option<Expr>,
     },
     Opaque {
         level_params: Vec<u32>,
@@ -113,9 +117,8 @@ impl ConstantInfo {
     }
     pub fn value(&self) -> Option<&Expr> {
         match self {
-            ConstantInfo::Def { value, .. }
-            | ConstantInfo::Theorem { value, .. }
-            | ConstantInfo::Opaque { value, .. } => Some(value),
+            ConstantInfo::Def { value, .. } | ConstantInfo::Opaque { value, .. } => Some(value),
+            ConstantInfo::Theorem { value, .. } => value.as_ref(),
             _ => None,
         }
     }

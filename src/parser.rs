@@ -12,9 +12,16 @@ pub struct Parser {
     pub names: Vec<Rc<String>>, // index -> full dotted name (for diagnostics / builtin lookup)
     pub name_by_str: FxHashMap<String, u32>,
     pub levels: Vec<Level>,
-    pub exprs: Vec<Expr>,
+    /// The export's expression nodes by index. A slot is `None` before its
+    /// `ie` line and again after `lifetimes` has released it.
+    pub exprs: Vec<Option<Expr>>,
     pub env: Environment,
     pub decl_count: usize,
+    /// Last references of the expression indices, from `lifetime::scan`;
+    /// `None` keeps every node (stdin input, or `KIOTA_KEEP_EXPORT_NODES`).
+    pub lifetimes: Option<crate::lifetime::Lifetimes>,
+    /// Lines read so far, counted like `lifetime::scan` counts them.
+    pub line_no: u32,
 }
 
 /// Undo only writes made by the current inductive block. The journal owns
@@ -91,6 +98,8 @@ impl Parser {
             exprs: Vec::new(),
             env: Environment::default(),
             decl_count: 0,
+            lifetimes: None,
+            line_no: 0,
         }
     }
 
@@ -110,10 +119,18 @@ impl Parser {
 
     fn require_expr(&self, v: &Value, k: &str) -> Result<Expr, TcError> {
         let i = Self::require_u32(v, k)?;
-        self.exprs
-            .get(i as usize)
-            .cloned()
-            .ok_or_else(|| TcError::Reject(format!("expr index {i} for `{k}` is out of range")))
+        match self.exprs.get(i as usize) {
+            Some(Some(e)) => Ok(e.clone()),
+            Some(None) => Err(Self::released(i)),
+            None => Err(TcError::Reject(format!("expr index {i} for `{k}` is out of range"))),
+        }
+    }
+
+    /// A reference the lifetime pre-pass did not see. The two passes read
+    /// the same fields, so this is a bug; it must surface as an error and
+    /// never as a wrong term.
+    fn released(i: u32) -> TcError {
+        TcError::Other(format!("expr index {i} was released after what the pre-pass took for its last reference"))
     }
 
     fn get_str<'a>(v: &'a Value, k: &str) -> &'a str {
@@ -155,8 +172,12 @@ impl Parser {
     fn level_at(&self, i: u32) -> Level {
         self.levels[i as usize].clone()
     }
-    fn expr_at(&self, i: u32) -> Expr {
-        self.exprs[i as usize].clone()
+    fn expr_at(&self, i: u32) -> Result<Expr, TcError> {
+        match self.exprs.get(i as usize) {
+            Some(Some(e)) => Ok(e.clone()),
+            Some(None) => Err(Self::released(i)),
+            None => Err(TcError::Reject(format!("expr index {i} is out of range"))),
+        }
     }
 
     fn handle_name(&mut self, idx: u32, v: &Value) {
@@ -221,28 +242,28 @@ impl Parser {
         } else if let Some(b) = v.get("bvar") {
             expr::bvar(b.as_u64().unwrap() as u32)
         } else if let Some(a) = v.get("app") {
-            let f = self.expr_at(Self::get_u32(a, "fn"));
-            let x = self.expr_at(Self::get_u32(a, "arg"));
+            let f = self.expr_at(Self::get_u32(a, "fn"))?;
+            let x = self.expr_at(Self::get_u32(a, "arg"))?;
             expr::app(f, x)
         } else if let Some(l) = v.get("lam") {
             let bi = bi_of(Self::get_str(l, "binderInfo"));
-            let ty = self.expr_at(Self::get_u32(l, "type"));
-            let body = self.expr_at(Self::get_u32(l, "body"));
+            let ty = self.expr_at(Self::get_u32(l, "type"))?;
+            let body = self.expr_at(Self::get_u32(l, "body"))?;
             expr::lam(bi, ty, body)
         } else if let Some(p) = v.get("forallE") {
             let bi = bi_of(Self::get_str(p, "binderInfo"));
-            let ty = self.expr_at(Self::get_u32(p, "type"));
-            let body = self.expr_at(Self::get_u32(p, "body"));
+            let ty = self.expr_at(Self::get_u32(p, "type"))?;
+            let body = self.expr_at(Self::get_u32(p, "body"))?;
             expr::pi(bi, ty, body)
         } else if let Some(l) = v.get("letE") {
-            let ty = self.expr_at(Self::get_u32(l, "type"));
-            let val = self.expr_at(Self::get_u32(l, "value"));
-            let body = self.expr_at(Self::get_u32(l, "body"));
+            let ty = self.expr_at(Self::get_u32(l, "type"))?;
+            let val = self.expr_at(Self::get_u32(l, "value"))?;
+            let body = self.expr_at(Self::get_u32(l, "body"))?;
             expr::let_(ty, val, body)
         } else if let Some(p) = v.get("proj") {
             let s = Self::get_u32(p, "typeName");
             let i = Self::get_u32(p, "idx");
-            let e2 = self.expr_at(Self::get_u32(p, "struct"));
+            let e2 = self.expr_at(Self::get_u32(p, "struct"))?;
             expr::proj(s, i, e2)
         } else if let Some(n) = v.get("natVal") {
             let s = n.as_str().unwrap_or("0");
@@ -253,14 +274,14 @@ impl Parser {
             expr::lit_str(s)
         } else if let Some(m) = v.get("mdata") {
             // Metadata wraps an expr; ignore metadata, use inner expr.
-            self.expr_at(Self::get_u32(m, "expr"))
+            self.expr_at(Self::get_u32(m, "expr"))?
         } else {
             return Err(TcError::Reject("unknown expr kind".into()));
         };
         while self.exprs.len() <= idx as usize {
-            self.exprs.push(expr::sort(level::zero()));
+            self.exprs.push(None);
         }
-        self.exprs[idx as usize] = e;
+        self.exprs[idx as usize] = Some(e);
         Ok(())
     }
 
@@ -345,7 +366,7 @@ impl Parser {
                     ConstantInfo::Theorem {
                         level_params,
                         typ,
-                        value,
+                        value: Some(value),
                     },
                 );
             }
@@ -983,58 +1004,111 @@ impl Parser {
     /// Parse+check the file line by line, checking each declaration as it is
     /// encountered (matching kernel semantics: later decls may depend on
     /// earlier ones). Returns Ok(()) if every checked declaration is accepted.
+    /// Check an export file: a first pass over the file computes when each
+    /// expression node can be released (`lifetime`), then the export is
+    /// checked line by line, releasing nodes as they expire.
+    pub fn run_file(&mut self, path: &str) -> Result<(), TcError> {
+        if std::env::var_os("KIOTA_KEEP_EXPORT_NODES").is_none() {
+            let lt = crate::lifetime::scan(path).map_err(|e| TcError::Other(format!("io: {e}")))?;
+            if std::env::var_os("KIOTA_PROGRESS").is_some() {
+                eprintln!("LIFETIMES lines={} nodes={} long_lived={}", lt.lines, lt.nodes, lt.long_lived());
+            }
+            self.lifetimes = Some(lt);
+        }
+        let file = std::fs::File::open(path).map_err(|e| TcError::Other(format!("io: {e}")))?;
+        self.run(std::io::BufReader::with_capacity(1 << 22, file))
+    }
+
     pub fn run<R: BufRead>(&mut self, reader: R) -> Result<(), TcError> {
         for line in reader.lines() {
             let line = line.map_err(|e| TcError::Other(format!("io: {e}")))?;
+            self.line_no += 1;
             if line.trim().is_empty() {
                 continue;
             }
             let v: Value = serde_json::from_str(&line)
                 .map_err(|e| TcError::Other(format!("json parse: {e} on line: {line}")))?;
-            self.handle_line(&v)?;
+            let result = self.handle_line(&v);
+            // Release after every declaration line, failed or not: in
+            // diagnostic modes the run continues past a failure.
+            if !matches!(result, Ok(false)) {
+                self.release_expired();
+            }
+            result?;
         }
         Ok(())
     }
 
-    fn handle_line(&mut self, v: &Value) -> Result<(), TcError> {
+    /// Drop the table slots of every node whose last reference is behind the
+    /// current line. The environment keeps what it still needs.
+    fn release_expired(&mut self) {
+        let Parser { lifetimes, exprs, line_no, .. } = self;
+        if let Some(lt) = lifetimes.as_mut() {
+            lt.release_after_decl(*line_no, exprs.len() as u32, |idx| exprs[idx as usize] = None);
+        }
+    }
+
+    /// A theorem's proof is unfolded only through a `const` node naming the
+    /// theorem, which the pre-pass has seen if the export has one. Once a
+    /// theorem no expression refers to is checked, its proof is released;
+    /// a referenced theorem keeps its proof whatever its size, so no
+    /// unfolding Lean would do is lost. `unfold_delta` declines if a
+    /// released proof is ever needed, which only a pre-pass gap could cause.
+    /// `KIOTA_KEEP_THEOREM_VALUES` keeps every proof.
+    fn release_theorem_value(&mut self, name: u32) {
+        if std::env::var_os("KIOTA_KEEP_THEOREM_VALUES").is_some() {
+            return;
+        }
+        let Some(lt) = self.lifetimes.as_ref() else { return };
+        if lt.name_referenced(name) {
+            return;
+        }
+        if let Some(ConstantInfo::Theorem { value, .. }) = self.env.consts.get_mut(&name) {
+            *value = None;
+        }
+    }
+
+    /// `Ok(true)` for a declaration record (one kernel transaction), `Ok(false)`
+    /// for names, levels, expressions and metadata.
+    fn handle_line(&mut self, v: &Value) -> Result<bool, TcError> {
         if v.get("meta").is_some() {
-            return Ok(());
+            return Ok(false);
         }
         if let Some(idx) = v.get("in").and_then(|x| x.as_u64()) {
             self.handle_name(idx as u32, v);
-            return Ok(());
+            return Ok(false);
         }
         if let Some(idx) = v.get("il").and_then(|x| x.as_u64()) {
             self.handle_level(idx as u32, v);
-            return Ok(());
+            return Ok(false);
         }
         if let Some(idx) = v.get("ie").and_then(|x| x.as_u64()) {
             self.handle_expr(idx as u32, v)?;
-            return Ok(());
+            return Ok(false);
         }
         if let Some(d) = v.get("axiom") {
             self.handle_def_like("axiomDecl", d)?;
             self.check_last(d, "axiom")?;
-            return Ok(());
+            return Ok(true);
         }
         if let Some(d) = v.get("def") {
             self.handle_def_like("defnDecl", d)?;
             self.check_last(d, "def")?;
-            return Ok(());
+            return Ok(true);
         }
         if let Some(d) = v.get("thm") {
             self.handle_def_like("thmDecl", d)?;
             self.check_last(d, "theorem")?;
-            return Ok(());
+            return Ok(true);
         }
         if let Some(d) = v.get("opaque") {
             self.handle_def_like("opaqueDecl", d)?;
             self.check_last(d, "opaque")?;
-            return Ok(());
+            return Ok(true);
         }
         if let Some(d) = v.get("quot") {
             self.handle_quot(d)?;
-            return Ok(());
+            return Ok(true);
         }
         if let Some(d) = v.get("inductive") {
             // An inductive block is one kernel transaction.  In particular,
@@ -1061,9 +1135,9 @@ impl Parser {
             if result.is_err() {
                 undo.rollback(&mut self.env);
             }
-            return result;
+            return result.map(|()| true);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn check_last(&mut self, d: &Value, kind: &str) -> Result<(), TcError> {
@@ -1128,7 +1202,9 @@ impl Parser {
         let string_ref = self.name_by_str.get("String").copied();
         Checker::new(&self.env, &self.names, nat_ref, string_ref)
             .check_decl(name, kind)
-            .map_err(|e| self.annotate(name, e))
+            .map_err(|e| self.annotate(name, e))?;
+        self.release_theorem_value(name);
+        Ok(())
     }
 
     fn annotate(&self, name: u32, e: TcError) -> TcError {

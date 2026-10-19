@@ -2930,7 +2930,7 @@ impl<'e> Checker<'e> {
         match self.env.get(n) {
             Some(ConstantInfo::Theorem {
                 level_params,
-                value,
+                value: Some(value),
                 ..
             }) => {
                 let key = (n, us.to_vec());
@@ -2942,6 +2942,14 @@ impl<'e> Checker<'e> {
                 self.unfold_cache.borrow_mut().insert(key, r.clone());
                 Ok(Some(r))
             }
+            // The proof was released after checking because no expression in
+            // the export names this theorem; reaching it means the pre-pass
+            // missed a reference. Lean would unfold it here, so the
+            // comparison cannot be decided without it.
+            Some(ConstantInfo::Theorem { value: None, .. }) => decline(format!(
+                "theorem `{}` would be unfolded, but its proof was released after checking",
+                self.name_str(n)
+            )),
             _ => Ok(None),
         }
     }
@@ -7979,7 +7987,7 @@ mod tests {
             ConstantInfo::Theorem {
                 level_params: vec![],
                 typ: true_ty,
-                value: expr::app(expr::const_(2, vec![]), junk),
+                value: Some(expr::app(expr::const_(2, vec![]), junk)),
             },
         );
         let names = [
@@ -8192,7 +8200,7 @@ mod tests {
             ConstantInfo::Theorem {
                 level_params: vec![],
                 typ: true_ty,
-                value: expr::app(expr::const_(4, vec![]), junk),
+                value: Some(expr::app(expr::const_(4, vec![]), junk)),
             },
         );
         let names = test_names(&["False", "True", "True.intro", "elim", "idT", "bad"]);
@@ -8514,7 +8522,7 @@ mod tests {
             ConstantInfo::Theorem {
                 level_params: vec![],
                 typ: true_ty,
-                value: expr::app(expr::const_(4, vec![]), junk),
+                value: Some(expr::app(expr::const_(4, vec![]), junk)),
             },
         );
         let names = test_names(&["False", "True", "True.intro", "elimP", "idP", "bad"]);
@@ -8600,7 +8608,7 @@ mod tests {
             ConstantInfo::Theorem {
                 level_params: vec![],
                 typ: expr::app(expr::app(expr::const_(3, vec![]), t.clone()), t),
-                value,
+                value: Some(value),
             },
         );
         let names = test_names(&[
@@ -11678,6 +11686,28 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         // Against `H (slow (big + 1))` the sides differ: never accepted.
         let r = eq(&w, &h_slow(&(&big + 1u32)));
         assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+    }
+
+    #[test]
+    fn unfolding_a_released_theorem_proof_declines() {
+        // `t : P` whose proof was released after checking: Lean would unfold
+        // it in the delta path, so a comparison that needs it declines; a
+        // retained proof still unfolds.
+        use crate::env::{ConstantInfo as CI, Environment};
+        let mut env = Environment::default();
+        let prop = expr::sort(level::zero());
+        env.insert(0, CI::Axiom { level_params: vec![], typ: prop.clone(), is_unsafe: false });
+        let p_ty = expr::const_(0, vec![]);
+        env.insert(1, CI::Axiom { level_params: vec![], typ: p_ty.clone(), is_unsafe: false });
+        env.insert(2, CI::Theorem { level_params: vec![], typ: p_ty.clone(), value: None });
+        env.insert(3, CI::Theorem { level_params: vec![], typ: p_ty, value: Some(expr::const_(1, vec![])) });
+        let names = test_names(&["P", "p", "released", "kept"]);
+        let tc = Checker::new(&env, &names, None, None);
+        let r = tc.unfold_delta(2, &[], true);
+        assert!(matches!(r, Err(TcError::Decline(ref m)) if m.contains("released")), "{r:?}");
+        let r = tc.unfold_delta(3, &[], true);
+        assert!(matches!(r, Ok(Some(_))), "{r:?}");
+        assert!(matches!(tc.unfold_delta(2, &[], false), Ok(None)));
     }
 
     #[test]
