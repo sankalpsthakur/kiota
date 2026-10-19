@@ -1,0 +1,55 @@
+name: remote-gate-diag
+
+# The four small-suite perf tests the strict gate flags, run with the
+# baseline (main), the candidate (context keys), and the candidate with the
+# WHNF cache key put back on the whole telescope, under the gate's limits.
+on:
+  push:
+    branches: ['remote/gate-keys-diag-2']
+
+permissions:
+  contents: read
+
+env:
+  BASELINE_SHA: 53a318914190ef75b17aacb20c22c1f11ecb8770
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the three binaries
+        run: |
+          cargo build --release --locked && cp target/release/kiota kiota-cand
+          python3 - <<'PY'
+          p = "src/tc.rs"; s = open(p).read()
+          old = "        (ctx.term_ctx_key(e), Self::ptr_key(e))\n    }"
+          assert s.count(old) == 1
+          s = s.replace(old, "        let ctx_key = if expr::is_closed(e) { 0 } else { ctx.id };\n        (ctx_key, Self::ptr_key(e))\n    }")
+          open(p, "w").write(s)
+          PY
+          cargo build --release --locked && cp target/release/kiota kiota-cand-oldwhnfkey
+          git checkout -q -- src/tc.rs
+          git checkout -q "$BASELINE_SHA" && cargo build --release --locked && cp target/release/kiota kiota-base
+          git checkout -q -
+      - name: Run the four tests
+        run: |
+          curl --fail --location --retry 3 --max-time 120 --proto '=https' \
+            https://arena.lean-lang.org/lean-arena-tests.tar.gz -o tests.tar.gz
+          mkdir tests && tar xzf tests.tar.gz -C tests
+          for t in app-lam shift-cascade proj-lazy-struct magma-list-pair-n21; do
+            f=tests/good/perf/$t.ndjson
+            echo "=== $t: $(wc -c < $f) bytes, $(wc -l < $f) lines"
+            for side in base cand cand-oldwhnfkey; do
+              ( ulimit -v 8388608; KIOTA_STATS=1 /usr/bin/time -v -o time-$t-$side.txt timeout 120 ./kiota-$side "$f" > out-$t-$side.txt 2> err-$t-$side.txt; echo $? > rc-$t-$side.txt )
+              rc=$(cat rc-$t-$side.txt)
+              echo "--- $t $side rc=$rc wall=$(grep 'Elapsed' time-$t-$side.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time-$t-$side.txt | awk '{print $NF}')"
+              grep -m1 -E "^(REJECT|DECLINE|ERROR)" out-$t-$side.txt err-$t-$side.txt | cut -c1-300 || true
+              grep -E "^(STATS|MEM |INTERN_CALLS|memory allocation)" err-$t-$side.txt | tail -4 | cut -c1-300 || true
+            done
+          done 2>&1 | tee diag.txt
+          cat diag.txt >> "$GITHUB_STEP_SUMMARY"
