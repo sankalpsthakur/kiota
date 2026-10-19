@@ -1,0 +1,59 @@
+name: remote-paired
+
+# Same-runner timing: build the baseline and the candidate, then run each on
+# the same export alternately, twice. Cross-job runner speed varies by 30%+.
+on:
+  push:
+    branches: ['remote/paired-keys']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # main 53a3189 vs fix/context-keys-past-64-binders 510a31f (this commit's tree).
+  BASELINE_SHA: 53a318914190ef75b17aacb20c22c1f11ecb8770
+  EXPORTS_RUN: '37534509955'
+
+jobs:
+  paired:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build candidate and baseline
+        run: |
+          echo "CANDIDATE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          cargo build --release --locked && cp target/release/kiota kiota-cand
+          git checkout -q "$BASELINE_SHA" && cargo build --release --locked && cp target/release/kiota kiota-base
+          git checkout -q -
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-std
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Alternate runs
+        run: |
+          sudo apt-get install -y zstd >/dev/null
+          zstd -d --rm std.ndjson.zst -o std.ndjson
+          zstd -d --rm init.ndjson.zst -o init.ndjson
+          for corpus in init std; do
+            for round in 1 2; do
+              for side in base cand; do
+                start=$(date +%s.%N)
+                KIOTA_PROGRESS=1 timeout 900 ./kiota-$side $corpus.ndjson 2> err-$corpus-$side-$round.txt > /dev/null; rc=$?
+                end=$(date +%s.%N)
+                decls=$(grep -c '\[decl #' err-$corpus-$side-$round.txt)
+                echo "PAIRED corpus=$corpus round=$round side=$side rc=$rc wall=$(python3 -c "print(round($end-$start,1))") decls=$decls"
+              done
+            done
+          done | tee paired.txt
+          cat paired.txt >> "$GITHUB_STEP_SUMMARY"
