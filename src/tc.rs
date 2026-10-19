@@ -85,6 +85,12 @@ thread_local! {
     /// `(serial, attempts)`: lazy-head fallbacks already spent on the decline
     /// with that serial while it unwinds through enclosing frames.
     static FALLBACK_TRIES: Cell<(u64, u32)> = const { Cell::new((u64::MAX, 0)) };
+    /// Set while a declaration is re-checked with Lean's lazy delta as the
+    /// main path (`def_eq_main_path_lazy`) after the eager pass declined or
+    /// rejected it (`check_decl`).
+    static LAZY_MAIN_PATH: Cell<bool> = const { Cell::new(false) };
+    /// Declarations re-checked that way in this thread (tests, statistics).
+    static LAZY_RETRIES: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Lazy-head fallbacks per unwinding decline. Every main-path frame is
@@ -794,7 +800,33 @@ impl<'e> Checker<'e> {
         }
     }
 
+    /// Checks `name` with the eager main path (`def_eq_main_path`); a
+    /// declaration it declines or rejects is checked once more with Lean's
+    /// lazy delta as the main path (`LAZY_MAIN_PATH`), and the second verdict
+    /// stands when it is an accept or a rejection. Both passes apply the same
+    /// rules in a different reduction order, so the retry can only trade a
+    /// decline for a decided verdict, and it costs nothing on declarations
+    /// the eager pass accepts (every corpus but a handful of declarations).
     pub fn check_decl(&self, name: u32, kind: &str) -> R<()> {
+        match self.check_decl_once(name, kind) {
+            Err(first @ (TcError::Decline(_) | TcError::Reject(_))) if !LAZY_MAIN_PATH.with(Cell::get) => {
+                if std::env::var_os("KIOTA_PROGRESS").is_some() {
+                    eprintln!("LAZY_RETRY {} after {first:?}", self.name_str(name));
+                }
+                LAZY_RETRIES.with(|c| c.set(c.get() + 1));
+                LAZY_MAIN_PATH.with(|l| l.set(true));
+                let r = self.check_decl_once(name, kind);
+                LAZY_MAIN_PATH.with(|l| l.set(false));
+                match r {
+                    Err(TcError::Decline(_)) => Err(first),
+                    r => r,
+                }
+            }
+            r => r,
+        }
+    }
+
+    fn check_decl_once(&self, name: u32, kind: &str) -> R<()> {
         self.conversion_trace_reported.set(false);
         let ci = self
             .env
@@ -2331,10 +2363,6 @@ impl<'e> Checker<'e> {
         Ok(r)
     }
 
-    /// Same as `whnf`: small defs unfold, huge Regular defs stay folded.
-    fn whnf_for_defeq(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
-        self.whnf(ctx, e)
-    }
 
     /// Congruence on unreduced matching Proj / same-const apps.
     /// Full WHNF of `f 1 a` vs `f 1 (Acc.intro …)` unfolds `f` and iotas
@@ -3654,49 +3682,106 @@ impl<'e> Checker<'e> {
         Err(TcError::Decline(declined))
     }
 
-    /// The main path: normalize both sides and compare. Returns
-    /// `(result, cacheable)`.
+    /// The main path. Eager by default; under `LAZY_MAIN_PATH` it is Lean's
+    /// `is_def_eq_core` after the quick checks: `whnf_core` both sides, then
+    /// lazy delta — unfold the side whose head definition ranks higher
+    /// (`lazy_delta_rank`; both when equal), one `lazy_delta_step` at a time,
+    /// comparing the arguments of a shared definition head before unfolding
+    /// it — and only once no definition head is left, the structural
+    /// comparison (`is_def_eq_core`: proof irrelevance, eta, structure eta,
+    /// unit-like, theorem unfolding).
+    ///
+    /// Normalizing both sides fully first unfolds `Nat.add x 4294967264` into
+    /// a `succ` chain before its arguments are ever compared, and the
+    /// comparison then counts the literal down (Batteries
+    /// `Char.isLower_toUpper_eq_false._proof_1_3`), which the lazy loop
+    /// never does; running the lazy loop for every comparison instead cost
+    /// 17% on cslib, and re-running the whole structural comparison at every
+    /// unfolding step inferred the types of every partially unfolded pair
+    /// (std +36%, cslib 2x). Returns `(result, cacheable)`.
     fn def_eq_main_path(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<(bool, bool)> {
-        let aw = self.whnf_for_defeq(ctx, a)?;
-        let bw = self.whnf_for_defeq(ctx, b)?;
+        if LAZY_MAIN_PATH.with(Cell::get) {
+            return self.def_eq_main_path_lazy(ctx, a, b);
+        }
+        // The eager path: normalize both sides (every definition head,
+        // cached per term) and compare once. Faster than the lazy loop on
+        // every corpus measured (cslib 1483 s against 1735 s), but it
+        // unfolds `Nat.add x 4294967264` into a `succ` chain before the
+        // arguments are compared; what it declines, `check_decl` re-checks
+        // with the lazy loop.
+        let aw = self.whnf(ctx, a)?;
+        let bw = self.whnf(ctx, b)?;
+        let r = self.is_def_eq_core(ctx, &aw, &bw)?;
+        // CONV_DEPTH / CORE_DEPTH abort as Decline, not Ok(false), so a stored
+        // false is a completed answer. True-only left std `#18000` retrying the
+        // same failing pair — 1e9 intern hits, intern size unchanged.
+        // Do not cache a result produced under a CORE_DEPTH stuck WHNF.
+        Ok((r, !CORE_ABORTED.with(|a| a.get())))
+    }
+
+    /// Lean's `is_def_eq_core` after the quick checks, used when a
+    /// declaration is re-checked (`LAZY_MAIN_PATH`): see `def_eq_main_path`'s
+    /// doc comment above for the loop.
+    fn def_eq_main_path_lazy(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<(bool, bool)> {
+        let mut x = self.whnf_core(ctx, a)?;
+        let mut y = self.whnf_core(ctx, b)?;
+        loop {
+            if Rc::ptr_eq(&x, &y) || x == y {
+                return Ok((true, !CORE_ABORTED.with(|c| c.get())));
+            }
+            let (step_x, step_y) = match (self.lazy_delta_rank(&x), self.lazy_delta_rank(&y)) {
+                (None, None) => break,
+                (Some(_), None) => (true, false),
+                (None, Some(_)) => (false, true),
+                (Some(hx), Some(hy)) => {
+                    if hx == hy && Self::lazy_same_head(&x, &y) {
+                        // The same definition on both sides: Lean compares
+                        // the arguments first. A decline inside an argument
+                        // is "not proved this way" (`slow n` against
+                        // `slow m` under `(P (slow n)).1`); unfolding the
+                        // head may still prove the sides equal.
+                        let abort_before = CORE_ABORTED.with(Cell::get);
+                        match self.app_spines_congruent(ctx, &x, &y) {
+                            Ok(true) => return Ok((true, !CORE_ABORTED.with(|c| c.get()))),
+                            Ok(false) => {}
+                            Err(TcError::Decline(_)) => CORE_ABORTED.with(|c| c.set(abort_before)),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    (hx >= hy, hy >= hx)
+                }
+            };
+            let mut moved = false;
+            if step_x {
+                if let Some(next) = self.lazy_delta_step(ctx, &x)? {
+                    x = next;
+                    moved = true;
+                }
+            }
+            if step_y {
+                if let Some(next) = self.lazy_delta_step(ctx, &y)? {
+                    y = next;
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
         if std::env::var_os("KIOTA_TRACE_EQ").is_some() {
             let ha = expr::unfold_apps(a).0;
             if let ExprData::Const(n, _) = &**ha {
                 let nm = self.name_str(*n);
                 if nm.contains("casesOn") || nm.ends_with(".rec") || nm.contains("match_1") {
-                    let hb = expr::unfold_apps(&aw).0;
-                    let hbn = match &**hb {
-                        ExprData::Const(m, _) => self.name_str(*m).to_string(),
-                        ExprData::Lam(_, _, _) => "lam".into(),
-                        ExprData::Let(_, _, _) => "let".into(),
-                        ExprData::BVar(i) => format!("#{i}"),
-                        ExprData::Proj(s, i, _) => format!("proj {}.{}", self.name_str(*s), i),
-                        ExprData::Pi(_, _, _) => "pi".into(),
-                        _ => format!("{hb:?}"),
-                    };
-                    eprintln!("WHNFHEAD {nm} -> {hbn}");
+                    eprintln!("WHNFHEAD {nm} -> {}", self.pp_budget(&x, 12));
                 }
             }
         }
-        if std::env::var_os("KIOTA_TRACE_LINEAR").is_some() {
-            let pa = self.pp_budget(a, 24);
-            let pb = self.pp_budget(b, 24);
-            if pa.contains("norm_eq_cert") || pb.contains("norm_eq_cert") {
-                eprintln!(
-                    "DEFEQ_WHNF a={} b={} aw={} bw={}",
-                    pa,
-                    pb,
-                    self.pp_budget(&aw, 24),
-                    self.pp_budget(&bw, 24)
-                );
-            }
-        }
-        let r = self.is_def_eq_core(ctx, &aw, &bw)?;
+        let r = self.is_def_eq_core(ctx, &x, &y)?;
         // CONV_DEPTH / CORE_DEPTH abort as Decline, not Ok(false), so a stored
         // false is a completed answer. True-only left std `#18000` retrying the
         // same failing pair — 1e9 intern hits, intern size unchanged.
-        // Do not cache a result produced under a CORE_DEPTH stuck WHNF
-        // (still true regardless of the eager-rescue namespace).
+        // Do not cache a result produced under a CORE_DEPTH stuck WHNF.
         Ok((r, !CORE_ABORTED.with(|a| a.get())))
     }
 
@@ -3734,6 +3819,10 @@ impl<'e> Checker<'e> {
         if Rc::ptr_eq(a, b) || a == b {
             return Ok(true);
         }
+        // A decline raised while comparing same-head arguments (below); the
+        // delta step may still prove equality without that argument, and
+        // only then does the verdict change (decline → accept, never → false).
+        let mut args_declined: Option<String> = None;
         // Proof irrelevance for distinct bvars (`HetT.ext`: `x.small` vs
         // `y.small` after `cases h : Property_x = Property_y`). Lean treats
         // any two inhabitants of the same Prop as defeq; we used to wait
@@ -3794,8 +3883,21 @@ impl<'e> Checker<'e> {
                 if let Some(r) = self.iterated_app_congruent(ctx, a, b)? {
                     return Ok(r);
                 }
-                if self.app_spines_congruent(ctx, a, b)? {
-                    return Ok(true);
+                // Lean compares same-head arguments before unfolding. Under
+                // the lazy main path a decline inside an argument (a budget
+                // on `slow n` against `slow m`) is "not proved this way":
+                // unfolding the head may prove the sides equal without it
+                // (`(P (slow n)).1` and `(Q (slow m)).1` both project `0`).
+                // The eager path keeps propagating it, as measured.
+                let abort_before = CORE_ABORTED.with(Cell::get);
+                match self.app_spines_congruent(ctx, a, b) {
+                    Ok(true) => return Ok(true),
+                    Ok(false) => {}
+                    Err(TcError::Decline(msg)) if LAZY_MAIN_PATH.with(Cell::get) => {
+                        CORE_ABORTED.with(|c| c.set(abort_before));
+                        args_declined = Some(msg);
+                    }
+                    Err(e) => return Err(e),
                 }
             }
             (ExprData::Proj(s1, i1, v1), ExprData::Proj(s2, i2, v2)) => {
@@ -3963,6 +4065,9 @@ impl<'e> Checker<'e> {
             }
         }
 
+        if let Some(msg) = args_declined {
+            return Err(TcError::Decline(msg));
+        }
         Ok(false)
     }
 
@@ -8150,6 +8255,27 @@ mod tests {
         }
     }
 
+    /// Runs a test body on a thread with a checker-sized stack. A comparison
+    /// that peels a literal nests one set of frames per peel; the checker
+    /// runs on its own large stack, the test harness's thread has 2 MB.
+    fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(256 << 20)
+            .spawn(f)
+            .expect("spawn")
+            .join()
+            .expect("test body")
+    }
+
+    /// Runs `f` with Lean's lazy delta as the main path, as `check_decl`'s
+    /// retry does.
+    fn with_lazy_main_path<T>(f: impl FnOnce() -> T) -> T {
+        let prev = LAZY_MAIN_PATH.with(|l| l.replace(true));
+        let r = f();
+        LAZY_MAIN_PATH.with(|l| l.set(prev));
+        r
+    }
+
     fn test_names(ss: &[&str]) -> Vec<std::rc::Rc<String>> {
         ss.iter().map(|s| std::rc::Rc::new((*s).into())).collect()
     }
@@ -11554,6 +11680,10 @@ fn regression_432_defining_equations_and_closed_values_convert() {
 
     #[test]
     fn speculative_decline_falls_back_to_projection() {
+        on_big_stack(speculative_decline_falls_back_to_projection_body)
+    }
+
+    fn speculative_decline_falls_back_to_projection_body() {
         // perf/proj-lazy-struct: `(P (slow n)).1` vs `(Q (slow m)).1`.
         // Congruence on `Pair.fst` compares the structs, and so `slow n`
         // with `slow m`, which declines here (`Nat.rec` on a literal past
@@ -11753,6 +11883,118 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         // The run check declines the (HUGE_LIT_RUN + 1)th consecutive literal
         // before it is peeled (and counted), so exactly HUGE_LIT_RUN peels.
         assert_eq!(tc.fuel_nat_peels.get() - peels_before, HUGE_LIT_RUN, "the run budget stopped it, not the peel budget");
+    }
+
+    /// `Nat.add x 2^40` against `A1 x 2^40` through a chain of thirty
+    /// aliases `A1 := A2 := … := Nat.add`, longer than the speculative
+    /// passes follow. The eager main path normalizes both sides and peels the
+    /// literal on each; the lazy loop unfolds the aliases until the heads
+    /// agree and compares the arguments, peeling nothing.
+    #[test]
+    fn the_lazy_main_path_unfolds_aliases_instead_of_peeling_literals() {
+        // `KIOTA_NBE=1` (opt-in, not the arena's configuration) evaluates the
+        // literal recursion itself and never reaches the paths under test.
+        if nbe::nbe_enabled() {
+            return;
+        }
+        on_big_stack(the_lazy_main_path_unfolds_aliases_instead_of_peeling_literals_body)
+    }
+
+    fn the_lazy_main_path_unfolds_aliases_instead_of_peeling_literals_body() {
+        use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+        let mut env = regression_429_nat_add_env();
+        let nat = expr::const_(0, vec![]);
+        let fn_ty = expr::pi(expr::BinderInfo::Default, nat.clone(), expr::pi(expr::BinderInfo::Default, nat.clone(), nat.clone()));
+        // A34 := Nat.add, A33 := A34, …, A5 := A6.
+        for i in (5..=34).rev() {
+            let target = if i == 34 { 4 } else { i + 1 };
+            env.insert(i, CI::Def {
+                level_params: vec![],
+                typ: fn_ty.clone(),
+                value: expr::const_(target, vec![]),
+                hints: RH::Regular(36 - i as u32),
+                is_unsafe: false,
+            });
+        }
+        let mut names = vec!["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add"];
+        let alias_names: Vec<String> = (5..=34).map(|i| format!("A{i}")).collect();
+        names.extend(alias_names.iter().map(|s| s.as_str()));
+        let names = test_names(&names);
+        let add = |f: u32, a: Expr, b: Expr| expr::apps(expr::const_(f, vec![]), &[a, b]);
+        let big = expr::lit_nat(BigUint::from(1u64 << 40));
+        let mut ctx = Ctx::new();
+        ctx.push(nat.clone());
+        let x = expr::bvar(0);
+        let lhs = add(4, x.clone(), big.clone());
+        let rhs = add(5, x.clone(), big.clone());
+        let eager = Checker::new(&env, &names, Some(0), None);
+        let r = eager.is_def_eq(&ctx, &lhs, &rhs);
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        assert!(eager.fuel_nat_peels.get() >= 1, "the eager path normalized through the literal");
+        let lazy = Checker::new(&env, &names, Some(0), None);
+        let r = with_lazy_main_path(|| lazy.is_def_eq(&ctx, &lhs, &rhs));
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        assert_eq!(lazy.fuel_nat_peels.get(), 0, "the lazy loop compared the arguments instead");
+        // Genuinely different arguments stay different in both modes.
+        let other = add(5, expr::bvar(0), expr::lit_nat(BigUint::from(7u32)));
+        assert!(matches!(eager.is_def_eq(&ctx, &lhs, &other), Ok(false)));
+        assert!(matches!(with_lazy_main_path(|| lazy.is_def_eq(&ctx, &lhs, &other)), Ok(false)));
+    }
+
+    /// `check_decl` re-checks a declaration the eager pass declined or
+    /// rejected with the lazy main path, exactly once, and never re-checks
+    /// one it accepted. `slow 2^300` counts the literal down in either order
+    /// (HUGE_LIT_RUN consecutive peels), so both passes decline and the first
+    /// message stands; `v 1 : M 1` against `M 0` is rejected by both.
+    #[test]
+    fn a_declined_or_rejected_declaration_is_rechecked_with_the_lazy_main_path() {
+        // `KIOTA_NBE=1` (opt-in, not the arena's configuration) evaluates the
+        // literal recursion itself and never reaches the paths under test.
+        if nbe::nbe_enabled() {
+            return;
+        }
+        on_big_stack(a_declined_or_rejected_declaration_is_rechecked_with_the_lazy_main_path_body)
+    }
+
+    fn a_declined_or_rejected_declaration_is_rechecked_with_the_lazy_main_path_body() {
+        use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+        let mut env = regression_429_nat_add_env();
+        let nat = expr::const_(0, vec![]);
+        let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
+        let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+        let m = |e: Expr| expr::app(expr::const_(5, vec![]), e);
+        let v = |e: Expr| expr::app(expr::const_(6, vec![]), e);
+        // M : Nat → Type, v : ∀ n, M n, slow n := Nat.rec 0 (fun _ ih => succ ih) n.
+        env.insert(5, CI::Axiom { level_params: vec![], typ: pi(nat.clone(), expr::sort(level::succ(level::zero()))), is_unsafe: false });
+        env.insert(6, CI::Axiom { level_params: vec![], typ: pi(nat.clone(), m(expr::bvar(0))), is_unsafe: false });
+        let ident = lam(
+            nat.clone(),
+            expr::apps(expr::const_(3, vec![]), &[
+                lam(nat.clone(), nat.clone()),
+                expr::lit_nat(0u32.into()),
+                lam(nat.clone(), lam(nat.clone(), expr::app(expr::const_(2, vec![]), expr::bvar(0)))),
+                expr::bvar(0),
+            ]),
+        );
+        env.insert(7, CI::Def { level_params: vec![], typ: pi(nat.clone(), nat.clone()), value: ident, hints: RH::Regular(1), is_unsafe: false });
+        let big = expr::lit_nat(BigUint::from(1u8) << 300u32);
+        let lit = |n: u32| expr::lit_nat(BigUint::from(n));
+        // declined: d : M (slow 2^300) := v 0 — rejected: e : M 0 := v 1 — fine: f : M 0 := v 0
+        env.insert(8, CI::Def { level_params: vec![], typ: m(expr::app(expr::const_(7, vec![]), big)), value: v(lit(0)), hints: RH::Regular(1), is_unsafe: false });
+        env.insert(9, CI::Def { level_params: vec![], typ: m(lit(0)), value: v(lit(1)), hints: RH::Regular(1), is_unsafe: false });
+        env.insert(10, CI::Def { level_params: vec![], typ: m(lit(0)), value: v(lit(0)), hints: RH::Regular(1), is_unsafe: false });
+        let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add", "M", "v", "slow", "d", "e", "f"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let before = LAZY_RETRIES.with(Cell::get);
+        let r = tc.check_decl(8, "def");
+        assert!(matches!(&r, Err(TcError::Decline(msg)) if msg.contains("countdown")), "{r:?}");
+        assert_eq!(LAZY_RETRIES.with(Cell::get), before + 1, "the declined declaration was re-checked once");
+        assert!(!LAZY_MAIN_PATH.with(Cell::get), "the flag is restored");
+        let r = tc.check_decl(9, "def");
+        assert!(matches!(r, Err(TcError::Reject(_))), "{r:?}");
+        assert_eq!(LAZY_RETRIES.with(Cell::get), before + 2, "the rejected declaration was re-checked once");
+        assert!(matches!(tc.check_decl(10, "def"), Ok(())));
+        assert_eq!(LAZY_RETRIES.with(Cell::get), before + 2, "an accepted declaration is never re-checked");
     }
 
     #[test]
@@ -12011,6 +12253,10 @@ fn regression_432_defining_equations_and_closed_values_convert() {
 
     #[test]
     fn declining_main_path_falls_back_to_lazy_heads() {
+        on_big_stack(declining_main_path_falls_back_to_lazy_heads_body)
+    }
+
+    fn declining_main_path_falls_back_to_lazy_heads_body() {
         // `S big` vs `R big`, with `R n := S n`. `S` reaches `H (slow n)`
         // through the aliases `D1 … D12`, and normalizing `S big` needs `H`
         // to case on `slow big`, which declines (byte cap). `S` ranks above
