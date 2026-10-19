@@ -6,7 +6,7 @@ name: remote-ab-corpus
 # soundness guard still admits genuine Lean input; these corpora can.
 on:
   push:
-    branches: ['remote/continue-keys']
+    branches: ['remote/continue-keys-tail']
 
 permissions:
   contents: read
@@ -24,25 +24,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Keep-going A/B of fix/context-keys-past-64-binders (510a31f) against
-        # main (53a3189), both with this diagnostic patch. Mathlib on the
-        # candidate only: RSS sampled every 60s with the current declaration,
-        # under a 14.5 GB address-space cap so the process aborts and the
-        # artifacts survive (16 GB runners die otherwise).
-        side: [baseline, candidate]
-        corpus: [init, std, cslib, mathlib]
-        exclude:
-          - side: baseline
-            corpus: mathlib
+        # The rest of mathlib after the fixed runaway: the context-key fix
+        # (510a31f) with this diagnostic patch, checking from declaration
+        # 314514 on (everything before is parsed, not checked), RSS sampled
+        # every 60s under a 14.5 GB address-space cap.
+        side: [candidate]
+        corpus: [mathlib]
         include:
-          - corpus: init
-            limit: 500
-          - corpus: std
-            limit: 590
-          - corpus: cslib
-            limit: 1800
           - corpus: mathlib
             limit: 5680
+            extra: 'KIOTA_MIN_DECL=314514'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,6 +56,7 @@ jobs:
           CORPUS: ${{ matrix.corpus }}
           LIMIT: ${{ matrix.limit }}
           SIDE: ${{ matrix.side }}
+          EXTRA: ${{ matrix.extra }}
         run: |
           sudo apt-get install -y zstd >/dev/null
           zstd -d --rm "$CORPUS.ndjson.zst" -o "$CORPUS.ndjson"
@@ -81,7 +73,7 @@ jobs:
           # depth limit (first per declaration), recovered or not.
           ulimit -v 14500000
           ( while true; do sleep 60; echo "$(date +%s) rss_kb=$(ps -o rss= -C kiota | tr -d ' ') last=$(grep -o '\[decl #[0-9]*\]' stamped.txt | tail -1)" >> rss.txt; done ) & sampler=$!
-          KIOTA_CONTINUE=1 KIOTA_PROGRESS=1 /usr/bin/time -v -o time.txt timeout "$LIMIT" ./target/release/kiota "$CORPUS.ndjson" \
+          env $EXTRA KIOTA_CONTINUE=1 KIOTA_PROGRESS=1 /usr/bin/time -v -o time.txt timeout "$LIMIT" ./target/release/kiota "$CORPUS.ndjson" \
             2>&1 > out.txt | python3 -u stamp.py > stamped.txt
           rc=${PIPESTATUS[0]}
           kill $sampler 2>/dev/null
