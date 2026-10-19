@@ -6,7 +6,7 @@ name: remote-ab-corpus
 # soundness guard still admits genuine Lean input; these corpora can.
 on:
   push:
-    branches: ['remote/continue-ld']
+    branches: ['remote/mem-curve']
 
 permissions:
   contents: read
@@ -24,20 +24,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Both sides keep going past a failed declaration (KIOTA_CONTINUE).
-        # Candidate: fix/lazy-delta-lean-step. Baseline: fix/library-interpreters
-        # (98141dc = 7f9ab37 + the diagnostic patch).
-        side: [baseline, candidate]
-        corpus: [init, std]
+        # Memory curve of fix/lazy-delta-lean-step on mathlib: RSS sampled every
+        # 60s with the current declaration, under a 13 GB address-space cap so the
+        # process aborts and the artifacts survive (16 GB runners die otherwise).
+        side: [candidate]
+        corpus: [mathlib]
         include:
-          - corpus: init
-            limit: 500
-          - corpus: std
-            limit: 590
           - corpus: mathlib
             limit: 5680
-          - corpus: cslib
-            limit: 1800
     steps:
       - uses: actions/checkout@v4
         with:
@@ -74,9 +68,12 @@ jobs:
           PY
           # KIOTA_TRACE_CONVERSION dumps the active comparison stack at any
           # depth limit (first per declaration), recovered or not.
+          ulimit -v 13000000
+          ( while true; do sleep 60; echo "$(date +%s) rss_kb=$(ps -o rss= -C kiota | tr -d ' ') last=$(grep -o '\[decl #[0-9]*\]' stamped.txt | tail -1)" >> rss.txt; done ) & sampler=$!
           KIOTA_CONTINUE=1 KIOTA_PROGRESS=1 /usr/bin/time -v -o time.txt timeout "$LIMIT" ./target/release/kiota "$CORPUS.ndjson" \
             2>&1 > out.txt | python3 -u stamp.py > stamped.txt
           rc=${PIPESTATUS[0]}
+          kill $sampler 2>/dev/null; tail -5 rss.txt
           end=$(date +%s.%N)
           sed -E 's/^[0-9.]+ //' stamped.txt > err.txt
           cat time.txt >> err.txt
@@ -111,6 +108,7 @@ jobs:
           path: |
             profile-${{ matrix.corpus }}-${{ matrix.side }}.txt
             failures-${{ matrix.corpus }}-${{ matrix.side }}.txt
+            rss.txt
             stamped.txt.gz
 
   report:
