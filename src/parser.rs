@@ -22,6 +22,9 @@ pub struct Parser {
     pub lifetimes: Option<crate::lifetime::Lifetimes>,
     /// Lines read so far, counted like `lifetime::scan` counts them.
     pub line_no: u32,
+    /// Released theorem proofs, on disk (`run_file` only). `None` keeps
+    /// unreleased proofs in memory under the reference policy.
+    pub proofs: Option<crate::proofstore::ProofStore>,
 }
 
 /// Undo only writes made by the current inductive block. The journal owns
@@ -100,6 +103,7 @@ impl Parser {
             decl_count: 0,
             lifetimes: None,
             line_no: 0,
+            proofs: None,
         }
     }
 
@@ -646,11 +650,11 @@ impl Parser {
         let nat_ref = self.name_by_str.get("Nat").copied();
         let string_ref = self.name_by_str.get("String").copied();
         for &name in &type_names {
-            Checker::new(&self.env, &self.names, nat_ref, string_ref)
+            Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
                 .check_inductive_group_structure(name)?;
         }
         let supplied_level_params = pending_recs[0].level_params.clone();
-        let derived = Checker::new(&self.env, &self.names, nat_ref, string_ref)
+        let derived = Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
             .reconstruct_recursors(&type_names, &supplied_level_params)?;
         if pending_recs.len() != derived.len() {
             return Err(TcError::Reject(format!(
@@ -688,7 +692,7 @@ impl Parser {
                     "recursor `{rname}` metadata does not match reconstruction"
                 )));
             }
-            Checker::new(&self.env, &self.names, nat_ref, string_ref)
+            Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
                 .validate_reconstructed_type(
                     &r.supplied_type,
                     &r.level_params,
@@ -1015,8 +1019,24 @@ impl Parser {
             }
             self.lifetimes = Some(lt);
         }
+        if std::env::var_os("KIOTA_KEEP_THEOREM_VALUES").is_none()
+            && std::env::var_os("KIOTA_NO_PROOF_STORE").is_none()
+        {
+            self.proofs = Some(crate::proofstore::ProofStore::new());
+        }
         let file = std::fs::File::open(path).map_err(|e| TcError::Other(format!("io: {e}")))?;
-        self.run(std::io::BufReader::with_capacity(1 << 22, file))
+        let r = self.run(std::io::BufReader::with_capacity(1 << 22, file));
+        if std::env::var_os("KIOTA_PROGRESS").is_some() {
+            if let Some(store) = self.proofs.as_ref() {
+                eprintln!(
+                    "PROOFSTORE theorems={} bytes={} loads={}",
+                    store.stored(),
+                    store.bytes(),
+                    store.loads()
+                );
+            }
+        }
+        r
     }
 
     pub fn run<R: BufRead>(&mut self, reader: R) -> Result<(), TcError> {
@@ -1048,15 +1068,39 @@ impl Parser {
         }
     }
 
-    /// A theorem's proof is unfolded only through a `const` node naming the
-    /// theorem, which the pre-pass has seen if the export has one. Once a
-    /// theorem no expression refers to is checked, its proof is released;
-    /// a referenced theorem keeps its proof whatever its size, so no
-    /// unfolding Lean would do is lost. `unfold_delta` declines if a
-    /// released proof is ever needed, which only a pre-pass gap could cause.
-    /// `KIOTA_KEEP_THEOREM_VALUES` keeps every proof.
+    /// Once a theorem is checked its proof is only read again by
+    /// `unfold_delta`. With a proof store (file input) every proof goes to
+    /// disk and is released from memory; the checker reads it back when a
+    /// comparison unfolds the theorem. If the store cannot be written the
+    /// proofs stay in memory from then on, which is always sound.
+    ///
+    /// Without a store: a theorem's proof is unfolded only through a
+    /// `const` node naming the theorem, which the pre-pass has seen if the
+    /// export has one. Once a theorem no expression refers to is checked,
+    /// its proof is released; a referenced theorem keeps its proof whatever
+    /// its size, so no unfolding Lean would do is lost. `unfold_delta`
+    /// declines if a released proof is ever needed, which only a pre-pass
+    /// gap could cause. `KIOTA_KEEP_THEOREM_VALUES` keeps every proof.
     fn release_theorem_value(&mut self, name: u32) {
         if std::env::var_os("KIOTA_KEEP_THEOREM_VALUES").is_some() {
+            return;
+        }
+        if let Some(store) = self.proofs.as_ref() {
+            let stored = match self.env.consts.get(&name) {
+                Some(ConstantInfo::Theorem { value: Some(v), .. }) => store.store(name, v),
+                _ => return,
+            };
+            match stored {
+                Ok(()) => {
+                    if let Some(ConstantInfo::Theorem { value, .. }) = self.env.consts.get_mut(&name) {
+                        *value = None;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("PROOFSTORE write failed ({e}); keeping theorem proofs in memory");
+                    self.proofs = None;
+                }
+            }
             return;
         }
         let Some(lt) = self.lifetimes.as_ref() else { return };
@@ -1126,7 +1170,7 @@ impl Parser {
                 let nat_ref = self.name_by_str.get("Nat").copied();
                 let string_ref = self.name_by_str.get("String").copied();
                 for n in names {
-                    Checker::new(&self.env, &self.names, nat_ref, string_ref)
+                    Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
                         .check_inductive_group(n)
                         .map_err(|e| self.annotate(n, e))?;
                 }
@@ -1200,7 +1244,7 @@ impl Parser {
         }
         let nat_ref = self.name_by_str.get("Nat").copied();
         let string_ref = self.name_by_str.get("String").copied();
-        Checker::new(&self.env, &self.names, nat_ref, string_ref)
+        Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
             .check_decl(name, kind)
             .map_err(|e| self.annotate(name, e))?;
         self.release_theorem_value(name);

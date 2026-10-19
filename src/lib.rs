@@ -5,5 +5,6 @@ pub mod lifetime;
 pub mod nat;
 pub mod nbe;
 pub mod parser;
+pub mod proofstore;
 pub mod stats;
 pub mod tc;
