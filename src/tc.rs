@@ -2320,9 +2320,14 @@ impl<'e> Checker<'e> {
         Ok(r)
     }
 
-    /// Same as `whnf`: small defs unfold, huge Regular defs stay folded.
+    /// Lean's `is_def_eq_core` never normalizes a side before comparing:
+    /// `whnf_core` (β, ζ, ι, projections, the Nat extensions) and then
+    /// lazy delta, one head unfolding at a time, comparing same-head
+    /// arguments before unfolding. `is_def_eq_core_go`'s delta step is that
+    /// loop; a full `whnf` here unfolded `Nat.add x 4294967264` into a
+    /// `succ` chain before the arguments were ever compared.
     fn whnf_for_defeq(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
-        self.whnf(ctx, e)
+        self.whnf_core(ctx, e)
     }
 
     /// Congruence on unreduced matching Proj / same-const apps.
