@@ -107,7 +107,7 @@ const MAX_HUGE_NAT_PEELS: u32 = 1 << 16;
 
 /// Head steps `try_lazy_delta` takes before leaving a comparison to the main
 /// path.
-const LAZY_DELTA_STEPS: usize = 16;
+const LAZY_DELTA_STEPS: usize = 512;
 
 #[derive(Debug)]
 pub enum TcError {
