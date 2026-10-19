@@ -1420,3 +1420,86 @@ fn skewpolynomial_phi_iterate_multiplicative_nat_accepts() {
 fn freegroup_unit_equiv_int_multiplicative_accepts() {
     assert_accept("freegroup-unit-equiv-int-multiplicative.accept.ndjson");
 }
+
+/// `P : Prop`, `p : P`, `f : P → P`, `q : P := f p`, with node 1 (`P`) used by
+/// three declarations and every other node by one.
+const LIFETIME_EXPORT: &str = r#"{"meta":{}}
+{"in":1,"str":{"pre":0,"str":"P"}}
+{"in":2,"str":{"pre":0,"str":"p"}}
+{"in":3,"str":{"pre":0,"str":"f"}}
+{"in":4,"str":{"pre":0,"str":"q"}}
+{"ie":0,"sort":0}
+{"axiom":{"name":1,"levelParams":[],"type":0}}
+{"ie":1,"const":{"name":1,"us":[]}}
+{"axiom":{"name":2,"levelParams":[],"type":1}}
+{"forallE":{"binderInfo":"default","type":1,"body":1},"ie":2}
+{"axiom":{"name":3,"levelParams":[],"type":2}}
+{"ie":3,"const":{"name":3,"us":[]}}
+{"ie":4,"const":{"name":2,"us":[]}}
+{"ie":5,"app":{"fn":3,"arg":4}}
+{"thm":{"name":4,"levelParams":[],"type":1,"value":5}}
+"#;
+
+#[test]
+fn run_file_releases_export_nodes_after_their_last_reference() {
+    let path = std::env::temp_dir().join(format!("kiota-lifetime-{}.ndjson", std::process::id()));
+    std::fs::write(&path, LIFETIME_EXPORT).unwrap();
+    let mut p = Parser::new();
+    let r = p.run_file(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(p.exprs.len(), 6);
+    assert!(p.exprs.iter().all(|e| e.is_none()), "every node expired by the last declaration");
+    assert_eq!(p.lifetimes.as_ref().unwrap().long_lived(), 1, "only `P` outlives its home declaration");
+    // The environment still holds what it needs: the checked theorem's type.
+    assert!(p.env.get(4).is_some());
+}
+
+#[test]
+fn a_reference_the_prepass_did_not_see_is_an_error_not_a_term() {
+    // Lifetimes computed from the export without its last line: `P` (node 1)
+    // then expires at `f`'s declaration, but the real export's theorem still
+    // references it. The slot must read as an error, never as a wrong term.
+    let truncated: String = LIFETIME_EXPORT.lines().take(14).map(|l| format!("{l}\n")).collect();
+    let lt = kiota::lifetime::scan_reader(std::io::BufReader::new(Cursor::new(truncated.into_bytes()))).unwrap();
+    let mut p = Parser::new();
+    p.lifetimes = Some(lt);
+    let r = p.run(Cursor::new(LIFETIME_EXPORT.as_bytes()));
+    match r {
+        Err(TcError::Other(msg)) => assert!(msg.contains("released"), "{msg}"),
+        other => panic!("expected an error for the released slot, got {other:?}"),
+    }
+}
+
+#[test]
+fn large_theorem_proofs_are_released_after_checking_and_small_ones_kept() {
+    // `big : P := f (f (… p))` with more applications than
+    // `KEEP_THEOREM_VALUE_NODES`; `small : P := p`.
+    let mut export = String::from(
+        r#"{"meta":{}}
+{"in":1,"str":{"pre":0,"str":"P"}}
+{"in":2,"str":{"pre":0,"str":"p"}}
+{"in":3,"str":{"pre":0,"str":"f"}}
+{"in":4,"str":{"pre":0,"str":"big"}}
+{"in":5,"str":{"pre":0,"str":"small"}}
+{"ie":0,"sort":0}
+{"ie":1,"const":{"name":1,"us":[]}}
+{"ie":2,"forallE":{"binderInfo":"default","type":1,"body":1}}
+{"ie":3,"const":{"name":3,"us":[]}}
+{"ie":4,"const":{"name":2,"us":[]}}
+{"axiom":{"name":1,"levelParams":[],"type":0}}
+{"axiom":{"name":2,"levelParams":[],"type":1}}
+{"axiom":{"name":3,"levelParams":[],"type":2}}
+"#,
+    );
+    let apps = kiota::parser::KEEP_THEOREM_VALUE_NODES as usize + 50;
+    for k in 0..apps {
+        export.push_str(&format!("{{\"ie\":{},\"app\":{{\"fn\":3,\"arg\":{}}}}}\n", 5 + k, 4 + k));
+    }
+    export.push_str(&format!("{{\"thm\":{{\"name\":4,\"levelParams\":[],\"type\":1,\"value\":{}}}}}\n", 4 + apps));
+    export.push_str("{\"thm\":{\"name\":5,\"levelParams\":[],\"type\":1,\"value\":4}}\n");
+    let mut p = Parser::new();
+    p.run(Cursor::new(export.into_bytes())).expect("both theorems check");
+    assert!(p.env.get(4).unwrap().value().is_none(), "the large proof is released");
+    assert!(p.env.get(5).unwrap().value().is_some(), "the small proof is kept");
+}

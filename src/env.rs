@@ -40,7 +40,11 @@ pub enum ConstantInfo {
     Theorem {
         level_params: Vec<u32>,
         typ: Expr,
-        value: Expr,
+        /// `None` once the parser has checked the theorem and released a
+        /// large proof (`parser::KEEP_THEOREM_VALUE_NODES`). The kernel
+        /// unfolds theorems only in the cold delta path; an unfold that
+        /// would need a released proof declines.
+        value: Option<Expr>,
     },
     Opaque {
         level_params: Vec<u32>,
@@ -113,9 +117,8 @@ impl ConstantInfo {
     }
     pub fn value(&self) -> Option<&Expr> {
         match self {
-            ConstantInfo::Def { value, .. }
-            | ConstantInfo::Theorem { value, .. }
-            | ConstantInfo::Opaque { value, .. } => Some(value),
+            ConstantInfo::Def { value, .. } | ConstantInfo::Opaque { value, .. } => Some(value),
+            ConstantInfo::Theorem { value, .. } => value.as_ref(),
             _ => None,
         }
     }
