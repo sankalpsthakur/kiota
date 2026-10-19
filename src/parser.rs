@@ -1238,15 +1238,29 @@ impl Parser {
         if let Ok(min) = std::env::var("KIOTA_MIN_DECL") {
             if let Ok(min_n) = min.parse::<usize>() {
                 if self.decl_count < min_n {
+                    // Diagnostic only: a skipped declaration still releases
+                    // its proof and resets the interner as `check_decl` would.
+                    self.release_theorem_value(name);
+                    crate::expr::clear_subst_memos();
+                    crate::expr::intern_clear_if_large(4_000_000);
                     return Ok(());
                 }
             }
         }
         let nat_ref = self.name_by_str.get("Nat").copied();
         let string_ref = self.name_by_str.get("String").copied();
-        Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
+        let r = Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
             .check_decl(name, kind)
-            .map_err(|e| self.annotate(name, e))?;
+            .map_err(|e| self.annotate(name, e));
+        // Diagnostic only (harness branches): report and keep going.
+        if std::env::var_os("KIOTA_CONTINUE").is_some() {
+            if let Err(e) = &r {
+                eprintln!("CONTINUE_PAST #{} {:?}", self.decl_count, e);
+                self.release_theorem_value(name);
+                return Ok(());
+            }
+        }
+        r?;
         self.release_theorem_value(name);
         Ok(())
     }
