@@ -356,3 +356,34 @@ Open:
 - Kaggle gate26 (keys + store, whole corpus, 30 GB, no time cap short of the
   session's) was still running at 23:30Z; its number is the single-process
   full-mathlib measurement.
+
+### 2026-10-20 - Whole-corpus confirmations after the night's landings
+
+- Kaggle (4 CPU, 30 GB, byte-identical export), keys + proof store before
+  #27 and #28: the whole of mathlib, 695,238 declarations, in one process,
+  16,990 s, 7.8 GB peak, exactly the five literal declines that #27 and #28
+  then removed. Kaggle runs about 2.1x slower than a GitHub runner, so this
+  is consistent with the windowed estimate of about 7500 s on GitHub and
+  4400 s on the arena machine.
+- cedar on main (run 39342048049): all declarations accepted, zero
+  failures, 452 s against the 940 s limit, 4.95 GB peak; the old
+  `pe_duration_toMinutes` runaway is gone.
+- con-leche on main (same run): 82 declines, all "WHNF core depth limit" on
+  the BitVec-64 family (`wscopedBP`, `leavesSubP`, `instantiate1P` equation
+  lemmas), 460 s, 12.8 GB peak. This family is the recursor depth cap on
+  `Fin.val (2^64 ...)` terms, not the countdown family, and is unchanged.
+- The same-runner mathlib timing settles the open question from the night:
+  the eager main path reaches 227k-231k declarations in 2000 s where the
+  lazy loop as the main path reaches 202k-207k (run 39341372877, two
+  rounds), so the eager default with the lazy re-check stays.
+- Small-suite gate on main 4da1c58: unchanged (pair-n21 under the 8 GiB cap
+  in default mode only).
+- The arena's own CI on the pin PR (lean-kernel-arena#277) built kiota at
+  c064ab6 and ran the non-skipped tests: every bug, other and perf test as
+  expected, including pair-n21 in 34 s uncapped; the two 60 s timeouts on
+  `eta-struct-major-and-no-whnf` and `eta-struct-major-no-whnf` are the
+  either-tests built to not terminate for a kernel that normalizes a
+  recursor's major premise first, identical on the old pin.
+
+Open: con-leche's BitVec depth-limit family; structure eta on a major
+premise before normalizing it (the two either-tests); the pin PR's review.
