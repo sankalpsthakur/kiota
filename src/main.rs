@@ -72,7 +72,11 @@ fn main() {
                     let stdin = std::io::stdin();
                     p.run(BufReader::new(stdin.lock()))
                 } else {
-                    p.run_file(&path.unwrap())
+                    let path = path.as_deref().unwrap();
+                    std::fs::File::open(path).map_err(|error| {
+                        tc::TcError::Other(format!("open input `{path}`: {error}"))
+                    })?;
+                    p.run_file(path)
                 }
             });
             kiota::stats::report();
