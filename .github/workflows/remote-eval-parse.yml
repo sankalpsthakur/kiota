@@ -1,0 +1,59 @@
+name: remote-eval-parse
+
+# The parse floor of the whole mathlib export, with the checker's own RSS
+# sampled (not the wrapper's) and /usr/bin/time's maximum resident set.
+on:
+  push:
+    branches: ['remote/eval-parse-*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: '37534509955'
+
+jobs:
+  mathlib-parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-mathlib
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Parse everything, check nothing
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm mathlib.ndjson.zst -o mathlib.ndjson
+          ls -la mathlib.ndjson; nproc; free -g
+          start=$(date +%s)
+          KIOTA_MIN_DECL=1000000000 KIOTA_PROGRESS=1 /usr/bin/time -v -o time.txt ./target/release/kiota mathlib.ndjson 2> err.txt > out.txt &
+          pid=$!
+          while kill -0 $pid 2>/dev/null; do
+            rss=$( (ps -o rss= -p $pid; ps -o rss= --ppid $pid) 2>/dev/null | sort -n | tail -1 | tr -d ' ')
+            echo "$(( $(date +%s) - start )) ${rss:-0} $(grep -c '\[decl #' err.txt)" >> rss.txt
+            sleep 10
+          done
+          wait $pid; rc=$?
+          end=$(date +%s)
+          peak=$(sort -k2 -n rss.txt | tail -1 | awk '{print $2}')
+          echo "PARSE rc=$rc wall=$((end-start)) decl_lines=$(grep -c '\[decl #' err.txt) last=$(grep -o '\[decl #[0-9]*\]' err.txt | tail -1) sampled_peak_rss_kb=$peak" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E "Maximum resident|Elapsed|User time|System time" time.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E "^(PROOFSTORE|LIFETIMES)" err.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          head -3 err.txt; tail -2 err.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mathlib-parse-fixed-${{ github.run_id }}
+          path: |
+            err.txt
+            rss.txt
+            time.txt
+          retention-days: 14
