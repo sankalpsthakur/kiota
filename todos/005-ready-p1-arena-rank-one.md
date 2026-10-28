@@ -387,3 +387,40 @@ Open:
 
 Open: con-leche's BitVec depth-limit family; structure eta on a major
 premise before normalizing it (the two either-tests); the pin PR's review.
+
+### 2026-10-28 - Pin #277 merged 10-20; board 21/31 on one forged quotient; parser hardening
+
+Board readback (arena 1a1d74fa, results of 2026-10-24 with reruns to 10-28,
+31 checkers, 242 tests): the pin PR leanprover/lean-kernel-arena#277 was merged
+by nomeata on 2026-10-20 06:32Z, so kiota runs at c064ab6 with the mathlib
+timeout. Key (1, 0, inf, 5), 21st of 31:
+
+- `bugs/forged-quot-ind` (new, #308) accepted: the only `bad_not_rejected`
+  on the board. `handle_quot` validated the Pi count of a quotient
+  declaration, not its type, so a lone `Quot.ind` over user definitions of
+  `Quot` and `Quot.mk` was admitted and `try_quot` proved `True → False`.
+- `bugs/loose-bvar-value` (new, #306): internal error (exit 3), scored as a
+  decline, where a rejection is expected.
+- mathlib: killed at 5680 s at declaration 575,600 of 622,201 (92.5%). The
+  arena runner is `nscloud-ubuntu-22.04-amd64-8x16` (8 vCPU, 16 GB); on the
+  tests kiota accepts it spends 1.5-2.5x the official kernel's instructions
+  (cslib 2.2x, cedar 2.46x, std 1.75x, init 1.58x), so mathlib would land
+  near 25-28T instructions, below every accepted checker (tenet-hs 18.0T).
+  Single-threaded at 4.4-4.7 G instructions/s; every checker above 10T wall
+  speed uses several cores.
+- The other four new bug tests (nested-name-capture, pi-closure-context,
+  closure-level-subst, unit-rec-rule) are rejected.
+
+Ranking arithmetic on this board: with the two fixes the key is (0, 0, inf,
+4) = 17th, ahead of lean4cobol (7 declines) and behind the 16 checkers that
+accept mathlib. A mathlib acceptance at 25-28T is also 17th; the rank moves
+only once mathlib is accepted under 18T (16th), 15.9T (15th), 14T (14th),
+11.6T (12th, the official kernel), 2.7T (3rd).
+
+Fix branch `fix/quot-canonical-types` (PR #29): quotient declarations are
+compared with `add_quot`'s types over the installed `Quot`/`Quot.mk`/`Eq`
+primitives; a loose bound variable in any declaration-level expression is a
+rejection at the record; a spelled name is declared once and the by-name
+lookups (`Nat`, `String`, `Quot`, `Eq`) resolve through the declared-name
+map. Local release binary on the published small suite: every `good/*`
+quotient user accepts, every `bad/bugs/*` and `bad/other/*` rejects.
