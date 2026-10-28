@@ -1405,6 +1405,11 @@ impl Parser {
         if let Ok(min) = std::env::var("KIOTA_MIN_DECL") {
             if let Ok(min_n) = min.parse::<usize>() {
                 if self.decl_count < min_n {
+                    // Harness: a skipped declaration releases what a checked
+                    // one would, so a window run shows the real memory floor.
+                    self.release_theorem_value(name);
+                    expr::clear_subst_memos();
+                    expr::intern_clear_if_large(4_000_000);
                     return Ok(());
                 }
             }

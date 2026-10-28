@@ -1,0 +1,158 @@
+name: remote-eval
+
+# Three measurements on one commit, each on its own runner:
+#   mathlib-full   the whole mathlib export in one strict process (the pin evidence)
+#   mathlib-parse  the same file with every check skipped: the parse floor in time and memory
+#   profile        perf on init and std: where the instructions go
+on:
+  push:
+    branches: ['remote/eval-*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: '37534509955'
+
+jobs:
+  mathlib-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-mathlib
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Whole mathlib, strict
+        run: |
+          set +e
+          sudo apt-get install -y zstd >/dev/null
+          zstd -d --rm mathlib.ndjson.zst -o mathlib.ndjson
+          ls -la mathlib.ndjson; nproc; free -g
+          ulimit -v 14500000
+          start=$(date +%s)
+          KIOTA_PROGRESS=1 timeout 20000 ./target/release/kiota mathlib.ndjson 2> err.txt > out.txt &
+          pid=$!
+          while kill -0 $pid 2>/dev/null; do
+            rss=$(ps -o rss= -p $pid 2>/dev/null | tr -d ' ')
+            echo "$(( $(date +%s) - start )) $rss $(grep -c '\[decl #' err.txt)" >> rss.txt
+            sleep 60
+          done
+          wait $pid; rc=$?
+          end=$(date +%s)
+          decls=$(grep -c '\[decl #' err.txt)
+          last=$(grep -o '\[decl #[0-9]*\]' err.txt | tail -1)
+          verdict=$(grep -m1 -E "^(REJECT|DECLINE|ERROR)" err.txt | cut -c1-300)
+          peak=$(sort -k2 -n rss.txt | tail -1 | awk '{print $2}')
+          echo "FULL rc=$rc wall=$((end-start)) decls=$decls last=$last peak_rss_kb=$peak $verdict" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E "^(PROOFSTORE|LIFETIMES|LAZY_RETRY|INTERN_CALLS)" err.txt | tail -5 | tee -a "$GITHUB_STEP_SUMMARY"
+          tail -3 err.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mathlib-full-${{ github.run_id }}
+          path: |
+            err.txt
+            rss.txt
+          retention-days: 14
+
+  mathlib-parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-mathlib
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Parse everything, check nothing
+        run: |
+          set +e
+          sudo apt-get install -y zstd >/dev/null
+          zstd -d --rm mathlib.ndjson.zst -o mathlib.ndjson
+          ulimit -v 14500000
+          start=$(date +%s)
+          KIOTA_MIN_DECL=1000000000 KIOTA_PROGRESS=1 timeout 6000 ./target/release/kiota mathlib.ndjson 2> err.txt > out.txt &
+          pid=$!
+          while kill -0 $pid 2>/dev/null; do
+            rss=$(ps -o rss= -p $pid 2>/dev/null | tr -d ' ')
+            echo "$(( $(date +%s) - start )) $rss $(grep -c '\[decl #' err.txt)" >> rss.txt
+            sleep 30
+          done
+          wait $pid; rc=$?
+          end=$(date +%s)
+          peak=$(sort -k2 -n rss.txt | tail -1 | awk '{print $2}')
+          echo "PARSE rc=$rc wall=$((end-start)) decls=$(grep -c '\[decl #' err.txt) peak_rss_kb=$peak" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E "^(PROOFSTORE|LIFETIMES)" err.txt | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mathlib-parse-${{ github.run_id }}
+          path: |
+            err.txt
+            rss.txt
+          retention-days: 14
+
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build with line tables
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+        run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-std
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install perf
+        run: |
+          set +e
+          sudo apt-get install -y zstd linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" >/dev/null 2>&1
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
+          [ -n "$PERF" ] || PERF=$(command -v perf)
+          echo "PERF=$PERF" >> "$GITHUB_ENV"
+          "$PERF" version
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+      - name: Profile init and std
+        run: |
+          set +e
+          ls *.zst
+          for c in init std; do
+            zstd -d --rm $c.ndjson.zst -o $c.ndjson
+            "$PERF" stat -e instructions,cycles,cache-misses,task-clock -o stat-$c.txt ./target/release/kiota $c.ndjson 2> err-$c.txt > /dev/null
+            echo "STAT $c rc=$? $(grep -E 'instructions|cycles|cache-misses|seconds time elapsed' stat-$c.txt | tr -s ' ' | tr '\n' ';')" | tee -a "$GITHUB_STEP_SUMMARY"
+            "$PERF" record -F 299 -g -o perf-$c.data ./target/release/kiota $c.ndjson 2> /dev/null > /dev/null
+            "$PERF" report -i perf-$c.data --stdio --no-children --percent-limit 0.7 2>/dev/null | grep -v "^$" | head -120 > report-$c.txt
+            "$PERF" report -i perf-$c.data --stdio --no-children --percent-limit 1.5 -g none 2>/dev/null | grep -E "^ +[0-9]" | head -40 > flat-$c.txt
+            echo "## flat $c" >> "$GITHUB_STEP_SUMMARY"; cat flat-$c.txt >> "$GITHUB_STEP_SUMMARY"
+            rm -f perf-$c.data
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: profile-${{ github.run_id }}
+          path: |
+            report-*.txt
+            flat-*.txt
+            stat-*.txt
+            err-*.txt
+          retention-days: 14
