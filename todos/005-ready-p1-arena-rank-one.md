@@ -424,3 +424,42 @@ rejection at the record; a spelled name is declared once and the by-name
 lookups (`Nat`, `String`, `Quot`, `Eq`) resolve through the declared-name
 map. Local release binary on the published small suite: every `good/*`
 quotient user accepts, every `bad/bugs/*` and `bad/other/*` rejects.
+
+#### 2026-10-28 (evening) - #29 landed; gate readback; parse floor; profile
+
+PR #29 landed by fast-forward (main = ff0698d, code c78fdb5). Its gate
+(run 40721442946) failed in all three modes on the items main's own gate
+on 3778267 (run 39365679897) fails on: default `good/perf/magma-list-
+pair-n21` crashes under the gate's 8 GiB cap (the arena accepts it in
+25 s uncapped), and nbe mode crashes or times out on the same seven perf
+tests (refute-cheap-last, app-lam, args-before-unfold, beta-ladder,
+folded-constant-first/last, grind-ring-5). Reclaim mode additionally timed
+out on `magma-list-deep-n36` at 120 s: that runner was 1.3-1.7x slower on
+every perf test (deep-n21 9.3 s against 5.6 s, pair-n21 44 s against 35 s)
+and the test takes 113 s of its 120 s on main's runner. Everything else:
+206/206 cases run, the two new arena bugs reject, all quotient users accept.
+
+Parse floor (remote-eval-parse, run 40722521161, `KIOTA_MIN_DECL`
+skip-all with the skipped declarations released like checked ones): the
+whole mathlib export (109,790,519 lines, 104,860,875 nodes, 6,226,987
+long-lived) parses in 140 s wall / 129 s user on a GitHub runner at a
+maximum resident set of 5.40 GB; the proof store takes every theorem
+(513,479) in 851 MB. Parsing is about 3% of the ~6300 s run; the resident
+floor is the environment itself. A second checking process would hold
+that floor again: two shards on the arena's 16 GB runner would sit near
+13-14 GB, three cannot fit.
+
+Profile (remote-eval, run 40721511029, perf task-clock sampling on a
+GitHub runner; hardware counters are unavailable there), std, share of
+time: `expr::intern` 25.5%, `ExprNode::drop` 10.5%, `node_eq` 7.9%,
+`instantiate_core` 5.4%, interner table rehash 3.8%, `intern_ctx_binding_id`
+3.7%, mimalloc 3.7%, `Ctx::used_bvar_key` 3.1%, interner table clear 2.6%,
+`unfold_apps` 2.2%, `alloc_node` 1.7%, `shift` 1.6%. init is the same
+picture (intern 23.4%, drop 10.9%). About 41% of the time is the
+hash-consing table and 10% is dropping nodes; the type-checking logic
+proper is the minority. The leaders at 0.5-2.7T instructions do not pay
+this; kiota's instruction gap is structural, not a hot spot.
+
+Pin bump for the landed main is staged on the fork
+(`bump-kiota-2026-10-28`, rev ff0698d); the arena PR waits for Sankalp's
+go-ahead.
