@@ -1,0 +1,61 @@
+name: remote-paired-deepn36
+
+# Same-runner timing of good/perf/magma-list-deep-n36 (and deep-n21) in
+# reclaim and default mode: the previous main (3778267) against this commit,
+# alternating, two rounds, with and without the gate's 8 GiB address cap.
+on:
+  push:
+    branches: ['remote/paired-deepn36-*']
+
+permissions:
+  contents: read
+
+jobs:
+  paired:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build both
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          old=3778267ccc143f324be5deac2310e3a03ba58865
+          git fetch --no-tags --depth=1 origin "$old"
+          git worktree add --detach "$RUNNER_TEMP/old" "$old"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/old-target" cargo build --release --locked --manifest-path "$RUNNER_TEMP/old/Cargo.toml"
+          cp "$RUNNER_TEMP/old-target/release/kiota" ./kiota-old
+          cp target/release/kiota ./kiota-new
+      - name: Suite
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --max-time 120 https://arena.lean-lang.org/lean-arena-tests.tar.gz -o tests.tar.gz
+          mkdir suite && tar xzf tests.tar.gz -C suite
+          ls suite/good/perf/magma-list-deep-n36.ndjson suite/good/perf/magma-list-deep-n21.ndjson
+      - name: Paired runs
+        run: |
+          set +e
+          nproc; free -g
+          run_case() {  # side mode cap file
+            local side=$1 mode=$2 cap=$3 f=$4 extra=""
+            [ "$mode" = reclaim ] && extra="KIOTA_RECLAIM=1"
+            local start end rc
+            start=$(date +%s.%N)
+            if [ "$cap" = capped ]; then
+              ( ulimit -v 8388608; env $extra timeout 300 ./kiota-$side "$f" >/dev/null 2>err.txt ); rc=$?
+            else
+              env $extra timeout 300 ./kiota-$side "$f" >/dev/null 2>err.txt; rc=$?
+            fi
+            end=$(date +%s.%N)
+            echo "PAIRED test=$(basename $f .ndjson) side=$side mode=$mode cap=$cap rc=$rc wall=$(python3 -c "print(round($end-$start,1))") $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-80)"
+          }
+          for round in 1 2; do
+            for side in old new; do
+              run_case $side reclaim capped suite/good/perf/magma-list-deep-n36.ndjson
+              run_case $side reclaim uncapped suite/good/perf/magma-list-deep-n36.ndjson
+              run_case $side default uncapped suite/good/perf/magma-list-deep-n36.ndjson
+              run_case $side reclaim uncapped suite/good/perf/magma-list-deep-n21.ndjson
+            done
+          done | tee paired.txt
+          cat paired.txt >> "$GITHUB_STEP_SUMMARY"
