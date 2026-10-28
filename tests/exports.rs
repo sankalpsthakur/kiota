@@ -1522,3 +1522,59 @@ fn proofs_of_theorems_no_expression_mentions_are_released_after_checking() {
     assert!(q.env.get(5).unwrap().value().is_some());
     assert!(q.proofs.is_none());
 }
+
+// The quotient primitives are admitted only as the kernel's own four
+// constants (`add_quot`): names, universe parameters and exact types over
+// the `Quot`, `Quot.mk` and `Eq` already installed as primitives.
+#[test]
+fn the_exported_quotient_primitives_are_the_kernels_own() {
+    assert_accept("quot-primitives.accept.ndjson");
+    assert_accept("quot-ind-reduction.accept.ndjson");
+}
+
+/// bugs/forged-quot-ind: a lone `Quot.ind` over a `Quot` and `Quot.mk`
+/// that are later ordinary definitions proves `False` without axioms.
+#[test]
+fn a_quotient_induction_principle_before_the_quotient_type_is_rejected() {
+    assert_reject_exact(
+        "forged-quot-ind.reject.ndjson",
+        "[Quot.ind] quotient declaration before the primitive `Quot`",
+    );
+}
+
+#[test]
+fn a_quotient_constructor_over_a_look_alike_quot_is_rejected() {
+    assert_reject_exact(
+        "quot-mk-without-quot.reject.ndjson",
+        "[Quot.mk] quotient declaration before the primitive `Quot`",
+    );
+    assert_reject_exact(
+        "quot-as-axiom.reject.ndjson",
+        "[Quot.mk] `Quot` is not the quotient primitive the kernel installs",
+    );
+}
+
+#[test]
+fn a_quotient_lift_with_its_universes_swapped_is_rejected() {
+    assert_reject_exact(
+        "quot-lift-swapped-universes.reject.ndjson",
+        "[Quot.lift] `Quot.lift` does not have the kernel's quotient type",
+    );
+}
+
+/// bugs/loose-bvar-value: a definition whose value is a loose bound
+/// variable is malformed, so it is rejected, not reported as an internal
+/// error, and before anything unfolds it.
+#[test]
+fn a_loose_bound_variable_in_a_declaration_is_rejected() {
+    assert_reject_exact(
+        "loose-bvar-value.reject.ndjson",
+        "[f] `value` has a loose bound variable (#0)",
+    );
+}
+
+/// Two name indices spelling the same name are one name to the kernel.
+#[test]
+fn a_second_declaration_under_the_same_spelled_name_is_rejected() {
+    assert_reject_exact("duplicate-name-string.reject.ndjson", "[Foo] duplicate declaration of Foo");
+}

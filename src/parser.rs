@@ -11,6 +11,12 @@ use std::rc::Rc;
 pub struct Parser {
     pub names: Vec<Rc<String>>, // index -> full dotted name (for diagnostics / builtin lookup)
     pub name_by_str: FxHashMap<String, u32>,
+    /// Spellings that more than one name index carries, with every index
+    /// (empty for a lean4export file, whose names are hash-consed). The
+    /// export refers to constants by index, but the kernel's identity for
+    /// a constant is its name, so `declared` and `reject_if_dup` look
+    /// through all indices of a spelling.
+    pub spelling_dups: FxHashMap<String, Vec<u32>>,
     pub levels: Vec<Level>,
     /// The export's expression nodes by index. A slot is `None` before its
     /// `ie` line and again after `lifetimes` has released it.
@@ -97,6 +103,7 @@ impl Parser {
         Parser {
             names: vec![Rc::new(String::new())], // index 0 = anonymous
             name_by_str: FxHashMap::default(),
+            spelling_dups: FxHashMap::default(),
             levels: vec![level::zero()], // index 0 = zero
             exprs: Vec::new(),
             env: Environment::default(),
@@ -121,12 +128,35 @@ impl Parser {
         }
     }
 
+    /// A declaration's type or value. Each is a closed term in the kernel;
+    /// a loose bound variable is a malformed declaration, which the
+    /// official kernel rejects when its type checker meets the variable.
     fn require_expr(&self, v: &Value, k: &str) -> Result<Expr, TcError> {
         let i = Self::require_u32(v, k)?;
+        let e = match self.exprs.get(i as usize) {
+            Some(Some(e)) => e.clone(),
+            Some(None) => return Err(Self::released(i)),
+            None => return Err(TcError::Reject(format!("expr index {i} for `{k}` is out of range"))),
+        };
+        if !expr::is_closed(&e) {
+            return Err(TcError::Reject(format!(
+                "`{k}` has a loose bound variable (#{})",
+                expr::loose_bvar_range(&e) - 1
+            )));
+        }
+        Ok(e)
+    }
+
+    /// An exported recursor rule's body. Nothing reduces with it: the
+    /// checker derives iota from the inductive declaration itself (field
+    /// order, K-likeness), as the official kernel does, so the body is
+    /// read like the other export fields it does not trust, open or not.
+    fn require_rule_body(&self, rule: &Value) -> Result<Expr, TcError> {
+        let i = Self::require_u32(rule, "rhs")?;
         match self.exprs.get(i as usize) {
             Some(Some(e)) => Ok(e.clone()),
             Some(None) => Err(Self::released(i)),
-            None => Err(TcError::Reject(format!("expr index {i} for `{k}` is out of range"))),
+            None => Err(TcError::Reject(format!("expr index {i} for `rhs` is out of range"))),
         }
     }
 
@@ -209,7 +239,14 @@ impl Parser {
         while self.names.len() <= idx as usize {
             self.names.push(Rc::new(String::new()));
         }
-        self.name_by_str.insert(full.clone(), idx);
+        if let Some(prev) = self.name_by_str.insert(full.clone(), idx) {
+            if prev != idx {
+                self.spelling_dups
+                    .entry(full.clone())
+                    .or_insert_with(|| vec![prev])
+                    .push(idx);
+            }
+        }
         self.names[idx as usize] = Rc::new(full);
     }
 
@@ -311,18 +348,30 @@ impl Parser {
         self.names.get(n as usize).map(|s| s.as_str()).unwrap_or("")
     }
 
+    /// A declaration's name must be new both as an index and as a spelled
+    /// name. The second check is the one that matters: two indices may
+    /// spell the same name, and the kernel knows only the name. Both are
+    /// read off the environment, so a rolled-back inductive block leaves
+    /// nothing behind.
     fn reject_if_dup(&self, name: u32) -> Result<(), TcError> {
-        if self.env.get(name).is_some() {
-            return Err(TcError::Reject(format!(
-                "duplicate declaration of {}",
-                self.names
-                    .get(name as usize)
-                    .map(|s| s.as_str())
-                    .unwrap_or("?")
-            )));
+        let spelled = self.name_str(name);
+        if self.env.get(name).is_some() || self.declared(spelled).is_some() {
+            return Err(TcError::Reject(format!("duplicate declaration of {spelled}")));
         }
         Ok(())
     }
+
+    /// The index of the declaration spelled `s`, if there is one: what the
+    /// by-name lookups (`Nat` and `String` literals, the quotient
+    /// primitives, `Eq`) must resolve through, since a name index that is
+    /// never declared must not shadow the constant that is.
+    fn declared(&self, s: &str) -> Option<u32> {
+        match self.spelling_dups.get(s) {
+            Some(indices) => indices.iter().copied().find(|i| self.env.get(*i).is_some()),
+            None => self.name_by_str.get(s).copied().filter(|i| self.env.get(*i).is_some()),
+        }
+    }
+
 
     fn handle_def_like(&mut self, kind: &str, v: &Value) -> Result<(), TcError> {
         let name = Self::require_u32(v, "name")?;
@@ -415,12 +464,8 @@ impl Parser {
         let name = Self::require_u32(v, "name")?;
         let level_params = Self::get_vec_u32(v, "levelParams");
         let typ = self.require_expr(v, "type")?;
+        self.check_quot_declaration(&kind, name, &level_params, &typ)?;
         self.reject_if_dup(name)?;
-        if !quot_type_matches_kind(&kind, &typ) {
-            return Err(TcError::Reject(
-                "quot type does not match kernel quotient shape".into(),
-            ));
-        }
         self.env.insert(
             name,
             ConstantInfo::Quot {
@@ -430,6 +475,128 @@ impl Parser {
             },
         );
         Ok(())
+    }
+
+    /// A quotient declaration is admitted only as the constant the kernel
+    /// would install itself (`add_quot` in Lean's `quot.cpp`): the right
+    /// name, the right universe parameters, and exactly the kernel's type,
+    /// built over the `Quot`, `Quot.mk` and `Eq` already in the environment
+    /// as primitives. `try_quot` reduces `Quot.lift` and `Quot.ind` by
+    /// argument position, and `Quot.ind` says every element of `Quot r` is
+    /// a `Quot.mk`; both are sound only for these four constants.
+    fn check_quot_declaration(
+        &self,
+        kind: &QuotKind,
+        name: u32,
+        level_params: &[u32],
+        typ: &Expr,
+    ) -> Result<(), TcError> {
+        let (expected_name, num_levels) = match kind {
+            QuotKind::Type => ("Quot", 1),
+            QuotKind::Ctor => ("Quot.mk", 1),
+            QuotKind::Lift => ("Quot.lift", 2),
+            QuotKind::Ind => ("Quot.ind", 1),
+        };
+        let spelled = self.name_str(name);
+        if spelled != expected_name {
+            return Err(TcError::Reject(format!(
+                "quotient declaration `{spelled}` is not `{expected_name}`"
+            )));
+        }
+        if level_params.len() != num_levels
+            || level_params.iter().collect::<FxHashSet<_>>().len() != num_levels
+        {
+            return Err(TcError::Reject(format!(
+                "`{spelled}` must have {num_levels} distinct universe parameter(s)"
+            )));
+        }
+        let eq = self.eq_primitive()?;
+        let quot = match kind {
+            QuotKind::Type => name,
+            _ => self.quot_primitive("Quot", |k| matches!(k, QuotKind::Type))?,
+        };
+        let quot_mk = match kind {
+            QuotKind::Ind => self.quot_primitive("Quot.mk", |k| matches!(k, QuotKind::Ctor))?,
+            _ => 0,
+        };
+        let canonical = canonical_quot_type(kind, level_params, quot, quot_mk, eq);
+        if !alpha_eq(typ, &canonical) {
+            return Err(TcError::Reject(format!(
+                "`{spelled}` does not have the kernel's quotient type"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The quotient primitive spelled `s`, which must already be in the
+    /// environment as a quotient declaration of the right kind, not as a
+    /// definition or inductive type that happens to carry the name.
+    fn quot_primitive(&self, s: &str, is_kind: impl Fn(&QuotKind) -> bool) -> Result<u32, TcError> {
+        match self.declared(s) {
+            Some(n) => match self.env.get(n) {
+                Some(ConstantInfo::Quot { kind, .. }) if is_kind(kind) => Ok(n),
+                _ => Err(TcError::Reject(format!(
+                    "`{s}` is not the quotient primitive the kernel installs"
+                ))),
+            },
+            None => Err(TcError::Reject(format!(
+                "quotient declaration before the primitive `{s}`"
+            ))),
+        }
+    }
+
+    /// `Eq` as the kernel requires it before it installs quotients
+    /// (`check_eq_type`): an inductive type with one universe parameter and
+    /// one constructor, of type `{α : Sort u} → α → α → Prop`, whose
+    /// constructor has type `{α : Sort u} → (a : α) → @Eq.{u} α a a`.
+    fn eq_primitive(&self) -> Result<u32, TcError> {
+        let reject = |what: &str| TcError::Reject(format!("quotients need `Eq` {what}"));
+        let Some(eq) = self.declared("Eq") else {
+            return Err(reject("to be declared first"));
+        };
+        let Some(ConstantInfo::InductiveType { level_params, typ, ctors, .. }) = self.env.get(eq) else {
+            return Err(reject("to be an inductive type"));
+        };
+        if level_params.len() != 1 {
+            return Err(reject("with one universe parameter"));
+        }
+        if ctors.len() != 1 {
+            return Err(reject("with one constructor"));
+        }
+        let u = level::param(level_params[0]);
+        let sort_u = expr::sort(u.clone());
+        let prop = expr::sort(level::zero());
+        let eq_type = expr::pi(
+            BinderInfo::Implicit,
+            sort_u.clone(),
+            expr::pi(
+                BinderInfo::Default,
+                expr::bvar(0),
+                expr::pi(BinderInfo::Default, expr::bvar(1), prop),
+            ),
+        );
+        if !alpha_eq(typ, &eq_type) {
+            return Err(reject("with the type `{α : Sort u} → α → α → Prop`"));
+        }
+        let Some(ConstantInfo::Constructor { typ: refl_type, induct, .. }) = self.env.get(ctors[0]) else {
+            return Err(reject("whose constructor is a constructor"));
+        };
+        let refl_expected = expr::pi(
+            BinderInfo::Implicit,
+            sort_u,
+            expr::pi(
+                BinderInfo::Default,
+                expr::bvar(0),
+                expr::apps(
+                    expr::const_(eq, vec![u]),
+                    &[expr::bvar(1), expr::bvar(0), expr::bvar(0)],
+                ),
+            ),
+        );
+        if *induct != eq || !alpha_eq(refl_type, &refl_expected) {
+            return Err(reject("whose constructor has the type `{α : Sort u} → (a : α) → @Eq α a a`"));
+        }
+        Ok(eq)
     }
 
     fn handle_inductive_block(
@@ -614,7 +781,7 @@ impl Parser {
                     out.push(RecRule {
                         ctor: Self::require_u32(rule, "ctor")?,
                         nfields: Self::require_u32(rule, "nfields")?,
-                        rhs: self.require_expr(rule, "rhs")?,
+                        rhs: self.require_rule_body(rule)?,
                     });
                 }
                 out
@@ -647,8 +814,8 @@ impl Parser {
                 "inductive group is missing recursors".into(),
             ));
         }
-        let nat_ref = self.name_by_str.get("Nat").copied();
-        let string_ref = self.name_by_str.get("String").copied();
+        let nat_ref = self.declared("Nat");
+        let string_ref = self.declared("String");
         for &name in &type_names {
             Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
                 .check_inductive_group_structure(name)?;
@@ -1131,27 +1298,27 @@ impl Parser {
             return Ok(false);
         }
         if let Some(d) = v.get("axiom") {
-            self.handle_def_like("axiomDecl", d)?;
+            self.handle_def_like("axiomDecl", d).map_err(|e| self.annotate_record(d, e))?;
             self.check_last(d, "axiom")?;
             return Ok(true);
         }
         if let Some(d) = v.get("def") {
-            self.handle_def_like("defnDecl", d)?;
+            self.handle_def_like("defnDecl", d).map_err(|e| self.annotate_record(d, e))?;
             self.check_last(d, "def")?;
             return Ok(true);
         }
         if let Some(d) = v.get("thm") {
-            self.handle_def_like("thmDecl", d)?;
+            self.handle_def_like("thmDecl", d).map_err(|e| self.annotate_record(d, e))?;
             self.check_last(d, "theorem")?;
             return Ok(true);
         }
         if let Some(d) = v.get("opaque") {
-            self.handle_def_like("opaqueDecl", d)?;
+            self.handle_def_like("opaqueDecl", d).map_err(|e| self.annotate_record(d, e))?;
             self.check_last(d, "opaque")?;
             return Ok(true);
         }
         if let Some(d) = v.get("quot") {
-            self.handle_quot(d)?;
+            self.handle_quot(d).map_err(|e| self.annotate_record(d, e))?;
             return Ok(true);
         }
         if let Some(d) = v.get("inductive") {
@@ -1242,13 +1409,22 @@ impl Parser {
                 }
             }
         }
-        let nat_ref = self.name_by_str.get("Nat").copied();
-        let string_ref = self.name_by_str.get("String").copied();
+        let nat_ref = self.declared("Nat");
+        let string_ref = self.declared("String");
         Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
             .check_decl(name, kind)
             .map_err(|e| self.annotate(name, e))?;
         self.release_theorem_value(name);
         Ok(())
+    }
+
+    /// `annotate` with the record's own `name`, for errors raised while a
+    /// declaration is read, before `check_decl` sees it.
+    fn annotate_record(&self, d: &Value, e: TcError) -> TcError {
+        match d.get("name").and_then(|x| x.as_u64()) {
+            Some(n) if (n as usize) < self.names.len() => self.annotate(n as u32, e),
+            _ => e,
+        }
     }
 
     fn annotate(&self, name: u32, e: TcError) -> TcError {
@@ -1267,20 +1443,133 @@ impl Parser {
 
 fn kind_or_direct(_v: &Value) {}
 
-fn pi_telescope_len(typ: &Expr) -> u32 {
-    let mut n = 0u32;
-    let mut cur = typ.clone();
-    loop {
-        match &**cur {
-            crate::expr::ExprData::Pi(_, _, body) => {
-                n += 1;
-                cur = body.clone();
-            }
-            _ => return n,
+
+
+/// Structural equality up to binder annotations. Binder names are not in
+/// `ExprData`; binder infos are, and the kernel's `expr` equality ignores
+/// them, so the canonical quotient types compare without them too.
+fn alpha_eq(a: &Expr, b: &Expr) -> bool {
+    if Rc::ptr_eq(a, b) {
+        return true;
+    }
+    match (&***a, &***b) {
+        (ExprData::BVar(i), ExprData::BVar(j)) => i == j,
+        (ExprData::Sort(l1), ExprData::Sort(l2)) => l1 == l2,
+        (ExprData::Const(n1, us1), ExprData::Const(n2, us2)) => n1 == n2 && us1 == us2,
+        (ExprData::App(f1, a1), ExprData::App(f2, a2)) => alpha_eq(f1, f2) && alpha_eq(a1, a2),
+        (ExprData::Lam(_, t1, b1), ExprData::Lam(_, t2, b2))
+        | (ExprData::Pi(_, t1, b1), ExprData::Pi(_, t2, b2)) => alpha_eq(t1, t2) && alpha_eq(b1, b2),
+        (ExprData::Let(t1, v1, b1), ExprData::Let(t2, v2, b2)) => {
+            alpha_eq(t1, t2) && alpha_eq(v1, v2) && alpha_eq(b1, b2)
         }
+        (ExprData::Proj(s1, i1, e1), ExprData::Proj(s2, i2, e2)) => {
+            s1 == s2 && i1 == i2 && alpha_eq(e1, e2)
+        }
+        (ExprData::Lit(l1), ExprData::Lit(l2)) => l1 == l2,
+        _ => false,
     }
 }
 
+/// The kernel's quotient declarations as `add_quot` builds them (Lean 4
+/// `src/kernel/quot.cpp`), in de Bruijn form over the given `Quot`,
+/// `Quot.mk` and `Eq` name indices and the declared universe parameters:
+///
+/// ```text
+/// Quot.{u}        : {α : Sort u} → (r : α → α → Prop) → Sort u
+/// Quot.mk.{u}     : {α : Sort u} → (r : α → α → Prop) → (a : α) → @Quot.{u} α r
+/// Quot.lift.{u v} : {α : Sort u} → {r : α → α → Prop} → {β : Sort v} → (f : α → β)
+///                   → (∀ (a b : α), r a b → @Eq.{v} β (f a) (f b)) → @Quot.{u} α r → β
+/// Quot.ind.{u}    : {α : Sort u} → {r : α → α → Prop} → {β : @Quot.{u} α r → Prop}
+///                   → (∀ (a : α), β (@Quot.mk.{u} α r a)) → ∀ (q : @Quot.{u} α r), β q
+/// ```
+fn canonical_quot_type(kind: &QuotKind, level_params: &[u32], quot: u32, quot_mk: u32, eq: u32) -> Expr {
+    use BinderInfo::{Default, Implicit};
+    let u = level::param(level_params[0]);
+    let sort_u = expr::sort(u.clone());
+    let prop = expr::sort(level::zero());
+    let bv = expr::bvar;
+    // `α → α → Prop` with `α` at index `a` (so `a + 1` under the first arrow).
+    let rel = |a: u32| expr::pi(Default, bv(a), expr::pi(Default, bv(a + 1), prop.clone()));
+    // `@Quot.{u} α r`
+    let quot_app = |a: u32, r: u32| expr::apps(expr::const_(quot, vec![u.clone()]), &[bv(a), bv(r)]);
+    match kind {
+        // {α} (r)
+        QuotKind::Type => expr::pi(Implicit, sort_u.clone(), expr::pi(Default, rel(0), sort_u)),
+        // {α} (r) (a) ↦ Quot α r
+        QuotKind::Ctor => expr::pi(
+            Implicit,
+            sort_u,
+            expr::pi(Default, rel(0), expr::pi(Default, bv(1), quot_app(2, 1))),
+        ),
+        QuotKind::Lift => {
+            let v = level::param(level_params[1]);
+            let sort_v = expr::sort(v.clone());
+            // Under {α} {r} {β} (f): f=#0 β=#1 r=#2 α=#3.
+            // ∀ (a b : α), r a b → @Eq.{v} β (f a) (f b)
+            let sanity = expr::pi(
+                Default,
+                bv(3),
+                expr::pi(
+                    Default,
+                    bv(4),
+                    expr::pi(
+                        Default,
+                        expr::apps(bv(4), &[bv(1), bv(0)]),
+                        expr::apps(
+                            expr::const_(eq, vec![v]),
+                            &[bv(4), expr::app(bv(3), bv(2)), expr::app(bv(3), bv(1))],
+                        ),
+                    ),
+                ),
+            );
+            expr::pi(
+                Implicit,
+                sort_u,
+                expr::pi(
+                    Implicit,
+                    rel(0),
+                    expr::pi(
+                        Implicit,
+                        sort_v,
+                        expr::pi(
+                            Default,
+                            expr::pi(Default, bv(2), bv(1)),
+                            expr::pi(Default, sanity, expr::pi(Default, quot_app(4, 3), bv(3))),
+                        ),
+                    ),
+                ),
+            )
+        }
+        QuotKind::Ind => {
+            // Under {α} {r} {β}: β=#0 r=#1 α=#2; under a further (a : α): a=#0 β=#1 r=#2 α=#3.
+            let mk = expr::pi(
+                Default,
+                bv(2),
+                expr::app(
+                    bv(1),
+                    expr::apps(expr::const_(quot_mk, vec![u.clone()]), &[bv(3), bv(2), bv(0)]),
+                ),
+            );
+            expr::pi(
+                Implicit,
+                sort_u,
+                expr::pi(
+                    Implicit,
+                    rel(0),
+                    expr::pi(
+                        Implicit,
+                        expr::pi(Default, quot_app(1, 0), prop.clone()),
+                        expr::pi(
+                            Default,
+                            mk,
+                            expr::pi(Default, quot_app(3, 2), expr::app(bv(2), bv(0))),
+                        ),
+                    ),
+                ),
+            )
+        }
+    }
+}
 
 fn ctor_field_tys(typ: &Expr, num_params: u32, inst: Option<&[Expr]>) -> Vec<Expr> {
     let mut cur = typ.clone();
@@ -1355,48 +1644,6 @@ fn expr_occurs_names(e: &Expr, names: &[u32]) -> bool {
     }
 }
 
-fn is_quot_rel(e: &Expr) -> bool {
-    match &***e {
-        ExprData::Pi(_, _, b1) => match &***b1 {
-            ExprData::Pi(_, _, b2) => matches!(&***b2, ExprData::Sort(l) if level::is_zero(l)),
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-/// Kernel quot shapes: Type 2-Pi Sort-dom + rel + Sort; Ctor 3-Pi Sort-dom + rel + App; Lift 6; Ind 5.
-fn quot_type_matches_kind(kind: &QuotKind, typ: &Expr) -> bool {
-    let mut doms: Vec<Expr> = Vec::new();
-    let mut cur = typ.clone();
-    loop {
-        match &**cur {
-            ExprData::Pi(_, dom, body) => {
-                doms.push(dom.clone());
-                cur = body.clone();
-            }
-            rest => {
-                let n = doms.len();
-                return match kind {
-                    QuotKind::Type => {
-                        n == 2
-                            && matches!(rest, ExprData::Sort(_))
-                            && matches!(&**doms[0], ExprData::Sort(_))
-                            && is_quot_rel(&doms[1])
-                    }
-                    QuotKind::Ctor => {
-                        n == 3
-                            && matches!(rest, ExprData::App(_, _))
-                            && matches!(&**doms[0], ExprData::Sort(_))
-                            && is_quot_rel(&doms[1])
-                    }
-                    QuotKind::Lift => n == 6,
-                    QuotKind::Ind => n == 5,
-                };
-            }
-        }
-    }
-}
 
 /// Lean nested recursor numbering: `.rec` first, then `.rec_1`, `.rec_2`, …
 /// Used for rec_group minor order only, not extra-rec reject.

@@ -53,3 +53,19 @@ fn diagnostic_cutoff_is_not_an_accept_or_reject() {
     assert_eq!(output.status.code(), Some(2), "{:?}", output);
     assert!(String::from_utf8_lossy(&output.stderr).contains("DECLINE:"));
 }
+
+#[test]
+fn a_loose_bound_variable_is_a_rejection_not_an_error() {
+    let output = run(include_bytes!("fixtures/loose-bvar-value.reject.ndjson"), None);
+    assert_eq!(output.status.code(), Some(1), "{:?}", output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("REJECT: [f] `value` has a loose bound variable"), "{stderr}");
+}
+
+#[test]
+fn a_forged_quotient_declaration_is_a_rejection() {
+    let output = run(include_bytes!("fixtures/forged-quot-ind.reject.ndjson"), None);
+    assert_eq!(output.status.code(), Some(1), "{:?}", output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("REJECT: [Quot.ind] quotient declaration before the primitive `Quot`"), "{stderr}");
+}
