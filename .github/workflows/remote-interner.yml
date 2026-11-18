@@ -1,0 +1,114 @@
+name: remote-interner
+
+# Pairs of builds on std, same runner, user time in A B B A order; then
+# counters and verdicts with KIOTA_STATS=1 (old against the newest).
+on:
+  push:
+    branches: ['remote/interner-2026*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+  OLD_REF: e593b7930975363769847599d973c26aa599c102
+  NEW_REF: 296ef58644dfc9f36a37ce88df339c07915e22f8
+
+jobs:
+  time:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {pair: old-A-1, a: e593b7930975363769847599d973c26aa599c102, b: 296ef58644dfc9f36a37ce88df339c07915e22f8, benv: ''}
+          - {pair: old-A-2, a: e593b7930975363769847599d973c26aa599c102, b: 296ef58644dfc9f36a37ce88df339c07915e22f8, benv: ''}
+          - {pair: old-A-3, a: e593b7930975363769847599d973c26aa599c102, b: 296ef58644dfc9f36a37ce88df339c07915e22f8, benv: ''}
+          - {pair: A-s15frontpack-1, a: 296ef58644dfc9f36a37ce88df339c07915e22f8, b: 818e287ab0e159a346af262044a45a68bc8642ec, benv: ''}
+          - {pair: A-s15frontpack-2, a: 296ef58644dfc9f36a37ce88df339c07915e22f8, b: 818e287ab0e159a346af262044a45a68bc8642ec, benv: ''}
+          - {pair: s11-A, a: 7efd21ca39c2c0b1c985b16a33b60abfbc1e6ef8, b: 296ef58644dfc9f36a37ce88df339c07915e22f8, benv: ''}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build both
+        env:
+          A: ${{ matrix.a }}
+          B: ${{ matrix.b }}
+        run: |
+          for side in a b; do
+            ref=$A; [ $side = b ] && ref=$B
+            git worktree add ../src-$side "$ref"
+            (cd ../src-$side && CARGO_TARGET_DIR=$PWD/target cargo build --release --locked 2>&1 | tail -1)
+            cp ../src-$side/target/release/kiota kiota-$side
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-std
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Timed runs
+        env:
+          PAIR: ${{ matrix.pair }}
+          BENV: ${{ matrix.benv }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm std.ndjson.zst -o std.ndjson
+          nproc; grep -m1 'model name' /proc/cpuinfo
+          echo "THP enabled=$(cat /sys/kernel/mm/transparent_hugepage/enabled) defrag=$(cat /sys/kernel/mm/transparent_hugepage/defrag)"
+          i=0
+          for side in a b b a; do
+            i=$((i+1))
+            extra=""; [ $side = b ] && extra="$BENV"
+            env $extra /usr/bin/time -v -o time.txt ./kiota-$side std.ndjson >/dev/null 2>err.txt &
+            sleep 100
+            hp=$(grep AnonHugePages /proc/$(pgrep -n -x kiota-$side)/smaps_rollup 2>/dev/null | awk '{print $2}')
+            wait; rc=$(grep -c 'Exit status: 0' time.txt)
+            echo "TIME pair=$PAIR run=$i side=$side ok=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') sys=$(grep 'System time' time.txt | awk '{print $NF}') wall=$(grep 'Elapsed' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') anon_huge_kb_at_100s=$hp $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-100)"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+
+  stats:
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [init, std, cslib]
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build both
+        run: |
+          for side in old new; do
+            ref=$OLD_REF; [ $side = new ] && ref=$NEW_REF
+            git worktree add ../src-$side "$ref"
+            (cd ../src-$side && CARGO_TARGET_DIR=$PWD/target cargo build --release --locked 2>&1 | tail -1)
+            cp ../src-$side/target/release/kiota kiota-$side
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Counters and verdicts
+        env:
+          C: ${{ matrix.corpus }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          sides="new old"; [ $C = cslib ] && sides=new
+          for side in $sides; do
+            KIOTA_STATS=1 KIOTA_INTERN_RESET_LOG=1 /usr/bin/time -v -o time.txt ./kiota-$side $C.ndjson >/dev/null 2>err-$side.txt; rc=$?
+            echo "STAT corpus=$C side=$side rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') resets=$(grep -c '^INTERN_RESET' err-$side.txt) $(grep -E '^STATS ' err-$side.txt | tail -1) $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err-$side.txt | cut -c1-100)"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+          # Everything the two binaries print must agree, counters included.
+          grep -E '^(STATS|STATS2|STATS3|INTERN_RESET|REJECT|DECLINE|ERROR)' err-old.txt > a.txt
+          grep -E '^(STATS|STATS2|STATS3|INTERN_RESET|REJECT|DECLINE|ERROR)' err-new.txt > b.txt
+          if cmp -s a.txt b.txt; then echo "STATCMP corpus=$C IDENTICAL lines=$(wc -l < a.txt)"; else echo "STATCMP corpus=$C DIFFERENT"; diff a.txt b.txt | head -20; fi | tee -a "$GITHUB_STEP_SUMMARY"
