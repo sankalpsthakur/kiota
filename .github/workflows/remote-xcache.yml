@@ -1,0 +1,50 @@
+name: remote-xcache
+
+# KIOTA_XCACHE off against on, same binary, same runner: verdict, user time,
+# peak memory and counters on init, std and cslib.
+on:
+  push:
+    branches: ['remote/xcache-2026*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+
+jobs:
+  xcache:
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [init, std, cslib]
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Off against on
+        env:
+          C: ${{ matrix.corpus }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          rounds="1 2"; [ "$C" = cslib ] && rounds="1"
+          for round in $rounds; do for side in off on; do
+            extra=""; [ $side = on ] && extra="KIOTA_XCACHE=1"
+            env $extra /usr/bin/time -v -o time.txt timeout 5000 ./target/release/kiota $C.ndjson >/dev/null 2>err.txt; rc=$?
+            echo "XC corpus=$C round=$round side=$side rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') wall=$(grep Elapsed time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-120)"
+          done; done | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$C" != cslib ]; then for side in off on; do
+            extra=""; [ $side = on ] && extra="KIOTA_XCACHE=1"
+            env $extra KIOTA_STATS=1 ./target/release/kiota $C.ndjson >/dev/null 2>err.txt
+            echo "XCSTATS corpus=$C side=$side $(grep -E '^STATS3' err.txt | tail -1) $(grep -E '^STATS ' err.txt | tail -1)"
+          done | tee -a "$GITHUB_STEP_SUMMARY"; fi
