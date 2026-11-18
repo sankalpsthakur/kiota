@@ -232,10 +232,21 @@ pub struct Extensions {
     pub nat_pred: Option<u32>,
     /// `Nat.bitwise`, which `Nat.land`, `Nat.lor` and `Nat.xor` are stated with.
     pub nat_bitwise: Option<u32>,
-    /// The type of `String` literals.
+    /// The type of `String` literals: the structure `String`, once
+    /// `String.ofList` has been validated, so that a literal denotes a term.
     pub string: Option<u32>,
     /// A constant named `String` is declared and cannot be the literals' type.
     pub string_forged: bool,
+    /// The structure named `String`, from its declaration on.
+    pub string_candidate: Option<u32>,
+    /// `Char.ofNat : Nat → Char` and that `Char`.
+    pub char_of_nat: Option<u32>,
+    pub char_ty: Option<u32>,
+    /// `String.ofList : List Char → String` and that `List`'s constructors:
+    /// the literal `"ab"` is `String.ofList [Char.ofNat 97, Char.ofNat 98]`.
+    pub string_of_list: Option<u32>,
+    pub list_nil: Option<u32>,
+    pub list_cons: Option<u32>,
     op_ids: [u32; ExtOp::ALL.len()],
     op_kinds: [Option<ExtOp>; ExtOp::ALL.len()],
     op_len: u8,
@@ -278,6 +289,10 @@ impl Extensions {
 pub struct Environment {
     /// Validated extension constants; see `Extensions`.
     pub ext: Extensions,
+    /// The native reduct of a string literal's bytes has been compared with
+    /// `String.ofList`'s (`Checker::native_string_projection_ok`). Set once;
+    /// an environment only grows, so the comparison stays true.
+    pub native_string_values_ok: std::cell::Cell<bool>,
     pub consts: FxHashMap<u32, ConstantInfo>,
     /// Inductive type name → recursor name, filled in by the parser.
     pub rec_of: FxHashMap<u32, u32>,

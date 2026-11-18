@@ -78,6 +78,54 @@ fn forged_nat_operations_do_not_get_their_native_rules() {
     }
 }
 
+/// `Genuine.lean` with exactly one definition wrong (`make_bases.sh`), and a
+/// theorem false for it. Everything the definition is stated with is
+/// genuine and validated, so it is turned away by its own equation: `mul x 0
+/// = x`, `pow x 0 = 0`, `sub x (succ y) = pred (pred (sub x y))`, a `beq`
+/// that is `ble` at `0, succ x` and the reverse, a `shiftLeft` that does not
+/// double, an `add` that counts twice.
+#[test]
+fn one_wrong_equation_turns_a_definition_away() {
+    for (file, off, on) in [
+        ("wrong-nat-add.reject.ndjson", ExtOp::NatAdd, None),
+        ("wrong-nat-mul.reject.ndjson", ExtOp::NatMul, Some(ExtOp::NatAdd)),
+        ("wrong-nat-pow.reject.ndjson", ExtOp::NatPow, Some(ExtOp::NatMul)),
+        ("wrong-nat-sub.reject.ndjson", ExtOp::NatSub, Some(ExtOp::NatAdd)),
+        ("wrong-nat-beq.reject.ndjson", ExtOp::NatBeq, Some(ExtOp::NatBle)),
+        ("wrong-nat-ble.reject.ndjson", ExtOp::NatBle, Some(ExtOp::NatBeq)),
+        ("wrong-nat-shiftleft.reject.ndjson", ExtOp::NatShiftLeft, Some(ExtOp::NatMul)),
+    ] {
+        let parser = reject_at_the_theorem(file);
+        assert!(parser.env.ext.id_of(off).is_none(), "{file}");
+        if let Some(on) = on {
+            assert!(parser.env.ext.id_of(on).is_some(), "{file}: {on:?} is genuine there");
+        }
+    }
+    // A `Nat.pred` with `pred (succ n) = succ n` under the genuine `Nat.sub`.
+    let parser = reject_at_the_theorem("wrong-nat-pred.reject.ndjson");
+    assert!(parser.env.ext.nat_pred.is_none() && parser.env.ext.id_of(ExtOp::NatSub).is_none());
+    // In the `sub` variant it is `Nat.sub`'s own equation that fails.
+    let parser = reject_at_the_theorem("wrong-nat-sub.reject.ndjson");
+    assert!(parser.env.ext.nat_pred.is_some());
+}
+
+/// `inductive String : Type | mk (h : False)` and `("a").1 : False`. Lean's
+/// kernel types every string literal as `String` whatever `String` is, and
+/// so did this checker: the file was accepted. A literal now has a type only
+/// once `String.ofList : List Char → String` is declared and validated,
+/// which makes it short for a term. Without one the checker cannot say what
+/// the literal is; that is a decline, not a rejection.
+#[test]
+fn a_string_literal_needs_string_of_list_to_denote_anything() {
+    let (parser, verdict) = check("forged-string-uninhabited.decline.ndjson");
+    match verdict {
+        Err(TcError::Decline(m))
+            if m == "[Forged.bad] String literal, but no validated `String.ofList` says what it denotes" => {}
+        other => panic!("got {other:?}"),
+    }
+    assert!(parser.env.ext.string.is_none() && parser.env.ext.string_candidate.is_some());
+}
+
 /// `Nat.sub` in the forged prelude is the genuine recursion over a `Nat.pred`
 /// that is the identity. Its own equations hold; it is off because the
 /// `Nat.pred` they are stated with is not the predecessor.
@@ -189,6 +237,10 @@ fn every_extension_validates_on_the_real_prelude() {
     assert!(ext.decidable_is_false.is_some() && ext.decidable_is_true.is_some());
     assert!(ext.nat_pred.is_some() && ext.nat_bitwise.is_some());
     assert!(ext.string.is_some() && !ext.string_forged);
+    assert!(ext.string_of_list.is_some() && ext.char_of_nat.is_some());
+    // `"ab".toByteArray.size = 2` in that file reduced the literal's bytes
+    // natively, after comparing them with `String.ofList`'s.
+    assert!(parser.env.native_string_values_ok.get());
 }
 
 /// The Init-sized fixture whose `KIOTA_STATS` counters are compared across

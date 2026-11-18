@@ -1848,6 +1848,11 @@ impl<'e> Checker<'e> {
             None if self.ext.string_forged => {
                 reject("String literal, but the declared `String` is not a structure in `Type`")
             }
+            // Not a rejection: the export may simply not carry the
+            // definition, and then this checker cannot say what a literal is.
+            None if self.ext.string_candidate.is_some() => {
+                decline("String literal, but no validated `String.ofList` says what it denotes")
+            }
             None => decline("String literal used but String type unavailable"),
         }
     }
@@ -3036,10 +3041,8 @@ impl<'e> Checker<'e> {
                     }
                 }
                 if let ExprData::Lit(Lit::Str(s)) = &***major {
-                    if *idx == 0 && self.native_string_projection_ok(*sname) {
-                        if let Some(bytes) = self.string_to_byte_array(s) {
-                            return Ok(Some(apps_at(S::APPS, bytes, &args)));
-                        }
+                    if let Some(reduct) = self.string_lit_proj(*sname, *idx, s) {
+                        return Ok(Some(apps_at(S::APPS, reduct, &args)));
                     }
                 }
                 Ok(self.lazy_head_step(major, fuel - 1)?
@@ -3584,11 +3587,9 @@ impl<'e> Checker<'e> {
                                 }
                             }
                             if let ExprData::Lit(Lit::Str(s)) = &**vw {
-                                if *idx == 0 && self.native_string_projection_ok(*sname) {
-                                    if let Some(ba) = self.string_to_byte_array(s) {
-                                        cur = apps_at(S::APPS, ba, &args);
-                                        continue;
-                                    }
+                                if let Some(reduct) = self.string_lit_proj(*sname, *idx, s) {
+                                    cur = apps_at(S::APPS, reduct, &args);
+                                    continue;
                                 }
                             }
                             // A failed projection reduction preserves its input,
@@ -3663,11 +3664,9 @@ impl<'e> Checker<'e> {
                         }
                     }
                     if let ExprData::Lit(Lit::Str(s)) = &**vw {
-                        if *idx == 0 && self.native_string_projection_ok(*sname) {
-                            if let Some(ba) = self.string_to_byte_array(s) {
-                                cur = ba;
-                                continue;
-                            }
+                        if let Some(reduct) = self.string_lit_proj(*sname, *idx, s) {
+                            cur = reduct;
+                            continue;
                         }
                     }
                     // Stuck projection: preserve the unreduced major so
@@ -6475,13 +6474,65 @@ impl<'e> Checker<'e> {
             return ok;
         }
         match self.check_native_string_projection(sname) {
-            Ok(ok) => {
-                self.native_string_ok.set(Some(ok));
-                ok
+            Ok(true) => {}
+            Ok(false) => {
+                self.native_string_ok.set(Some(false));
+                return false;
             }
             // An abort says nothing about the environment, so it is not cached.
-            Err(_) => false,
+            Err(_) => return false,
         }
+        // Type preservation says the reduct is *a* `ByteArray`. That it is
+        // the one the literal has by definition is compared once per
+        // environment, against `String.ofList`.
+        if self.env.native_string_values_ok.get() {
+            self.native_string_ok.set(Some(true));
+            return true;
+        }
+        // Off while the comparison runs: it must not use the rule it is
+        // about to justify, should a literal turn up inside it.
+        self.native_string_ok.set(Some(false));
+        let ok = match self.native_string_values_agree(sname) {
+            None => true,
+            Some(Ok(true)) => {
+                self.env.native_string_values_ok.set(true);
+                extensions::trace_string_bytes(true);
+                true
+            }
+            Some(Ok(false)) => {
+                extensions::trace_string_bytes(false);
+                false
+            }
+            Some(Err(_)) => {
+                self.native_string_ok.set(None);
+                return false;
+            }
+        };
+        self.native_string_ok.set(Some(ok));
+        ok
+    }
+
+    /// One step of a projection of the string literal `s`.
+    ///
+    /// Field 0 is the literal's bytes, built natively once that has been
+    /// checked against this environment (`native_string_projection_ok`). If
+    /// it has not, the literal is read the way Lean's kernel reads it, as
+    /// `String.ofList [Char.ofNat c, …]`, and stays under the projection for
+    /// ordinary reduction to finish: slower, and the same term by
+    /// definition. Any other field is left alone, as before.
+    fn string_lit_proj(&self, sname: u32, idx: u32, s: &str) -> Option<Expr> {
+        if idx != 0 {
+            return None;
+        }
+        if self.native_string_projection_ok(sname) {
+            if let Some(bytes) = self.string_to_byte_array(s) {
+                return Some(bytes);
+            }
+        }
+        if self.ext.string != Some(sname) {
+            return None;
+        }
+        Some(expr::proj(sname, 0, self.string_lit_as_of_list(s)?))
     }
 
     fn check_native_string_projection(&self, sname: u32) -> R<bool> {

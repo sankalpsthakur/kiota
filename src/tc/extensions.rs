@@ -30,6 +30,9 @@
 //!   `Nat.add`) needs that one validated first.
 //! * `ite`, `dite`, `Decidable.decide`: both rules, at both constructors of
 //!   the validated `Decidable`, on variables.
+//! * `String`, `Char.ofNat`, `String.ofList`: a structure in `Type` and two
+//!   definitions with the types that make `String.ofList [Char.ofNat c, …]`
+//!   a term. A string literal has a type only after that.
 //! * `Nat.land`, `Nat.lor`, `Nat.xor`: `Nat.bitwise f` for an `f` with the
 //!   right truth table.
 //! * `Nat.div`, `Nat.mod`, `Nat.modCore`, `Nat.gcd`, and `Nat.bitwise`
@@ -96,9 +99,23 @@ pub fn report() {
     eprintln!("{line}");
 }
 
+/// The outcome of `Checker::native_string_values_agree`, reported like a
+/// declaration's: a line under `KIOTA_EXT_TRACE` when it holds, a note on
+/// stderr when it does not.
+pub(super) fn trace_string_bytes(agree: bool) {
+    if !agree {
+        eprintln!("kiota: `String.ofList` does not give a literal the bytes the kernel assumes; a literal's bytes get no native reduction");
+    } else if trace_enabled() {
+        eprintln!("EXT on String literal bytes");
+    }
+}
+
 /// The names `on_declared` acts on.
 fn is_extension_spelling(s: &str) -> bool {
-    matches!(s, "Nat" | "Bool" | "Decidable" | "String" | "Nat.pred" | "Nat.bitwise")
+    matches!(
+        s,
+        "Nat" | "Bool" | "Decidable" | "String" | "Nat.pred" | "Nat.bitwise" | "Char.ofNat" | "String.ofList"
+    )
         || ExtOp::from_spelling(s).is_some()
 }
 
@@ -116,7 +133,7 @@ pub fn on_declared(
     let spelled = names.get(name as usize).map(|s| s.as_str()).unwrap_or("");
     // Every extension name starts with one of these letters; nearly every
     // declaration is turned away here.
-    if !matches!(spelled.as_bytes().first(), Some(b'N' | b'B' | b'D' | b'S' | b'i' | b'd')) {
+    if !matches!(spelled.as_bytes().first(), Some(b'N' | b'B' | b'C' | b'D' | b'S' | b'i' | b'd')) {
         return None;
     }
     if !is_extension_spelling(spelled) {
@@ -207,7 +224,20 @@ impl Validator<'_> {
             }
             "String" => {
                 self.validate_string(name)?;
-                ext.string = Some(name);
+                ext.string_candidate = Some(name);
+                Ok(())
+            }
+            "Char.ofNat" => {
+                ext.char_ty = Some(self.validate_char_of_nat(name)?);
+                ext.char_of_nat = Some(name);
+                Ok(())
+            }
+            "String.ofList" => {
+                let (string, nil, cons) = self.validate_string_of_list(name)?;
+                ext.string_of_list = Some(name);
+                ext.list_nil = Some(nil);
+                ext.list_cons = Some(cons);
+                ext.string = Some(string);
                 Ok(())
             }
             "Nat.pred" => {
@@ -311,14 +341,94 @@ impl Validator<'_> {
     }
 
     /// The type of string literals: a one-constructor inductive in `Type`
-    /// without parameters. (That a literal denotes an inhabitant is not
-    /// established: see the report on `String.ofList`.)
+    /// without parameters. It becomes the literals' type when
+    /// `String.ofList` is validated.
     fn validate_string(&self, n: u32) -> V {
         let ctors = self.plain_inductive(n, 0)?;
         if ctors.len() != 1 {
             return no("it does not have one constructor");
         }
         Ok(())
+    }
+
+    /// `Char.ofNat : Nat → C` for a constant `C`, a definition. Returns `C`.
+    fn validate_char_of_nat(&self, f: u32) -> Result<u32, String> {
+        let (nat, _, _) = self.nat()?;
+        let Some(ConstantInfo::Def { level_params, typ, is_unsafe: false, .. }) = self.env.get(f) else {
+            return Err("it is not a definition".into());
+        };
+        if !level_params.is_empty() {
+            return Err("it has universe parameters".into());
+        }
+        match &***typ {
+            ExprData::Pi(_, d, r) if is_const(d, nat) => match &***r {
+                ExprData::Const(ch, us) if us.is_empty() => Ok(*ch),
+                _ => Err("it is not `Nat → Char`".into()),
+            },
+            _ => Err("it is not `Nat → Char`".into()),
+        }
+    }
+
+    /// `String.ofList : List Char → String`, a definition, over the `Char`
+    /// of `Char.ofNat`, the structure `String`, and a `List` whose `nil` and
+    /// `cons` build a `List Char` (lean4lean's `checkStringOfList`). With
+    /// that, a string literal is short for a term that type-checks: Lean's
+    /// kernel reads `"ab"` as `String.ofList [Char.ofNat 97, Char.ofNat 98]`.
+    /// Without it a literal would be an inhabitant of `String` by fiat, and
+    /// `structure String where h : False` would make it a proof of `False`.
+    /// Returns `String`, `List.nil`, `List.cons`.
+    fn validate_string_of_list(&self, f: u32) -> Result<(u32, u32, u32), String> {
+        let string = self.ext.string_candidate.ok_or("`String` is not a structure in `Type`")?;
+        let (char_of_nat, ch) = match (self.ext.char_of_nat, self.ext.char_ty) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return Err("`Char.ofNat` is not validated".into()),
+        };
+        let Some(ConstantInfo::Def { level_params, typ, is_unsafe: false, .. }) = self.env.get(f) else {
+            return Err("it is not a definition".into());
+        };
+        if !level_params.is_empty() {
+            return Err("it has universe parameters".into());
+        }
+        let wrong = || "it is not `List Char → String`".to_string();
+        let ExprData::Pi(_, dom, cod) = &***typ else { return Err(wrong()) };
+        if !is_const(cod, string) {
+            return Err(wrong());
+        }
+        let ExprData::App(l, elem) = &***dom else { return Err(wrong()) };
+        let list = match &***l {
+            ExprData::Const(l, us) if us.len() == 1 && level::is_def_eq(&us[0], &level::zero()) && is_const(elem, ch) => *l,
+            _ => return Err(wrong()),
+        };
+        let (nil, cons) = match self.env.get(list) {
+            Some(ConstantInfo::InductiveType { ctors, .. })
+                if ctors.len() == 2
+                    && self.spelled(list) == "List"
+                    && self.spelled(ctors[0]) == "List.nil"
+                    && self.spelled(ctors[1]) == "List.cons" =>
+            {
+                (ctors[0], ctors[1])
+            }
+            _ => return Err("its argument is not a `List` with `nil` and `cons`".into()),
+        };
+        // `[Char.ofNat 0] : List Char`
+        let zero = vec![level::zero()];
+        let one_char = expr::apps(
+            expr::const_(cons, zero.clone()),
+            &[
+                c(ch),
+                expr::app(c(char_of_nat), expr::lit_nat(BigUint::from(0u32))),
+                expr::app(expr::const_(nil, zero), c(ch)),
+            ],
+        );
+        let well_typed = self.attempt(|tc| {
+            let ctx = Ctx::new();
+            let t = tc.infer_type(&ctx, &one_char)?;
+            tc.is_def_eq(&ctx, &t, dom)
+        });
+        if !well_typed {
+            return Err("`[Char.ofNat 0]` is not a `List Char`".into());
+        }
+        Ok((string, nil, cons))
     }
 
     /// An inductive type in `Type`, alone in its block, without universe
@@ -730,6 +840,7 @@ pub fn trusting_names(
     ext.bool_true = find("Bool.true");
     ext.decidable_is_false = find("Decidable.isFalse");
     ext.decidable_is_true = find("Decidable.isTrue");
+    ext.string_candidate = string_ref;
     ext.nat_pred = find("Nat.pred");
     ext.nat_bitwise = find("Nat.bitwise");
     for op in ExtOp::ALL {
@@ -738,4 +849,46 @@ pub fn trusting_names(
         }
     }
     ext
+}
+
+impl Checker<'_> {
+    /// `(String.ofList [Char.ofNat c, …]).1 ≡ string_to_byte_array(s)` for
+    /// strings with one, two, three and four byte characters. The first is
+    /// what Lean's kernel takes the literal's first field to be; the second
+    /// is what `whnf` puts there. Agreement on samples is evidence that the
+    /// builder is UTF-8 as this prelude defines it, not a proof for every
+    /// string. `None` when the environment has no validated `String.ofList`
+    /// (unit tests over hand-built environments).
+    pub(super) fn native_string_values_agree(&self, sname: u32) -> Option<R<bool>> {
+        self.ext.string_of_list?;
+        Some(uncounted(|| {
+            let ctx = Ctx::new();
+            for sample in ["", "a", "ab", "\u{e9}", "\u{20ac}", "\u{1f600}"] {
+                let (Some(bytes), Some(meant)) =
+                    (self.string_to_byte_array(sample), self.string_lit_as_of_list(sample))
+                else {
+                    return Ok(false);
+                };
+                if !self.is_def_eq(&ctx, &expr::proj(sname, 0, meant), &bytes)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }))
+    }
+
+    /// The string literal `s` as Lean's kernel defines it:
+    /// `String.ofList [Char.ofNat c₁, …, Char.ofNat cₙ]` over its characters.
+    /// `None` without a validated `String.ofList`.
+    pub(super) fn string_lit_as_of_list(&self, s: &str) -> Option<Expr> {
+        let (of_list, char_of_nat, ch) = (self.ext.string_of_list?, self.ext.char_of_nat?, self.ext.char_ty?);
+        let (nil, cons) = (self.ext.list_nil?, self.ext.list_cons?);
+        let zero = vec![level::zero()];
+        let mut list = expr::app(expr::const_(nil, zero.clone()), c(ch));
+        for k in s.chars().rev() {
+            let code = expr::lit_nat(BigUint::from(k as u32));
+            list = expr::apps(expr::const_(cons, zero.clone()), &[c(ch), expr::app(c(char_of_nat), code), list]);
+        }
+        Some(expr::app(c(of_list), list))
+    }
 }

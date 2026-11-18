@@ -9,7 +9,8 @@ same name beside this script (Lean 4.33.0, lean4export df81913):
     lean -o Forged.olean Forged.lean
     LEAN_PATH=$PWD lean4export Forged > Forged.base.ndjson
 
-A fixture is one base plus one theorem appended here. The theorems cannot
+(`make_bases.sh` does this for every base, including the `GenuineBut*`
+variants of Genuine.lean.) A fixture is one base plus one theorem appended here. The theorems cannot
 come from Lean: the false ones Lean refuses to add, and the accept twins use
 raw literals that a prelude-free file has no notation for.
 """
@@ -187,6 +188,26 @@ def main():
     dite_true(ctors, f"{dst}/forged-decidable-istrue-axiom-dite.reject.ndjson", "Forged.bad")
     decide_true(ctors, f"{dst}/forged-decidable-istrue-axiom-decide.reject.ndjson", "Forged.bad")
     literal_is_zero(ctors, f"{dst}/forged-nat-ctor-order.reject.ndjson", "Forged.bad")
+
+    # GenuineBut*.lean: Genuine.lean with exactly one definition wrong, and a
+    # theorem that is false for it. Everything it is stated with is genuine,
+    # so it is the definition's own equation that fails.
+    for variant, op, a, b, r, ty in [
+        ("Add", "add", 2, 2, 4, "Nat"), ("Mul", "mul", 2, 3, 6, "Nat"), ("Pow", "pow", 2, 3, 8, "Nat"),
+        ("Pred", "sub", 5, 2, 3, "Nat"), ("Sub", "sub", 5, 2, 3, "Nat"),
+        ("Beq", "beq", 2, 3, "Bool.false", "Bool"), ("Ble", "ble", 2, 3, "Bool.true", "Bool"),
+        ("ShiftLeft", "shiftLeft", 1, 4, 16, "Nat"),
+    ]:
+        nat_op(f"{src}/GenuineBut{variant}.base.ndjson", f"{dst}/wrong-nat-{variant.lower()}.reject.ndjson",
+               "Forged.bad", f"Nat.{op}", a, b, r, ty=ty)
+
+    # ForgedString.lean: `("a").1 : False`.
+    x = Export(f"{src}/ForgedString.base.ndjson")
+    lit = x.expr({"strVal": "a"})
+    proof = x.expr({"proj": {"typeName": x.names["String"], "idx": 0, "struct": lit}})
+    n = x.name("Forged.bad")
+    x.emit({"thm": {"all": [n], "levelParams": [], "name": n, "type": x.const("False"), "value": proof}})
+    x.write(f"{dst}/forged-string-uninhabited.decline.ndjson")
 
     # The same statements over the genuine definitions; the literals are too
     # large for anything but the native reductions.
