@@ -232,7 +232,15 @@ impl Parser {
         }
     }
 
-    fn handle_name(&mut self, idx: u32, v: &Value) {
+    /// A name index may be given a spelling at any point, and an unused one
+    /// may be given another. Once a declaration has taken the index its
+    /// spelling is fixed: constants are keyed by index here, while the
+    /// literal extensions (`Nat.succ`, `Nat.add`, ...), the quotient
+    /// primitives and `Eq` are recognised by spelling, so a later line that
+    /// respelled the index would turn an arbitrary constant into one of
+    /// those. In the official kernel a name is its spelling and nothing can
+    /// rename a declared constant.
+    fn handle_name(&mut self, idx: u32, v: &Value) -> Result<(), TcError> {
         let full = if let Some(s) = v.get("str") {
             let pre = Self::get_u32(s, "pre");
             let seg = Self::get_str(s, "str");
@@ -257,6 +265,12 @@ impl Parser {
         while self.names.len() <= idx as usize {
             self.names.push(Rc::new(String::new()));
         }
+        if self.env.get(idx).is_some() && *self.names[idx as usize] != full {
+            return Err(TcError::Reject(format!(
+                "name index {idx} is respelled `{full}` after `{}` was declared under it",
+                self.names[idx as usize]
+            )));
+        }
         if let Some(prev) = self.name_by_str.insert(full.clone(), idx) {
             if prev != idx {
                 self.spelling_dups
@@ -266,6 +280,7 @@ impl Parser {
             }
         }
         self.names[idx as usize] = Rc::new(full);
+        Ok(())
     }
 
     fn handle_level(&mut self, idx: u32, v: &Value) {
@@ -1312,7 +1327,7 @@ impl Parser {
             return Ok(false);
         }
         if let Some(idx) = v.get("in").and_then(|x| x.as_u64()) {
-            self.handle_name(idx as u32, v);
+            self.handle_name(idx as u32, v)?;
             return Ok(false);
         }
         if let Some(idx) = v.get("il").and_then(|x| x.as_u64()) {

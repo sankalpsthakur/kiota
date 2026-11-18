@@ -69,3 +69,21 @@ fn a_forged_quotient_declaration_is_a_rejection() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("REJECT: [Quot.ind] quotient declaration before the primitive `Quot`"), "{stderr}");
 }
+
+#[test]
+fn a_declared_name_index_cannot_be_respelled() {
+    // An axiom `F : Nat -> Nat` respelled `Nat.succ`: the literal extension
+    // goes by spelling, and computed `F 4 = 5`.
+    let output = run(include_bytes!("fixtures/name-index-respelled-into-nat-succ.reject.ndjson"), None);
+    assert_eq!(output.status.code(), Some(1), "{:?}", output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is respelled `Nat.succ` after `F` was declared under it"),
+        "{stderr}"
+    );
+    // The other direction: `Nat.succ` stops being `Nat.succ` between two
+    // theorems about the same term.
+    let output = run(include_bytes!("fixtures/name-index-respelled-after-cached-equality.reject.ndjson"), None);
+    assert_eq!(output.status.code(), Some(1), "{:?}", output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is respelled `S` after `Nat.succ` was declared"));
+}
