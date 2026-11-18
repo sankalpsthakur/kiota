@@ -5945,6 +5945,17 @@ impl<'e> Checker<'e> {
             ExprData::Const(n, _) => *n,
             _ => return Ok(None),
         };
+        let r = self.try_nat_extension_at(ctx, n, args)?;
+        if r.is_some() {
+            extensions::fired(self.ext.op_of(n));
+        }
+        Ok(r)
+    }
+
+    /// `try_nat_extension` for the constant `n`. Which rule applies is read
+    /// from `self.ext`: `n` is `Nat.succ` of the validated `Nat`, or a
+    /// constant validated for one `ExtOp`, or the answer is `None`.
+    fn try_nat_extension_at(&self, ctx: &Ctx, n: u32, args: &[Expr]) -> R<Option<Expr>> {
         if self.ext.nat_ctors.is_some_and(|(_, succ)| succ == n) {
             if args.is_empty() {
                 return Ok(None);
@@ -6356,6 +6367,7 @@ impl<'e> Checker<'e> {
             return Ok(None);
         }
         let proof = iargs[1].clone();
+        extensions::fired(Some(if is_dite { ExtOp::Dite } else { ExtOp::Ite }));
         let branch = if is_true { &args[3] } else { &args[4] };
         let reduced = if is_dite {
             expr::app(branch.clone(), proof)

@@ -57,6 +57,40 @@ fn trace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KIOTA_EXT_TRACE").is_some())
 }
 
+thread_local! {
+    /// Under `KIOTA_EXT_TRACE`: how often each native rule rewrote a term,
+    /// by `ExtOp::ALL` position; the last cell is `Nat.succ` of a numeral.
+    static FIRED: [Cell<u64>; ExtOp::ALL.len() + 1] = const { [const { Cell::new(0) }; ExtOp::ALL.len() + 1] };
+}
+
+/// A native rule fired; `op` is `None` for `Nat.succ`. Counted only under
+/// `KIOTA_EXT_TRACE`.
+#[inline]
+pub(super) fn fired(op: Option<ExtOp>) {
+    if trace_enabled() {
+        let i = match op {
+            Some(op) => ExtOp::ALL.iter().position(|o| *o == op).unwrap_or(ExtOp::ALL.len()),
+            None => ExtOp::ALL.len(),
+        };
+        FIRED.with(|f| f[i].set(f[i].get() + 1));
+    }
+}
+
+/// `KIOTA_EXT_TRACE`: one line with the number of rewrites per native rule.
+pub fn report() {
+    if !trace_enabled() {
+        return;
+    }
+    let mut line = String::from("EXT fired");
+    FIRED.with(|f| {
+        for (i, op) in ExtOp::ALL.iter().enumerate() {
+            line.push_str(&format!(" {}={}", op.spelling(), f[i].get()));
+        }
+        line.push_str(&format!(" Nat.succ={}", f[ExtOp::ALL.len()].get()));
+    });
+    eprintln!("{line}");
+}
+
 /// The names `on_declared` acts on.
 fn is_extension_spelling(s: &str) -> bool {
     matches!(s, "Nat" | "Bool" | "Decidable" | "String" | "Nat.pred" | "Nat.bitwise")

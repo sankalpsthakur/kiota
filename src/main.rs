@@ -99,6 +99,7 @@ fn main() {
             });
             kiota::stats::report();
             kiota::stats::report_shortcuts();
+            kiota::tc::extensions::report();
             let result = match outcome {
                 Ok(r) => r,
                 Err(_) => Err(tc::TcError::Other("panic during checking".into())),
