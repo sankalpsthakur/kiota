@@ -69,6 +69,15 @@ thread_local! {
     /// Set when `whnf_core` hits CONV_DEPTH. The abort is a Decline, never a
     /// stuck term cached or returned as WHNF (criterion 2).
     static CORE_ABORTED: Cell<bool> = const { Cell::new(false) };
+    /// Results on closed terms that outlive the declaration that computed
+    /// them (`KIOTA_XCACHE`). A closed term's type and weak head normal
+    /// form depend on the environment only, which only grows, so a result
+    /// is as true for a later declaration as for the one that found it.
+    /// Keys are allocation identities, which are never reused.
+    static XINFER: RefCell<FxHashMap<usize, (Expr, bool)>> = RefCell::new(FxHashMap::default());
+    static XWHNF: RefCell<FxHashMap<usize, Expr>> = RefCell::new(FxHashMap::default());
+    static XCACHE_ON: bool = std::env::var_os("KIOTA_XCACHE").is_some();
+    static XCACHE_HITS: Cell<u64> = const { Cell::new(0) };
     /// Unreduced same-const App congruence (`try_unreduced` + `is_def_eq_core`
     /// pairwise) nested 15+ deep on class spines walks the *tree*, not the
     /// intern DAG — 7^15 at std `#18000` (`LawfulVecOperator.mk`). One level
@@ -166,6 +175,13 @@ fn num_bigint_gcd(a: &BigUint, b: &BigUint) -> BigUint {
     }
     x
 }
+/// Entries a cross-declaration cache holds before it is emptied.
+const XCACHE_CAP: usize = 4_000_000;
+
+pub fn xcache_hits() -> u64 {
+    XCACHE_HITS.with(Cell::get)
+}
+
 fn decline<T>(msg: impl Into<String>) -> R<T> {
     DECLINE_SERIAL.with(|s| s.set(s.get() + 1));
     Err(TcError::Decline(msg.into()))
@@ -285,6 +301,11 @@ pub struct Checker<'e> {
     /// (each one less than the last) that run has made (`HUGE_LIT_RUN`).
     fuel_nat_last: std::cell::RefCell<Option<num_bigint::BigUint>>,
     fuel_nat_run: std::cell::Cell<u32>,
+    /// Set once this declaration's own constant was met and left folded
+    /// (`unfold_def`'s self-reference guard). Results computed after that
+    /// may reflect the guard, so they stay out of the cross-declaration
+    /// caches.
+    xcache_tainted: std::cell::Cell<bool>,
     /// Lean `infer_only`: skip app-arg checks. Only for PI
     /// (`proofs_of_same_prop`) on already-checked terms.
     infer_only: std::cell::Cell<bool>,
@@ -690,6 +711,7 @@ impl<'e> Checker<'e> {
             fuel_nat_peels: std::cell::Cell::new(0),
             fuel_nat_last: std::cell::RefCell::new(None),
             fuel_nat_run: std::cell::Cell::new(0),
+            xcache_tainted: std::cell::Cell::new(false),
             infer_only: std::cell::Cell::new(false),
             decl_value_size: std::cell::Cell::new(0),
             checking_prop_structure: std::cell::Cell::new(false),
@@ -1287,8 +1309,29 @@ impl<'e> Checker<'e> {
                 return Ok(t.clone());
             }
         }
+        let xcache = key.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b);
+        if xcache {
+            let hit = XINFER.with(|m| m.borrow().get(&key.1).cloned());
+            if let Some((t, checked)) = hit {
+                if infer_only || checked {
+                    XCACHE_HITS.with(|c| c.set(c.get() + 1));
+                    cache_ref.borrow_mut().insert(key, (t.clone(), checked));
+                    return Ok(t);
+                }
+            }
+        }
+        crate::stats::miss(0, key.0, key.1, 0);
         let t = self.infer_type_uncached(ctx, e)?;
         let checked = !self.infer_only.get();
+        if xcache && checked && !self.xcache_tainted.get() {
+            XINFER.with(|m| {
+                let mut m = m.borrow_mut();
+                if m.len() >= XCACHE_CAP {
+                    m.clear();
+                }
+                m.insert(key.1, (t.clone(), true));
+            });
+        }
         {
             let mut cache = cache_ref.borrow_mut();
             if expr::reclamation_enabled() && cache.len() >= 50_000 {
@@ -2329,8 +2372,18 @@ impl<'e> Checker<'e> {
         // the normal one so a rescue still benefits from memoization.
         let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
         if let Some(r) = self.whnf_cache_get(force_eager, &k) {
+            crate::stats::whnf_hit();
             return Ok(r);
         }
+        let xcache = k.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b);
+        if xcache {
+            if let Some(r) = XWHNF.with(|m| m.borrow().get(&k.1).cloned()) {
+                XCACHE_HITS.with(|c| c.set(c.get() + 1));
+                self.whnf_cache_insert(force_eager, k, r.clone());
+                return Ok(r);
+            }
+        }
+        crate::stats::miss(1, k.0, k.1, 0);
         let mut cur = e.clone();
         let r = loop {
             let core = self.whnf_core(ctx, &cur)?;
@@ -2365,6 +2418,15 @@ impl<'e> Checker<'e> {
             return Ok(r);
         }
         self.whnf_cache_insert(force_eager, k, r.clone());
+        if xcache && !self.xcache_tainted.get() {
+            XWHNF.with(|m| {
+                let mut m = m.borrow_mut();
+                if m.len() >= XCACHE_CAP {
+                    m.clear();
+                }
+                m.insert(k.1, r.clone());
+            });
+        }
         Ok(r)
     }
 
@@ -3039,6 +3101,7 @@ impl<'e> Checker<'e> {
 
     fn unfold_def(&self, n: u32, us: &[Level]) -> R<Option<Expr>> {
         if self.declaring.get() == Some(n) {
+            self.xcache_tainted.set(true);
             return Ok(None);
         }
         match self.env.get(n) {
@@ -3604,8 +3667,10 @@ impl<'e> Checker<'e> {
         // non-forced lookup.
         let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
         if let Some(r) = self.defeq_cache_get(force_eager, &key) {
+            crate::stats::defeq_hit();
             return Ok(r);
         }
+        crate::stats::miss(2, key.0, key.1, key.2);
         // Proof irrelevance before app congruence. Typeclass instances are
         // proofs of a Prop (the class). Pairwise of `LawfulVecOperator.mk`
         // (7 args, nested ~15 deep) is a tree walk; PI compares the inferred
