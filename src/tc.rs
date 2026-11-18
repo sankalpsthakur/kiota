@@ -1624,6 +1624,7 @@ impl<'e> Checker<'e> {
         all: &[u32],
         params: &[Expr],
         major: &Expr,
+        large_elim: bool,
     ) -> R<Option<(u32, u32, Vec<Expr>, Vec<Level>)>> {
         let mt = match self.infer_type(ctx, major) {
             Ok(t) => t,
@@ -1638,8 +1639,12 @@ impl<'e> Checker<'e> {
             }
         };
         let mtw = self.whnf(ctx, &mt)?;
-        // Lean skips Prop structures (`is_prop` of the type). PSigma is Type.
-        if self.is_prop(ctx, &mtw)? {
+        // A structure in `Prop` is expanded only under a recursor that
+        // eliminates into `Sort u`: its fields are then all proofs, so
+        // `mk e.1 … e.n` is `e` by proof irrelevance and every projection
+        // is allowed. This is the official kernel's rule since lean4#15371;
+        // before it, Lean skipped every `Prop` structure. PSigma is Type.
+        if !large_elim && self.is_prop(ctx, &mtw)? {
             if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
                 eprintln!(
                     "IOTA to_ctor skip Prop structure ty={}",
@@ -4194,7 +4199,34 @@ impl<'e> Checker<'e> {
 
         let k_like = self.is_k_like(&all)?;
 
-        let major_w = self.whnf_major(ctx, major, rname)?;
+        // Whether this recursor eliminates into `Sort u`: it then has one
+        // universe parameter more than the block's first type (the official
+        // kernel's own test, see `to_cnstr_when_structure`).
+        let large_elim = match all.first().and_then(|i| self.env.get(*i)) {
+            Some(ConstantInfo::InductiveType { level_params: ind_lp, .. }) => {
+                level_params.len() != ind_lp.len()
+            }
+            _ => false,
+        };
+
+        // Structure eta comes before unfolding the major (lean4#15351). A
+        // major that is not a constructor after β/ζ/proj/ι alone, and whose
+        // type is a structure, is `mk major.1 … major.n`; the rule fires on
+        // that without looking inside the major, which may have no weak
+        // head normal form at all (a proof built from an inconsistent
+        // context, or a term that computes through one). The projections
+        // reduce the major later, and only if the minor uses a field.
+        let major_core = self.whnf_core(ctx, major)?;
+        let eta_first = if self.is_ctor_or_nat_lit_head(&major_core) {
+            None
+        } else {
+            self.to_ctor_when_structure(ctx, &all, params, &major_core, large_elim)?
+        };
+        let major_w = if eta_first.is_some() {
+            major_core
+        } else {
+            self.whnf_major(ctx, &major_core, rname)?
+        };
 
         // Recursor-application memo: a `Nat.rec`/`brecOn` "below" step
         // recurs with the *same* (motive, minors) pointers and a strictly
@@ -4296,9 +4328,11 @@ impl<'e> Checker<'e> {
             _ => None,
         };
 
-        let (cname, cnp, ctor_args, ctor_us) = if let Some(x) = ctor {
+        let (cname, cnp, ctor_args, ctor_us) = if let Some(x) = eta_first {
+            (x.0, x.1, x.2, Some(x.3))
+        } else if let Some(x) = ctor {
             x
-        } else if let Some(x) = self.to_ctor_when_structure(ctx, &all, params, &major_w)? {
+        } else if let Some(x) = self.to_ctor_when_structure(ctx, &all, params, &major_w, large_elim)? {
             if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
                 eprintln!(
                     "IOTA expand rec={} major={} → ctor {} nparams={} nfields={}",
