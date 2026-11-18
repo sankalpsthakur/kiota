@@ -1063,6 +1063,19 @@ impl Parser {
                     "recursor `{rname}` metadata does not match reconstruction"
                 )));
             }
+            // The rule list is the recursor's own member's constructors, in
+            // their declared order, each with its field count. Iota finds a
+            // recursor's constructors and, where the recursor's type cannot
+            // tell two minors apart, the minor's position through this list
+            // (`rec_owns_ctor`, `ctor_minor_index`), so an exported list in
+            // another order selected another minor premise.
+            let supplied_rules: Vec<(u32, u32)> =
+                r.rules.iter().map(|rule| (rule.ctor, rule.nfields)).collect();
+            if supplied_rules != d.rules {
+                return Err(TcError::Reject(format!(
+                    "recursor `{rname}` rules do not match its constructors"
+                )));
+            }
             self.checker()
                 .validate_reconstructed_type(
                     &r.supplied_type,
@@ -1083,19 +1096,6 @@ impl Parser {
                         "recursor `{rname}` type reconstruction: {msg}"
                     )),
                 })?;
-            // The rule list is the recursor's own member's constructors, in
-            // their declared order, each with its field count. Iota finds a
-            // recursor's constructors and, where the recursor's type cannot
-            // tell two minors apart, the minor's position through this list
-            // (`rec_owns_ctor`, `ctor_minor_index`), so an exported list in
-            // another order selected another minor premise.
-            let supplied_rules: Vec<(u32, u32)> =
-                r.rules.iter().map(|rule| (rule.ctor, rule.nfields)).collect();
-            if supplied_rules != d.rules {
-                return Err(TcError::Reject(format!(
-                    "recursor `{rname}` rules do not match reconstruction"
-                )));
-            }
             // K-like reduction is decided from the declaration, here and at
             // every use; a supplied flag has to agree with it.
             if let Some(k) = r.k {

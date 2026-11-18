@@ -293,8 +293,8 @@ fn recursor_rule_list_mismatch_rolls_back_the_block() {
     // constructors after the block's types and constructors are staged, so
     // each failure still has a transaction to roll back.
     for (record, expected) in [
-        (missing_owner, "recursor `LALNest.rec` rules do not match reconstruction".to_string()),
-        (duplicate_owner, "recursor `LALNest.rec_1` rules do not match reconstruction".to_string()),
+        (missing_owner, "recursor `LALNest.rec` rules do not match its constructors".to_string()),
+        (duplicate_owner, "recursor `LALNest.rec_1` rules do not match its constructors".to_string()),
     ] {
         assert!(matches!(import_record(&mut parser, &record), Err(TcError::Reject(m))
             if m == expected));
@@ -1889,7 +1889,7 @@ fn an_unknown_or_double_record_is_rejected() {
 fn recursor_rules_in_another_order_are_rejected() {
     assert_reject_exact(
         "recursor-rules-permuted.reject.ndjson",
-        "recursor `Snd.Tr.rec_1` rules do not match reconstruction",
+        "recursor `Snd.Tr.rec_1` rules do not match its constructors",
     );
     // The same false theorem under the genuine rule list, and the genuine
     // export with the true one.
@@ -1905,11 +1905,11 @@ fn recursor_rules_in_another_order_are_rejected() {
 fn recursor_rule_field_count_and_length_are_checked() {
     assert_reject_exact(
         "recursor-rule-nfields-lie.reject.ndjson",
-        "recursor `Snd.Tr.rec` rules do not match reconstruction",
+        "recursor `Snd.Tr.rec` rules do not match its constructors",
     );
     assert_reject_exact(
         "recursor-rule-missing.reject.ndjson",
-        "recursor `Snd.C.rec` rules do not match reconstruction",
+        "recursor `Snd.C.rec` rules do not match its constructors",
     );
 }
 
