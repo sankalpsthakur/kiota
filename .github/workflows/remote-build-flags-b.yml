@@ -1,0 +1,181 @@
+name: remote-build-flags-pairs
+
+# After round three (run 44344781467) showed what the profile is worth in
+# instructions on init, three questions are left:
+#   insn:  does the gain hold outside the training export? Instructions under
+#          cachegrind on twelve fixtures that are not Init, and on all of std.
+#   pair:  what does the target CPU buy in time? plain, pgo, x86-64-v3+pgo
+#          and native+pgo on init, interleaved on one runner.
+#   e2e:   the proposed arena build block with the CPU line changed, run by
+#          the arena's own lka.py (the block as proposed, with native, is
+#          the e2e jobs of run 44344781467).
+on:
+  push:
+    branches: ['remote/build-flags-2026*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+  SMALL_TESTS: "tutorial init-prelude *constlevels* *level-imax-leq* *nat-rec-rules* *unit-rec-rule* *orphan-rec* *loose-bvar-value* *app-lam* *shared-subterm* *beta-ladder* *let-ladder*"
+
+jobs:
+  insn:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [plain, pgo, v3+pgo]
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-std
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y zstd time valgrind >/dev/null
+          zstd -d --rm init.ndjson.zst -o init.ndjson
+          zstd -d --rm std.ndjson.zst -o std.ndjson
+          scripts/build-flags/build_side.sh "$SIDE" init.ndjson "kiota-$SIDE" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Instructions under cachegrind
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set +e
+          count() {
+            work=$1; file=$2; limit=$3
+            KIOTA_STATS=1 timeout "$limit" valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null \
+              "./kiota-$SIDE" "$file" >/dev/null 2>"vg-$work.txt"; rc=$?
+            echo "INSN side=$SIDE work=$work rc=$rc Ir=$(grep -E 'I +refs:' "vg-$work.txt" | awk '{print $NF}' | tr -d ,) stats_md5=$(grep -E '^STATS' "vg-$work.txt" | md5sum | cut -c1-12)"
+          }
+          count std std.ndjson 95m > out-std.txt &
+          ls -S tests/fixtures/*.ndjson | grep -v 'nat-shift-right-large-amount.reject' | head -n 12 > fixtures.txt
+          n=0
+          while IFS= read -r f; do
+            n=$((n + 1))
+            count "fixture-$(basename "$f" | cut -c1-40)" "$f" 20m > "out-fx-$n.txt" &
+            [ $((n % 3)) = 0 ] && wait -n
+          done < fixtures.txt
+          for i in $(seq 1 "$n"); do
+            while [ ! -s "out-fx-$i.txt" ]; do sleep 5; done
+          done
+          cat out-fx-*.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "INSN_SUM side=$SIDE work=fixtures files=$n Ir=$(cat out-fx-*.txt | grep -oE 'Ir=[0-9]+' | cut -d= -f2 | awk '{s+=$1} END{printf "%.0f", s}') rcs=$(cat out-fx-*.txt | grep -oE 'rc=[0-9]+' | sort | uniq -c | tr -s ' ' | tr '\n' ',')" | tee -a "$GITHUB_STEP_SUMMARY"
+          wait
+          cat out-std.txt | tee -a "$GITHUB_STEP_SUMMARY"
+
+  pair:
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the sides
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm init.ndjson.zst -o init.ndjson
+          for side in plain pgo v3+pgo native+pgo; do
+            scripts/build-flags/build_side.sh "$side" init.ndjson "kiota-$side"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: User time on init, interleaved
+        env:
+          REP: ${{ matrix.rep }}
+        run: |
+          set +e
+          for cycle in 1 2; do
+            case "$REP$cycle" in
+              11|22|31) order="plain pgo v3+pgo native+pgo" ;;
+              12|21) order="native+pgo v3+pgo pgo plain" ;;
+              *) order="v3+pgo plain native+pgo pgo" ;;
+            esac
+            for side in $order; do
+              KIOTA_STATS=1 /usr/bin/time -v -o time.txt "./kiota-$side" init.ndjson >/dev/null 2>err.txt; rc=$?
+              echo "PAIR corpus=init rep=$REP cycle=$cycle side=$side rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') sys=$(grep 'System time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') stats_md5=$(grep -E '^STATS' err.txt | md5sum | cut -c1-12)"
+            done
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+
+  e2e:
+    # `uv run lka.py` with rustup's llvm-tools-preview, the proposed block
+    # with its CPU line replaced.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: v3
+            cpu: "-C target-cpu=x86-64-v3"
+          - name: generic
+            cpu: ""
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Arena checkout with the proposed checker file
+        env:
+          CPU: ${{ matrix.cpu }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y time >/dev/null
+          pipx install uv >/dev/null
+          git clone --depth 1 https://github.com/leanprover/lean-kernel-arena arena
+          git -C arena log -1 --format='ARENA rev=%H date=%cI' | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 scripts/build-flags/arena_checker_yaml.py docs/arena-build-proposal.yaml "$GITHUB_SHA" arena/checkers/kiota.yaml
+          grep -c '^  CPU="-C target-cpu=native"$' arena/checkers/kiota.yaml
+          sed -i "s|^  CPU=\"-C target-cpu=native\"\$|  CPU=\"$CPU\"|" arena/checkers/kiota.yaml
+          grep -n '^  CPU=' arena/checkers/kiota.yaml | tee -a "$GITHUB_STEP_SUMMARY"
+          curl -sSf https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Build checker
+        working-directory: arena
+        env:
+          VARIANT: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          uv run lka.py build-checker kiota
+          echo "E2E variant=$VARIANT build_seconds=$(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
+          cat _build/checkers/kiota/src/kiota-build.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -q '^KIOTA_BUILD=pgo' _build/checkers/kiota/src/kiota-build.txt
+          ../scripts/build-flags/profile_match.sh "e2e-$VARIANT" _build/checkers/kiota/src/pgo.profdata _build/checkers/kiota/src/target/release/kiota | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Generate tests and run
+        working-directory: arena
+        run: |
+          set -euo pipefail
+          set -f
+          uv run lka.py build-test $SMALL_TESTS
+          uv run lka.py run --checker kiota --test init $SMALL_TESTS | tail -n 40
+      - name: Results
+        run: python3 scripts/build-flags/check_arena_results.py arena 20 | tee -a "$GITHUB_STEP_SUMMARY"
