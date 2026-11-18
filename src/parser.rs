@@ -9,15 +9,28 @@ use std::io::{BufRead, Write};
 use std::rc::Rc;
 
 pub struct Parser {
-    pub names: Vec<Rc<String>>, // index -> full dotted name (for diagnostics / builtin lookup)
+    /// Canonical name index -> the name, rendered by `render_str_component` so
+    /// that two different names never render alike. The slot of an index
+    /// that has no name line yet, or that is a second index for a name
+    /// (see `name_canon`), holds the empty string; the checker never sees
+    /// such an index.
+    pub names: Vec<Rc<String>>,
+    /// Rendered name -> its canonical index. One entry per name.
     pub name_by_str: FxHashMap<String, u32>,
-    /// Spellings that more than one name index carries, with every index
-    /// (empty for a lean4export file, whose names are hash-consed). The
-    /// export refers to constants by index, but the kernel's identity for
-    /// a constant is its name, so `declared` and `reject_if_dup` look
-    /// through all indices of a spelling.
-    pub spelling_dups: FxHashMap<String, Vec<u32>>,
-    pub levels: Vec<Level>,
+    /// Export name index -> canonical index, `NO_NAME` before the index's
+    /// name line. The kernel's identity for a constant, a universe
+    /// parameter or a structure is its name, and the export may give one
+    /// name several indices (lean4export never does). Every name index
+    /// read from the export goes through this table, so the environment,
+    /// the expressions and the levels only ever hold the first index a
+    /// name was given.
+    name_canon: Vec<u32>,
+    /// Some export index is a second index for its name. Then the
+    /// pre-pass's "no expression refers to this constant" is not about
+    /// names any more, and `release_theorem_value` stops relying on it.
+    aliased_names: bool,
+    /// The export's levels by index; `None` before the index's `il` line.
+    pub levels: Vec<Option<Level>>,
     /// The export's expression nodes by index. A slot is `None` before its
     /// `ie` line and again after `lifetimes` has released it.
     pub exprs: Vec<Option<Expr>>,
@@ -83,6 +96,65 @@ impl InductiveUndo {
     }
 }
 
+/// `name_canon` entry of an index no name line has defined.
+const NO_NAME: u32 = u32::MAX;
+
+/// A bound variable index no binder can reach. The export's de Bruijn
+/// indices are natural numbers; one that does not fit is read as this, so
+/// the node stays loose under any number of binders an export can nest and
+/// is rejected where a declaration uses it (`loose_of` adds one, which
+/// `u32::MAX` itself would wrap to "closed").
+const BVAR_UNBOUND: u32 = u32::MAX - 1;
+
+/// One component of a name, rendered so that the dotted rendering of a
+/// whole name determines the name: a `Name.str` component is written as it
+/// is unless that could be read as something else (it is empty, has a dot,
+/// has a guillemet, or is all digits like a `Name.num` component), in which
+/// case it is quoted in `«»` with `»` doubled. The by-name lookups
+/// (`Nat.succ`, `Quot.mk`, `Eq`, `I.rec`, ...) compare renderings, so the
+/// one-component name `«Nat.succ»` and the numeral-named `Foo.«0»` are not
+/// `Nat.succ` and `Foo.0`.
+fn render_str_component(seg: &str) -> String {
+    let plain = !seg.is_empty()
+        && !seg.contains(['.', '«', '»'])
+        && !seg.bytes().all(|b| b.is_ascii_digit());
+    if plain {
+        seg.to_string()
+    } else {
+        format!("«{}»", seg.replace('»', "»»"))
+    }
+}
+
+/// A numeral as lean4export's reader takes it (`String.toNat?`, Lean
+/// 4.35): decimal digits, with single underscores allowed between digits.
+/// Anything else is not a numeral; it is not read as zero, and a sign or a
+/// trailing separator is not dropped.
+fn parse_nat_literal(s: &str) -> Option<BigUint> {
+    let mut last_was_digit = false;
+    let mut separators = false;
+    for b in s.bytes() {
+        if b == b'_' {
+            if !last_was_digit {
+                return None;
+            }
+            last_was_digit = false;
+            separators = true;
+        } else if b.is_ascii_digit() {
+            last_was_digit = true;
+        } else {
+            return None;
+        }
+    }
+    if !last_was_digit {
+        return None;
+    }
+    if separators {
+        s.replace('_', "").parse().ok()
+    } else {
+        s.parse().ok()
+    }
+}
+
 fn bi_of(s: &str) -> BinderInfo {
     match s {
         "implicit" => BinderInfo::Implicit,
@@ -103,8 +175,9 @@ impl Parser {
         Parser {
             names: vec![Rc::new(String::new())], // index 0 = anonymous
             name_by_str: FxHashMap::default(),
-            spelling_dups: FxHashMap::default(),
-            levels: vec![level::zero()], // index 0 = zero
+            name_canon: vec![0],
+            aliased_names: false,
+            levels: vec![Some(level::zero())], // index 0 = zero
             exprs: Vec::new(),
             env: Environment::default(),
             decl_count: 0,
@@ -112,10 +185,6 @@ impl Parser {
             line_no: 0,
             proofs: None,
         }
-    }
-
-    fn get_u32(v: &Value, k: &str) -> u32 {
-        v.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as u32
     }
 
     fn require_u32(v: &Value, k: &str) -> Result<u32, TcError> {
@@ -139,9 +208,16 @@ impl Parser {
             None => return Err(TcError::Reject(format!("expr index {i} for `{k}` is out of range"))),
         };
         if !expr::is_closed(&e) {
+            let range = expr::loose_bvar_range(&e);
+            // `BVAR_UNBOUND` under however many binders the term has.
+            if range > u32::MAX / 2 {
+                return Err(TcError::Reject(format!(
+                    "`{k}` has a bound variable whose index no binder can reach"
+                )));
+            }
             return Err(TcError::Reject(format!(
                 "`{k}` has a loose bound variable (#{})",
-                expr::loose_bvar_range(&e) - 1
+                range - 1
             )));
         }
         Ok(e)
@@ -199,30 +275,55 @@ impl Parser {
                 .ok_or_else(|| TcError::Reject(format!("field `{k}` must be a bool"))),
         }
     }
-    fn get_vec_u32(v: &Value, k: &str) -> Vec<u32> {
-        v.get(k)
-            .and_then(|x| x.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|e| e.as_u64())
-                    .map(|n| n as u32)
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn pair_u32(v: &Value) -> (u32, u32) {
-        if let Some(arr) = v.as_array() {
-            let a = arr.get(0).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-            let b = arr.get(1).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-            (a, b)
-        } else {
-            (Self::get_u32(v, "lhs"), Self::get_u32(v, "rhs"))
+    /// A table index given directly as a JSON value (`"succ": 3`, an entry
+    /// of `"us"`). Like `require_u32`, nothing is defaulted or truncated:
+    /// `4294967296` is not index 0.
+    fn index_of(x: &Value, what: &str) -> Result<u32, TcError> {
+        match x.as_u64() {
+            Some(n) if n <= u32::MAX as u64 => Ok(n as u32),
+            _ => Err(TcError::Reject(format!("{what} must be a u32 index"))),
         }
     }
 
-    fn level_at(&self, i: u32) -> Level {
-        self.levels[i as usize].clone()
+    /// The two level indices of a `max`/`imax` record.
+    fn pair_u32(v: &Value, what: &str) -> Result<(u32, u32), TcError> {
+        match v.as_array().map(|a| a.as_slice()) {
+            Some([a, b]) => Ok((Self::index_of(a, what)?, Self::index_of(b, what)?)),
+            _ => Err(TcError::Reject(format!("{what} must be a pair of level indices"))),
+        }
+    }
+
+    /// The name an export index stands for, as its canonical index. An
+    /// index is usable only after its name line.
+    fn name_at(&self, i: u32) -> Result<u32, TcError> {
+        match self.name_canon.get(i as usize) {
+            Some(&c) if c != NO_NAME => Ok(c),
+            _ => Err(TcError::Reject(format!("name index {i} is used before its name line"))),
+        }
+    }
+
+    fn require_name(&self, v: &Value, k: &str) -> Result<u32, TcError> {
+        self.name_at(Self::require_u32(v, k)?)
+    }
+
+    /// A list of names (`levelParams`, `all`, `ctors`). An absent list is
+    /// empty; one that is there must be an array of defined name indices.
+    fn name_list(&self, v: &Value, k: &str) -> Result<Vec<u32>, TcError> {
+        match v.get(k) {
+            None => Ok(Vec::new()),
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|x| self.name_at(Self::index_of(x, &format!("an entry of `{k}`"))?))
+                .collect(),
+            Some(_) => Err(TcError::Reject(format!("field `{k}` must be an array of name indices"))),
+        }
+    }
+
+    fn level_at(&self, i: u32) -> Result<Level, TcError> {
+        match self.levels.get(i as usize) {
+            Some(Some(l)) => Ok(l.clone()),
+            _ => Err(TcError::Reject(format!("level index {i} is used before its level line"))),
+        }
     }
     fn expr_at(&self, i: u32) -> Result<Expr, TcError> {
         match self.exprs.get(i as usize) {
@@ -231,109 +332,179 @@ impl Parser {
             None => Err(TcError::Reject(format!("expr index {i} is out of range"))),
         }
     }
+    /// The expression a record's field `k` refers to.
+    fn expr_field(&self, v: &Value, k: &str) -> Result<Expr, TcError> {
+        self.expr_at(Self::require_u32(v, k)?)
+    }
 
-    fn handle_name(&mut self, idx: u32, v: &Value) {
-        let full = if let Some(s) = v.get("str") {
-            let pre = Self::get_u32(s, "pre");
-            let seg = Self::get_str(s, "str");
-            let parent = &*self.names[pre as usize];
-            if parent.is_empty() {
-                seg.to_string()
-            } else {
-                format!("{}.{}", parent, seg)
-            }
+    /// A name line fixes what its index means, once. The prefix must have
+    /// its own line already (index 0 is the anonymous name): a name spelled
+    /// while its prefix slot was still empty used to be read as its bare
+    /// last component, so that `Foo.Nat` was `Nat`. A second line for an
+    /// index must give the same name again: the environment is keyed by
+    /// index while the literal types, the `Nat` extensions, the quotient
+    /// primitives and `Eq` are found by name, so a line that renamed an
+    /// index turned whatever was declared under it into one of those. In
+    /// the official kernel a name is its components and nothing renames a
+    /// constant.
+    ///
+    /// Two indices may carry one name; the second is then only another way
+    /// to write the first (`name_canon`).
+    fn handle_name(&mut self, v: &Value) -> Result<(), TcError> {
+        let idx = Self::require_u32(v, "in")?;
+        if idx == NO_NAME {
+            return Err(TcError::Reject(format!("name index {idx} is out of range")));
+        }
+        let (pre, component) = if let Some(s) = v.get("str") {
+            let seg = s
+                .get("str")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| TcError::Reject("name line: `str` must be a string".into()))?;
+            (Self::require_u32(s, "pre")?, render_str_component(seg))
         } else if let Some(n) = v.get("num") {
-            let pre = Self::get_u32(n, "pre");
-            let i = n.get("i").and_then(|x| x.as_u64()).unwrap_or(0);
-            let parent = &*self.names[pre as usize];
-            if parent.is_empty() {
-                format!("{}", i)
-            } else {
-                format!("{}.{}", parent, i)
-            }
+            let i = match n.get("i") {
+                Some(Value::Number(i)) if i.is_u64() => i.to_string(),
+                _ => return Err(TcError::Reject("name line: `i` must be a natural number".into())),
+            };
+            (Self::require_u32(n, "pre")?, i)
         } else {
-            String::new()
+            return Err(TcError::Reject("name line is neither `str` nor `num`".into()));
         };
-        while self.names.len() <= idx as usize {
-            self.names.push(Rc::new(String::new()));
+        let parent = match self.name_canon.get(pre as usize) {
+            Some(&c) if c != NO_NAME => c,
+            _ => {
+                return Err(TcError::Reject(format!(
+                    "name index {idx} has prefix {pre}, which has no name line yet"
+                )))
+            }
+        };
+        let full = if parent == 0 {
+            component
+        } else {
+            format!("{}.{}", self.names[parent as usize], component)
+        };
+        if self.name_canon.len() <= idx as usize {
+            self.name_canon.resize(idx as usize + 1, NO_NAME);
+            self.names.resize(idx as usize + 1, self.names[0].clone());
         }
-        if let Some(prev) = self.name_by_str.insert(full.clone(), idx) {
-            if prev != idx {
-                self.spelling_dups
-                    .entry(full.clone())
-                    .or_insert_with(|| vec![prev])
-                    .push(idx);
+        // The index that already stands for this name, if the name has one.
+        let known = self.name_by_str.get(&full).copied();
+        match self.name_canon[idx as usize] {
+            NO_NAME => match known {
+                Some(first) => {
+                    self.name_canon[idx as usize] = first;
+                    self.aliased_names = true;
+                }
+                None => {
+                    self.name_canon[idx as usize] = idx;
+                    self.names[idx as usize] = Rc::new(full.clone());
+                    self.name_by_str.insert(full, idx);
+                }
+            },
+            prev if known == Some(prev) => {}
+            prev => {
+                let was = if prev == 0 { "the anonymous name" } else { self.names[prev as usize].as_str() };
+                return Err(TcError::Reject(format!(
+                    "name index {idx} is {was}; a second name line spells it `{full}`"
+                )));
             }
         }
-        self.names[idx as usize] = Rc::new(full);
+        Ok(())
     }
 
-    fn handle_level(&mut self, idx: u32, v: &Value) {
+    fn handle_level(&mut self, v: &Value) -> Result<(), TcError> {
+        let idx = Self::require_u32(v, "il")?;
         let l = if let Some(a) = v.get("succ") {
-            level::succ(self.level_at(a.as_u64().unwrap() as u32))
+            level::succ(self.level_at(Self::index_of(a, "`succ`")?)?)
         } else if let Some(m) = v.get("max") {
-            let (a, b) = Self::pair_u32(m);
-            level::max(self.level_at(a), self.level_at(b))
+            let (a, b) = Self::pair_u32(m, "`max`")?;
+            level::max(self.level_at(a)?, self.level_at(b)?)
         } else if let Some(m) = v.get("imax") {
-            let (a, b) = Self::pair_u32(m);
-            level::imax(self.level_at(a), self.level_at(b))
+            let (a, b) = Self::pair_u32(m, "`imax`")?;
+            level::imax(self.level_at(a)?, self.level_at(b)?)
         } else if let Some(p) = v.get("param") {
-            level::param(p.as_u64().unwrap() as u32)
+            level::param(self.name_at(Self::index_of(p, "`param`")?)?)
         } else {
-            level::zero()
+            return Err(TcError::Reject("unknown level kind".into()));
         };
-        while self.levels.len() <= idx as usize {
-            self.levels.push(level::zero());
+        if self.levels.len() <= idx as usize {
+            self.levels.resize(idx as usize + 1, None);
         }
-        self.levels[idx as usize] = l;
+        self.levels[idx as usize] = Some(l);
+        Ok(())
     }
 
-    fn handle_expr(&mut self, idx: u32, v: &Value) -> Result<(), TcError> {
+    /// A binder's name is not part of the term, but the index is a name
+    /// reference like any other and must have its line.
+    fn check_binder_name(&self, b: &Value) -> Result<(), TcError> {
+        match b.get("name") {
+            None => Ok(()),
+            Some(n) => self.name_at(Self::index_of(n, "binder `name`")?).map(|_| ()),
+        }
+    }
+
+    fn handle_expr(&mut self, v: &Value) -> Result<(), TcError> {
+        let idx = Self::require_u32(v, "ie")?;
         let e = if let Some(l) = v.get("sort") {
-            expr::sort(self.level_at(l.as_u64().unwrap() as u32))
+            expr::sort(self.level_at(Self::index_of(l, "`sort`")?)?)
         } else if let Some(c) = v.get("const") {
-            let name = Self::get_u32(c, "name");
-            let us = Self::get_vec_u32(c, "us")
-                .into_iter()
-                .map(|i| self.level_at(i))
-                .collect();
+            let name = self.require_name(c, "name")?;
+            let us = match c.get("us") {
+                None => Vec::new(),
+                Some(Value::Array(us)) => us
+                    .iter()
+                    .map(|u| self.level_at(Self::index_of(u, "an entry of `us`")?))
+                    .collect::<Result<_, _>>()?,
+                Some(_) => return Err(TcError::Reject("field `us` must be an array of level indices".into())),
+            };
             expr::const_(name, us)
         } else if let Some(b) = v.get("bvar") {
-            expr::bvar(b.as_u64().unwrap() as u32)
+            match b.as_u64() {
+                Some(i) => expr::bvar(i.min(BVAR_UNBOUND as u64) as u32),
+                None => return Err(TcError::Reject("`bvar` must be a natural number".into())),
+            }
         } else if let Some(a) = v.get("app") {
-            let f = self.expr_at(Self::get_u32(a, "fn"))?;
-            let x = self.expr_at(Self::get_u32(a, "arg"))?;
+            let f = self.expr_field(a, "fn")?;
+            let x = self.expr_field(a, "arg")?;
             expr::app(f, x)
         } else if let Some(l) = v.get("lam") {
+            self.check_binder_name(l)?;
             let bi = bi_of(Self::get_str(l, "binderInfo"));
-            let ty = self.expr_at(Self::get_u32(l, "type"))?;
-            let body = self.expr_at(Self::get_u32(l, "body"))?;
+            let ty = self.expr_field(l, "type")?;
+            let body = self.expr_field(l, "body")?;
             expr::lam(bi, ty, body)
         } else if let Some(p) = v.get("forallE") {
+            self.check_binder_name(p)?;
             let bi = bi_of(Self::get_str(p, "binderInfo"));
-            let ty = self.expr_at(Self::get_u32(p, "type"))?;
-            let body = self.expr_at(Self::get_u32(p, "body"))?;
+            let ty = self.expr_field(p, "type")?;
+            let body = self.expr_field(p, "body")?;
             expr::pi(bi, ty, body)
         } else if let Some(l) = v.get("letE") {
-            let ty = self.expr_at(Self::get_u32(l, "type"))?;
-            let val = self.expr_at(Self::get_u32(l, "value"))?;
-            let body = self.expr_at(Self::get_u32(l, "body"))?;
+            self.check_binder_name(l)?;
+            let ty = self.expr_field(l, "type")?;
+            let val = self.expr_field(l, "value")?;
+            let body = self.expr_field(l, "body")?;
             expr::let_(ty, val, body)
         } else if let Some(p) = v.get("proj") {
-            let s = Self::get_u32(p, "typeName");
-            let i = Self::get_u32(p, "idx");
-            let e2 = self.expr_at(Self::get_u32(p, "struct"))?;
+            let s = self.require_name(p, "typeName")?;
+            let i = Self::require_u32(p, "idx")?;
+            let e2 = self.expr_field(p, "struct")?;
             expr::proj(s, i, e2)
         } else if let Some(n) = v.get("natVal") {
-            let s = n.as_str().unwrap_or("0");
-            let n: BigUint = s.parse().unwrap_or_default();
+            let n = n
+                .as_str()
+                .and_then(parse_nat_literal)
+                .ok_or_else(|| TcError::Reject("`natVal` must be a string of decimal digits".into()))?;
             expr::lit_nat(n)
         } else if let Some(s) = v.get("strVal") {
-            let s = s.as_str().unwrap_or("").to_string();
+            let s = s
+                .as_str()
+                .ok_or_else(|| TcError::Reject("`strVal` must be a string".into()))?
+                .to_string();
             expr::lit_str(s)
         } else if let Some(m) = v.get("mdata") {
             // Metadata wraps an expr; ignore metadata, use inner expr.
-            self.expr_at(Self::get_u32(m, "expr"))?
+            self.expr_field(m, "expr")?
         } else {
             return Err(TcError::Reject("unknown expr kind".into()));
         };
@@ -366,35 +537,36 @@ impl Parser {
         self.names.get(n as usize).map(|s| s.as_str()).unwrap_or("")
     }
 
-    /// A declaration's name must be new both as an index and as a spelled
-    /// name. The second check is the one that matters: two indices may
-    /// spell the same name, and the kernel knows only the name. Both are
-    /// read off the environment, so a rolled-back inductive block leaves
-    /// nothing behind.
+    /// A declaration's name must be new. `name` is canonical, so this is
+    /// about the name and not about the index the record happened to use.
+    /// It is read off the environment, so a rolled-back inductive block
+    /// leaves nothing behind.
     fn reject_if_dup(&self, name: u32) -> Result<(), TcError> {
-        let spelled = self.name_str(name);
-        if self.env.get(name).is_some() || self.declared(spelled).is_some() {
-            return Err(TcError::Reject(format!("duplicate declaration of {spelled}")));
+        if self.env.get(name).is_some() {
+            return Err(TcError::Reject(format!("duplicate declaration of {}", self.name_str(name))));
         }
         Ok(())
     }
 
-    /// The index of the declaration spelled `s`, if there is one: what the
-    /// by-name lookups (`Nat` and `String` literals, the quotient
-    /// primitives, `Eq`) must resolve through, since a name index that is
-    /// never declared must not shadow the constant that is.
+    /// The declaration named `s`, if there is one: what the by-name lookups
+    /// (`Nat` and `String` literals, the quotient primitives, `Eq`) resolve
+    /// through. `s` is a rendering as in `names`; a name that merely has a
+    /// name line is not a constant.
     fn declared(&self, s: &str) -> Option<u32> {
-        match self.spelling_dups.get(s) {
-            Some(indices) => indices.iter().copied().find(|i| self.env.get(*i).is_some()),
-            None => self.name_by_str.get(s).copied().filter(|i| self.env.get(*i).is_some()),
-        }
+        self.name_by_str.get(s).copied().filter(|i| self.env.get(*i).is_some())
     }
 
+    /// A checker over the current environment.
+    fn checker(&self) -> Checker<'_> {
+        Checker::new(&self.env, &self.names, self.declared("Nat"), self.declared("String"))
+            .with_name_index(&self.name_by_str)
+            .with_proof_store(self.proofs.as_ref())
+    }
 
     fn handle_def_like(&mut self, kind: &str, v: &Value) -> Result<(), TcError> {
-        let name = Self::require_u32(v, "name")?;
+        let name = self.require_name(v, "name")?;
         self.reject_if_dup(name)?;
-        let level_params = Self::get_vec_u32(v, "levelParams");
+        let level_params = self.name_list(v, "levelParams")?;
         let typ = self.require_expr(v, "type")?;
         self.check_universe_params(&level_params, &[("type", &typ)])?;
         match kind {
@@ -483,8 +655,8 @@ impl Parser {
                 )))
             }
         };
-        let name = Self::require_u32(v, "name")?;
-        let level_params = Self::get_vec_u32(v, "levelParams");
+        let name = self.require_name(v, "name")?;
+        let level_params = self.name_list(v, "levelParams")?;
         let typ = self.require_expr(v, "type")?;
         self.check_quot_declaration(&kind, name, &level_params, &typ)?;
         self.reject_if_dup(name)?;
@@ -625,7 +797,7 @@ impl Parser {
         &mut self,
         v: &Value,
         undo: &mut InductiveUndo,
-    ) -> Result<(), TcError> {
+    ) -> Result<Vec<u32>, TcError> {
         let types = v
             .get("types")
             .and_then(|x| x.as_array())
@@ -656,17 +828,19 @@ impl Parser {
         // never declares).
         let mut declared_ctors: std::collections::HashMap<u32, Vec<u32>> =
             std::collections::HashMap::new();
+        let mut type_names: Vec<u32> = Vec::with_capacity(types.len());
         for t in &types {
-            let name = Self::require_u32(t, "name")?;
+            let name = self.require_name(t, "name")?;
             self.reject_if_dup(name)?;
-            let level_params = Self::get_vec_u32(t, "levelParams");
+            type_names.push(name);
+            let level_params = self.name_list(t, "levelParams")?;
             let typ = self.require_expr(t, "type")?;
             self.check_universe_params(&level_params, &[("type", &typ)])
                 .map_err(|e| self.annotate(name, e))?;
             let num_params = Self::require_u32(t, "numParams")?;
             let num_indices = Self::require_u32(t, "numIndices")?;
-            let all = Self::get_vec_u32(t, "all");
-            let ctor_names = Self::get_vec_u32(t, "ctors");
+            let all = self.name_list(t, "all")?;
+            let ctor_names = self.name_list(t, "ctors")?;
             let is_rec = Self::require_bool(t, "isRec")?;
             let is_unsafe = Self::get_bool(t, "isUnsafe");
             if is_unsafe {
@@ -695,13 +869,13 @@ impl Parser {
             );
         }
         for c in &ctors {
-            let name = Self::require_u32(c, "name")?;
+            let name = self.require_name(c, "name")?;
             self.reject_if_dup(name)?;
-            let level_params = Self::get_vec_u32(c, "levelParams");
+            let level_params = self.name_list(c, "levelParams")?;
             let typ = self.require_expr(c, "type")?;
             self.check_universe_params(&level_params, &[("type", &typ)])
                 .map_err(|e| self.annotate(name, e))?;
-            let induct = Self::require_u32(c, "induct")?;
+            let induct = self.require_name(c, "induct")?;
             let cidx = Self::require_u32(c, "cidx")?;
             let num_params = Self::require_u32(c, "numParams")?;
             let num_fields = Self::require_u32(c, "numFields")?;
@@ -764,29 +938,27 @@ impl Parser {
             num_indices: u32,
             num_motives: u32,
             num_minors: u32,
+            k: Option<bool>,
             rules: Vec<RecRule>,
         }
 
         // Decode recursor records without exposing any of them through the
-        // environment.  Their redundant type and count fields are assertions
+        // environment.  Their type, counts, `k` and rule list are assertions
         // to compare with reconstruction, never inputs to later typing.
         let mut pending_recs = Vec::with_capacity(recs.len());
         let mut pending_names = FxHashSet::default();
         for r in &recs {
-            let name = Self::require_u32(r, "name")?;
+            let name = self.require_name(r, "name")?;
             self.reject_if_dup(name)?;
             if !pending_names.insert(name) {
                 return Err(TcError::Reject(format!(
                     "duplicate declaration of {}",
-                    self.names
-                        .get(name as usize)
-                        .map(|s| s.as_str())
-                        .unwrap_or("?")
+                    self.name_str(name)
                 )));
             }
-            let level_params = Self::get_vec_u32(r, "levelParams");
+            let level_params = self.name_list(r, "levelParams")?;
             let typ = self.require_expr(r, "type")?;
-            let all = Self::get_vec_u32(r, "all");
+            let all = self.name_list(r, "all")?;
             let num_params = Self::require_u32(r, "numParams")?;
             let num_indices = Self::require_u32(r, "numIndices")?;
             let num_motives = Self::require_u32(r, "numMotives")?;
@@ -795,24 +967,28 @@ impl Parser {
             if is_unsafe {
                 return Err(TcError::Reject(format!(
                     "unsafe recursor `{}`",
-                    self.names
-                        .get(name as usize)
-                        .map(|s| s.as_str())
-                        .unwrap_or("?")
+                    self.name_str(name)
                 )));
             }
-            let rules = if let Some(arr) = r.get("rules").and_then(|x| x.as_array()) {
-                let mut out = Vec::with_capacity(arr.len());
-                for rule in arr {
-                    out.push(RecRule {
-                        ctor: Self::require_u32(rule, "ctor")?,
-                        nfields: Self::require_u32(rule, "nfields")?,
-                        rhs: self.require_rule_body(rule)?,
-                    });
+            let k = match r.get("k") {
+                None => None,
+                Some(Value::Bool(k)) => Some(*k),
+                Some(_) => return Err(TcError::Reject("field `k` must be a bool".into())),
+            };
+            let rules = match r.get("rules") {
+                None => Vec::new(),
+                Some(Value::Array(arr)) => {
+                    let mut out = Vec::with_capacity(arr.len());
+                    for rule in arr {
+                        out.push(RecRule {
+                            ctor: self.require_name(rule, "ctor")?,
+                            nfields: Self::require_u32(rule, "nfields")?,
+                            rhs: self.require_rule_body(rule)?,
+                        });
+                    }
+                    out
                 }
-                out
-            } else {
-                Vec::new()
+                Some(_) => return Err(TcError::Reject("field `rules` must be an array".into())),
             };
             pending_recs.push(PendingRecursor {
                 name,
@@ -823,6 +999,7 @@ impl Parser {
                 num_indices,
                 num_motives,
                 num_minors,
+                k,
                 rules,
             });
         }
@@ -830,8 +1007,7 @@ impl Parser {
         // Reconstruct in declaration order, followed by nested auxiliaries in
         // specialization order. Serialized signatures stay outside the
         // environment until every recursor in the block has been compared.
-        // Exported `numNested`, `k`, and rule RHS are not construction inputs.
-        let type_names: Vec<u32> = types.iter().map(|t| Self::get_u32(t, "name")).collect();
+        // Exported `numNested` and rule RHS are not construction inputs.
         if type_names.is_empty() {
             return Err(TcError::Reject("empty inductive group".into()));
         }
@@ -840,15 +1016,11 @@ impl Parser {
                 "inductive group is missing recursors".into(),
             ));
         }
-        let nat_ref = self.declared("Nat");
-        let string_ref = self.declared("String");
         for &name in &type_names {
-            Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
-                .check_inductive_group_structure(name)?;
+            self.checker().check_inductive_group_structure(name)?;
         }
         let supplied_level_params = pending_recs[0].level_params.clone();
-        let derived = Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
-            .reconstruct_recursors(&type_names, &supplied_level_params)?;
+        let derived = self.checker().reconstruct_recursors(&type_names, &supplied_level_params)?;
         if pending_recs.len() != derived.len() {
             return Err(TcError::Reject(format!(
                 "inductive group has {} recursors but reconstruction requires {}",
@@ -857,6 +1029,12 @@ impl Parser {
             )));
         }
 
+        // `I.rec` is the name Lean reserves for `I`'s recursor, and it is the
+        // name every user of the recursor is compiled against; the nested
+        // auxiliaries are `I.rec_1`, `I.rec_2`, … after the block's first
+        // type. Each reconstructed recursor is matched to the record of that
+        // name, and there are as many records as reconstructed recursors, so
+        // no record goes by any other name.
         let first_name = self.name_str(type_names[0]).to_string();
         let mut ordered = Vec::with_capacity(derived.len());
         for (i, d) in derived.iter().enumerate() {
@@ -885,7 +1063,7 @@ impl Parser {
                     "recursor `{rname}` metadata does not match reconstruction"
                 )));
             }
-            Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
+            self.checker()
                 .validate_reconstructed_type(
                     &r.supplied_type,
                     &r.level_params,
@@ -905,6 +1083,29 @@ impl Parser {
                         "recursor `{rname}` type reconstruction: {msg}"
                     )),
                 })?;
+            // The rule list is the recursor's own member's constructors, in
+            // their declared order, each with its field count. Iota finds a
+            // recursor's constructors and, where the recursor's type cannot
+            // tell two minors apart, the minor's position through this list
+            // (`rec_owns_ctor`, `ctor_minor_index`), so an exported list in
+            // another order selected another minor premise.
+            let supplied_rules: Vec<(u32, u32)> =
+                r.rules.iter().map(|rule| (rule.ctor, rule.nfields)).collect();
+            if supplied_rules != d.rules {
+                return Err(TcError::Reject(format!(
+                    "recursor `{rname}` rules do not match reconstruction"
+                )));
+            }
+            // K-like reduction is decided from the declaration, here and at
+            // every use; a supplied flag has to agree with it.
+            if let Some(k) = r.k {
+                if k != d.k {
+                    return Err(TcError::Reject(format!(
+                        "recursor `{rname}` has k={k} but reconstruction gives k={}",
+                        d.k
+                    )));
+                }
+            }
             // Store the reconstructed type under this declaration's own
             // validated alpha labels.  No serialized type structure crosses
             // the transaction boundary.
@@ -915,7 +1116,16 @@ impl Parser {
             stored.level_params = r.level_params.clone();
             ordered.push((r, stored));
         }
-        for (r, d) in ordered {
+        // Ownership and the group's minor order follow reconstruction, not
+        // the records: the i-th declared type is eliminated by the i-th
+        // reconstructed recursor, and the minors of every recursor in the
+        // block are the members' constructors in member order, which is the
+        // order of `ordered` (Lean's `rec_k`).
+        let group: Vec<u32> = ordered.iter().map(|(r, _)| r.name).collect();
+        for (i, (r, d)) in ordered.into_iter().enumerate() {
+            if let Some(owner) = type_names.get(i) {
+                undo.insert_owner(&mut self.env, *owner, r.name);
+            }
             undo.insert_constant(
                 &mut self.env,
                 r.name,
@@ -928,148 +1138,15 @@ impl Parser {
                     num_motives: d.num_motives,
                     num_minors: d.num_minors,
                     rules: r.rules,
-                    // Preserve the importer policy: ignore serialized `k`.
                     k: d.k,
                     is_unsafe: false,
                 },
             );
         }
-        let nested = derived.len() > type_names.len();
-        // `I.rec` is the name Lean reserves for `I`'s recursor, and it is the
-        // name every user of the recursor is compiled against. An export
-        // that supplies `I.not_rec` instead is not offering a constant the
-        // kernel would ever have built, so no amount of checking its *type*
-        // makes it legitimate. Nested auxiliaries are `I.rec_1`, `I.rec_2`,
-        // …; identity for iota stays rule constructors (see above), this
-        // only fixes what the constant may be called.
-        for r in &recs {
-            let rname = Self::get_u32(r, "name");
-            let rstr = self.name_str(rname);
-            let named_for_group = type_names.iter().any(|t| {
-                let tstr = self.name_str(*t);
-                match rstr.strip_prefix(tstr) {
-                    Some(".rec") => true,
-                    Some(suf) => suf
-                        .strip_prefix(".rec_")
-                        .is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit())),
-                    None => false,
-                }
-            });
-            if !named_for_group {
-                return Err(TcError::Reject(format!(
-                    "recursor `{rstr}` is not named `I.rec` for an inductive in this group"
-                )));
-            }
+        for n in &group {
+            undo.insert_group(&mut self.env, *n, group.clone());
         }
-        let mut seen_rec_for: FxHashSet<u32> = FxHashSet::default();
-        for r in &recs {
-            let rname = Self::get_u32(r, "name");
-            let rstr = self
-                .names
-                .get(rname as usize)
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            let all = Self::get_vec_u32(r, "all");
-            let rules_arr = r.get("rules").and_then(|x| x.as_array());
-            let n_rules = rules_arr.map(|a| a.len()).unwrap_or(0);
-            let mut claimed: Vec<u32> = Vec::new();
-            if let Some(arr) = rules_arr {
-                for rule in arr {
-                    let ctor = Self::get_u32(rule, "ctor");
-                    if let Some(ConstantInfo::Constructor { induct, .. }) = self.env.get(ctor) {
-                        if type_names.contains(induct) && !claimed.contains(induct) {
-                            claimed.push(*induct);
-                        }
-                    }
-                }
-            }
-            if claimed.is_empty() && n_rules == 0 {
-                for t in &all {
-                    if type_names.contains(t) && !claimed.contains(t) {
-                        claimed.push(*t);
-                    }
-                }
-                if claimed.is_empty() && !nested {
-                    return Err(TcError::Reject(format!(
-                        "recursor `{rstr}` does not recursor any type in this inductive group"
-                    )));
-                }
-            }
-            for owner in &claimed {
-                if !seen_rec_for.insert(*owner) {
-                    return Err(TcError::Reject(format!(
-                        "duplicate recursor for type {owner}"
-                    )));
-                }
-                undo.insert_owner(&mut self.env, *owner, rname);
-            }
-            let num_motives = Self::get_u32(r, "numMotives");
-            let motives_ok = num_motives as usize == all.len()
-                || num_motives as usize == type_names.len()
-                || (nested && num_motives as usize >= type_names.len());
-            if !motives_ok {
-                return Err(TcError::Reject(format!(
-                    "recursor `{rstr}` has numMotives={num_motives} but group size is {}",
-                    type_names.len()
-                )));
-            }
-            let mut nctors = 0u32;
-            for tname in &type_names {
-                if let Some(ConstantInfo::InductiveType { ctors, .. }) = self.env.get(*tname) {
-                    nctors += ctors.len() as u32;
-                }
-            }
-            let num_minors = Self::get_u32(r, "numMinors");
-            let minors_ok = if nested {
-                num_minors >= nctors
-            } else {
-                num_minors == nctors
-            };
-            if !minors_ok {
-                return Err(TcError::Reject(format!(
-                    "recursor `{rstr}` has numMinors={num_minors} but constructor count is {nctors}"
-                )));
-            }
-        }
-        {
-            // Minor concatenation is Lean's rec_k order (main, then nested
-            // types in specialization order). Main = recs in `rec_of` (rule
-            // constructors), not the pretty suffix `.rec`. Nested recs with
-            // the same container (`Value.rec_3` / `rec_4`, both `List`) share
-            // `ctor.induct`; `I.rec_N` is the specialization index — order
-            // only, not a reject gate. Unique-container first-occurrence
-            // put `List` before `Map` and rejected `Value._sizeOf_5_eq`.
-            let mut group: Vec<u32> = recs.iter().map(|r| Self::get_u32(r, "name")).collect();
-            group.sort_by_key(|n| {
-                let (tag, rec_k) = rec_sort_key(
-                    self.names
-                        .get(*n as usize)
-                        .map(|s| s.as_str())
-                        .unwrap_or(""),
-                );
-                if self.env.rec_of.values().any(|r| r == n) {
-                    (0u8, 0u32)
-                } else {
-                    (tag.saturating_add(1), rec_k)
-                }
-            });
-            for n in &group {
-                undo.insert_group(&mut self.env, *n, group.clone());
-            }
-        }
-        for t in &type_names {
-            if !self.env.rec_of.contains_key(t) {
-                let tstr = self
-                    .names
-                    .get(*t as usize)
-                    .map(|s| s.as_str())
-                    .unwrap_or("?");
-                return Err(TcError::Reject(format!(
-                    "inductive `{tstr}` is missing a recursor"
-                )));
-            }
-        }
-        Ok(())
+        Ok(type_names)
     }
 
     /// Nested specializations actually occurring in constructor fields of
@@ -1297,7 +1374,9 @@ impl Parser {
             return;
         }
         let Some(lt) = self.lifetimes.as_ref() else { return };
-        if lt.name_referenced(name) {
+        // The pre-pass knows which name indices the expressions mention, and
+        // an index is the name only while no name has a second index.
+        if self.aliased_names || lt.name_referenced(name) {
             return;
         }
         if let Some(ConstantInfo::Theorem { value, .. }) = self.env.consts.get_mut(&name) {
@@ -1307,20 +1386,37 @@ impl Parser {
 
     /// `Ok(true)` for a declaration record (one kernel transaction), `Ok(false)`
     /// for names, levels, expressions and metadata.
+    ///
+    /// A line is one record of one kind, as in lean4export's own reader: a
+    /// table entry is its index key and its payload, a declaration is its
+    /// one key. Anything else is rejected, not skipped: a record this reader
+    /// does not know could be a declaration it then never checks.
     fn handle_line(&mut self, v: &Value) -> Result<bool, TcError> {
-        if v.get("meta").is_some() {
+        let Some(obj) = v.as_object() else {
+            return Err(TcError::Reject("export line is not a JSON object".into()));
+        };
+        // A table entry without its payload is left to its handler, which
+        // says what is missing.
+        let table = obj.contains_key("in") || obj.contains_key("il") || obj.contains_key("ie");
+        if obj.len() > if table { 2 } else { 1 } {
+            let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+            return Err(TcError::Reject(format!(
+                "export record with keys {keys:?} is not one record"
+            )));
+        }
+        if obj.contains_key("meta") {
             return Ok(false);
         }
-        if let Some(idx) = v.get("in").and_then(|x| x.as_u64()) {
-            self.handle_name(idx as u32, v);
+        if obj.contains_key("in") {
+            self.handle_name(v)?;
             return Ok(false);
         }
-        if let Some(idx) = v.get("il").and_then(|x| x.as_u64()) {
-            self.handle_level(idx as u32, v);
+        if obj.contains_key("il") {
+            self.handle_level(v)?;
             return Ok(false);
         }
-        if let Some(idx) = v.get("ie").and_then(|x| x.as_u64()) {
-            self.handle_expr(idx as u32, v)?;
+        if obj.contains_key("ie") {
+            self.handle_expr(v)?;
             return Ok(false);
         }
         if let Some(d) = v.get("axiom") {
@@ -1354,16 +1450,9 @@ impl Parser {
             // later declaration in the stream.
             let mut undo = InductiveUndo::default();
             let result = (|| {
-                self.handle_inductive_block(d, &mut undo)?;
-                let names: Vec<u32> = d
-                    .get("types")
-                    .and_then(|x| x.as_array())
-                    .map(|a| a.iter().map(|t| Self::get_u32(t, "name")).collect())
-                    .unwrap_or_default();
-                let nat_ref = self.name_by_str.get("Nat").copied();
-                let string_ref = self.name_by_str.get("String").copied();
+                let names = self.handle_inductive_block(d, &mut undo)?;
                 for n in names {
-                    Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
+                    self.checker()
                         .check_inductive_group(n)
                         .map_err(|e| self.annotate(n, e))?;
                 }
@@ -1374,11 +1463,12 @@ impl Parser {
             }
             return result.map(|()| true);
         }
-        Ok(false)
+        let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        Err(TcError::Reject(format!("unknown export record with keys {keys:?}")))
     }
 
     fn check_last(&mut self, d: &Value, kind: &str) -> Result<(), TcError> {
-        let name = Self::require_u32(d, "name")?;
+        let name = self.require_name(d, "name")?;
         self.decl_count += 1;
         let nm = self
             .names
@@ -1435,9 +1525,7 @@ impl Parser {
                 }
             }
         }
-        let nat_ref = self.declared("Nat");
-        let string_ref = self.declared("String");
-        Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
+        self.checker()
             .check_decl(name, kind)
             .map_err(|e| self.annotate(name, e))?;
         self.release_theorem_value(name);
@@ -1447,8 +1535,8 @@ impl Parser {
     /// `annotate` with the record's own `name`, for errors raised while a
     /// declaration is read, before `check_decl` sees it.
     fn annotate_record(&self, d: &Value, e: TcError) -> TcError {
-        match d.get("name").and_then(|x| x.as_u64()) {
-            Some(n) if (n as usize) < self.names.len() => self.annotate(n as u32, e),
+        match d.get("name").and_then(|x| x.as_u64()).map(|n| self.name_canon.get(n as usize)) {
+            Some(Some(&c)) if c != NO_NAME => self.annotate(c, e),
             _ => e,
         }
     }
@@ -1466,8 +1554,6 @@ impl Parser {
         }
     }
 }
-
-fn kind_or_direct(_v: &Value) {}
 
 
 
@@ -1668,20 +1754,4 @@ fn expr_occurs_names(e: &Expr, names: &[u32]) -> bool {
         ExprData::Proj(_, _, v) => expr_occurs_names(v, names),
         _ => false,
     }
-}
-
-
-/// Lean nested recursor numbering: `.rec` first, then `.rec_1`, `.rec_2`, …
-/// Used for rec_group minor order only, not extra-rec reject.
-fn rec_sort_key(name: &str) -> (u8, u32) {
-    if let Some((_, suf)) = name.rsplit_once(".rec_") {
-        if let Ok(n) = suf.parse::<u32>() {
-            return (1, n);
-        }
-        return (2, 0);
-    }
-    if name.ends_with(".rec") {
-        return (0, 0);
-    }
-    (3, 0)
 }

@@ -1,0 +1,11 @@
+{"meta":{"exporter":{"name":"handcrafted","version":"0.1.0"},"format":{"version":"3.1.0"},"lean":{"githash":"5045d0056413266e57c625dcd7c365b10e377c52","version":"4.34.1"}}}
+{"sort":0,"ie":0}
+{"in":1,"str":{"pre":0,"str":"P"}}
+{"axiom":{"isUnsafe":false,"levelParams":[],"name":1,"type":0}}
+{"const":{"name":1,"us":[]},"ie":1}
+{"bvar":0,"ie":2}
+{"in":2,"str":{"pre":0,"str":"h"}}
+{"lam":{"binderInfo":"default","name":2,"type":4294967297,"body":4294967298},"ie":3}
+{"forallE":{"binderInfo":"default","name":2,"type":1,"body":1},"ie":4}
+{"in":3,"str":{"pre":0,"str":"t"}}
+{"thm":{"all":[3],"levelParams":[],"name":3,"type":4,"value":3}}

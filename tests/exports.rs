@@ -138,8 +138,13 @@ fn recursor_type_reconstruction_alpha_renamed_auxiliary_accepts() {
     let rec = recursor_record(&mut record, rec_name);
     let supplied = parser.exprs[rec["type"].as_u64().unwrap() as usize].clone().unwrap();
     let old = rec["levelParams"][0].as_u64().unwrap() as u32;
-    // Include the canonicalizer's initial choice to exercise collision avoidance.
-    let renamed = u32::MAX;
+    // A universe parameter is a name, and a name index needs its name line.
+    // (The canonicalizer's own first choice, `u32::MAX`, can no longer be an
+    // export's name index at all.)
+    let renamed = parser.names.len() as u32;
+    parser
+        .run(Cursor::new(format!(r#"{{"in":{renamed},"str":{{"pre":0,"str":"renamedUniverse"}}}}"#)))
+        .expect("name line");
     let subst = kiota::level::subst_map(&[old], &[kiota::level::param(renamed)]);
     let renamed_supplied = expr::instantiate_level_params(&supplied, &subst);
     assert_ne!(renamed_supplied, supplied);
@@ -219,7 +224,7 @@ fn recursor_type_reconstruction_undeclared_universe_rejects() {
 }
 
 #[test]
-fn recursor_type_reconstruction_serialized_k_is_recomputed() {
+fn recursor_type_reconstruction_serialized_k_must_agree() {
     for (fixture_name, rec_name, expected_k) in [
         ("067_eqRec.accept.ndjson", "Eq.rec", true),
         ("recursor-type-reconstruction.accept.ndjson", "LALNest.rec_1", false),
@@ -228,12 +233,20 @@ fn recursor_type_reconstruction_serialized_k_is_recomputed() {
         let rec_name = parser.name_by_str[rec_name];
         let rec = recursor_record(&mut record, rec_name);
         assert_eq!(rec["k"].as_bool(), Some(expected_k));
+        let original = record.clone();
+        let rec = recursor_record(&mut record, rec_name);
         rec["k"] = serde_json::json!(!expected_k);
-        import_record(&mut parser, &record).expect("serialized k remains ignored");
+        let shown = parser.names[rec_name as usize].to_string();
+        // `k` is an assertion about the declaration: a flag that disagrees
+        // with the reconstructed one is rejected, in both directions.
+        assert!(matches!(import_record(&mut parser, &record), Err(TcError::Reject(m))
+            if m == format!("recursor `{shown}` has k={} but reconstruction gives k={expected_k}", !expected_k)));
+        assert!(parser.env.get(rec_name).is_none());
+        import_record(&mut parser, &original).expect("the genuine record");
         let ConstantInfo::Recursor { k, .. } = parser.env.get(rec_name).unwrap() else {
             panic!("expected reconstructed recursor");
         };
-        assert_eq!(*k, expected_k, "stored k must be derived in both directions");
+        assert_eq!(*k, expected_k, "stored k is the derived one");
     }
 }
 
@@ -257,7 +270,7 @@ fn recursor_type_reconstruction_duplicate_name_preserves_prior_state() {
 }
 
 #[test]
-fn recursor_type_reconstruction_late_failure_rolls_back_ownership() {
+fn recursor_rule_list_mismatch_rolls_back_the_block() {
     let (mut parser, original) = pending_inductive(
         "recursor-type-reconstruction.accept.ndjson", "LALNest.rec",
     );
@@ -268,19 +281,20 @@ fn recursor_type_reconstruction_late_failure_rolls_back_ownership() {
     let auxiliary = parser.name_by_str["LALNest.rec_1"];
     let owner = parser.name_by_str["LALNest"];
     let mut missing_owner = original.clone();
-    // A nonempty rule list naming an earlier block's constructor claims no
-    // current owner. This reaches the missing-owner check after rec_group has
-    // been filled, rather than failing during type reconstruction.
+    // A rule list naming an earlier block's constructor: the main recursor
+    // would own no constructor of its own type.
     recursor_record(&mut missing_owner, main)["rules"][0]["ctor"] =
         serde_json::json!(parser.name_by_str["LALWrap.mk"]);
     let mut duplicate_owner = original.clone();
-    // Both recursors now claim the current constructor. Whichever comes first
-    // writes rec_of; the second fails, exercising rollback of that write too.
+    // The auxiliary recursor claims the main type's constructor as well.
     recursor_record(&mut duplicate_owner, auxiliary)["rules"][0]["ctor"] =
         serde_json::json!(parser.name_by_str["LALNest.node"]);
+    // The rule lists are compared with the reconstructed members'
+    // constructors after the block's types and constructors are staged, so
+    // each failure still has a transaction to roll back.
     for (record, expected) in [
-        (missing_owner, "inductive `LALNest` is missing a recursor".to_string()),
-        (duplicate_owner, format!("duplicate recursor for type {owner}")),
+        (missing_owner, "recursor `LALNest.rec` rules do not match reconstruction".to_string()),
+        (duplicate_owner, "recursor `LALNest.rec_1` rules do not match reconstruction".to_string()),
     ] {
         assert!(matches!(import_record(&mut parser, &record), Err(TcError::Reject(m))
             if m == expected));
@@ -1691,4 +1705,238 @@ fn a_prop_field_after_a_data_field_mentioned_under_a_binder_is_not_projected() {
         "proj-prop-after-dependent-data-under-binder.reject.ndjson",
         "[projProp6] cannot project a Prop field that comes after a dependent data field",
     );
+}
+
+// ---- The export's tables: names, levels, expressions ----
+//
+// Fixtures written by `scripts/snd-fixtures/gen.py`.
+
+/// The environment is keyed by name index, and `Nat.succ`, `Quot.mk`, `Eq`
+/// and the literal types are found by name. A second name line that gave a
+/// declared index another name turned `axiom F : Nat → Nat` into
+/// `Nat.succ`, and `t : P (F 4) := (p5 : P 5)` was accepted.
+#[test]
+fn a_name_index_cannot_be_respelled_after_its_declaration() {
+    assert_reject_exact(
+        "name-index-respelled-after-declaration.reject.ndjson",
+        "name index 5 is F; a second name line spells it `Nat.succ`",
+    );
+}
+
+/// The other order: spell an unused index `Nat`, respell it `T`, declare
+/// `axiom T : Type` under it. The first spelling still led to the index, so
+/// `T` typed every literal and `def bad : T := 5` was accepted.
+#[test]
+fn a_name_index_cannot_be_respelled_before_its_declaration() {
+    assert_reject_exact(
+        "name-index-respelled-before-declaration.reject.ndjson",
+        "name index 1 is Nat; a second name line spells it `T`",
+    );
+}
+
+/// A second line that gives an index the name it already has changes
+/// nothing.
+#[test]
+fn a_repeated_name_line_is_accepted() {
+    assert_accept("name-line-repeated.accept.ndjson");
+}
+
+/// A name line read while its prefix slot was empty was spelled as its
+/// last component alone: index 2, `Foo.Nat` once index 1 was spelled, was
+/// `Nat`, and `def five : Foo.Nat := 5` was accepted.
+#[test]
+fn a_name_needs_its_prefix_first() {
+    assert_reject_exact(
+        "name-prefix-not-yet-defined.reject.ndjson",
+        "name index 2 has prefix 1, which has no name line yet",
+    );
+    // With the prefix first the same declarations are read as what they are.
+    assert_reject_exact(
+        "name-foo-nat-is-not-nat.reject.ndjson",
+        "[five] def 5: value type does not match declared type",
+    );
+    let p = parse_accept("name-prefix-defined-first.accept.ndjson");
+    assert!(p.name_by_str.contains_key("Foo.Nat") && !p.name_by_str.contains_key("Nat"));
+}
+
+/// A name is its components. The one-component name `«Nat.succ»` renders
+/// differently from `Nat.succ` and is not the constructor the literal
+/// extension knows; the two-component name is.
+#[test]
+fn a_component_with_a_dot_is_one_component() {
+    assert_reject_exact(
+        "name-one-component-with-dot.reject.ndjson",
+        "[t] theorem 11: value type does not match declared type",
+    );
+    assert_accept("name-nat-succ-two-components.accept.ndjson");
+    let mut p = Parser::new();
+    p.run(Cursor::new(concat!(
+        r#"{"in":1,"str":{"pre":0,"str":"Nat.succ"}}"#, "\n",
+        r#"{"in":2,"str":{"pre":0,"str":"Nat"}}"#, "\n",
+        r#"{"in":3,"str":{"pre":2,"str":"succ"}}"#, "\n",
+        r#"{"in":4,"str":{"pre":2,"str":"0"}}"#, "\n",
+        r#"{"in":5,"num":{"pre":2,"i":0}}"#, "\n",
+        r#"{"in":6,"str":{"pre":2,"str":""}}"#, "\n",
+        r#"{"in":7,"str":{"pre":2,"str":"a»b"}}"#, "\n",
+    )))
+    .unwrap();
+    let rendered: Vec<&str> = p.names[1..].iter().map(|n| n.as_str()).collect();
+    assert_eq!(rendered, ["«Nat.succ»", "Nat", "Nat.succ", "Nat.«0»", "Nat.0", "Nat.«»", "Nat.«a»»b»"]);
+}
+
+/// A name index is usable only after its name line; an unfilled slot is
+/// not the anonymous name.
+#[test]
+fn a_name_index_without_a_name_line_is_rejected() {
+    assert_reject_exact(
+        "name-index-without-name-line.reject.ndjson",
+        "name index 3 is used before its name line",
+    );
+}
+
+/// Two indices that carry one name are that one name: a constant declared
+/// through one is the constant used through the other, and a second
+/// declaration through the other is a duplicate.
+#[test]
+fn two_indices_for_one_name_are_one_name() {
+    let p = parse_accept("name-second-index-is-the-same-name.accept.ndjson");
+    assert_eq!(p.name_by_str["Foo"], 1);
+    assert_eq!(p.names[2].as_str(), "", "the second index is only an alias");
+    assert_reject_exact("duplicate-name-string.reject.ndjson", "[Foo] duplicate declaration of Foo");
+}
+
+/// Two name indices spell `Nat`, one of them never declared. Every check
+/// types a literal by the declared constant; the inductive check went by
+/// the last index with the spelling and rejected `mk : P 5 -> T`.
+#[test]
+fn nat_literal_in_a_constructor_under_a_duplicate_nat_spelling_accepts() {
+    assert_accept("nat-literal-under-duplicate-nat-spelling.accept.ndjson");
+    assert_accept("nat-literal-under-duplicate-nat-spelling-inductive-only.accept.ndjson");
+}
+
+/// The export's de Bruijn indices are natural numbers. `#4294967296` was
+/// truncated to `#0`, so `fun (h : P) => #4294967296` proved `P → P`; and
+/// `#4294967295`, which fits, made the loose range wrap to "closed".
+#[test]
+fn a_bound_variable_index_is_not_truncated() {
+    assert_reject_exact(
+        "bvar-index-beyond-u32.reject.ndjson",
+        "[t] `value` has a bound variable whose index no binder can reach",
+    );
+    assert_reject_exact(
+        "bvar-index-u32-max.reject.ndjson",
+        "[t] `value` has a bound variable whose index no binder can reach",
+    );
+    // A node no declaration uses is not an error, whatever its index.
+    assert_accept("bvar-index-beyond-u32-unused.accept.ndjson");
+}
+
+/// Table references are not truncated either: expression `2^32 + i` is not
+/// expression `i`.
+#[test]
+fn an_expression_reference_is_not_truncated() {
+    assert_reject_exact("expr-index-beyond-u32.reject.ndjson", "field `type` must be a u32");
+}
+
+/// A level slot that no level line filled read as `zero`: `Sort #3` with
+/// only level 5 defined was `Prop`.
+#[test]
+fn a_level_index_without_a_level_line_is_rejected() {
+    assert_reject_exact(
+        "level-index-without-level-line.reject.ndjson",
+        "level index 3 is used before its level line",
+    );
+    assert_accept("level-index-sparse.accept.ndjson");
+}
+
+/// Numerals are decimal digits with single underscores between digits, as
+/// lean4export's own reader takes them. `5_` and `+5` were read as 5 and
+/// anything unparseable as 0.
+#[test]
+fn a_numeral_is_decimal_digits() {
+    for name in [
+        "nat-literal-trailing-separator.reject.ndjson",
+        "nat-literal-signed.reject.ndjson",
+        "nat-literal-not-a-numeral.reject.ndjson",
+    ] {
+        assert_reject_exact(name, "`natVal` must be a string of decimal digits");
+    }
+    assert_accept("nat-literal-separated.accept.ndjson");
+}
+
+/// A record of a kind this reader does not know is rejected, not skipped:
+/// skipped, a declaration would go unchecked. A line is one record.
+#[test]
+fn an_unknown_or_double_record_is_rejected() {
+    assert_reject_exact(
+        "unknown-record-kind.reject.ndjson",
+        r#"unknown export record with keys ["theorem"]"#,
+    );
+    assert_reject_exact(
+        "two-records-on-one-line.reject.ndjson",
+        r#"export record with keys ["axiom", "ie", "sort"] is not one record"#,
+    );
+}
+
+// ---- Recursor records ----
+
+/// `Snd.Tr` nests `C` twice, so two minors of the block's recursors are
+/// for `C.a`. With a major `@C.a (id' Tr)` the recursor's type cannot tell
+/// them apart and iota took the minor's position from the exported rule
+/// list. With `Snd.Tr.rec_1`'s rules listed as `[b, a]`, `X` (which is
+/// `N.z`) reduced to `N.o` and `bad : X = N.o := Eq.refl N.o` was accepted.
+#[test]
+fn recursor_rules_in_another_order_are_rejected() {
+    assert_reject_exact(
+        "recursor-rules-permuted.reject.ndjson",
+        "recursor `Snd.Tr.rec_1` rules do not match reconstruction",
+    );
+    // The same false theorem under the genuine rule list, and the genuine
+    // export with the true one.
+    assert_reject_exact(
+        "recursor-rules-genuine-false-theorem.reject.ndjson",
+        "[Snd.bad] theorem 62: value type does not match declared type",
+    );
+    assert_accept("recursor-rules-nested.accept.ndjson");
+}
+
+/// The rule list is compared in full: field counts and length.
+#[test]
+fn recursor_rule_field_count_and_length_are_checked() {
+    assert_reject_exact(
+        "recursor-rule-nfields-lie.reject.ndjson",
+        "recursor `Snd.Tr.rec` rules do not match reconstruction",
+    );
+    assert_reject_exact(
+        "recursor-rule-missing.reject.ndjson",
+        "recursor `Snd.C.rec` rules do not match reconstruction",
+    );
+}
+
+/// `k` is an assertion, as in the official kernel, which compares the whole
+/// exported recursor with the one it generates.
+#[test]
+fn recursor_k_flag_is_an_assertion() {
+    assert_reject_exact(
+        "recursor-k-flag-lie.reject.ndjson",
+        "recursor `T.rec` has k=true but reconstruction gives k=false",
+    );
+    assert_reject_exact(
+        "recursor-k-flag-denied.reject.ndjson",
+        "recursor `Eq.rec` has k=false but reconstruction gives k=true",
+    );
+    assert_accept("recursor-k-flag.accept.ndjson");
+}
+
+/// `mutual inductive A | mk : B → A; inductive B` (no constructors), as
+/// lean4export writes it. A recursor without rules used to claim every type
+/// of its block, so `B.rec` collided with `A.rec` ("duplicate recursor for
+/// type") and this valid export was rejected. Ownership now follows the
+/// reconstruction order.
+#[test]
+fn a_mutual_block_with_an_empty_member_accepts() {
+    let p = parse_accept("mutual-with-empty-member.accept.ndjson");
+    for (ty, rec) in [("A", "A.rec"), ("B", "B.rec")] {
+        assert_eq!(p.env.rec_of[&p.name_by_str[ty]], p.name_by_str[rec]);
+    }
 }

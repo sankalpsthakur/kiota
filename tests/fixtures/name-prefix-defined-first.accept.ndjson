@@ -1,0 +1,10 @@
+{"meta":{"exporter":{"name":"handcrafted","version":"0.1.0"},"format":{"version":"3.1.0"},"lean":{"githash":"5045d0056413266e57c625dcd7c365b10e377c52","version":"4.34.1"}}}
+{"succ":0,"il":1}
+{"sort":1,"ie":0}
+{"in":3,"str":{"pre":0,"str":"pad"}}
+{"in":1,"str":{"pre":0,"str":"Foo"}}
+{"in":2,"str":{"pre":1,"str":"Nat"}}
+{"axiom":{"isUnsafe":false,"levelParams":[],"name":2,"type":0}}
+{"const":{"name":2,"us":[]},"ie":1}
+{"in":4,"str":{"pre":0,"str":"five"}}
+{"axiom":{"isUnsafe":false,"levelParams":[],"name":4,"type":1}}
