@@ -48,6 +48,22 @@ fn invalid_proof_still_rejects() {
 }
 
 #[test]
+fn malformed_recursor_type_is_a_proof_rejection() {
+    let output = run(
+        include_bytes!("fixtures/recursor-type-reconstruction.reject.ndjson"),
+        None,
+    );
+    assert_eq!(output.status.code(), Some(1), "{:?}", output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "REJECT: recursor `LALNest.rec_1` type does not match reconstructed type"
+        ),
+        "{:?}",
+        output
+    );
+}
+
+#[test]
 fn diagnostic_cutoff_is_not_an_accept_or_reject() {
     let output = run(include_bytes!("fixtures/067_eqRec.accept.ndjson"), Some("0"));
     assert_eq!(output.status.code(), Some(2), "{:?}", output);
