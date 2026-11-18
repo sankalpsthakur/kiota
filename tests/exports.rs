@@ -1647,3 +1647,35 @@ fn nat_literal_in_a_constructor_under_a_duplicate_nat_spelling_accepts() {
     assert_accept("nat-literal-under-duplicate-nat-spelling.accept.ndjson");
     assert_accept("nat-literal-under-duplicate-nat-spelling-inductive-only.accept.ndjson");
 }
+
+/// The cross-declaration caches key on node identity, and every parser on
+/// a thread shares one interner: `const 1` is one node whatever name 1 is.
+/// Here it is `X : Type` in the first export and `X : Prop` in the second,
+/// where `def Y : Type := X` is ill typed. A cache that outlived the first
+/// environment answered `X : Type` and the second export was accepted.
+#[test]
+fn cross_declaration_caches_do_not_outlive_their_environment() {
+    fn export(x_type: u32) -> String {
+        [
+            r#"{"in":1,"str":{"pre":0,"str":"X"}}"#.to_string(),
+            r#"{"in":2,"str":{"pre":0,"str":"Y"}}"#.to_string(),
+            r#"{"il":1,"succ":0}"#.to_string(),
+            r#"{"ie":0,"sort":1}"#.to_string(),
+            r#"{"ie":1,"sort":0}"#.to_string(),
+            r#"{"ie":2,"const":{"name":1,"us":[]}}"#.to_string(),
+            format!(r#"{{"axiom":{{"isUnsafe":false,"levelParams":[],"name":1,"type":{x_type}}}}}"#),
+            r#"{"def":{"all":[2],"hints":"opaque","levelParams":[],"name":2,"safety":"safe","type":0,"value":2}}"#.to_string(),
+        ]
+        .join("\n")
+    }
+    let before = kiota::tc::set_xcache_for_thread(true);
+    let first = Parser::new().run(Cursor::new(export(0)));
+    assert!(first.is_ok(), "X : Type, Y : Type := X should accept, got {first:?}");
+    assert!(kiota::tc::xcache_len() > 0, "the first export left nothing in the caches to leak");
+    let second = Parser::new().run(Cursor::new(export(1)));
+    kiota::tc::set_xcache_for_thread(before);
+    assert!(
+        matches!(second, Err(TcError::Reject(_))),
+        "X : Prop, Y : Type := X should reject, got {second:?}"
+    );
+}

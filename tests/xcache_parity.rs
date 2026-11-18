@@ -142,3 +142,20 @@ fn the_arena_small_suite_has_one_verdict_under_all_cache_flags() {
     assert!(seen > 100, "suite not found under {}", root.display());
     assert!(bad.is_empty(), "verdicts differ:\n{}", bad.join("\n"));
 }
+
+/// `whnf-depth-cap-then-shallow`: with the caches, the hits in `d2` skip the
+/// bottom-up typing pass that keeps its long reduction shallow, the eager
+/// pass runs into the depth cap and fails, and the declaration is checked
+/// again without the caches. That re-check is what accepts it.
+#[test]
+fn a_failure_after_a_cache_hit_is_decided_again_without_the_caches() {
+    let path = fixtures_dir().join("whnf-depth-cap-then-shallow.accept.ndjson");
+    let with = check(&path, &["KIOTA_XCACHE"], true);
+    assert_eq!(with.code, ACCEPT, "{}", with.stderr);
+    assert_eq!(stat(&with, "xcache_rechecks"), 1, "{}", with.stderr);
+    assert_eq!(stat(&with, "xcache_recheck_accepts"), 1, "{}", with.stderr);
+    let without = check(&path, &[], true);
+    assert_eq!(without.code, ACCEPT, "{}", without.stderr);
+    assert_eq!(stat(&without, "xcache_hits"), 0);
+    assert_eq!(stat(&without, "xcache_rechecks"), 0);
+}

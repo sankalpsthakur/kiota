@@ -76,7 +76,21 @@ thread_local! {
     /// Keys are allocation identities, which are never reused.
     static XINFER: RefCell<FxHashMap<usize, (Expr, bool)>> = RefCell::new(FxHashMap::default());
     static XWHNF: RefCell<FxHashMap<usize, Expr>> = RefCell::new(FxHashMap::default());
-    static XCACHE_ON: bool = std::env::var_os("KIOTA_XCACHE").is_some();
+    static XCACHE_ON: Cell<bool> = Cell::new(std::env::var_os("KIOTA_XCACHE").is_some());
+    /// Set while the caches are neither read nor written although the flag
+    /// is on: an inductive block's transaction, and the re-check of a
+    /// declaration that failed after a cache hit (`XcacheSuspended`).
+    static XCACHE_SUSPENDED: Cell<bool> = const { Cell::new(false) };
+    /// What the three maps were filled under: the environment's epoch and
+    /// the constants literals are typed by (`xcache_bind`).
+    static XCACHE_BOUND: Cell<(u64, Option<u32>, Option<u32>)> = const { Cell::new((0, None, None)) };
+    /// Counts every `decline` raised and every `whnf_core` depth abort on
+    /// this thread, swallowed or not (`Checker::budget_mark`).
+    static BUDGET_EVENTS: Cell<u64> = const { Cell::new(0) };
+    /// Declarations checked again without the caches because their check
+    /// failed after a cache hit, and how many of those then passed
+    /// (`note_xcache_recheck`).
+    static XCACHE_RECHECKS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
     static XMEMO_ON: bool = std::env::var_os("KIOTA_XMEMO").is_some();
     /// Closed pairs proved definitionally equal. Only `true` is kept: an
     /// equality once derived stays derivable as the environment grows.
@@ -186,8 +200,93 @@ pub fn xcache_hits() -> u64 {
     XCACHE_HITS.with(Cell::get)
 }
 
+/// `(rechecks, of which accepted)`: declarations whose check failed after
+/// a cache hit and was done again without the caches.
+pub fn xcache_rechecks() -> (u64, u64) {
+    XCACHE_RECHECKS.with(Cell::get)
+}
+
+fn note_xcache_recheck(accepted: bool) {
+    XCACHE_RECHECKS.with(|c| {
+        let (n, ok) = c.get();
+        c.set((n + 1, ok + accepted as u64));
+    });
+}
+
+/// Whether the cross-declaration caches may be read and written right now.
+/// Off under the lazy main path: that pass re-decides what the eager pass
+/// could not and may turn its rejection into an accept, so it neither reads
+/// the eager pass's results nor leaves its own behind, and runs exactly as
+/// it does without the flag.
+fn xcache_usable() -> bool {
+    XCACHE_ON.with(Cell::get)
+        && !XCACHE_SUSPENDED.with(Cell::get)
+        && !LAZY_MAIN_PATH.with(Cell::get)
+}
+
+/// Turn the cross-declaration caches on or off for the current thread,
+/// overriding `KIOTA_XCACHE`, and return the previous setting. For tests
+/// that need a setting in-process; the binary only ever reads the
+/// environment variable.
+#[doc(hidden)]
+pub fn set_xcache_for_thread(on: bool) -> bool {
+    xcache_clear();
+    XCACHE_ON.with(|b| b.replace(on))
+}
+
+/// Entries the cross-declaration caches hold on this thread.
+#[doc(hidden)]
+pub fn xcache_len() -> usize {
+    XINFER.with(|m| m.borrow().len()) + XWHNF.with(|m| m.borrow().len()) + XDEFEQ.with(|m| m.borrow().len())
+}
+
+/// Empty the cross-declaration caches.
+pub fn xcache_clear() {
+    XINFER.with(|m| m.borrow_mut().clear());
+    XWHNF.with(|m| m.borrow_mut().clear());
+    XDEFEQ.with(|m| m.borrow_mut().clear());
+}
+
+/// While one of these is alive the cross-declaration caches are neither
+/// read nor written. Restores the previous state on drop, so an early
+/// return or an error on the way out cannot leave them suspended.
+pub struct XcacheSuspended(bool);
+
+impl XcacheSuspended {
+    pub fn new() -> Self {
+        XcacheSuspended(XCACHE_SUSPENDED.with(|s| s.replace(true)))
+    }
+}
+
+impl Drop for XcacheSuspended {
+    fn drop(&mut self) {
+        XCACHE_SUSPENDED.with(|s| s.set(self.0));
+    }
+}
+
+/// Run `f` with the cross-declaration caches neither read nor written.
+pub fn with_xcache_suspended<T>(f: impl FnOnce() -> T) -> T {
+    let _suspended = XcacheSuspended::new();
+    f()
+}
+
+/// Tie the cross-declaration caches to one environment and one pair of
+/// literal types. Their keys are node identities. A node such as `const 5`
+/// is shared by every environment checked on this thread while name 5 is a
+/// different constant in each, a rolled-back inductive block leaves facts
+/// about constants that are gone, and the type of a literal is whatever
+/// `nat_ref` / `string_ref` the checker was handed. Any change empties the
+/// maps.
+fn xcache_bind(epoch: u64, nat_ref: Option<u32>, string_ref: Option<u32>) {
+    let bound = (epoch, nat_ref, string_ref);
+    if XCACHE_BOUND.with(|b| b.replace(bound)) != bound {
+        xcache_clear();
+    }
+}
+
 fn decline<T>(msg: impl Into<String>) -> R<T> {
     DECLINE_SERIAL.with(|s| s.set(s.get() + 1));
+    BUDGET_EVENTS.with(|s| s.set(s.get() + 1));
     Err(TcError::Decline(msg.into()))
 }
 
@@ -310,6 +409,16 @@ pub struct Checker<'e> {
     /// may reflect the guard, so they stay out of the cross-declaration
     /// caches.
     xcache_tainted: std::cell::Cell<bool>,
+    /// `BUDGET_EVENTS` when this declaration's check began. Once a decline
+    /// was raised or `whnf_core` hit its depth cap, a result computed in
+    /// this declaration may be the product of a budget that ran out: a
+    /// recursor left stuck at the cap is returned as a weak head normal
+    /// form, the abort is forgotten one `whnf` up, and from there the stuck
+    /// form sits in the per-declaration caches for anything later to build
+    /// on. Such a result is still equal to its term, but it is not what a
+    /// later declaration with a fresh budget computes, so nothing is added
+    /// to the cross-declaration caches for the rest of the declaration.
+    budget_mark: std::cell::Cell<u64>,
     /// Lean `infer_only`: skip app-arg checks. Only for PI
     /// (`proofs_of_same_prop`) on already-checked terms.
     infer_only: std::cell::Cell<bool>,
@@ -686,6 +795,7 @@ impl<'e> Checker<'e> {
         nat_ref: Option<u32>,
         string_ref: Option<u32>,
     ) -> Self {
+        xcache_bind(env.epoch(), nat_ref, string_ref);
         Checker {
             env,
             names,
@@ -716,6 +826,7 @@ impl<'e> Checker<'e> {
             fuel_nat_last: std::cell::RefCell::new(None),
             fuel_nat_run: std::cell::Cell::new(0),
             xcache_tainted: std::cell::Cell::new(false),
+            budget_mark: std::cell::Cell::new(BUDGET_EVENTS.with(Cell::get)),
             infer_only: std::cell::Cell::new(false),
             decl_value_size: std::cell::Cell::new(0),
             checking_prop_structure: std::cell::Cell::new(false),
@@ -833,8 +944,35 @@ impl<'e> Checker<'e> {
     /// rules in a different reduction order, so the retry can only trade a
     /// decline for a decided verdict, and it costs nothing on declarations
     /// the eager pass accepts (every corpus but a handful of declarations).
+    /// Whether a result computed now may go into the cross-declaration
+    /// caches: nothing so far in this declaration has met its own constant
+    /// (`xcache_tainted`) or run out of a budget (`budget_mark`).
+    fn xcache_may_store(&self) -> bool {
+        !self.xcache_tainted.get() && BUDGET_EVENTS.with(Cell::get) == self.budget_mark.get()
+    }
+
     pub fn check_decl(&self, name: u32, kind: &str) -> R<()> {
+        let hits = XCACHE_HITS.with(Cell::get);
         match self.check_decl_once(name, kind) {
+            // A cache hit skips work, and with it changes how deep the rest
+            // of the check recurses and which per-declaration results are
+            // at hand (`whnf-depth-cap-then-shallow`: the hits skip the
+            // bottom-up pass that kept a long reduction shallow). A failure
+            // that followed one is therefore not yet what the checker says
+            // without the caches. The declaration is checked again from
+            // the start with the caches suspended, eager pass and lazy
+            // retry exactly as without the flag, and that is the verdict.
+            Err(_) if XCACHE_HITS.with(Cell::get) != hits => {
+                // `check_decl_once` empties the per-declaration caches; these
+                // are the memos it keeps, emptied here so that the re-check
+                // starts as a new checker would.
+                self.unfold_cache.borrow_mut().clear();
+                self.iota_value_cache.borrow_mut().clear();
+                self.iota_lit_memo.borrow_mut().clear();
+                let again = with_xcache_suspended(|| self.check_decl(name, kind));
+                note_xcache_recheck(again.is_ok());
+                again
+            }
             Err(first @ (TcError::Decline(_) | TcError::Reject(_))) if !LAZY_MAIN_PATH.with(Cell::get) => {
                 if std::env::var_os("KIOTA_PROGRESS").is_some() {
                     eprintln!("LAZY_RETRY {} after {first:?}", self.name_str(name));
@@ -930,6 +1068,7 @@ impl<'e> Checker<'e> {
         self.fuel_nat_peels.set(0);
         *self.fuel_nat_last.borrow_mut() = None;
         self.fuel_nat_run.set(0);
+        self.budget_mark.set(BUDGET_EVENTS.with(Cell::get));
         self.decl_value_size.set(
             ci.value()
                 .map(|v| expr_size_capped(v, 200_000))
@@ -1070,6 +1209,13 @@ impl<'e> Checker<'e> {
             self.unfold_cache.borrow_mut().clear();
             self.iota_value_cache.borrow_mut().clear();
             self.iota_lit_memo.borrow_mut().clear();
+            // The cross-declaration caches and the kept substitution memos
+            // hold strong references into the generation being dropped.
+            // Their keys are never-reused ids, so a stale entry cannot
+            // answer for another term, but it pins that generation and
+            // hands back nodes no new term is pointer-equal to.
+            xcache_clear();
+            expr::clear_subst_memos();
             expr::intern_clear_if_large(INTERN_RESET);
             if std::env::var_os("KIOTA_INTERN_RESET_LOG").is_some() {
                 eprintln!(
@@ -1321,7 +1467,9 @@ impl<'e> Checker<'e> {
                 return Ok(t.clone());
             }
         }
-        let xcache = key.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b);
+        // Closed by the term's own loose-variable range, not by the context
+        // key: an ill-scoped open term under the empty context keys as 0 too.
+        let xcache = expr::is_closed(e) && !force_eager && xcache_usable();
         if xcache {
             let hit = XINFER.with(|m| m.borrow().get(&key.1).cloned());
             if let Some((t, checked)) = hit {
@@ -1335,7 +1483,7 @@ impl<'e> Checker<'e> {
         crate::stats::miss(0, key.0, key.1, 0);
         let t = self.infer_type_uncached(ctx, e)?;
         let checked = !self.infer_only.get();
-        if xcache && checked && !self.xcache_tainted.get() {
+        if xcache && checked && self.xcache_may_store() {
             XINFER.with(|m| {
                 let mut m = m.borrow_mut();
                 if m.len() >= XCACHE_CAP {
@@ -2387,7 +2535,7 @@ impl<'e> Checker<'e> {
             crate::stats::whnf_hit();
             return Ok(r);
         }
-        let xcache = k.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b);
+        let xcache = expr::is_closed(e) && !force_eager && xcache_usable();
         if xcache {
             if let Some(r) = XWHNF.with(|m| m.borrow().get(&k.1).cloned()) {
                 XCACHE_HITS.with(|c| c.set(c.get() + 1));
@@ -2430,7 +2578,7 @@ impl<'e> Checker<'e> {
             return Ok(r);
         }
         self.whnf_cache_insert(force_eager, k, r.clone());
-        if xcache && !self.xcache_tainted.get() {
+        if xcache && self.xcache_may_store() {
             XWHNF.with(|m| {
                 let mut m = m.borrow_mut();
                 if m.len() >= XCACHE_CAP {
@@ -2927,6 +3075,7 @@ impl<'e> Checker<'e> {
             self.dump_conversion_trace(&e);
             CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
             CORE_ABORTED.with(|a| a.set(true));
+            BUDGET_EVENTS.with(|s| s.set(s.get() + 1));
             // Do not cache. A β/ζ/proj redex at the cap is not WHNF — Decline.
             // A stuck recursor/axiom app is already WHNF; returning it as Ok
             // is honest (Init `Int8.toInt_toInt32`).
@@ -3572,7 +3721,12 @@ impl<'e> Checker<'e> {
         }
     }
     fn defeq_cache_insert(&self, force_eager: bool, key: (u64, usize, usize), v: bool) {
-        if v && key.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b) {
+        // Only `true` is kept, and a derived equality holds whatever budget
+        // ran out on the way, so `budget_mark` does not apply. An equality
+        // derived while this declaration's own constant stayed folded holds
+        // once it unfolds too, but nothing that saw the constant being
+        // declared outlives its check.
+        if v && key.0 == 0 && !force_eager && !self.xcache_tainted.get() && xcache_usable() {
             XDEFEQ.with(|m| {
                 let mut m = m.borrow_mut();
                 if m.len() >= XCACHE_CAP {
@@ -3691,7 +3845,12 @@ impl<'e> Checker<'e> {
             crate::stats::defeq_hit();
             return Ok(r);
         }
-        if key.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b)
+        // Only a pair of closed terms is looked up. Ids are never shared
+        // between terms, so an entry some ill-scoped open pair left under
+        // the empty context (key 0 as well) is never read.
+        if key.0 == 0 && !force_eager
+            && expr::is_closed(a) && expr::is_closed(b)
+            && xcache_usable()
             && XDEFEQ.with(|m| m.borrow().contains(&(key.1, key.2)))
         {
             XCACHE_HITS.with(|c| c.set(c.get() + 1));

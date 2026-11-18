@@ -80,6 +80,9 @@ impl InductiveUndo {
                 InductiveWrite::Group(name, prior) => restore(&mut env.rec_group, name, prior),
             }
         }
+        // Constants were taken out again: whatever was cached about them
+        // while the block was being checked must not be read back.
+        env.invalidate();
     }
 }
 
@@ -1367,6 +1370,11 @@ impl Parser {
             // a malformed supplied recursor type must not leave the block's
             // types, constructors, recursors, or ownership maps visible to a
             // later declaration in the stream.
+            // The cross-declaration caches stay out of the whole transaction:
+            // until it commits, the environment holds the block's types,
+            // constructors and recursors unchecked, and a failure takes them
+            // out again.
+            let _no_xcache = crate::tc::XcacheSuspended::new();
             let mut undo = InductiveUndo::default();
             let result = (|| {
                 self.handle_inductive_block(d, &mut undo)?;

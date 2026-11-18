@@ -135,7 +135,14 @@ impl ConstantInfo {
     }
 }
 
-#[derive(Default)]
+/// Source of `Environment::epoch` values, shared by every thread so that two
+/// environments never carry the same one.
+static NEXT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn fresh_epoch() -> u64 {
+    NEXT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct Environment {
     pub consts: FxHashMap<u32, ConstantInfo>,
     /// Inductive type name → recursor name, filled in by the parser.
@@ -143,6 +150,26 @@ pub struct Environment {
     /// Recursor → every recursor in its inductive block (`.rec`, `.rec_1`, …),
     /// sorted so main comes first. Used for nested ι, not for trusting RHS.
     pub rec_group: FxHashMap<u32, Vec<u32>>,
+    /// Identifies this environment and the history of its constants as far
+    /// as a cache of facts about closed terms cares: it stays the same for
+    /// as long as constants are only added. Replacing or removing one
+    /// (`insert` over an existing name, `invalidate` after a rollback)
+    /// takes a fresh value. The cross-declaration caches in `tc` are keyed
+    /// by node identity alone, and a name index is another constant in
+    /// another environment, so they are emptied whenever the epoch they
+    /// were filled under is not the one being checked against.
+    epoch: u64,
+}
+
+impl Default for Environment {
+    fn default() -> Self {
+        Environment {
+            consts: FxHashMap::default(),
+            rec_of: FxHashMap::default(),
+            rec_group: FxHashMap::default(),
+            epoch: fresh_epoch(),
+        }
+    }
 }
 
 impl Environment {
@@ -150,6 +177,16 @@ impl Environment {
         self.consts.get(&n)
     }
     pub fn insert(&mut self, n: u32, ci: ConstantInfo) {
-        self.consts.insert(n, ci);
+        if self.consts.insert(n, ci).is_some() {
+            self.invalidate();
+        }
+    }
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    /// Call after a constant was replaced or taken out again: facts cached
+    /// about the old constants must not be read back.
+    pub fn invalidate(&mut self) {
+        self.epoch = fresh_epoch();
     }
 }

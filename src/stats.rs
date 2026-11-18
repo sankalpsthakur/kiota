@@ -93,7 +93,12 @@ pub fn report() {
         "STATS2 whnf_hit={} defeq_hit={} closed_first_miss(infer,whnf,defeq)={:?} closed_cross_decl_repeat={:?} open_miss={:?}",
         g(&WHNF_HITS), g(&DEFEQ_HITS), arr(&CLOSED_MISS), arr(&CLOSED_XHIT), arr(&OPEN_MISS),
     );
-    eprintln!("STATS3 xcache_hits={}", crate::tc::xcache_hits());
+    eprintln!(
+        "STATS3 xcache_hits={} xcache_rechecks={} xcache_recheck_accepts={}",
+        crate::tc::xcache_hits(),
+        crate::tc::xcache_rechecks().0,
+        crate::tc::xcache_rechecks().1
+    );
     eprintln!(
         "STATS infer={} infer_hit={} whnf={} defeq={} inst_nodes={} shift_nodes={} ctx_clones={} intern_calls={} live_nodes={}",
         g(&INFER_CALLS),
