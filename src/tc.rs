@@ -9,6 +9,18 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
+/// Whether an environment variable is set, read from the environment the
+/// first time the call site runs. The trace and ablation switches below sit
+/// on paths that run tens of millions of times; asking the C library for
+/// the variable on each pass (a lock, a scan of the whole environment) was
+/// a measurable share of a run.
+macro_rules! env_set {
+    ($name:literal) => {{
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 mod recursor;
 #[cfg(test)]
 mod reclamation_tests;
@@ -836,7 +848,7 @@ impl<'e> Checker<'e> {
         // probe. Those maps otherwise hold one extra decl of residue while
         // `type_is_multiarg_prop_structure` runs.
         expr::clear_subst_memos();
-        CTX_IDS.with(|m| m.borrow_mut().clear());
+        CTX_IDS.with(|m| expr::clear_memo(&mut m.borrow_mut()));
         CTX_NEXT.with(|c| c.set(1));
         CORE_ABORTED.with(|a| a.set(false));
         crate::stats::set_theorem_delta_scope(self.name_str(name));
@@ -993,12 +1005,12 @@ impl<'e> Checker<'e> {
         // declaration. Keeping them across decls is how `#3491`–`#3495`
         // grew from ~0.9 GB to multi-GB before the next omega proof.
         expr::clear_subst_memos();
-        CTX_IDS.with(|m| m.borrow_mut().clear());
+        CTX_IDS.with(|m| expr::clear_memo(&mut m.borrow_mut()));
         CTX_NEXT.with(|c| c.set(1));
-        self.whnf_cache.borrow_mut().clear();
-        self.whnf_core_cache.borrow_mut().clear();
-        self.defeq_cache.borrow_mut().clear();
-        self.infer_cache.borrow_mut().clear();
+        expr::clear_memo(&mut self.whnf_cache.borrow_mut());
+        expr::clear_memo(&mut self.whnf_core_cache.borrow_mut());
+        expr::clear_memo(&mut self.defeq_cache.borrow_mut());
+        expr::clear_memo(&mut self.infer_cache.borrow_mut());
         // `ctx_key`s (via `CTX_NEXT`, reset above) are reused across
         // declarations, so a stale eager-namespace entry from the last
         // declaration would be keyed identically but mean something
@@ -1006,10 +1018,10 @@ impl<'e> Checker<'e> {
         // Keys now use non-recycled allocation IDs, not allocator addresses;
         // clearing still bounds retained results and preserves declaration
         // boundaries between conversion modes.
-        self.eager_whnf_cache.borrow_mut().clear();
-        self.eager_whnf_core_cache.borrow_mut().clear();
-        self.eager_defeq_cache.borrow_mut().clear();
-        self.eager_infer_cache.borrow_mut().clear();
+        expr::clear_memo(&mut self.eager_whnf_cache.borrow_mut());
+        expr::clear_memo(&mut self.eager_whnf_core_cache.borrow_mut());
+        expr::clear_memo(&mut self.eager_defeq_cache.borrow_mut());
+        expr::clear_memo(&mut self.eager_infer_cache.borrow_mut());
         // The hash-cons table itself is the one node-lifetime root the
         // above never bounded: it holds a strong `Rc` to every distinct
         // `Expr` ever built, for the life of the process, regardless of
@@ -1324,7 +1336,7 @@ impl<'e> Checker<'e> {
                 if !self.infer_only.get() {
                     let at = self.infer_type(ctx, a)?;
                     if !self.is_def_eq(ctx, &at, &dom)? {
-                        if std::env::var_os("KIOTA_DEBUG").is_some() {
+                        if env_set!("KIOTA_DEBUG") {
                             let atw = self.whnf(ctx, &at).unwrap_or_else(|_| at.clone());
                             let dw = self.whnf(ctx, &dom).unwrap_or_else(|_| dom.clone());
                             return reject(format!(
@@ -1631,7 +1643,7 @@ impl<'e> Checker<'e> {
         let mt = match self.infer_type(ctx, major) {
             Ok(t) => t,
             Err(e) => {
-                if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
+                if env_set!("KIOTA_TRACE_IOTA") {
                     eprintln!(
                         "IOTA to_ctor infer fail major={} err={e:?}",
                         self.pp_budget(major, 8)
@@ -1647,7 +1659,7 @@ impl<'e> Checker<'e> {
         // is allowed. This is the official kernel's rule since lean4#15371;
         // before it, Lean skipped every `Prop` structure. PSigma is Type.
         if !large_elim && self.is_prop(ctx, &mtw)? {
-            if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
+            if env_set!("KIOTA_TRACE_IOTA") {
                 eprintln!(
                     "IOTA to_ctor skip Prop structure ty={}",
                     self.pp_budget(&mtw, 10)
@@ -1689,7 +1701,7 @@ impl<'e> Checker<'e> {
             _ => return Ok(None),
         };
         if targs.len() < num_params as usize {
-            if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
+            if env_set!("KIOTA_TRACE_IOTA") {
                 eprintln!(
                     "IOTA to_ctor underapplied {} targs={} nparams={}",
                     self.name_str(tname),
@@ -1961,7 +1973,7 @@ impl<'e> Checker<'e> {
         };
         let eq = self.is_def_eq(ctx, &ta, &tb)?;
         if !eq {
-            if std::env::var_os("KIOTA_TRACE_PI").is_some() {
+            if env_set!("KIOTA_TRACE_PI") {
                 eprintln!(
                     "PI_FAIL ctx={} a={} b={} ta={} tb={}",
                     ctx.len(),
@@ -2164,7 +2176,7 @@ impl<'e> Checker<'e> {
                     .all(|(x, y)| level::is_def_eq(x, y))
             {
                 let has_pr = self.const_has_proof_arg(*n1);
-                if std::env::var_os("KIOTA_TRACE_PAIR").is_some() && a1.len() >= 3 {
+                if env_set!("KIOTA_TRACE_PAIR") && a1.len() >= 3 {
                     Self::trace_pair("core", self.name_str(*n1), a1.len(), has_pr);
                 }
                 let r = if has_pr {
@@ -2175,7 +2187,7 @@ impl<'e> Checker<'e> {
                 } else {
                     self.pairwise_args(ctx, &a1, &a2)?
                 };
-                if !r && std::env::var_os("KIOTA_TRACE_EQ").is_some() && a1.len() >= 4 {
+                if !r && env_set!("KIOTA_TRACE_EQ") && a1.len() >= 4 {
                     eprintln!(
                         "EQCORE fail {} na={}",
                         self.name_str(*n1),
@@ -2213,7 +2225,7 @@ impl<'e> Checker<'e> {
         }
         for (i, (x, y)) in a1.iter().zip(a2.iter()).enumerate() {
             if !self.is_def_eq(ctx, x, y)? {
-                if std::env::var_os("KIOTA_TRACE_EQ").is_some() {
+                if env_set!("KIOTA_TRACE_EQ") {
                     eprintln!(
                         "EQPAIR fail i={i}/{} a={} b={}",
                         a1.len(),
@@ -2242,7 +2254,7 @@ impl<'e> Checker<'e> {
         if a1.len() != a2.len() {
             return Ok(false);
         }
-        let trace = std::env::var_os("KIOTA_TRACE_DEFEQ_ARGS").is_some();
+        let trace = env_set!("KIOTA_TRACE_DEFEQ_ARGS");
         let mut ty = fn_ty.clone();
         let mut i = 0;
         while i < a1.len() {
@@ -2298,7 +2310,7 @@ impl<'e> Checker<'e> {
         });
         if depth > CONV_DEPTH {
             WHNF_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-            if depth == CONV_DEPTH + 1 && std::env::var_os("KIOTA_DEBUG").is_some() {
+            if depth == CONV_DEPTH + 1 && env_set!("KIOTA_DEBUG") {
                 eprintln!("WHNF_DEPTH {}", self.pp_budget(e, 50));
             }
             self.dump_conversion_trace(e);
@@ -2621,7 +2633,7 @@ impl<'e> Checker<'e> {
         let (ExprData::Const(n1, u1), ExprData::Const(n2, u2)) = (&**h1, &**h2) else {
             return Ok(false);
         };
-        if std::env::var_os("KIOTA_TRACE_LINEAR").is_some() {
+        if env_set!("KIOTA_TRACE_LINEAR") {
             let s1 = self.name_str(*n1);
             let s2 = self.name_str(*n2);
             if (s1 == "Eq" || s1.ends_with(".Eq") || s2 == "Eq" || s2.ends_with(".Eq"))
@@ -2669,12 +2681,12 @@ impl<'e> Checker<'e> {
         if !u1.iter().zip(u2.iter()).all(|(x, y)| level::is_def_eq(x, y)) {
             return Ok(false);
         }
-        let eq_trace = std::env::var_os("KIOTA_TRACE_LINEAR").is_some()
+        let eq_trace = env_set!("KIOTA_TRACE_LINEAR")
             && a1.iter().chain(a2.iter()).any(|e| {
                 self.pp_budget(e, 40).contains("norm_eq_cert")
             });
         let has_pr = self.const_has_proof_arg(*n1);
-        if std::env::var_os("KIOTA_TRACE_PAIR").is_some() && a1.len() >= 3 {
+        if env_set!("KIOTA_TRACE_PAIR") && a1.len() >= 3 {
             Self::trace_pair("unreduced", self.name_str(*n1), a1.len(), has_pr);
         }
         let r = if has_pr {
@@ -2688,7 +2700,7 @@ impl<'e> Checker<'e> {
         if eq_trace {
             eprintln!("EQARGS r={r} n={} na={}", self.name_str(*n1), a1.len());
         }
-        if !r && std::env::var_os("KIOTA_TRACE_EQ").is_some() && a1.len() >= 4 {
+        if !r && env_set!("KIOTA_TRACE_EQ") && a1.len() >= 4 {
             eprintln!(
                 "EQSPINE fail {} na={} a4={} b4={}",
                 self.name_str(*n1),
@@ -2858,8 +2870,8 @@ impl<'e> Checker<'e> {
             // Do not cache. A β/ζ/proj redex at the cap is not WHNF — Decline.
             // A stuck recursor/axiom app is already WHNF; returning it as Ok
             // is honest (Init `Int8.toInt_toInt32`).
-            if std::env::var_os("KIOTA_TRACE_IOTA").is_some()
-                || std::env::var_os("KIOTA_TRACE_EQ").is_some()
+            if env_set!("KIOTA_TRACE_IOTA")
+                || env_set!("KIOTA_TRACE_EQ")
             {
                 eprintln!("CORE_DEPTH abort {}", crate::expr::loose_bvar_range(&e));
             }
@@ -3072,7 +3084,7 @@ impl<'e> Checker<'e> {
         if let Some(r) = self.unfold_def(n, us)? {
             return Ok(Some(r));
         }
-        if !theorems || std::env::var_os("KIOTA_NO_THEOREM_DELTA").is_some() {
+        if !theorems || env_set!("KIOTA_NO_THEOREM_DELTA") {
             return Ok(None);
         }
         match self.env.get(n) {
@@ -3401,7 +3413,7 @@ impl<'e> Checker<'e> {
         match self.env.get(n) {
             Some(ConstantInfo::Def { .. }) => true,
             Some(ConstantInfo::Theorem { .. }) => {
-                std::env::var_os("KIOTA_NO_THEOREM_DELTA").is_none() && self.delta_body_is_small(n)
+                !env_set!("KIOTA_NO_THEOREM_DELTA") && self.delta_body_is_small(n)
             }
             _ => false,
         }
@@ -3426,7 +3438,7 @@ impl<'e> Checker<'e> {
         // (opaque-unless-small). Large proofs stay folded so Check of
         // equation lemmas does not intern-explode or mis-reduce.
         let is_thm = is_thm_kind
-            && std::env::var_os("KIOTA_NO_THEOREM_DELTA").is_none()
+            && !env_set!("KIOTA_NO_THEOREM_DELTA")
             && crate::stats::theorem_delta_in_scope()
             && self.delta_body_is_small(n);
         // Lean `is_delta` = `has_value`. WHNF unfolds Abbrev and Regular
@@ -3453,7 +3465,7 @@ impl<'e> Checker<'e> {
         });
         if depth > CONV_DEPTH {
             DEFEQ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-            if depth == CONV_DEPTH + 1 && std::env::var_os("KIOTA_DEBUG").is_some() {
+            if depth == CONV_DEPTH + 1 && env_set!("KIOTA_DEBUG") {
                 eprintln!(
                     "DEFEQ_DEPTH a={} b={}",
                     self.pp_budget(a, 50),
@@ -3795,7 +3807,7 @@ impl<'e> Checker<'e> {
                 break;
             }
         }
-        if std::env::var_os("KIOTA_TRACE_EQ").is_some() {
+        if env_set!("KIOTA_TRACE_EQ") {
             let ha = expr::unfold_apps(a).0;
             if let ExprData::Const(n, _) = &**ha {
                 let nm = self.name_str(*n);
@@ -3817,7 +3829,7 @@ impl<'e> Checker<'e> {
         if !r && crate::stats::trace_neq() {
             eprintln!("NEQ[{}]  {}   ###   {}", ctx.len(), self.pp_budget(a, 60), self.pp_budget(b, 60));
         }
-        if !r && std::env::var_os("KIOTA_TRACE_NEG").is_some() {
+        if !r && env_set!("KIOTA_TRACE_NEG") {
             let pa = self.pp_budget(a, 40);
             let pb = self.pp_budget(b, 40);
             if pa.contains("4294967296") || pb.contains("4294967296") {
@@ -4022,7 +4034,7 @@ impl<'e> Checker<'e> {
         } else {
             None
         };
-        if std::env::var_os("KIOTA_TRACE_DELTA").is_some() {
+        if env_set!("KIOTA_TRACE_DELTA") {
             eprintln!(
                 "DELTA n1={:?} n2={:?}  {}   ###   {}",
                 n1.map(|n| self.name_str(n).to_string()),
@@ -4261,10 +4273,10 @@ impl<'e> Checker<'e> {
         let iota_memo_on = self
             .iota_memo_override
             .get()
-            .unwrap_or_else(|| std::env::var_os("KIOTA_NO_IOTA_MEMO").is_none());
+            .unwrap_or_else(|| !env_set!("KIOTA_NO_IOTA_MEMO"));
         if rest.is_empty() {
             if let ExprData::Lit(Lit::Nat(n)) = &**major_w {
-                if std::env::var_os("KIOTA_TRACE_IOTA_TRIPLES").is_some() {
+                if env_set!("KIOTA_TRACE_IOTA_TRIPLES") {
                     eprintln!(
                         "IOTA_TRIPLE rec={} motives={:?} minors={:?} n={}",
                         self.name_str(rname),
@@ -4284,7 +4296,7 @@ impl<'e> Checker<'e> {
         }
         let (mhead, margs) = expr::unfold_apps(&major_w);
 
-        if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
+        if env_set!("KIOTA_TRACE_IOTA") {
             eprintln!(
                 "IOTA rec={} major={} mhead={}",
                 self.name_str(rname),
@@ -4355,7 +4367,7 @@ impl<'e> Checker<'e> {
         let (cname, cnp, ctor_args, ctor_us) = if let Some(x) = ctor {
             x
         } else if let Some(x) = self.to_ctor_when_structure(ctx, &all, params, &major_w, large_elim)? {
-            if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
+            if env_set!("KIOTA_TRACE_IOTA") {
                 eprintln!(
                     "IOTA expand rec={} major={} → ctor {} nparams={} nfields={}",
                     self.name_str(rname),
@@ -7266,7 +7278,7 @@ impl<'e> Checker<'e> {
     /// the contract, a bug here may cost completeness, never turn into a
     /// wrong accept.
     fn infer_type_via_nbe(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
-        if std::env::var_os("KIOTA_TRACE_INFER_NBE").is_some() {
+        if env_set!("KIOTA_TRACE_INFER_NBE") {
             eprintln!(
                 "infer_type_via_nbe ctxlen={} e={}",
                 ctx.len(),
@@ -7289,7 +7301,7 @@ impl<'e> Checker<'e> {
         // this runs 221 times with combined `ctx.len()` of 594, negligible
         // next to `eval`'s ~55k total calls. See `types_compatible`'s
         // comment for where the cost actually is.
-        if std::env::var_os("KIOTA_TRACE_RESCUE").is_some() {
+        if env_set!("KIOTA_TRACE_RESCUE") {
             eprintln!("INFER_VIA_NBE ctxlen={}", ctx.len());
         }
         // `ctx[i]`'s type used to be eagerly `eval`'d here on
@@ -7430,7 +7442,7 @@ impl<'e> Checker<'e> {
         // confirm (not guess) that neither one is actually invoked on the
         // Acc-shape export fixtures at all — see the comment above
         // `types_compatible`.
-        if std::env::var_os("KIOTA_TRACE_RESCUE").is_some() {
+        if env_set!("KIOTA_TRACE_RESCUE") {
             eprintln!(
                 "RESCUE app f_size={} a_size={}",
                 expr_size_capped(f, 100_000),
@@ -7470,7 +7482,7 @@ impl<'e> Checker<'e> {
     /// to avoid re-dispatching into the same NbE path). Only ever rescues
     /// a decline into an accept that matches eager's own judgment.
     fn value_type_ok_eager(&self, ctx: &Ctx, value: &Expr, typ: &Expr) -> R<bool> {
-        if std::env::var_os("KIOTA_TRACE_RESCUE").is_some() {
+        if env_set!("KIOTA_TRACE_RESCUE") {
             eprintln!("RESCUE value value_size={}", expr_size_capped(value, 100_000));
         }
         // See `app_arg_type_ok_eager`'s comment: re-deriving `value`'s type
@@ -7603,7 +7615,7 @@ impl<'e> Checker<'e> {
                 if !self.infer_only.get() {
                     let at = self.infer_type_value(ctx, tys, env, a)?;
                     if !self.types_compatible(ctx, depth, &at, &dom_v)? && !self.app_arg_type_ok_eager(ctx, f, a)? {
-                        if std::env::var_os("KIOTA_DEBUG").is_some() {
+                        if env_set!("KIOTA_DEBUG") {
                             let at_q = self.quote(depth, &at).unwrap_or_else(|_| a.clone());
                             let dom_q = self.quote(depth, &dom_v).unwrap_or_else(|_| a.clone());
                             let eager_at = self

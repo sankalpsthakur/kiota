@@ -3,7 +3,6 @@ use num_bigint::BigUint;
 use rustc_hash::{FxHashMap, FxHasher};
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
 use std::rc::Rc;
 
 mod reclaim;
@@ -97,17 +96,72 @@ impl Hash for ExprNode {
 
 // Interned terms form spines that can be thousands of nodes deep (e.g. a
 // left-nested `App` chain). The compiler-derived recursive drop would recurse
-// once per spine node and overflow the stack. Dismantle owned children with a
-// heap worklist so teardown depth is O(1) regardless of term depth.
+// once per spine node and overflow the stack, so a node whose release can
+// cascade dismantles its children with a heap worklist: teardown depth is
+// O(1) regardless of term depth.
+//
+// Most releases cannot cascade. The hash-cons table holds a reference to
+// every node it knows, so when a table reset walks the slots nearly every
+// child of a dying node is still referenced from somewhere else. When every
+// child is, dropping the fields only decrements counters, and the worklist
+// (and its allocation) is skipped.
 impl Drop for ExprNode {
+    #[inline]
     fn drop(&mut self) {
-        let mut stack: Vec<Expr> = Vec::new();
-        take_children(&mut self.data, &mut stack);
-        while let Some(e) = stack.pop() {
-            if let Ok(mut node) = Rc::try_unwrap(e) {
-                take_children(&mut node.data, &mut stack);
-            }
+        // Whether releasing this node's reference could be the child's last.
+        #[inline(always)]
+        fn last(e: &Expr) -> bool {
+            Rc::strong_count(e) == 1
         }
+        let cascades = match &self.data {
+            ExprData::BVar(_) | ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => {
+                false
+            }
+            // The same child twice holds two of its references: both go.
+            ExprData::App(a, b) | ExprData::Lam(_, a, b) | ExprData::Pi(_, a, b) => {
+                last(a) || last(b) || Rc::ptr_eq(a, b)
+            }
+            ExprData::Let(a, b, c) => {
+                last(a)
+                    || last(b)
+                    || last(c)
+                    || Rc::ptr_eq(a, b)
+                    || Rc::ptr_eq(a, c)
+                    || Rc::ptr_eq(b, c)
+            }
+            ExprData::Proj(_, _, v) => last(v),
+        };
+        if cascades {
+            drop_cascade(&mut self.data);
+        }
+    }
+}
+
+thread_local! {
+    /// The worklist `drop_cascade` reuses, so a cascade does not allocate.
+    static DROP_STACK: RefCell<Vec<Expr>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A worklist that grew past this many entries is freed instead of kept.
+const DROP_STACK_KEEP: usize = 1 << 16;
+
+#[inline(never)]
+fn drop_cascade(data: &mut ExprData) {
+    // `try_with`: a node can die while the thread's locals are being torn
+    // down, after this one is gone. A worklist dropped mid-use (it is taken
+    // out of the cell, so nothing here observes that) is only an allocation.
+    let mut stack: Vec<Expr> = DROP_STACK
+        .try_with(|s| std::mem::take(&mut *s.borrow_mut()))
+        .unwrap_or_default();
+    take_children(data, &mut stack);
+    while let Some(e) = stack.pop() {
+        if let Ok(mut node) = Rc::try_unwrap(e) {
+            take_children(&mut node.data, &mut stack);
+            // `node` drops here childless: its own `drop` returns at once.
+        }
+    }
+    if stack.capacity() <= DROP_STACK_KEEP {
+        let _ = DROP_STACK.try_with(|s| *s.borrow_mut() = stack);
     }
 }
 
@@ -182,6 +236,7 @@ fn used_shift_binder(u: u64) -> u64 {
 }
 
 /// Computed once per node from children that already carry their own bits.
+#[inline(always)]
 fn used_of(d: &ExprData) -> u64 {
     match d {
         ExprData::BVar(i) => {
@@ -205,6 +260,7 @@ fn used_of(d: &ExprData) -> u64 {
 }
 
 /// Computed once per node, from children that already carry their own range.
+#[inline(always)]
 fn loose_of(d: &ExprData) -> u32 {
     match d {
         ExprData::BVar(i) => *i + 1,
@@ -218,63 +274,280 @@ fn loose_of(d: &ExprData) -> u32 {
     }
 }
 
-fn hash_node(d: &ExprData) -> u64 {
-    let mut h = FxHasher::default();
-    match d {
-        ExprData::BVar(i) => {
-            0u8.hash(&mut h);
-            i.hash(&mut h);
-        }
-        ExprData::Sort(l) => {
-            1u8.hash(&mut h);
-            l.hash(&mut h);
-        }
-        ExprData::Const(n, us) => {
-            2u8.hash(&mut h);
-            n.hash(&mut h);
-            us.hash(&mut h);
-        }
-        ExprData::App(f, a) => {
-            3u8.hash(&mut h);
-            ptr(f).hash(&mut h);
-            ptr(a).hash(&mut h);
-        }
-        ExprData::Lam(bi, ty, body) => {
-            4u8.hash(&mut h);
-            (*bi as u8).hash(&mut h);
-            ptr(ty).hash(&mut h);
-            ptr(body).hash(&mut h);
-        }
-        ExprData::Pi(bi, ty, body) => {
-            5u8.hash(&mut h);
-            (*bi as u8).hash(&mut h);
-            ptr(ty).hash(&mut h);
-            ptr(body).hash(&mut h);
-        }
-        ExprData::Let(ty, val, body) => {
-            6u8.hash(&mut h);
-            ptr(ty).hash(&mut h);
-            ptr(val).hash(&mut h);
-            ptr(body).hash(&mut h);
-        }
-        ExprData::Proj(s, i, v) => {
-            7u8.hash(&mut h);
-            s.hash(&mut h);
-            i.hash(&mut h);
-            ptr(v).hash(&mut h);
-        }
-        ExprData::Lit(Lit::Nat(n)) => {
-            8u8.hash(&mut h);
-            n.hash(&mut h);
-        }
-        ExprData::Lit(Lit::Str(s)) => {
-            9u8.hash(&mut h);
-            s.hash(&mut h);
-        }
-    }
-    h.finish()
+/// Odd multiplier (the one `rustc-hash` 2 uses). A multiply pushes entropy
+/// toward the high bits, which is where the table takes its index from.
+const HASH_K: u64 = 0xf135_7aea_2e62_a9c5;
+
+/// Fold `x` into `h`. The half-rotation brings the well-mixed high half of
+/// the previous product down, so the next multiply spreads both words again.
+/// For two words under 2^32 (node identities) the 64-bit result is injective.
+#[inline(always)]
+fn hash_mix(h: u64, x: u64) -> u64 {
+    (h.rotate_left(32) ^ x).wrapping_mul(HASH_K)
 }
 
+// One arbitrary odd seed per node kind, so equal children under different
+// kinds do not collide systematically.
+const SEED_BVAR: u64 = 0x9e37_79b9_7f4a_7c15;
+const SEED_SORT: u64 = 0xc2b2_ae3d_27d4_eb4f;
+const SEED_CONST: u64 = 0x1656_67b1_9e37_79f9;
+const SEED_APP: u64 = 0x27d4_eb2f_1656_67c5;
+const SEED_LAM: u64 = 0x85eb_ca77_c2b2_ae63;
+const SEED_PI: u64 = 0xff51_afd7_ed55_8ccd;
+const SEED_LET: u64 = 0xc4ce_b9fe_1a85_ec53;
+const SEED_PROJ: u64 = 0x2545_f491_4f6c_dd1d;
+const SEED_NAT: u64 = 0x94d0_49bb_1331_11eb;
+const SEED_STR: u64 = 0xbf58_476d_1ce4_e5b9;
+
+// The hash of each kind, from its fields. `hash_node` and the `Shape` of the
+// kind both come here, so one structure has one hash however it arrives.
+#[inline(always)]
+fn hash_bvar(i: u32) -> u64 {
+    hash_mix(SEED_BVAR, i as u64)
+}
+#[inline(always)]
+fn hash_sort(l: &Level) -> u64 {
+    let mut h = FxHasher::default();
+    l.hash(&mut h);
+    hash_mix(SEED_SORT, h.finish())
+}
+#[inline(always)]
+fn hash_const(n: u32, us: &Rc<Vec<Level>>) -> u64 {
+    let mut h = FxHasher::default();
+    n.hash(&mut h);
+    us.hash(&mut h);
+    hash_mix(SEED_CONST, h.finish())
+}
+#[inline(always)]
+fn hash_app(f: &Expr, a: &Expr) -> u64 {
+    hash_mix(hash_mix(SEED_APP, ptr(f) as u64), ptr(a) as u64)
+}
+#[inline(always)]
+fn hash_binder(seed: u64, bi: BinderInfo, ty: &Expr, body: &Expr) -> u64 {
+    hash_mix(
+        hash_mix(seed.wrapping_add(bi as u64), ptr(ty) as u64),
+        ptr(body) as u64,
+    )
+}
+#[inline(always)]
+fn hash_let(ty: &Expr, val: &Expr, body: &Expr) -> u64 {
+    hash_mix(
+        hash_mix(hash_mix(SEED_LET, ptr(ty) as u64), ptr(val) as u64),
+        ptr(body) as u64,
+    )
+}
+#[inline(always)]
+fn hash_proj(s: u32, i: u32, v: &Expr) -> u64 {
+    hash_mix(
+        hash_mix(SEED_PROJ, ((s as u64) << 32) | i as u64),
+        ptr(v) as u64,
+    )
+}
+#[inline(always)]
+fn hash_nat(n: &BigUint) -> u64 {
+    let mut h = FxHasher::default();
+    n.hash(&mut h);
+    hash_mix(SEED_NAT, h.finish())
+}
+#[inline(always)]
+fn hash_str(s: &Rc<String>) -> u64 {
+    let mut h = FxHasher::default();
+    s.hash(&mut h);
+    hash_mix(SEED_STR, h.finish())
+}
+
+/// Structural hash of one node. Children contribute their identity, never
+/// their content, so the cost does not depend on term size. Only the lookup
+/// structure reads this value: every candidate is confirmed by `node_eq`,
+/// so the function is free to change without changing any result.
+#[inline(always)]
+fn hash_node(d: &ExprData) -> u64 {
+    match d {
+        ExprData::BVar(i) => hash_bvar(*i),
+        ExprData::Sort(l) => hash_sort(l),
+        ExprData::Const(n, us) => hash_const(*n, us),
+        ExprData::App(f, a) => hash_app(f, a),
+        ExprData::Lam(bi, ty, body) => hash_binder(SEED_LAM, *bi, ty, body),
+        ExprData::Pi(bi, ty, body) => hash_binder(SEED_PI, *bi, ty, body),
+        ExprData::Let(ty, val, body) => hash_let(ty, val, body),
+        ExprData::Proj(s, i, v) => hash_proj(*s, *i, v),
+        ExprData::Lit(Lit::Nat(n)) => hash_nat(n),
+        ExprData::Lit(Lit::Str(s)) => hash_str(s),
+    }
+}
+
+/// A node on its way into the table, its kind known at compile time.
+///
+/// A constructor knows which kind it builds. Going through `ExprData` made
+/// the lookup ask again, at run time, for the hash, for each candidate
+/// comparison and for the release of the unused fields. With one `Shape`
+/// per kind every constructor compiles to the code for its own kind, and
+/// the enum value is only built for a node that turns out to be new.
+trait Shape: Sized {
+    fn hash(&self) -> u64;
+    /// Whether `n` is this structure: same kind, same scalars, children
+    /// compared by identity (as `node_eq` compares them).
+    fn is(&self, n: &ExprData) -> bool;
+    fn into_data(self) -> ExprData;
+}
+
+struct BVarShape(u32);
+struct SortShape(Level);
+struct ConstShape(u32, Rc<Vec<Level>>);
+struct AppShape(Expr, Expr);
+struct LamShape(BinderInfo, Expr, Expr);
+struct PiShape(BinderInfo, Expr, Expr);
+struct LetShape(Expr, Expr, Expr);
+struct ProjShape(u32, u32, Expr);
+struct NatShape(BigUint);
+struct StrShape(Rc<String>);
+
+impl Shape for BVarShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_bvar(self.0)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::BVar(i) if *i == self.0)
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::BVar(self.0)
+    }
+}
+impl Shape for SortShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_sort(&self.0)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Sort(l) if *l == self.0)
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Sort(self.0)
+    }
+}
+impl Shape for ConstShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_const(self.0, &self.1)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Const(c, us) if *c == self.0 && *us == self.1)
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Const(self.0, self.1)
+    }
+}
+impl Shape for AppShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_app(&self.0, &self.1)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::App(f, a) if Rc::ptr_eq(f, &self.0) && Rc::ptr_eq(a, &self.1))
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::App(self.0, self.1)
+    }
+}
+impl Shape for LamShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_binder(SEED_LAM, self.0, &self.1, &self.2)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Lam(bi, ty, body)
+            if *bi == self.0 && Rc::ptr_eq(ty, &self.1) && Rc::ptr_eq(body, &self.2))
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Lam(self.0, self.1, self.2)
+    }
+}
+impl Shape for PiShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_binder(SEED_PI, self.0, &self.1, &self.2)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Pi(bi, ty, body)
+            if *bi == self.0 && Rc::ptr_eq(ty, &self.1) && Rc::ptr_eq(body, &self.2))
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Pi(self.0, self.1, self.2)
+    }
+}
+impl Shape for LetShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_let(&self.0, &self.1, &self.2)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Let(ty, val, body)
+            if Rc::ptr_eq(ty, &self.0) && Rc::ptr_eq(val, &self.1) && Rc::ptr_eq(body, &self.2))
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Let(self.0, self.1, self.2)
+    }
+}
+impl Shape for ProjShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_proj(self.0, self.1, &self.2)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Proj(s, i, v)
+            if *s == self.0 && *i == self.1 && Rc::ptr_eq(v, &self.2))
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Proj(self.0, self.1, self.2)
+    }
+}
+impl Shape for NatShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_nat(&self.0)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Lit(Lit::Nat(m)) if *m == self.0)
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Lit(Lit::Nat(self.0))
+    }
+}
+impl Shape for StrShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_str(&self.0)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Lit(Lit::Str(t)) if *t == self.0)
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Lit(Lit::Str(self.0))
+    }
+}
+
+#[inline(always)]
 fn node_eq(a: &ExprData, b: &ExprData) -> bool {
     match (a, b) {
         (ExprData::BVar(i), ExprData::BVar(j)) => i == j,
@@ -298,69 +571,167 @@ fn node_eq(a: &ExprData, b: &ExprData) -> bool {
     }
 }
 
-/// Hash-cons table. Almost every hash is unique (`bmax=1` at 30M nodes), so a
-/// `HashMap<u64, Vec<Expr>>` paid a heap `Vec` per node — HashMap → Vec → Rc
-/// on every lookup. Primary is a single `Expr` per hash; overflow is only for
-/// the rare collision. Check of std `#18000` at 30M intern was 15min vs <2s
-/// at parse-only 2.5M intern; the extra pointer chase was the difference.
+/// One table slot: the node and the hash it was filed under. Keeping the
+/// hash beside the pointer lets a probe skip a mismatched neighbour, and lets
+/// the table grow, without touching the node itself.
+#[derive(Clone)]
+struct Slot {
+    hash: u64,
+    node: Option<Expr>,
+}
+
+const EMPTY_SLOT: Slot = Slot { hash: 0, node: None };
+
+/// Slots a new table starts with (1 MiB). Small inputs stay cache-resident.
+const INITIAL_SLOTS_LOG2: u32 = 16;
+/// A table reset keeps its slots up to this size (256 MiB) and shrinks a
+/// larger one, so one outsized declaration does not pin its table forever.
+const RETAINED_SLOTS_LOG2: u32 = 24;
+
+/// Hash-cons table: open addressing with linear probing over a power-of-two
+/// slot array, indexed by the top bits of `hash_node`.
+///
+/// Nodes are never removed one at a time (only `clear` empties the table),
+/// so there are no tombstones and a probe stops at the first empty slot.
+/// A lookup costs one cache line of slots plus the candidate node, where
+/// the `HashMap<u64, Expr>` it replaces paid a control-byte group, a bucket
+/// and the node, and re-hashed its `u64` key. `clear` keeps the slot array,
+/// so the table is not regrown (and its pages not re-faulted) after every
+/// reset.
 struct Interner {
-    primary: FxHashMap<u64, Expr>,
-    overflow: FxHashMap<u64, Vec<Expr>>,
+    slots: Vec<Slot>,
+    /// `64 - log2(slots.len())`: the index is the top bits of the hash.
+    shift: u32,
+    len: usize,
+    /// Grow once `len` passes this (5/8 of the slots).
+    grow_at: usize,
+    /// The identity the next allocated node gets. Never reset: see `identity`.
+    next_id: usize,
+    /// `intern` calls on this thread, in either mode.
+    calls: u64,
+    /// The call count at which the next progress line is printed.
+    next_report: u64,
+    /// `KIOTA_RECLAIM`: this table stays empty and `WEAK_INTERN` files the
+    /// nodes. Read once here so the hot path does not ask the environment's
+    /// thread-local on every call.
+    weak_mode: bool,
 }
 
 impl Default for Interner {
     fn default() -> Self {
-        Interner {
-            primary: FxHashMap::default(),
-            overflow: FxHashMap::default(),
-        }
+        Interner::with_slots_log2(INITIAL_SLOTS_LOG2)
     }
 }
 
 impl Interner {
-    fn intern(&mut self, d: ExprData) -> Expr {
-        let h = hash_node(&d);
-        if let Some(e) = self.primary.get(&h) {
-            if node_eq(&d, e) {
-                return e.clone();
-            }
-            if let Some(bucket) = self.overflow.get(&h) {
-                for e in bucket {
-                    if node_eq(&d, e) {
+    fn with_slots_log2(log2: u32) -> Self {
+        let n = 1usize << log2;
+        Interner {
+            slots: vec![EMPTY_SLOT; n],
+            shift: 64 - log2,
+            len: 0,
+            grow_at: n / 8 * 5,
+            next_id: 1,
+            calls: 0,
+            next_report: INTERN_REPORT_EVERY,
+            weak_mode: reclamation_enabled(),
+        }
+    }
+
+    #[inline(always)]
+    fn take_id(&mut self) -> usize {
+        let id = self.next_id;
+        self.next_id = id.checked_add(1).expect("expression identity exhausted");
+        id
+    }
+
+    #[inline(always)]
+    fn intern<K: Shape>(&mut self, k: K, h: u64) -> Expr {
+        let mask = self.slots.len() - 1;
+        let mut i = (h >> self.shift) as usize;
+        loop {
+            let slot = &self.slots[i];
+            match &slot.node {
+                None => break,
+                Some(e) => {
+                    if slot.hash == h && k.is(e) {
                         return e.clone();
                     }
                 }
             }
-            let e = alloc_node(d);
-            self.overflow.entry(h).or_default().push(e.clone());
-            return e;
+            i = (i + 1) & mask;
         }
-        if let Some(bucket) = self.overflow.get(&h) {
-            for e in bucket {
-                if node_eq(&d, e) {
-                    return e.clone();
-                }
-            }
+        let id = self.take_id();
+        let e = alloc_node_with(k.into_data(), id);
+        self.slots[i] = Slot {
+            hash: h,
+            node: Some(e.clone()),
+        };
+        self.len += 1;
+        if self.len > self.grow_at {
+            self.grow();
         }
-        let e = alloc_node(d);
-        self.primary.insert(h, e.clone());
         e
     }
 
+    /// Double the slot array. Re-filing uses the stored hash only.
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) {
+        let log2 = 64 - self.shift + 1;
+        let n = 1usize << log2;
+        let old = std::mem::replace(&mut self.slots, vec![EMPTY_SLOT; n]);
+        self.shift = 64 - log2;
+        self.grow_at = n / 8 * 5;
+        let mask = n - 1;
+        for slot in old {
+            if slot.node.is_some() {
+                let mut i = (slot.hash >> self.shift) as usize;
+                while self.slots[i].node.is_some() {
+                    i = (i + 1) & mask;
+                }
+                self.slots[i] = slot;
+            }
+        }
+    }
+
+    #[inline]
     fn len(&self) -> usize {
-        self.primary.len() + self.overflow.values().map(|v| v.len()).sum::<usize>()
+        self.len
+    }
+
+    /// Drop every node reference the table holds. The slot array is kept
+    /// (unless it outgrew `RETAINED_SLOTS_LOG2`), so the refill neither
+    /// re-allocates nor re-files anything.
+    fn clear(&mut self) {
+        if self.slots.len() > 1usize << RETAINED_SLOTS_LOG2 {
+            let fresh = Interner::with_slots_log2(RETAINED_SLOTS_LOG2);
+            let old = std::mem::replace(&mut self.slots, fresh.slots);
+            self.shift = fresh.shift;
+            self.grow_at = fresh.grow_at;
+            drop(old);
+        } else if self.len != 0 {
+            for slot in self.slots.iter_mut() {
+                slot.node = None;
+            }
+        }
+        self.len = 0;
     }
 }
 
+/// Allocate a node outside the strong table (`KIOTA_RECLAIM` and tests).
+/// Identities come from the one counter either way.
 fn alloc_node(d: ExprData) -> Expr {
+    let id = INTERN.with(|t| t.borrow_mut().take_id());
+    alloc_node_with(d, id)
+}
+
+#[inline(always)]
+fn alloc_node_with(d: ExprData, identity: usize) -> Expr {
     let loose = loose_of(&d);
     let used_bvars = used_of(&d);
     Rc::new(ExprNode {
-        identity: NEXT_NODE_ID.with(|next| {
-            let id = next.get();
-            next.set(id.checked_add(1).expect("expression identity exhausted"));
-            id
-        }),
+        identity,
         data: d,
         loose,
         used_bvars,
@@ -368,10 +739,8 @@ fn alloc_node(d: ExprData) -> Expr {
 }
 
 thread_local! {
-    static NEXT_NODE_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
     static INTERN: RefCell<Interner> = RefCell::new(Interner::default());
     static WEAK_INTERN: RefCell<reclaim::WeakInterner> = RefCell::new(reclaim::WeakInterner::default());
-    static INTERN_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LEVEL_INST_MEMO: RefCell<FxHashMap<(usize, usize), Expr>> =
         RefCell::new(FxHashMap::default());
     // IDs are assigned only after comparing the complete substitution. A hash
@@ -489,20 +858,67 @@ pub fn bits_to_list(mut bits: u64, base: u32) -> Vec<u32> {
     out
 }
 
-pub fn intern(d: ExprData) -> Expr {
-    let n = INTERN_CALLS.with(|c| {
-        let n = c.get() + 1;
-        c.set(n);
-        n
-    });
-    if n % 100_000_000 == 0 {
-        eprintln!("INTERN_CALLS {n} nodes={}", intern_node_count());
+/// A progress line on stderr every this many `intern` calls.
+const INTERN_REPORT_EVERY: u64 = 100_000_000;
+
+/// Look a node up, allocating it if it is new.
+///
+/// Inlined into every constructor below. `K` is the constructor's own
+/// `Shape`, so each gets a copy of the lookup compiled for its kind. The
+/// hash is taken first: it needs nothing from the table.
+#[inline(always)]
+fn intern_inline<K: Shape>(k: K) -> Expr {
+    let h = k.hash();
+    INTERN.with(|t| {
+        let mut t = t.borrow_mut();
+        t.calls += 1;
+        if t.calls == t.next_report {
+            t.report();
+        }
+        if t.weak_mode {
+            drop(t);
+            return intern_weak(k.into_data());
+        }
+        t.intern(k, h)
+    })
+}
+
+#[cold]
+#[inline(never)]
+fn intern_weak(d: ExprData) -> Expr {
+    WEAK_INTERN.with(|t| t.borrow_mut().intern(d))
+}
+
+impl Interner {
+    #[cold]
+    #[inline(never)]
+    fn report(&mut self) {
+        self.next_report += INTERN_REPORT_EVERY;
+        let n = self.calls;
+        let nodes = if self.weak_mode {
+            WEAK_INTERN.with(|w| w.borrow().len())
+        } else {
+            self.len()
+        };
+        eprintln!("INTERN_CALLS {n} nodes={nodes}");
         let _ = std::io::Write::flush(&mut std::io::stderr());
     }
-    if reclamation_enabled() {
-        WEAK_INTERN.with(|t| t.borrow_mut().intern(d))
-    } else {
-        INTERN.with(|t| t.borrow_mut().intern(d))
+}
+
+/// `intern` for a node whose kind is only known at run time: hand it to
+/// the constructor of its kind, the one way into the table.
+pub fn intern(d: ExprData) -> Expr {
+    match d {
+        ExprData::BVar(i) => bvar(i),
+        ExprData::Sort(l) => sort(l),
+        ExprData::Const(n, us) => intern_inline(ConstShape(n, us)),
+        ExprData::App(f, a) => app(f, a),
+        ExprData::Lam(bi, ty, body) => lam(bi, ty, body),
+        ExprData::Pi(bi, ty, body) => pi(bi, ty, body),
+        ExprData::Let(ty, val, body) => let_(ty, val, body),
+        ExprData::Proj(s, i, v) => proj(s, i, v),
+        ExprData::Lit(Lit::Nat(n)) => lit_nat(n),
+        ExprData::Lit(Lit::Str(s)) => intern_inline(StrShape(s)),
     }
 }
 
@@ -542,7 +958,7 @@ pub fn intern_clear_if_large(threshold: usize) -> bool {
     INTERN.with(|t| {
         let mut t = t.borrow_mut();
         if t.len() > threshold {
-            *t = Interner::default();
+            t.clear();
             true
         } else {
             false
@@ -551,7 +967,7 @@ pub fn intern_clear_if_large(threshold: usize) -> bool {
 }
 
 pub fn intern_calls() -> u64 {
-    INTERN_CALLS.with(|c| c.get())
+    INTERN.with(|t| t.borrow().calls)
 }
 
 /// Allocate `n` unique interned apps so a later Check sees a large table
@@ -564,47 +980,66 @@ pub fn warm_intern(n: u32) {
     let _ = e;
 }
 
+/// Largest capacity (entries) a per-declaration memo keeps between
+/// declarations.
+const MEMO_KEEP_CAPACITY: usize = 1 << 12;
+
+/// Empty a per-declaration memo.
+///
+/// `HashMap::clear` sweeps the map's whole allocation whatever it holds, so
+/// a map that one large declaration stretched to millions of entries would
+/// charge that sweep to every declaration after it. Such a map is released
+/// instead and grows again on demand; a small one keeps its allocation.
+/// Either way the map is empty afterwards and nothing reads its capacity.
+pub fn clear_memo<K, V, S: Default>(m: &mut std::collections::HashMap<K, V, S>) {
+    if m.capacity() > MEMO_KEEP_CAPACITY {
+        *m = Default::default();
+    } else {
+        m.clear();
+    }
+}
+
 /// Drop per-decl substitution memos. The intern table stays: env terms
 /// live there. These two maps grow with every `shift`/`instantiate_level_params`
 /// and were never cleared, so std `#18000` hung after 18k decls of residue.
 pub fn clear_subst_memos() {
-    LEVEL_INST_MEMO.with(|m| m.borrow_mut().clear());
+    LEVEL_INST_MEMO.with(|m| clear_memo(&mut m.borrow_mut()));
     // Clear the memo first: IDs can be reused only after its entries are gone.
-    LEVEL_SUBST_IDS.with(|m| m.borrow_mut().clear());
-    SHIFT_MEMO.with(|m| m.borrow_mut().clear());
-    INST1_MEMO.with(|m| m.borrow_mut().clear());
-    USED_SET_MEMO.with(|m| m.borrow_mut().clear());
+    LEVEL_SUBST_IDS.with(|m| clear_memo(&mut m.borrow_mut()));
+    SHIFT_MEMO.with(|m| clear_memo(&mut m.borrow_mut()));
+    INST1_MEMO.with(|m| clear_memo(&mut m.borrow_mut()));
+    USED_SET_MEMO.with(|m| clear_memo(&mut m.borrow_mut()));
 }
 
 pub fn bvar(i: u32) -> Expr {
-    intern(ExprData::BVar(i))
+    intern_inline(BVarShape(i))
 }
 pub fn sort(l: Level) -> Expr {
-    intern(ExprData::Sort(l))
+    intern_inline(SortShape(l))
 }
 pub fn const_(n: u32, us: Vec<Level>) -> Expr {
-    intern(ExprData::Const(n, Rc::new(us)))
+    intern_inline(ConstShape(n, Rc::new(us)))
 }
 pub fn app(f: Expr, a: Expr) -> Expr {
-    intern(ExprData::App(f, a))
+    intern_inline(AppShape(f, a))
 }
 pub fn lam(bi: BinderInfo, ty: Expr, body: Expr) -> Expr {
-    intern(ExprData::Lam(bi, ty, body))
+    intern_inline(LamShape(bi, ty, body))
 }
 pub fn pi(bi: BinderInfo, ty: Expr, body: Expr) -> Expr {
-    intern(ExprData::Pi(bi, ty, body))
+    intern_inline(PiShape(bi, ty, body))
 }
 pub fn let_(ty: Expr, val: Expr, body: Expr) -> Expr {
-    intern(ExprData::Let(ty, val, body))
+    intern_inline(LetShape(ty, val, body))
 }
 pub fn proj(s: u32, i: u32, e: Expr) -> Expr {
-    intern(ExprData::Proj(s, i, e))
+    intern_inline(ProjShape(s, i, e))
 }
 pub fn lit_nat(n: num_bigint::BigUint) -> Expr {
-    intern(ExprData::Lit(Lit::Nat(n)))
+    intern_inline(NatShape(n))
 }
 pub fn lit_str(s: impl Into<String>) -> Expr {
-    intern(ExprData::Lit(Lit::Str(Rc::new(s.into()))))
+    intern_inline(StrShape(Rc::new(s.into())))
 }
 
 /// True when `e` has no loose bvars.
@@ -671,15 +1106,178 @@ pub fn instantiate(e: &Expr, args: &[Expr]) -> Expr {
     // full traversal. The grind perf tests amplify a shared simp-lemma
     // application thousands of times; keying on (node, depth) — args are
     // fixed within one call — visits each unique node once.
-    let mut memo = rustc_hash::FxHashMap::default();
-    instantiate_core(e, args, 0, &mut memo)
+    //
+    // The memo is per call, but its storage is not: a fresh map grew from
+    // nothing on every substitution (allocate, re-file, free, several times
+    // over for a body of a few dozen nodes), and emptying a kept map cost
+    // its capacity however few entries the call made. `SubstMemo` is taken
+    // from a thread-local, remembers which slots it filled, and empties
+    // exactly those. The entries, the hits and the misses of every call are
+    // what a fresh map would give.
+    if loose_bvar_range(e) == 0 {
+        // What `instantiate_core` answers at depth 0, before any memo use.
+        return e.clone();
+    }
+    let mut memo = INST_SCRATCH
+        .try_with(|m| std::mem::take(&mut *m.borrow_mut()))
+        .unwrap_or_default();
+    let r = instantiate_core(e, args, 0, &mut memo);
+    crate::stats::inst_nodes_add(memo.misses);
+    memo.misses = 0;
+    memo.clear();
+    let _ = INST_SCRATCH.try_with(|m| *m.borrow_mut() = memo);
+    r
+}
+
+thread_local! {
+    /// The emptied memo of the last `instantiate` call, for its storage.
+    static INST_SCRATCH: RefCell<SubstMemo> = RefCell::new(SubstMemo::default());
+}
+
+struct SubstSlot {
+    id: usize,
+    depth: u32,
+    /// `None` marks an empty slot.
+    val: Option<Expr>,
+}
+
+/// One `instantiate` call's memo, `(node identity, depth) -> result`: open
+/// addressing with linear probing, plus the list of slots in use so that
+/// emptying costs the entries made and not the capacity.
+struct SubstMemo {
+    slots: Vec<SubstSlot>,
+    /// `64 - log2(slots.len())`.
+    shift: u32,
+    /// Indices of the occupied slots.
+    filled: Vec<u32>,
+    /// Nodes this call substituted into (lookups that found nothing), for
+    /// the `inst_nodes` counter: added up here and reported once per call
+    /// instead of asking on every node whether counters are on.
+    misses: u64,
+}
+
+/// Slots of a new memo, and of one emptied after outgrowing the limit below.
+const SUBST_MEMO_SLOTS_LOG2: u32 = 5;
+/// A memo stretched past this many slots by one large body goes back to the
+/// initial size, so the small substitutions after it probe a table that
+/// stays in the first-level cache.
+const SUBST_MEMO_KEEP_SLOTS: usize = 1 << 10;
+
+impl Default for SubstMemo {
+    fn default() -> Self {
+        SubstMemo::with_slots_log2(SUBST_MEMO_SLOTS_LOG2)
+    }
+}
+
+impl SubstMemo {
+    fn with_slots_log2(log2: u32) -> Self {
+        let n = 1usize << log2;
+        let mut slots = Vec::with_capacity(n);
+        slots.resize_with(n, || SubstSlot {
+            id: 0,
+            depth: 0,
+            val: None,
+        });
+        SubstMemo {
+            slots,
+            shift: 64 - log2,
+            filled: Vec::new(),
+            misses: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn start(&self, id: usize, depth: u32) -> usize {
+        (hash_mix(hash_mix(SEED_APP, id as u64), depth as u64) >> self.shift) as usize
+    }
+
+    #[inline]
+    fn get(&self, id: usize, depth: u32) -> Option<&Expr> {
+        let mask = self.slots.len() - 1;
+        let mut i = self.start(id, depth);
+        loop {
+            let s = &self.slots[i];
+            match &s.val {
+                None => return None,
+                Some(v) => {
+                    if s.id == id && s.depth == depth {
+                        return Some(v);
+                    }
+                }
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, id: usize, depth: u32, val: Expr) {
+        // At most half full, so a probe always ends at an empty slot.
+        if (self.filled.len() + 1) * 2 > self.slots.len() {
+            self.grow();
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = self.start(id, depth);
+        loop {
+            let s = &mut self.slots[i];
+            match &s.val {
+                None => break,
+                Some(_) => {
+                    if s.id == id && s.depth == depth {
+                        s.val = Some(val);
+                        return;
+                    }
+                }
+            }
+            i = (i + 1) & mask;
+        }
+        self.slots[i] = SubstSlot {
+            id,
+            depth,
+            val: Some(val),
+        };
+        self.filled.push(i as u32);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) {
+        let log2 = 64 - self.shift + 1;
+        let mut bigger = SubstMemo::with_slots_log2(log2);
+        bigger.filled.reserve(self.filled.len() + 1);
+        bigger.misses = self.misses;
+        let mask = bigger.slots.len() - 1;
+        for &i in &self.filled {
+            let s = &mut self.slots[i as usize];
+            let (id, depth) = (s.id, s.depth);
+            let val = s.val.take();
+            let mut j = bigger.start(id, depth);
+            while bigger.slots[j].val.is_some() {
+                j = (j + 1) & mask;
+            }
+            bigger.slots[j] = SubstSlot { id, depth, val };
+            bigger.filled.push(j as u32);
+        }
+        *self = bigger;
+    }
+
+    /// Release every entry.
+    #[inline]
+    fn clear(&mut self) {
+        if self.slots.len() > SUBST_MEMO_KEEP_SLOTS {
+            *self = SubstMemo::default();
+            return;
+        }
+        for i in self.filled.drain(..) {
+            self.slots[i as usize].val = None;
+        }
+    }
 }
 
 fn instantiate_core(
     e: &Expr,
     args: &[Expr],
     depth: u32,
-    memo: &mut rustc_hash::FxHashMap<(usize, u32), Expr>,
+    memo: &mut SubstMemo,
 ) -> Expr {
     // Every loose bvar is bound above `depth`, so neither the substitution nor
     // the renumbering below can reach into this subterm. Returning it whole is
@@ -687,11 +1285,11 @@ fn instantiate_core(
     if loose_bvar_range(e) <= depth {
         return e.clone();
     }
-    let key = (identity(e), depth);
-    if let Some(r) = memo.get(&key) {
+    let id = identity(e);
+    if let Some(r) = memo.get(id, depth) {
         return r.clone();
     }
-    crate::stats::inst_node();
+    memo.misses += 1;
     let r = match &***e {
         ExprData::BVar(i) => {
             if *i >= depth && ((*i - depth) as usize) < args.len() {
@@ -725,7 +1323,7 @@ fn instantiate_core(
         ),
         ExprData::Proj(s, i, v) => proj(*s, *i, instantiate_core(v, args, depth, memo)),
     };
-    memo.insert(key, r.clone());
+    memo.insert(id, depth, r.clone());
     r
 }
 
@@ -940,6 +1538,151 @@ mod tests {
         );
     }
 
+    /// The table starts at `1 << INITIAL_SLOTS_LOG2` slots and doubles.
+    /// Every node filed before a doubling must still be found after it,
+    /// and a second pass must not allocate.
+    #[test]
+    fn interner_growth_keeps_every_node_findable() {
+        let n = (1u32 << INITIAL_SLOTS_LOG2) * 3;
+        let head = const_(7, vec![]);
+        let before = intern_node_count();
+        let first: Vec<Expr> = (0..n)
+            .map(|i| app(head.clone(), lit_nat(BigUint::from(i))))
+            .collect();
+        let after = intern_node_count();
+        assert!(after - before >= n as usize, "unique nodes were filed");
+        for (i, e) in first.iter().enumerate() {
+            let again = app(head.clone(), lit_nat(BigUint::from(i as u32)));
+            assert!(Rc::ptr_eq(e, &again), "node {i} lost after growth");
+        }
+        assert_eq!(intern_node_count(), after, "second pass allocated");
+    }
+
+    /// Kinds that share children must not be confused with one another,
+    /// whatever the hash says: `node_eq` decides.
+    #[test]
+    fn interner_distinguishes_kinds_over_the_same_children() {
+        let a = bvar(1);
+        let b = bvar(2);
+        let nodes = [
+            app(a.clone(), b.clone()),
+            app(b.clone(), a.clone()),
+            lam(BinderInfo::Default, a.clone(), b.clone()),
+            lam(BinderInfo::Implicit, a.clone(), b.clone()),
+            pi(BinderInfo::Default, a.clone(), b.clone()),
+            pi(BinderInfo::InstImplicit, a.clone(), b.clone()),
+            let_(a.clone(), b.clone(), a.clone()),
+            let_(a.clone(), a.clone(), b.clone()),
+            proj(1, 2, a.clone()),
+            proj(2, 1, a.clone()),
+            proj(1, 2, b.clone()),
+        ];
+        for (i, x) in nodes.iter().enumerate() {
+            for (j, y) in nodes.iter().enumerate() {
+                assert_eq!(Rc::ptr_eq(x, y), i == j, "nodes {i} and {j}");
+            }
+        }
+    }
+
+    /// A reset empties the table in place. What it held and nothing else
+    /// referenced is freed; what something else still holds survives with
+    /// its content, and the table hash-conses the next generation.
+    #[test]
+    fn interner_reset_frees_unreferenced_nodes_and_keeps_referenced_ones() {
+        let kept = app(const_(11, vec![]), lit_nat(BigUint::from(5u32)));
+        let kept_weak = Rc::downgrade(&kept);
+        let dead_weak = {
+            let dead = app(const_(12, vec![]), lit_nat(BigUint::from(6u32)));
+            Rc::downgrade(&dead)
+        };
+        // Under `KIOTA_RECLAIM` the table holds no node alive to begin with.
+        assert_eq!(
+            dead_weak.upgrade().is_some(),
+            !reclamation_enabled(),
+            "the strong table holds it"
+        );
+        assert!(intern_clear_if_large(0));
+        assert_eq!(intern_node_count(), 0);
+        assert!(dead_weak.upgrade().is_none(), "reset freed the unreferenced node");
+        assert!(kept_weak.upgrade().is_some());
+        match &**kept {
+            ExprData::App(f, a) => {
+                assert!(matches!(&***f, ExprData::Const(11, _)));
+                assert!(matches!(&***a, ExprData::Lit(Lit::Nat(n)) if *n == BigUint::from(5u32)));
+            }
+            _ => panic!("kept node changed shape"),
+        }
+        let x = app(bvar(0), bvar(1));
+        assert!(Rc::ptr_eq(&x, &app(bvar(0), bvar(1))));
+    }
+
+    /// Releasing a spine hundreds of thousands of nodes deep must not
+    /// recurse once per node: test threads have a 2 MiB stack.
+    #[test]
+    fn dropping_deep_spines_does_not_overflow_the_stack() {
+        const DEPTH: u32 = 400_000;
+        // Left-nested applications.
+        let mut spine = bvar(0);
+        for i in 0..DEPTH {
+            spine = app(spine, lit_nat(BigUint::from(i)));
+        }
+        // Nested binders, body-deep.
+        let mut binders = bvar(0);
+        for _ in 0..DEPTH {
+            binders = lam(BinderInfo::Default, s0(), binders);
+        }
+        // The same child on both sides: each level holds two references to
+        // the level below, and nothing else does once the table lets go.
+        let mut doubled = bvar(0);
+        for _ in 0..DEPTH {
+            doubled = app(doubled.clone(), doubled);
+        }
+        // Three references to the level below.
+        let mut tripled = bvar(1);
+        for _ in 0..DEPTH {
+            tripled = let_(tripled.clone(), tripled.clone(), tripled);
+        }
+        let mut projs = bvar(2);
+        for i in 0..DEPTH {
+            projs = proj(i, 0, projs);
+        }
+        // With the table emptied these five are the only owners.
+        assert!(intern_clear_if_large(0));
+        let weak = [
+            Rc::downgrade(&spine),
+            Rc::downgrade(&binders),
+            Rc::downgrade(&doubled),
+            Rc::downgrade(&tripled),
+            Rc::downgrade(&projs),
+        ];
+        drop((spine, binders, doubled, tripled, projs));
+        assert!(weak.iter().all(|w| w.upgrade().is_none()));
+    }
+
+    /// The other order: the owners go first, so the table reset is what
+    /// releases every node, in slot order rather than term order.
+    #[test]
+    fn resetting_a_table_of_deep_spines_does_not_overflow_the_stack() {
+        const DEPTH: u32 = 400_000;
+        let mut spine = bvar(0);
+        let mut doubled = bvar(1);
+        for i in 0..DEPTH {
+            spine = app(spine, lit_nat(BigUint::from(i)));
+            doubled = app(doubled.clone(), doubled);
+        }
+        let weak = [Rc::downgrade(&spine), Rc::downgrade(&doubled)];
+        drop((spine, doubled));
+        if reclamation_enabled() {
+            // The weak table never owned them: the drop above released both.
+            assert!(weak.iter().all(|w| w.upgrade().is_none()));
+            return;
+        }
+        assert!(weak.iter().all(|w| w.upgrade().is_some()), "the table holds them");
+        assert!(intern_clear_if_large(0));
+        assert!(weak.iter().all(|w| w.upgrade().is_none()));
+        assert_eq!(intern_node_count(), 0);
+    }
+
     #[test]
     fn intern_clear_if_large_is_a_noop_under_threshold() {
         let _ = const_(1, vec![]);
@@ -979,6 +1722,112 @@ mod tests {
         for n in 0..1_000 {
             assert!(identity(&const_(n, vec![])) > original_id);
         }
+    }
+
+    /// Every kind has one way into the table. The constructors and the
+    /// run-time `intern` must agree on each kind, whichever of the two files
+    /// the node first, and the general `hash_node`/`node_eq` (which the
+    /// reclaiming table uses) must agree with the per-kind ones.
+    #[test]
+    fn constructors_and_run_time_intern_share_one_node_per_structure() {
+        let c = const_(97, vec![level::zero()]);
+        let x = bvar(5);
+        let us = Rc::new(vec![level::succ(level::zero())]);
+        let big = BigUint::from(u64::MAX) * BigUint::from(3u8);
+        // (built by the constructor, the same structure as `ExprData`)
+        let by_constructor: Vec<(Expr, ExprData)> = vec![
+            (bvar(41), ExprData::BVar(41)),
+            (sort(level::succ(level::zero())), ExprData::Sort(level::succ(level::zero()))),
+            (const_(98, (*us).clone()), ExprData::Const(98, us.clone())),
+            (app(c.clone(), x.clone()), ExprData::App(c.clone(), x.clone())),
+            (
+                lam(BinderInfo::Implicit, c.clone(), x.clone()),
+                ExprData::Lam(BinderInfo::Implicit, c.clone(), x.clone()),
+            ),
+            (
+                pi(BinderInfo::Implicit, c.clone(), x.clone()),
+                ExprData::Pi(BinderInfo::Implicit, c.clone(), x.clone()),
+            ),
+            (
+                let_(c.clone(), x.clone(), c.clone()),
+                ExprData::Let(c.clone(), x.clone(), c.clone()),
+            ),
+            (proj(3, 1, x.clone()), ExprData::Proj(3, 1, x.clone())),
+            (lit_nat(big.clone()), ExprData::Lit(Lit::Nat(big.clone()))),
+            (lit_str("shape"), ExprData::Lit(Lit::Str(Rc::new("shape".to_string())))),
+        ];
+        let before = intern_node_count();
+        for (i, (e, d)) in by_constructor.iter().enumerate() {
+            assert!(node_eq(d, e), "kind {i}: node_eq disagrees with the constructor");
+            assert_eq!(
+                hash_node(d),
+                hash_node(&e.data),
+                "kind {i}: equal structures, different hashes"
+            );
+            assert!(Rc::ptr_eq(e, &intern(d.clone())), "kind {i}: run-time intern made a second node");
+        }
+        assert_eq!(intern_node_count(), before, "a lookup allocated");
+        // The other order: `intern` files it, the constructor finds it.
+        let via_intern = intern(ExprData::App(x.clone(), c.clone()));
+        assert!(Rc::ptr_eq(&via_intern, &app(x.clone(), c.clone())));
+        let via_intern = intern(ExprData::Pi(BinderInfo::Default, x.clone(), c.clone()));
+        assert!(Rc::ptr_eq(&via_intern, &pi(BinderInfo::Default, x.clone(), c.clone())));
+        // Same children under a different kind or scalar is a different node.
+        assert!(!Rc::ptr_eq(
+            &lam(BinderInfo::Implicit, c.clone(), x.clone()),
+            &pi(BinderInfo::Implicit, c.clone(), x.clone())
+        ));
+        assert!(!Rc::ptr_eq(
+            &lam(BinderInfo::Implicit, c.clone(), x.clone()),
+            &lam(BinderInfo::Default, c.clone(), x.clone())
+        ));
+        assert!(!Rc::ptr_eq(&proj(3, 1, x.clone()), &proj(3, 2, x.clone())));
+        assert!(!Rc::ptr_eq(&proj(3, 1, x.clone()), &proj(4, 1, x.clone())));
+        assert!(!Rc::ptr_eq(&app(c.clone(), x.clone()), &app(x.clone(), c.clone())));
+        assert!(!Rc::ptr_eq(&lit_str("shape"), &lit_str("shapf")));
+        assert!(!Rc::ptr_eq(&lit_nat(big.clone()), &lit_nat(big + 1u8)));
+    }
+
+    /// A per-declaration memo is empty after `clear_memo` whatever its
+    /// size. A small one keeps its allocation; one stretched past the limit
+    /// gives it back, so the next declarations do not sweep it.
+    #[test]
+    fn clear_memo_empties_and_releases_an_oversized_map() {
+        let mut small: FxHashMap<(usize, usize), Expr> = FxHashMap::default();
+        for i in 0..100usize {
+            small.insert((i, i), bvar(i as u32));
+        }
+        let kept = small.capacity();
+        clear_memo(&mut small);
+        assert!(small.is_empty());
+        assert_eq!(small.capacity(), kept, "a small memo keeps its allocation");
+
+        let mut large: FxHashMap<(usize, usize), Expr> = FxHashMap::default();
+        let held = bvar(7);
+        let before = Rc::strong_count(&held);
+        for i in 0..(4 * MEMO_KEEP_CAPACITY) {
+            large.insert((i, 0), held.clone());
+        }
+        assert!(large.capacity() > MEMO_KEEP_CAPACITY);
+        clear_memo(&mut large);
+        assert!(large.is_empty());
+        assert!(large.capacity() <= MEMO_KEEP_CAPACITY, "an oversized memo is released");
+        assert_eq!(Rc::strong_count(&held), before, "every entry was dropped");
+        // And it is usable again.
+        large.insert((1, 1), held.clone());
+        assert_eq!(large.len(), 1);
+
+        // The memos `clear_subst_memos` owns go through it.
+        let body = app(bvar(0), bvar(1));
+        for i in 0..(2 * MEMO_KEEP_CAPACITY as u32) {
+            let _ = instantiate1(&body, &lit_nat(BigUint::from(i)));
+        }
+        assert!(INST1_MEMO.with(|m| m.borrow().capacity()) > MEMO_KEEP_CAPACITY);
+        clear_subst_memos();
+        assert!(INST1_MEMO.with(|m| m.borrow().is_empty()));
+        assert!(INST1_MEMO.with(|m| m.borrow().capacity()) <= MEMO_KEEP_CAPACITY);
+        let c = const_(99, vec![]);
+        assert!(Rc::ptr_eq(&instantiate1(&body, &c), &app(c.clone(), bvar(0))));
     }
 
     #[test]
@@ -1201,6 +2050,72 @@ mod tests {
             ),
             _ => proj(0, 0, gen(seed, depth - 1)),
         }
+    }
+
+    /// `instantiate` borrows its memo's allocation from the previous call.
+    /// Whatever the previous call left behind (small, large enough to be
+    /// dropped, or nothing), every call must answer as a fresh memo would.
+    #[test]
+    fn instantiate_memo_reuse_never_changes_substitution() {
+        let mut seed = 0xD1CE_5EED_u64;
+        // A body with far more distinct open nodes than the kept capacity.
+        // A balanced tree, not a spine: substitution recurses once per level,
+        // and four thousand levels overflow a test thread's stack in a debug
+        // build.
+        let mut layer: Vec<Expr> = (0..(4 * SUBST_MEMO_KEEP_SLOTS as u32))
+            .map(|i| app(bvar(1), lit_nat(BigUint::from(i))))
+            .collect();
+        layer.push(bvar(0));
+        while layer.len() > 1 {
+            layer = layer
+                .chunks(2)
+                .map(|pair| match pair {
+                    [l, r] => app(l.clone(), r.clone()),
+                    [l] => l.clone(),
+                    _ => unreachable!(),
+                })
+                .collect();
+        }
+        let wide = layer.pop().expect("one root");
+        let a0 = const_(5, vec![]);
+        let a1 = lam(BinderInfo::Default, s0(), bvar(0));
+        for round in 0..60 {
+            let e = gen(&mut seed, 5);
+            let x = gen(&mut seed, 2);
+            for args in [vec![x.clone()], vec![x.clone(), a1.clone()]] {
+                assert!(
+                    Rc::ptr_eq(&instantiate(&e, &args), &instantiate_ref(&e, &args, 0)),
+                    "round {round}: reused memo changed a result"
+                );
+            }
+            if round % 7 == 0 {
+                // Stretch the memo past what is kept, then carry on.
+                let args = [a0.clone(), a1.clone()];
+                assert!(Rc::ptr_eq(
+                    &instantiate(&wide, &args),
+                    &instantiate_ref(&wide, &args, 0)
+                ));
+            }
+            // A closed term comes back as itself, whatever the arguments.
+            let closed = lam(BinderInfo::Default, s0(), app(bvar(0), a0.clone()));
+            assert!(Rc::ptr_eq(&instantiate(&closed, &[x]), &closed));
+        }
+    }
+
+    /// The same shared subterm under two binder depths must be substituted
+    /// per depth: the memo key carries the depth, and a reused allocation
+    /// must not carry entries from one call into the next.
+    #[test]
+    fn instantiate_memo_does_not_leak_between_calls() {
+        let shared = app(bvar(0), bvar(1));
+        let body = app(shared.clone(), lam(BinderInfo::Default, s0(), shared.clone()));
+        let c1 = const_(21, vec![]);
+        let c2 = const_(22, vec![]);
+        let r1 = instantiate(&body, std::slice::from_ref(&c1));
+        let r2 = instantiate(&body, std::slice::from_ref(&c2));
+        assert!(Rc::ptr_eq(&r1, &instantiate_ref(&body, std::slice::from_ref(&c1), 0)));
+        assert!(Rc::ptr_eq(&r2, &instantiate_ref(&body, std::slice::from_ref(&c2), 0)));
+        assert!(!Rc::ptr_eq(&r1, &r2), "the second call saw the first call's entries");
     }
 
     #[test]

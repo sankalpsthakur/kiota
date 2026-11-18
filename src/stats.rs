@@ -40,6 +40,14 @@ bump!(shift_node, SHIFT_NODES);
 bump!(ctx_clone, CTX_CLONES);
 bump!(infer_hit, INFER_HITS);
 
+/// Add a whole substitution's worth of nodes to `inst_nodes` at once.
+#[inline]
+pub fn inst_nodes_add(n: u64) {
+    if enabled() {
+        INST_NODES.with(|c| c.set(c.get() + n));
+    }
+}
+
 pub fn inst_nodes() -> u64 {
     INST_NODES.with(|c| c.get())
 }
