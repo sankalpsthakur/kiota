@@ -819,8 +819,9 @@ impl<'e> Checker<'e> {
     pub fn check_decl(&self, name: u32, kind: &str) -> R<()> {
         match self.check_decl_once(name, kind) {
             Err(first @ (TcError::Decline(_) | TcError::Reject(_))) if !LAZY_MAIN_PATH.with(Cell::get) => {
-                if std::env::var_os("KIOTA_PROGRESS").is_some() {
-                    eprintln!("LAZY_RETRY {} after {first:?}", self.name_str(name));
+                if std::env::var_os("KIOTA_PROGRESS").is_some() || std::env::var_os("KIOTA_SLOW_MS").is_some() {
+                    let why: String = format!("{first:?}").chars().take(160).collect();
+                    eprintln!("LAZY_RETRY {} after {why}", self.name_str(name));
                 }
                 LAZY_RETRIES.with(|c| c.set(c.get() + 1));
                 LAZY_MAIN_PATH.with(|l| l.set(true));

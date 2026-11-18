@@ -1437,9 +1437,43 @@ impl Parser {
         }
         let nat_ref = self.declared("Nat");
         let string_ref = self.declared("String");
-        Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
-            .check_decl(name, kind)
-            .map_err(|e| self.annotate(name, e))?;
+        // Diagnostic only (remote branch): declarations over KIOTA_SLOW_MS
+        // milliseconds, with the resident set before and after.
+        let slow_ms: Option<u128> = std::env::var("KIOTA_SLOW_MS").ok().and_then(|v| v.parse().ok());
+        let rss_kb = || -> u64 {
+            std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|s| s.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok()))
+                .map(|pages| pages * 4)
+                .unwrap_or(0)
+        };
+        let t0 = std::time::Instant::now();
+        let rss0 = if slow_ms.is_some() { rss_kb() } else { 0 };
+        let checked = Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
+            .check_decl(name, kind);
+        if let Some(th) = slow_ms {
+            let ms = t0.elapsed().as_millis();
+            let rss1 = rss_kb();
+            if ms >= th || rss1 > rss0 + 262_144 {
+                eprintln!(
+                    "SLOW #{} {kind} {nm} ms={ms} rss_kb={rss0}->{rss1} verdict={}",
+                    self.decl_count,
+                    match &checked { Ok(()) => "ok", Err(TcError::Decline(_)) => "decline", Err(TcError::Reject(_)) => "reject", Err(_) => "error" }
+                );
+            }
+        }
+        checked
+            .map_err(|e| self.annotate(name, e))
+            .or_else(|e| match e {
+                // Diagnostic only (remote branch): report every decline and
+                // carry on; the process still ends in a decline.
+                TcError::Decline(m) if std::env::var_os("KIOTA_KEEP_GOING").is_some() => {
+                    eprintln!("DECLINE-CONT #{}: {m}", self.decl_count);
+                    KEEP_GOING_DECLINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                }
+                e => Err(e),
+            })?;
         self.release_theorem_value(name);
         Ok(())
     }
@@ -1466,6 +1500,8 @@ impl Parser {
         }
     }
 }
+
+pub static KEEP_GOING_DECLINES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn kind_or_direct(_v: &Value) {}
 
