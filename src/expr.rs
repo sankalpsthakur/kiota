@@ -56,11 +56,59 @@ pub enum ExprData {
 /// (0 = closed). `used_bvars` is the bitset of those indices (`bit i` = bvar
 /// `i` occurs); `u64::MAX` means some bvar is `≥ 64` and the defeq pair key
 /// must fall back to `suffix[loose]`.
+///
+/// With `Rc`'s two counters the node is exactly 64 bytes, one cache line
+/// (a size test pins this). To fit, the identity and the loose range share
+/// one word: the identity in the high 48 bits, the range in the low 16.
+/// A range of `LOOSE_WIDE` or more does not fit and is kept, exactly, in
+/// `WIDE_LOOSE` under the node's identity.
 pub struct ExprNode {
-    identity: usize,
+    id_loose: u64,
     data: ExprData,
-    loose: u32,
     used_bvars: u64,
+}
+
+/// Bits of `id_loose` that hold the loose range.
+const LOOSE_BITS: u32 = 16;
+/// The low-bits value that sends `loose` to `WIDE_LOOSE`.
+const LOOSE_WIDE: u32 = (1 << LOOSE_BITS) - 1;
+/// Identities are below this (2^48 nodes allocated by one thread).
+const IDENTITY_LIMIT: usize = 1 << (64 - LOOSE_BITS);
+
+thread_local! {
+    /// The loose range of every live node whose range is `LOOSE_WIDE` or
+    /// more, by identity. Such a node sits under tens of thousands of
+    /// binders it does not bind; the entry goes when the node does.
+    static WIDE_LOOSE: RefCell<FxHashMap<usize, u32>> = RefCell::new(FxHashMap::default());
+}
+
+impl ExprNode {
+    #[inline(always)]
+    fn id(&self) -> usize {
+        (self.id_loose >> LOOSE_BITS) as usize
+    }
+
+    /// The smallest `k` with every loose bvar index `< k`.
+    #[inline(always)]
+    fn loose(&self) -> u32 {
+        let low = self.id_loose as u32 & LOOSE_WIDE;
+        if low != LOOSE_WIDE {
+            low
+        } else {
+            self.loose_wide()
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn loose_wide(&self) -> u32 {
+        let id = self.id();
+        WIDE_LOOSE.with(|w| {
+            *w.borrow()
+                .get(&id)
+                .expect("a node with a wide loose range has its range on file")
+        })
+    }
 }
 
 impl std::ops::Deref for ExprNode {
@@ -90,7 +138,7 @@ impl Eq for ExprNode {}
 impl Hash for ExprNode {
     #[inline(always)]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.identity.hash(state)
+        self.id().hash(state)
     }
 }
 
@@ -108,6 +156,9 @@ impl Hash for ExprNode {
 impl Drop for ExprNode {
     #[inline]
     fn drop(&mut self) {
+        if self.id_loose as u32 & LOOSE_WIDE == LOOSE_WIDE {
+            forget_wide_loose(self.id());
+        }
         // Whether releasing this node's reference could be the child's last.
         #[inline(always)]
         fn last(e: &Expr) -> bool {
@@ -135,6 +186,13 @@ impl Drop for ExprNode {
             drop_cascade(&mut self.data);
         }
     }
+}
+
+#[cold]
+#[inline(never)]
+fn forget_wide_loose(id: usize) {
+    // `try_with`: a node can outlive this thread-local during teardown.
+    let _ = WIDE_LOOSE.try_with(|w| w.borrow_mut().remove(&id));
 }
 
 thread_local! {
@@ -197,7 +255,7 @@ fn ptr(e: &Expr) -> usize {
 /// Address reuse must not let a memo entry for a discarded term match a new
 /// allocation. IDs are thread-local, like the Rc terms and all checker caches.
 pub fn identity(e: &Expr) -> usize {
-    e.identity
+    e.id()
 }
 
 /// The smallest `k` such that every loose bvar in `e` has index `< k`.
@@ -208,7 +266,7 @@ pub fn identity(e: &Expr) -> usize {
 /// so `instantiate`/`shift` can return it whole instead of rebuilding it.
 #[inline(always)]
 pub fn loose_bvar_range(e: &Expr) -> u32 {
-    e.loose
+    e.loose()
 }
 
 /// Bitset of loose bvar indices, or `u64::MAX` if some index is `≥ 64`.
@@ -265,12 +323,15 @@ fn loose_of(d: &ExprData) -> u32 {
     match d {
         ExprData::BVar(i) => *i + 1,
         ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => 0,
-        ExprData::App(f, a) => f.loose.max(a.loose),
+        ExprData::App(f, a) => f.loose().max(a.loose()),
         ExprData::Lam(_, ty, body) | ExprData::Pi(_, ty, body) => {
-            ty.loose.max(body.loose.saturating_sub(1))
+            ty.loose().max(body.loose().saturating_sub(1))
         }
-        ExprData::Let(ty, val, body) => ty.loose.max(val.loose).max(body.loose.saturating_sub(1)),
-        ExprData::Proj(_, _, v) => v.loose,
+        ExprData::Let(ty, val, body) => ty
+            .loose()
+            .max(val.loose())
+            .max(body.loose().saturating_sub(1)),
+        ExprData::Proj(_, _, v) => v.loose(),
     }
 }
 
@@ -448,7 +509,8 @@ impl Interner {
     #[inline(always)]
     fn take_id(&mut self) -> usize {
         let id = self.next_id;
-        self.next_id = id.checked_add(1).expect("expression identity exhausted");
+        assert!(id < IDENTITY_LIMIT, "expression identity exhausted");
+        self.next_id = id + 1;
         id
     }
 
@@ -572,12 +634,20 @@ fn alloc_node(d: ExprData) -> Expr {
 fn alloc_node_with(d: ExprData, identity: usize) -> Expr {
     let loose = loose_of(&d);
     let used_bvars = used_of(&d);
+    if loose >= LOOSE_WIDE {
+        file_wide_loose(identity, loose);
+    }
     Rc::new(ExprNode {
-        identity,
+        id_loose: ((identity as u64) << LOOSE_BITS) | loose.min(LOOSE_WIDE) as u64,
         data: d,
-        loose,
         used_bvars,
     })
+}
+
+#[cold]
+#[inline(never)]
+fn file_wide_loose(identity: usize, loose: u32) {
+    WIDE_LOOSE.with(|w| w.borrow_mut().insert(identity, loose));
 }
 
 thread_local! {
@@ -653,7 +723,7 @@ pub fn used_bvar_set(e: &Expr) -> Option<Rc<[u32]>> {
 
 /// The indices of `c` at or above `drop`, re-based to `drop`.
 fn child_used(c: &Expr, drop: u32) -> Option<Vec<u32>> {
-    if c.loose <= drop {
+    if c.loose() <= drop {
         return Some(Vec::new());
     }
     if c.used_bvars != USED_OVERFLOW {
@@ -856,7 +926,7 @@ pub fn lit_str(s: impl Into<String>) -> Expr {
 /// True when `e` has no loose bvars.
 #[inline(always)]
 pub fn is_closed(e: &Expr) -> bool {
-    e.loose == 0
+    e.loose() == 0
 }
 
 pub fn apps(f: Expr, args: &[Expr]) -> Expr {
@@ -1525,6 +1595,125 @@ mod tests {
         for n in 0..1_000 {
             assert!(identity(&const_(n, vec![])) > original_id);
         }
+    }
+
+    /// The recent-node table in front of the slot array must be emptied
+    /// with it. A node the caller still holds across a reset is no longer
+    /// filed, so asking for its structure again allocates a new node (as it
+    /// did before there was a front table), and that new node is then the
+    /// one found, whichever table answers.
+    #[test]
+    fn interner_reset_empties_the_recent_node_table() {
+        let c = const_(93, vec![]);
+        let held = app(c.clone(), bvar(3));
+        // Found again while filed, by the front table or the slots.
+        assert!(Rc::ptr_eq(&held, &app(c.clone(), bvar(3))));
+        clear_subst_memos();
+        assert!(intern_clear_if_large(0));
+        let again = app(c.clone(), bvar(3));
+        assert!(
+            !Rc::ptr_eq(&held, &again),
+            "a reset table answered with a node from before the reset"
+        );
+        assert_ne!(identity(&held), identity(&again));
+        for _ in 0..3 {
+            assert!(Rc::ptr_eq(&again, &app(c.clone(), bvar(3))));
+        }
+        // The children were re-filed too: `c` itself predates the reset.
+        assert!(!Rc::ptr_eq(&c, &const_(93, vec![])));
+    }
+
+    /// Two structures whose hashes share a front-table prefix evict each
+    /// other there; each must still be found in the slot array. With far
+    /// more nodes than front entries every prefix is contended.
+    #[test]
+    fn recent_node_table_eviction_never_loses_a_node() {
+        let n = (1u32 << FRONT_SLOTS_LOG2) * 8;
+        let head = const_(94, vec![]);
+        let first: Vec<Expr> = (0..n).map(|i| app(head.clone(), bvar(i))).collect();
+        let before = intern_node_count();
+        // Ascending, descending and strided orders hit the front table with
+        // different residents each time.
+        for (i, e) in first.iter().enumerate() {
+            assert!(Rc::ptr_eq(e, &app(head.clone(), bvar(i as u32))));
+        }
+        for (i, e) in first.iter().enumerate().rev() {
+            assert!(Rc::ptr_eq(e, &app(head.clone(), bvar(i as u32))));
+        }
+        for k in 0..n {
+            let i = (k.wrapping_mul(7919)) % n;
+            assert!(Rc::ptr_eq(&first[i as usize], &app(head.clone(), bvar(i))));
+        }
+        assert_eq!(intern_node_count(), before, "a lookup allocated");
+    }
+
+    /// `Rc`'s two counters plus the node are one 64-byte cache line.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn a_node_is_one_cache_line() {
+        assert_eq!(std::mem::size_of::<ExprData>(), 32);
+        assert_eq!(std::mem::size_of::<ExprNode>(), 48);
+    }
+
+    /// The loose range shares a word with the identity and has 16 bits
+    /// there. Ranges at and past the escape value are kept on the side and
+    /// must read back exactly, through every constructor, and be forgotten
+    /// with the node.
+    #[test]
+    fn loose_range_is_exact_at_and_past_the_inline_limit() {
+        let wide_entries = || WIDE_LOOSE.with(|w| w.borrow().len());
+        let start = wide_entries();
+        for i in [
+            0u32,
+            1,
+            LOOSE_WIDE - 3,
+            LOOSE_WIDE - 2, // range LOOSE_WIDE - 1: the largest inline value
+            LOOSE_WIDE - 1, // range LOOSE_WIDE: the first one on the side
+            LOOSE_WIDE,
+            LOOSE_WIDE + 1,
+            70_000,
+            1 << 20,
+            u32::MAX - 1,
+        ] {
+            let v = bvar(i);
+            assert_eq!(loose_bvar_range(&v), i + 1, "bvar {i}");
+            assert!(!is_closed(&v));
+            let c = const_(95, vec![]);
+            assert_eq!(loose_bvar_range(&app(c.clone(), v.clone())), i + 1);
+            assert_eq!(loose_bvar_range(&app(v.clone(), bvar(0))), i + 1);
+            assert_eq!(loose_bvar_range(&proj(1, 0, v.clone())), i + 1);
+            // A binder takes one off the body's range, not the type's.
+            assert_eq!(loose_bvar_range(&lam(BinderInfo::Default, c.clone(), v.clone())), i);
+            assert_eq!(loose_bvar_range(&pi(BinderInfo::Default, v.clone(), c.clone())), i + 1);
+            assert_eq!(loose_bvar_range(&let_(c.clone(), v.clone(), bvar(0))), i + 1);
+            assert_eq!(loose_bvar_range(&let_(c.clone(), c.clone(), v.clone())), i);
+            // Identity is unaffected by where the range is kept.
+            assert_eq!(identity(&v), identity(&bvar(i)));
+        }
+        // Two binders around a body at the first side-table range bring it
+        // back inline, one binder at a time.
+        let body = bvar(LOOSE_WIDE);
+        let one = lam(BinderInfo::Default, s0(), body.clone());
+        let two = lam(BinderInfo::Default, s0(), one.clone());
+        assert_eq!(loose_bvar_range(&body), LOOSE_WIDE + 1);
+        assert_eq!(loose_bvar_range(&one), LOOSE_WIDE);
+        assert_eq!(loose_bvar_range(&two), LOOSE_WIDE - 1);
+
+        // Substitution and shifting read the range to decide what to skip.
+        let e = app(bvar(70_000), bvar(0));
+        let a = const_(96, vec![]);
+        let r = instantiate(&e, std::slice::from_ref(&a));
+        assert!(Rc::ptr_eq(&r, &app(bvar(69_999), a.clone())));
+        assert!(Rc::ptr_eq(&r, &instantiate_ref(&e, std::slice::from_ref(&a), 0)));
+        assert!(Rc::ptr_eq(&shift(&e, 5, 1), &app(bvar(70_005), bvar(0))));
+        assert!(Rc::ptr_eq(&shift(&e, 5, 1), &shift_ref(&e, 5, 1)));
+        assert!(Rc::ptr_eq(&shift(&e, 5, 70_001), &e), "nothing at or above the cutoff");
+
+        // The side entries go with their nodes.
+        drop((body, one, two, e, r));
+        clear_subst_memos();
+        assert!(intern_clear_if_large(0));
+        assert_eq!(wide_entries(), start, "a released node left its range on file");
     }
 
     #[test]
