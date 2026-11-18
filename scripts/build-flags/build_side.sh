@@ -31,7 +31,14 @@ for part in "${parts[@]}"; do
   esac
 done
 prof="$PWD/prof-$side"
-profdata_tool() { ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-profdata | head -n 1; }
+# rustup's llvm-tools-preview puts llvm-profdata in the sysroot; a nix
+# toolchain (the arena's) has none there and one on PATH.
+profdata_tool() {
+  local t
+  t=$(ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-profdata 2>/dev/null | head -n 1 || true)
+  [ -n "$t" ] || t=$(command -v llvm-profdata)
+  echo "$t"
+}
 if [ -n "$pgo" ]; then
   RUSTFLAGS="$flags -C profile-generate=$prof --cfg kiota_pgo_gen" cargo build --release --locked \
     --target-dir "t-gen-$side" 2>&1 | tail -n 1
