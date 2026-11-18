@@ -1,0 +1,43 @@
+name: remote-mem
+
+# Peak memory and time of the heavy perf cases: main, the merged branch with
+# the one-argument rule (KIOTA_NO_SPINE), and the default, uncapped and under
+# the gate's 8 GiB address-space cap.
+on:
+  push:
+    branches: ['remote/mem-2026*']
+permissions:
+  contents: read
+jobs:
+  mem:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: |
+          set -euo pipefail
+          cargo build --release --locked; cp target/release/kiota kiota-new
+          for pair in main:6a39271 interner:b07b891; do
+            side=${pair%%:*}; rev=${pair##*:}
+            git worktree add --detach "$RUNNER_TEMP/$side" "$rev"
+            CARGO_TARGET_DIR="$RUNNER_TEMP/$side-t" cargo build --release --locked --manifest-path "$RUNNER_TEMP/$side/Cargo.toml"
+            cp "$RUNNER_TEMP/$side-t/release/kiota" kiota-$side
+          done
+      - name: Measure
+        run: |
+          set +e
+          curl --fail -sL --retry 3 https://arena.lean-lang.org/lean-arena-tests.tar.gz -o t.tgz; mkdir suite; tar xzf t.tgz -C suite
+          sudo apt-get install -y time >/dev/null
+          for t in magma-list-deep-n36 magma-list-pair-n21 magma-list-deep-n21 gf3-matrix-product grind-ring-5; do
+            f=suite/good/perf/$t.ndjson
+            for arm in main interner nospine new; do
+              bin=kiota-$arm; extra="A=1"; [ $arm = nospine ] && { bin=kiota-new; extra="KIOTA_NO_SPINE=1"; }
+              env $extra /usr/bin/time -v -o time.txt timeout 300 ./$bin $f >/dev/null 2>err.txt; rc=$?
+              ( ulimit -v 8388608; env $extra timeout 300 ./$bin $f >/dev/null 2>err2.txt ); rc2=$?
+              echo "MEM test=$t arm=$arm rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_mb=$(( $(grep 'Maximum resident' time.txt | awk '{print $NF}') / 1024 )) capped_rc=$rc2 $(tail -1 err2.txt | cut -c1-90)"
+            done
+          done | tee -a "$GITHUB_STEP_SUMMARY"
