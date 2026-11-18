@@ -2059,10 +2059,24 @@ mod tests {
     fn instantiate_memo_reuse_never_changes_substitution() {
         let mut seed = 0xD1CE_5EED_u64;
         // A body with far more distinct open nodes than the kept capacity.
-        let mut wide = bvar(0);
-        for i in 0..(4 * SUBST_MEMO_KEEP_SLOTS as u32) {
-            wide = app(wide, app(bvar(1), lit_nat(BigUint::from(i))));
+        // A balanced tree, not a spine: substitution recurses once per level,
+        // and four thousand levels overflow a test thread's stack in a debug
+        // build.
+        let mut layer: Vec<Expr> = (0..(4 * SUBST_MEMO_KEEP_SLOTS as u32))
+            .map(|i| app(bvar(1), lit_nat(BigUint::from(i))))
+            .collect();
+        layer.push(bvar(0));
+        while layer.len() > 1 {
+            layer = layer
+                .chunks(2)
+                .map(|pair| match pair {
+                    [l, r] => app(l.clone(), r.clone()),
+                    [l] => l.clone(),
+                    _ => unreachable!(),
+                })
+                .collect();
         }
+        let wide = layer.pop().expect("one root");
         let a0 = const_(5, vec![]);
         let a1 = lam(BinderInfo::Default, s0(), bvar(0));
         for round in 0..60 {
