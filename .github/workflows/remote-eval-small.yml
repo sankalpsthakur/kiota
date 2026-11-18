@@ -1,0 +1,88 @@
+name: remote-eval-small
+
+# Three binaries (main a8aadd8, the universe-parameter fix, this commit) on
+# the arena's current small tarball, perf cases included, and on every
+# corner-case export built with the arena's own lka.py (the `either` tests
+# are not in the tarball).
+on:
+  push:
+    branches: ['remote/eval-2026*']
+
+permissions:
+  contents: read
+
+jobs:
+  small:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build three binaries
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          cp target/release/kiota ./kiota-new
+          for pair in old:a8aadd8 mid:07367f0; do
+            side=${pair%%:*}; rev=${pair##*:}
+            git worktree add --detach "$RUNNER_TEMP/$side" "$rev"
+            CARGO_TARGET_DIR="$RUNNER_TEMP/$side-target" cargo build --release --locked --manifest-path "$RUNNER_TEMP/$side/Cargo.toml"
+            cp "$RUNNER_TEMP/$side-target/release/kiota" ./kiota-$side
+          done
+      - name: Arena tarball
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --max-time 120 https://arena.lean-lang.org/lean-arena-tests.tar.gz -o tests.tar.gz
+          mkdir suite && tar xzf tests.tar.gz -C suite
+      - name: Corner-case exports (lka.py build-test)
+        run: |
+          set -euo pipefail
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"; export PATH="$HOME/.elan/bin:$PATH"
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          git clone -q --depth 1 https://github.com/leanprover/lean-kernel-arena arena
+          cd arena && git rev-parse HEAD
+          uv run lka.py build-test 'corner-cases/*' 2>&1 | tail -40
+          find _build/tests -name '*.ndjson' | sort | head -100
+      - name: Run
+        run: |
+          set +e
+          nproc; free -g
+          run_one() { # side file
+            local start end rc
+            start=$(date +%s.%N)
+            timeout 150 ./kiota-$1 "$2" >/dev/null 2>err.txt; rc=$?
+            end=$(date +%s.%N)
+            echo "CASE side=$1 rc=$rc wall=$(python3 -c "print(round($end-$start,1))") file=$2 $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-90)"
+          }
+          for f in $(find arena/_build/tests/corner-cases -name '*.ndjson' | sort) $(find suite -name '*.ndjson' | sort); do
+            for side in old mid new; do run_one $side "$f"; done
+          done > cases.txt
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import re,collections
+          rows=collections.OrderedDict()
+          for l in open('cases.txt'):
+              m=re.match(r'CASE side=(\w+) rc=(\d+) wall=([\d.]+) file=(\S+) ?(.*)',l)
+              if not m: continue
+              side,rc,wall,f,msg=m.groups(); rows.setdefault(f,{})[side]=(int(rc),float(wall),msg)
+          tot={'old':0,'mid':0,'new':0}
+          for f,r in rows.items():
+              for s in tot: tot[s]+=r[s][1]
+              rcs={s:r[s][0] for s in r}
+              want = 1 if '/bad/' in f else (0 if '/good/' in f else None)
+              flag = len(set(rcs.values()))>1 or (want is not None and any(v!=want for v in rcs.values())) or max(v[1] for v in r.values())>20
+              if flag or 'eta' in f:
+                  print('ROW',f,' '.join(f"{s}:rc={r[s][0]},{r[s][1]}s" for s in ('old','mid','new')),'|',r['new'][2])
+          print('TOTAL wall',tot,'cases',len(rows))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: small-${{ github.run_id }}
+          path: |
+            cases.txt
+            arena/_build/tests/corner-cases/*.ndjson
+          retention-days: 30
