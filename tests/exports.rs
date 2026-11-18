@@ -1578,3 +1578,48 @@ fn a_loose_bound_variable_in_a_declaration_is_rejected() {
 fn a_second_declaration_under_the_same_spelled_name_is_rejected() {
     assert_reject_exact("duplicate-name-string.reject.ndjson", "[Foo] duplicate declaration of Foo");
 }
+
+/// A universe parameter a declaration mentions without declaring is not a
+/// closed universe: a later declaration that declares the same name would
+/// capture it. The official kernel refuses every such reference.
+#[test]
+fn an_undeclared_universe_parameter_in_an_inductive_type_is_rejected() {
+    assert_reject_exact(
+        "undeclared-universe-inductive-type.reject.ndjson",
+        "[U] `type` mentions the undeclared universe parameter `u`",
+    );
+}
+
+#[test]
+fn an_undeclared_universe_parameter_in_a_constructor_type_is_rejected() {
+    assert_reject_exact(
+        "undeclared-universe-constructor-type.reject.ndjson",
+        "[W.mk] `type` mentions the undeclared universe parameter `u`",
+    );
+    assert_accept("declared-universe-constructor-type.accept.ndjson");
+}
+
+#[test]
+fn an_undeclared_universe_parameter_in_an_axiom_or_definition_type_is_rejected() {
+    assert_reject_exact(
+        "undeclared-universe-axiom-type.reject.ndjson",
+        "[A] `type` mentions the undeclared universe parameter `u`",
+    );
+    assert_reject_exact(
+        "undeclared-universe-def-type.reject.ndjson",
+        "[f] `type` mentions the undeclared universe parameter `u`",
+    );
+}
+
+#[test]
+fn an_undeclared_universe_parameter_in_a_value_is_rejected() {
+    assert_reject_exact(
+        "undeclared-universe-def-value.reject.ndjson",
+        "[f] `value` mentions the undeclared universe parameter `v`",
+    );
+    assert_reject_exact(
+        "undeclared-universe-theorem-value.reject.ndjson",
+        "[f] `value` mentions the undeclared universe parameter `v`",
+    );
+    assert_accept("declared-universe-def-value.accept.ndjson");
+}

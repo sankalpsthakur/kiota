@@ -147,6 +147,24 @@ impl Parser {
         Ok(e)
     }
 
+    /// Every universe parameter a declaration's expressions mention must be
+    /// one of its own `levelParams`, as the official kernel's `check_level`
+    /// demands of every `Sort` and constant it infers. A stray parameter is
+    /// not a closed universe: it is captured by whichever later declaration
+    /// happens to declare that name and instantiates it.
+    fn check_universe_params(&self, level_params: &[u32], fields: &[(&str, &Expr)]) -> Result<(), TcError> {
+        let mut seen = FxHashSet::default();
+        for (k, e) in fields {
+            if let Some(p) = expr::undeclared_level_param(e, level_params, &mut seen) {
+                return Err(TcError::Reject(format!(
+                    "`{k}` mentions the undeclared universe parameter `{}`",
+                    self.name_str(p)
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// An exported recursor rule's body. Nothing reduces with it: the
     /// checker derives iota from the inductive declaration itself (field
     /// order, K-likeness), as the official kernel does, so the body is
@@ -378,6 +396,7 @@ impl Parser {
         self.reject_if_dup(name)?;
         let level_params = Self::get_vec_u32(v, "levelParams");
         let typ = self.require_expr(v, "type")?;
+        self.check_universe_params(&level_params, &[("type", &typ)])?;
         match kind {
             "axiomDecl" | "axiom" => {
                 let is_unsafe = Self::get_bool(v, "isUnsafe");
@@ -395,6 +414,7 @@ impl Parser {
             }
             "defnDecl" | "def" => {
                 let value = self.require_expr(v, "value")?;
+                self.check_universe_params(&level_params, &[("type", &typ), ("value", &value)])?;
                 let hints = Self::require_hints(v)?;
                 let safety = Self::get_str(v, "safety");
                 if safety == "unsafe" || safety == "partial" {
@@ -414,6 +434,7 @@ impl Parser {
             }
             "thmDecl" | "theorem" => {
                 let value = self.require_expr(v, "value")?;
+                self.check_universe_params(&level_params, &[("type", &typ), ("value", &value)])?;
                 self.env.insert(
                     name,
                     ConstantInfo::Theorem {
@@ -425,6 +446,7 @@ impl Parser {
             }
             "opaqueDecl" | "opaque" => {
                 let value = self.require_expr(v, "value")?;
+                self.check_universe_params(&level_params, &[("type", &typ), ("value", &value)])?;
                 let safety = Self::get_str(v, "safety");
                 if safety == "unsafe" || safety == "partial" {
                     return Err(TcError::Reject(format!("{safety} opaque")));
@@ -639,6 +661,8 @@ impl Parser {
             self.reject_if_dup(name)?;
             let level_params = Self::get_vec_u32(t, "levelParams");
             let typ = self.require_expr(t, "type")?;
+            self.check_universe_params(&level_params, &[("type", &typ)])
+                .map_err(|e| self.annotate(name, e))?;
             let num_params = Self::require_u32(t, "numParams")?;
             let num_indices = Self::require_u32(t, "numIndices")?;
             let all = Self::get_vec_u32(t, "all");
@@ -675,6 +699,8 @@ impl Parser {
             self.reject_if_dup(name)?;
             let level_params = Self::get_vec_u32(c, "levelParams");
             let typ = self.require_expr(c, "type")?;
+            self.check_universe_params(&level_params, &[("type", &typ)])
+                .map_err(|e| self.annotate(name, e))?;
             let induct = Self::require_u32(c, "induct")?;
             let cidx = Self::require_u32(c, "cidx")?;
             let num_params = Self::require_u32(c, "numParams")?;

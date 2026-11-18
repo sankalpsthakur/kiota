@@ -754,6 +754,77 @@ fn level_subst_id<S: std::hash::BuildHasher>(
     *ids.entry(key).or_insert(next)
 }
 
+/// The first universe parameter `e` mentions that is not in `declared`.
+/// `seen` carries the composite nodes already walked, so the fields of one
+/// declaration share the work and a shared subterm is walked once.
+pub fn undeclared_level_param(
+    e: &Expr,
+    declared: &[u32],
+    seen: &mut rustc_hash::FxHashSet<usize>,
+) -> Option<u32> {
+    fn in_level(l: &Level, declared: &[u32]) -> Option<u32> {
+        use crate::level::LevelData;
+        let mut stack = vec![l];
+        while let Some(l) = stack.pop() {
+            match &**l {
+                LevelData::Zero => {}
+                LevelData::Param(p) => {
+                    if !declared.contains(p) {
+                        return Some(*p);
+                    }
+                }
+                LevelData::Succ(a) => stack.push(a),
+                LevelData::Max(a, b) | LevelData::IMax(a, b) => {
+                    stack.push(a);
+                    stack.push(b);
+                }
+            }
+        }
+        None
+    }
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        match &***e {
+            ExprData::BVar(_) | ExprData::Lit(_) => {}
+            ExprData::Sort(l) => {
+                if let Some(p) = in_level(l, declared) {
+                    return Some(p);
+                }
+            }
+            ExprData::Const(_, ls) => {
+                for l in ls.iter() {
+                    if let Some(p) = in_level(l, declared) {
+                        return Some(p);
+                    }
+                }
+            }
+            composite => {
+                if !seen.insert(ptr(e)) {
+                    continue;
+                }
+                match composite {
+                    ExprData::App(f, a) => {
+                        stack.push(f);
+                        stack.push(a);
+                    }
+                    ExprData::Lam(_, ty, body) | ExprData::Pi(_, ty, body) => {
+                        stack.push(ty);
+                        stack.push(body);
+                    }
+                    ExprData::Let(ty, val, body) => {
+                        stack.push(ty);
+                        stack.push(val);
+                        stack.push(body);
+                    }
+                    ExprData::Proj(_, _, v) => stack.push(v),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn instantiate_level_params(e: &Expr, subst: &FxHashMap<u32, Level>) -> Expr {
     if subst.is_empty() {
         return e.clone();
