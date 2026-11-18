@@ -431,6 +431,8 @@ pub struct Checker<'e> {
     /// Where the parser put the proofs it released after checking
     /// (`Parser::release_theorem_value`); `unfold_delta` reads them back.
     proofs: Option<&'e crate::proofstore::ProofStore>,
+    /// The parser's rendered name -> index table, for `find_name`.
+    name_index: Option<&'e FxHashMap<String, u32>>,
 }
 
 thread_local! {
@@ -833,6 +835,7 @@ impl<'e> Checker<'e> {
             eq_arg_heads: RefCell::new(Vec::new()),
             declaring: std::cell::Cell::new(None),
             proofs: None,
+            name_index: None,
         }
     }
 
@@ -4110,6 +4113,13 @@ impl<'e> Checker<'e> {
         r
     }
 
+    /// Attach the parser's name table, so that `find_name` is a lookup and
+    /// not a scan of every name in the export.
+    pub fn with_name_index(mut self, index: &'e FxHashMap<String, u32>) -> Self {
+        self.name_index = Some(index);
+        self
+    }
+
     /// Attach the parser's store of released theorem proofs.
     pub fn with_proof_store(mut self, proofs: Option<&'e crate::proofstore::ProofStore>) -> Self {
         self.proofs = proofs;
@@ -6383,11 +6393,21 @@ impl<'e> Checker<'e> {
 
 
 
+    /// The declared constant named `s`. A name that only has a name line,
+    /// or the first index in the table that happens to carry the spelling,
+    /// is not a constant: the reductions that call this build terms with
+    /// the result.
     fn find_name(&self, s: &str) -> Option<u32> {
-        self.names
-            .iter()
-            .position(|n| n.as_str() == s)
-            .map(|i| i as u32)
+        let found = match self.name_index {
+            Some(index) => index.get(s).copied(),
+            None => self
+                .names
+                .iter()
+                .enumerate()
+                .position(|(i, n)| n.as_str() == s && self.env.get(i as u32).is_some())
+                .map(|i| i as u32),
+        };
+        found.filter(|n| self.env.get(*n).is_some())
     }
 
 
@@ -8987,6 +9007,28 @@ mod tests {
 
     fn test_names(ss: &[&str]) -> Vec<std::rc::Rc<String>> {
         ss.iter().map(|s| std::rc::Rc::new((*s).into())).collect()
+    }
+
+    /// `find_name` hands back constants, and a name line alone does not
+    /// make one: the reductions that ask for `Nat.add` build terms with it.
+    #[test]
+    fn find_name_resolves_declared_constants_only() {
+        let names = test_names(&["", "Nat.add", "Nat.mul"]);
+        let mut env = Environment::default();
+        env.insert(
+            2,
+            ConstantInfo::Axiom { level_params: vec![], typ: expr::sort(level::zero()), is_unsafe: false },
+        );
+        let mut index = FxHashMap::default();
+        index.insert("Nat.add".to_string(), 1u32);
+        index.insert("Nat.mul".to_string(), 2u32);
+        let scanning = Checker::new(&env, &names, None, None);
+        let indexed = Checker::new(&env, &names, None, None).with_name_index(&index);
+        for tc in [&scanning, &indexed] {
+            assert_eq!(tc.find_name("Nat.add"), None, "named, never declared");
+            assert_eq!(tc.find_name("Nat.mul"), Some(2));
+            assert_eq!(tc.find_name("Nat.pow"), None);
+        }
     }
 
     /// A `String` whose only field is `Nat`, with the rest of the native
