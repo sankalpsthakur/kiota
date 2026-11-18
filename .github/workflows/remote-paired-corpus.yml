@@ -1,0 +1,89 @@
+name: remote-paired-corpus
+
+# Same-runner timing of init and std: main 07367f0, eta-first (db02c8a)
+# fixes (07367f0) and this commit (eta before unfold), two rounds, alternating.
+on:
+  push:
+    branches: ['remote/paired-2026*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+
+jobs:
+  paired:
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [init, std, cslib]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build three binaries
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          cp target/release/kiota ./kiota-new
+          for pair in old:07367f0 mid:db02c8a; do
+            side=${pair%%:*}; rev=${pair##*:}
+            git worktree add --detach "$RUNNER_TEMP/$side" "$rev"
+            CARGO_TARGET_DIR="$RUNNER_TEMP/$side-target" cargo build --release --locked --manifest-path "$RUNNER_TEMP/$side/Cargo.toml"
+            cp "$RUNNER_TEMP/$side-target/release/kiota" ./kiota-$side
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Paired runs
+        env:
+          C: ${{ matrix.corpus }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          nproc; free -g
+          for round in 1 2; do
+            for side in old mid new; do
+              /usr/bin/time -v -o time.txt timeout 4500 ./kiota-$side $C.ndjson >/dev/null 2>err.txt; rc=$?
+              echo "PAIRED corpus=$C round=$round side=$side rc=$rc wall=$(grep 'Elapsed' time.txt | awk '{print $NF}') user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-120)"
+            done
+          done | tee paired.txt
+          cat paired.txt >> "$GITHUB_STEP_SUMMARY"
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and time the perf cases
+        run: |
+          set +e
+          cargo build --release --locked; cp target/release/kiota kiota-new
+          git worktree add --detach "$RUNNER_TEMP/old" 07367f0
+          CARGO_TARGET_DIR="$RUNNER_TEMP/old-target" cargo build --release --locked --manifest-path "$RUNNER_TEMP/old/Cargo.toml"; cp "$RUNNER_TEMP/old-target/release/kiota" kiota-old
+          curl --fail -sL --retry 3 https://arena.lean-lang.org/lean-arena-tests.tar.gz -o t.tgz; mkdir suite; tar xzf t.tgz -C suite
+          sudo apt-get install -y time >/dev/null
+          for round in 1 2; do for f in suite/good/perf/*.ndjson suite/bad/perf/*.ndjson; do for side in old new; do
+            /usr/bin/time -v -o time.txt timeout 200 ./kiota-$side $f >/dev/null 2>/dev/null; rc=$?
+            echo "PERF $(basename $f .ndjson) round=$round side=$side rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') rss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}')"
+          done; done; done | tee perf.txt
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import re,collections
+          d=collections.defaultdict(lambda: collections.defaultdict(list))
+          for l in open('perf.txt'):
+              m=re.match(r'PERF (\S+) round=\d side=(\w+) rc=(\d+) user=([\d.]+) rss_kb=(\d+)',l)
+              if m: d[m[1]][m[2]].append((int(m[3]),float(m[4]),int(m[5])))
+          for t,v in d.items():
+              o=min(x[1] for x in v['old']); n=min(x[1] for x in v['new'])
+              print(f"PERFROW {t} old={o}s new={n}s ratio={n/max(o,0.01):.2f} rc_old={[x[0] for x in v['old']]} rc_new={[x[0] for x in v['new']]} rss_old={max(x[2] for x in v['old'])//1024}MB rss_new={max(x[2] for x in v['new'])//1024}MB")
+          PY
