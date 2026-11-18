@@ -86,4 +86,9 @@ fn a_declared_name_index_cannot_be_respelled() {
     let output = run(include_bytes!("fixtures/name-index-respelled-after-cached-equality.reject.ndjson"), None);
     assert_eq!(output.status.code(), Some(1), "{:?}", output);
     assert!(String::from_utf8_lossy(&output.stderr).contains("is respelled `S` after `Nat.succ` was declared"));
+    // Respelled before its declaration: the index was filed under `Nat`,
+    // and an axiom `T` declared under it became the type of every literal.
+    let output = run(include_bytes!("fixtures/name-index-respelled-before-declaration.reject.ndjson"), None);
+    assert_eq!(output.status.code(), Some(1), "{:?}", output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is respelled `T`; it is `Nat`"));
 }

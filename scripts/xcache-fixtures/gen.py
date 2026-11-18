@@ -126,9 +126,27 @@ def whnf_depth_cap_then_shallow(n=8300):
     return x
 
 
+def literal_typed_by_a_respelled_unused_index():
+    """A name index spelled `Nat` while unused, respelled `T`, then declared.
+
+    axiom T : Type sits under an index the parser's spelling table still
+    filed under `Nat`, so a literal was typed `T` and `def bad : T := 5`
+    was accepted, with or without the cache flags, although no `Nat`
+    exists.
+    """
+    x = Export()
+    type1 = x.sort(x.lsucc(0))
+    t = x.name("Nat")
+    x.emit({"in": t, "str": {"pre": 0, "str": "T"}})
+    x.axiom(t, type1)
+    x.defn("bad", x.const(t), x.nat(5))
+    return x
+
+
 FIXTURES = {
     "name-index-respelled-into-nat-succ.reject.ndjson": name_respelled_into_nat_succ,
     "name-index-respelled-after-cached-equality.reject.ndjson": name_respelled_after_cached_equality,
+    "name-index-respelled-before-declaration.reject.ndjson": literal_typed_by_a_respelled_unused_index,
     "nat-literal-under-duplicate-nat-spelling.accept.ndjson": lambda: nat_literal_under_duplicate_nat_spelling(True),
     "nat-literal-under-duplicate-nat-spelling-inductive-only.accept.ndjson": lambda: nat_literal_under_duplicate_nat_spelling(False),
     "whnf-depth-cap-then-shallow.accept.ndjson": whnf_depth_cap_then_shallow,

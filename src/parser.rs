@@ -235,14 +235,17 @@ impl Parser {
         }
     }
 
-    /// A name index may be given a spelling at any point, and an unused one
-    /// may be given another. Once a declaration has taken the index its
-    /// spelling is fixed: constants are keyed by index here, while the
-    /// literal extensions (`Nat.succ`, `Nat.add`, ...), the quotient
-    /// primitives and `Eq` are recognised by spelling, so a later line that
-    /// respelled the index would turn an arbitrary constant into one of
-    /// those. In the official kernel a name is its spelling and nothing can
-    /// rename a declared constant.
+    /// A name index may be given its spelling at any point, once: a second
+    /// name line for it must spell the same name. Constants are keyed by
+    /// index here, while the literal types (`Nat`, `String`), the literal
+    /// extensions (`Nat.succ`, `Nat.add`, ...), the quotient primitives and
+    /// `Eq` are found by spelling. A line that respelled a declared index
+    /// would turn an arbitrary constant into one of those; one that
+    /// respelled an index before its declaration would leave the first
+    /// spelling pointing at it (`name_by_str`), so that an axiom `T`
+    /// declared under an index first spelled `Nat` became the type of
+    /// every literal. In the official kernel a name is its spelling and
+    /// nothing can rename a constant.
     fn handle_name(&mut self, idx: u32, v: &Value) -> Result<(), TcError> {
         let full = if let Some(s) = v.get("str") {
             let pre = Self::get_u32(s, "pre");
@@ -268,11 +271,21 @@ impl Parser {
         while self.names.len() <= idx as usize {
             self.names.push(Rc::new(String::new()));
         }
-        if self.env.get(idx).is_some() && *self.names[idx as usize] != full {
-            return Err(TcError::Reject(format!(
-                "name index {idx} is respelled `{full}` after `{}` was declared under it",
-                self.names[idx as usize]
-            )));
+        if *self.names[idx as usize] != full {
+            if self.env.get(idx).is_some() {
+                return Err(TcError::Reject(format!(
+                    "name index {idx} is respelled `{full}` after `{}` was declared under it",
+                    self.names[idx as usize]
+                )));
+            }
+            // An empty slot is one no name line has filled yet (indices may
+            // be sparse and arrive in any order).
+            if !self.names[idx as usize].is_empty() {
+                return Err(TcError::Reject(format!(
+                    "name index {idx} is respelled `{full}`; it is `{}`",
+                    self.names[idx as usize]
+                )));
+            }
         }
         if let Some(prev) = self.name_by_str.insert(full.clone(), idx) {
             if prev != idx {
