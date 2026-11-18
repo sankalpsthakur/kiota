@@ -104,12 +104,13 @@ const MAX_FALLBACK_TRIES: u32 = 4;
 /// Kept well under typical C-stack (~8MB) so this is a decline, not a segfault.
 const CONV_DEPTH: u32 = 8_192;
 
-/// `KIOTA_NO_ITE_SHORTCUT=1` (opt-in, for measurement): `whnf_core` never
-/// decides an `ite`/`dite` condition itself, in either pass; δ and the
-/// `Decidable.rec` ι do, as in the official kernel.
-fn no_ite_shortcut() -> bool {
+/// `KIOTA_NO_DECIDE_SHORTCUT=1` (opt-in, for measurement): `whnf_core`
+/// never normalizes the `Decidable` instance of an `ite`, `dite` or
+/// `Decidable.decide` itself, in either pass; δ and the `Decidable.rec` ι
+/// do, as in the official kernel. The lazy pass never takes the shortcut.
+fn no_decide_shortcut() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("KIOTA_NO_ITE_SHORTCUT").is_some())
+    *FLAG.get_or_init(|| std::env::var_os("KIOTA_NO_DECIDE_SHORTCUT").is_some())
 }
 
 /// Consecutive iota peels of literals over 256 bits (each one less than the
@@ -2997,7 +2998,7 @@ impl<'e> Checker<'e> {
                             // hash word of an open term: evaluating it counts
                             // `x * 4294967296` down one `succ` at a time (as
                             // the official kernel would, if it ever asked).
-                            if !LAZY_MAIN_PATH.with(Cell::get) && !no_ite_shortcut() {
+                            if !LAZY_MAIN_PATH.with(Cell::get) && !no_decide_shortcut() {
                                 if let Some(r) = self.try_dite(ctx, &head, &args)? {
                                     cur = r;
                                     continue;
@@ -5637,6 +5638,15 @@ impl<'e> Checker<'e> {
                 Ok(None)
             }
             "Decidable.decide" if args.len() >= 2 => {
+                // Like `ite`/`dite` (see `whnf_core_go`): an ordinary
+                // definition to Lean's `whnf_core`. con-leche's
+                // `lpOfData_pack` compares `w % 2 == 1` with `lpOfData w`,
+                // which unfolds to it; both become `decide (_ = _)` over
+                // the same open `UInt64` terms, and deciding the instance
+                // here evaluated them before the arguments were compared.
+                if LAZY_MAIN_PATH.with(Cell::get) || no_decide_shortcut() {
+                    return Ok(None);
+                }
                 let inst = self.whnf(ctx, &args[1])?;
                 let (ih, _) = expr::unfold_apps(&inst);
                 let iname = match &**ih {

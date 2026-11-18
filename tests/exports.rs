@@ -1660,3 +1660,23 @@ fn rfl_between_ites_over_an_unevaluable_condition_accepts() {
 fn ites_over_distinct_open_conditions_are_not_equal() {
     assert_reject("ite-distinct-open-conditions.reject.ndjson");
 }
+
+/// The comparison inside con-leche `ConLeche.lpOfData_pack`
+/// (`tests/fixtures/src/conleche-decide-open-uint64-argument.lean`):
+/// `lpOfData w = (w % 2 == 1)` by `rfl` for a packed `UInt64` word of
+/// variables. Both sides become `decide (_ = _)` over the same open terms and
+/// Lean's lazy delta compares the arguments. `whnf_core` deciding the
+/// instance (the `Decidable.decide` shortcut) evaluated the word instead and
+/// counted `x * 4294967296` down to the depth limit in both passes.
+#[test]
+fn rfl_between_decides_over_an_unevaluable_instance_accepts() {
+    assert_accept_deep("conleche-decide-open-uint64-argument.accept.ndjson");
+}
+
+/// The reject twin: `decide (b = true) = decide (c = true)` by `rfl` for
+/// variables `b`, `c`. The official kernel rejects it; comparing `decide`s
+/// argument by argument must not accept it.
+#[test]
+fn decides_over_distinct_open_propositions_are_not_equal() {
+    assert_reject("decide-distinct-open-propositions.reject.ndjson");
+}
