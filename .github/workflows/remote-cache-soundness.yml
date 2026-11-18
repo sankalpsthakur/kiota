@@ -1,0 +1,59 @@
+name: remote-cache-soundness
+
+# One binary, one runner per corpus: the verdict and counters with no cache
+# flag, with KIOTA_XCACHE, with KIOTA_XMEMO, with both, and a
+# KIOTA_XCACHE_VERIFY pass that recomputes every cache hit and compares.
+on:
+  push:
+    branches: ['remote/cache-soundness-20261118e']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+
+jobs:
+  parity:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - corpus: init
+            sides: off both
+          - corpus: std
+            sides: off both
+          - corpus: cedar
+            sides: off both
+          - corpus: cslib
+            sides: off both
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Configurations
+        env:
+          C: ${{ matrix.corpus }}
+          SIDES: ${{ matrix.sides }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          for side in $SIDES; do
+            extra=""
+            [ $side = xcache ] && extra="KIOTA_XCACHE=1"
+            [ $side = xmemo ] && extra="KIOTA_XMEMO=1"
+            [ $side = both ] && extra="KIOTA_XCACHE=1 KIOTA_XMEMO=1"
+            [ $side = verify ] && extra="KIOTA_XCACHE=1 KIOTA_XCACHE_VERIFY=1"
+            env $extra KIOTA_STATS=1 /usr/bin/time -v -o time.txt ./target/release/kiota $C.ndjson >/dev/null 2>err.txt; rc=$?
+            echo "CS corpus=$C side=$side rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -E '^STATS3' err.txt | tail -1) $(grep -E '^STATS ' err.txt | tail -1) $(grep -E '^XVERIFY ' err.txt | tail -1) $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-100)"
+            grep -E '^XVERIFY_MISMATCH' err.txt | head -20 | cut -c1-700
+          done | tee -a "$GITHUB_STEP_SUMMARY"
