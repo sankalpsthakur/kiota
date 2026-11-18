@@ -89,6 +89,24 @@ pub(super) fn fired(op: Option<ExtOp>) {
     }
 }
 
+thread_local! {
+    /// Under `KIOTA_EXT_TRACE`: string literals whose bytes were built
+    /// natively, and those read as `String.ofList […]` because the native
+    /// rule was off. The second stays 0 on an export of Lean's prelude.
+    static STRING_BYTES: [Cell<u64>; 2] = const { [const { Cell::new(0) }; 2] };
+}
+
+/// A projection of a string literal took a step, natively or not.
+#[inline]
+pub(super) fn string_bytes(native: bool) {
+    if trace_enabled() && !crate::stats::paused() {
+        STRING_BYTES.with(|c| {
+            let i = usize::from(!native);
+            c[i].set(c[i].get() + 1)
+        });
+    }
+}
+
 /// `KIOTA_EXT_TRACE`: one line with the number of rewrites per native rule.
 pub fn report() {
     if !trace_enabled() {
@@ -100,6 +118,9 @@ pub fn report() {
             line.push_str(&format!(" {}={}", op.spelling(), f[i].get()));
         }
         line.push_str(&format!(" Nat.succ={}", f[ExtOp::ALL.len()].get()));
+    });
+    STRING_BYTES.with(|c| {
+        line.push_str(&format!(" String.bytes={} String.ofList-reading={}", c[0].get(), c[1].get()));
     });
     eprintln!("{line}");
 }

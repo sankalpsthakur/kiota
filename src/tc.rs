@@ -6526,13 +6526,16 @@ impl<'e> Checker<'e> {
         }
         if self.native_string_projection_ok(sname) {
             if let Some(bytes) = self.string_to_byte_array(s) {
+                extensions::string_bytes(true);
                 return Some(bytes);
             }
         }
         if self.ext.string != Some(sname) {
             return None;
         }
-        Some(expr::proj(sname, 0, self.string_lit_as_of_list(s)?))
+        let read = expr::proj(sname, 0, self.string_lit_as_of_list(s)?);
+        extensions::string_bytes(false);
+        Some(read)
     }
 
     fn check_native_string_projection(&self, sname: u32) -> R<bool> {
