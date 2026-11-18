@@ -463,3 +463,67 @@ this; kiota's instruction gap is structural, not a hot spot.
 Pin bump for the landed main is staged on the fork
 (`bump-kiota-2026-10-28`, rev ff0698d); the arena PR waits for Sankalp's
 go-ahead.
+
+### 2026-11-18 - con-leche: the BitVec depth-limit family was the `ite`/`decide` shortcut in the lazy pass
+
+Branch `perf/ws-con-leche` (132463b, fd7248f on e593b79). Not on main.
+
+Diagnosis. The 82 declines on con-leche (arena test `con-leche`,
+leanprover/con-leche 78ded4b6, 10,043,114 export lines, sha256 b9ad1d95...
+identical to the board's) are equation lemmas of functions guarded by a read
+of a packed `UInt64` field (`wscopedBP`, `leavesSubP`, `instantiate1P`,
+`abstractRangeP`, `abstract1P`, `allLevelParamsDefinedP`,
+`instantiate1LiftP`, `hasLooseBVarB`: `.eq_1`..`.eq_10`), plus
+`Expr.mkBvar_eq` and `lpOfData_pack`. Each is `rfl` between two terms that
+unfold to `ite c inst t e` (or `decide p`) over the same condition, and the
+condition reads `h * 4294967296 + ...` of an open term with an opaque
+`mixHash` inside. The official kernel's lazy delta compares the two
+applications argument by argument and never evaluates the condition.
+kiota's `whnf_core` decided `ite`/`dite`/`Decidable.decide` itself by
+normalizing the `Decidable` instance, and `def_eq_main_path_lazy` opens with
+`whnf_core` of both sides, so the lazy retry evaluated the condition too:
+`Nat.mul x 4294967296` with `x` stuck unfolds to
+`Nat.add (Nat.mul x 4294967295) x`, the Nat extension normalizes the first
+argument, and the literal is counted down one `succ` per nested `whnf_core`
+to CORE_DEPTH (8192). The official kernel's `whnf` would recurse the same
+way if it were ever asked for that term; it is not.
+
+Fix. Under LAZY_MAIN_PATH `whnf_core` leaves `ite`, `dite` and
+`Decidable.decide` to δ and the `Decidable.rec` ι. The eager pass is
+unchanged. Four fixtures (two accepts cut from con-leche to one Lean file
+each, two reject twins the official kernel rejects), sources in
+tests/fixtures/src.
+
+Measured (GitHub runners, the arena's build line `cargo build --release`):
+
+| run | side | con-leche verdict | user s | wall | peak RSS | declines (keep-going) |
+|---|---|---|---|---|---|---|
+| 44331616042 | base e593b79 | decline (rc 2) at `wscopedBP.eq_1` | 3.3 | 0:03 | 0.38 GB | 82 |
+| 44331616042 | 132463b (`ite`/`dite`) | decline (rc 2) at `lpOfData_pack` | 58.8 | 0:59 | 0.86 GB | 1 |
+| 44344203853 | fd7248f (+`decide`) | accept (rc 0), twice | 480, 556 | 8:04, 9:20 | 13.07 GB | 0 |
+| 44344203853 | fd7248f, `KIOTA_NO_DECIDE_SHORTCUT=1` | timeout at 720 s, twice | 714 | 12:00 | 13.5 GB | 0 (accept in 754 s uncapped) |
+
+fd7248f on con-leche: 83 lazy retries, all accepted;
+intern_calls=2,025,649,823. Standing corpora at fd7248f against base, same
+exports (run 44313744961): init, std, cedar, cslib all rc 0 with every
+STATS counter identical to base (intern_calls 540,395,910 / 1,105,416,459 /
+1,390,747,875 / 7,315,777,664) and zero lazy retries. mathlib at fd7248f
+was still running when this was written (run 44344203853, job
+"corpus (mathlib, fix2)"; base and 132463b in run 44331616042).
+
+Open:
+- Margin. The arena's timeout for this test is 720 s; 484-560 s wall on a
+  GitHub runner is inside it, but runners vary by 30%. Two declarations
+  the eager pass accepts take 227 s of it and all of the memory above
+  4.5 GB: `ConLeche.Model.fixCtorData_of` (130 s, +2.8 GB) and
+  `ConLeche.Cached.defeqLoopI_congr` (97 s, +9.0 GB, the 13 GB peak).
+  Both predate this change (main on 2026-10-20: 12.8 GB peak). The
+  official kernel checks the whole test in 69 s at 0.93 GB.
+- The eager shortcuts stay: with all three off in the eager pass
+  (`KIOTA_NO_DECIDE_SHORTCUT=1`) nothing declines and nothing is retried,
+  but `ConLeche.ensureSortIO_def` alone takes 238 s and 6.7 GB, and the
+  test times out.
+- `whnf_core` in the lazy pass still runs the Nat extension on open terms,
+  which Lean's `lazy_delta_reduction` only does for closed ones
+  (`!has_fvar`); no declaration in con-leche or the standing corpora needs
+  that changed.
