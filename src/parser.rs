@@ -96,6 +96,14 @@ impl InductiveUndo {
     }
 }
 
+/// A recursor the current inductive block has put in the environment, with
+/// what `validate_recursor_rule` needs to apply its member's constructors.
+struct StagedRecursor {
+    name: u32,
+    member_levels: Vec<Level>,
+    member_params: Vec<Expr>,
+}
+
 /// `name_canon` entry of an index no name line has defined.
 const NO_NAME: u32 = u32::MAX;
 
@@ -797,7 +805,7 @@ impl Parser {
         &mut self,
         v: &Value,
         undo: &mut InductiveUndo,
-    ) -> Result<Vec<u32>, TcError> {
+    ) -> Result<(Vec<u32>, Vec<StagedRecursor>), TcError> {
         let types = v
             .get("types")
             .and_then(|x| x.as_array())
@@ -1113,6 +1121,9 @@ impl Parser {
             let subst = level::subst_map(&d.level_params, &levels);
             let mut stored = d.clone();
             stored.typ = expr::instantiate_level_params(&d.typ, &subst);
+            stored.member_levels = d.member_levels.iter().map(|l| level::instantiate(l, &subst)).collect();
+            stored.member_params =
+                d.member_params.iter().map(|p| expr::instantiate_level_params(p, &subst)).collect();
             stored.level_params = r.level_params.clone();
             ordered.push((r, stored));
         }
@@ -1122,7 +1133,13 @@ impl Parser {
         // block are the members' constructors in member order, which is the
         // order of `ordered` (Lean's `rec_k`).
         let group: Vec<u32> = ordered.iter().map(|(r, _)| r.name).collect();
+        let mut staged = Vec::with_capacity(ordered.len());
         for (i, (r, d)) in ordered.into_iter().enumerate() {
+            staged.push(StagedRecursor {
+                name: r.name,
+                member_levels: d.member_levels,
+                member_params: d.member_params,
+            });
             if let Some(owner) = type_names.get(i) {
                 undo.insert_owner(&mut self.env, *owner, r.name);
             }
@@ -1146,7 +1163,7 @@ impl Parser {
         for n in &group {
             undo.insert_group(&mut self.env, *n, group.clone());
         }
-        Ok(type_names)
+        Ok((type_names, staged))
     }
 
     /// Nested specializations actually occurring in constructor fields of
@@ -1456,11 +1473,26 @@ impl Parser {
             // later declaration in the stream.
             let mut undo = InductiveUndo::default();
             let result = (|| {
-                let names = self.handle_inductive_block(d, &mut undo)?;
+                let (names, recursors) = self.handle_inductive_block(d, &mut undo)?;
                 for n in names {
                     self.checker()
                         .check_inductive_group(n)
                         .map_err(|e| self.annotate(n, e))?;
+                }
+                // The exported computation rules, now that the block's
+                // recursors can be typed. Nothing reduces with them; they
+                // are checked because the official kernel refuses an
+                // export whose rule is not the one it generates.
+                for rec in &recursors {
+                    let rules = match self.env.get(rec.name) {
+                        Some(ConstantInfo::Recursor { rules, .. }) => rules.len(),
+                        _ => 0,
+                    };
+                    for pos in 0..rules {
+                        self.checker()
+                            .validate_recursor_rule(rec.name, pos, &rec.member_levels, &rec.member_params)
+                            .map_err(|e| self.annotate(rec.name, e))?;
+                    }
                 }
                 Ok(())
             })();

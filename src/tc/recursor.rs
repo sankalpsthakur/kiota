@@ -46,6 +46,13 @@ pub(crate) struct DerivedRecursor {
     /// an auxiliary recursor these are the source constructors
     /// (`List.nil`, `List.cons`), as Lean restores them.
     pub rules: Vec<(u32, u32)>,
+    /// How this recursor's member applies its constructors: the universe
+    /// levels and the parameters, the latter in the context of the block's
+    /// parameters alone. For a declared type these are the block's own; for
+    /// an auxiliary member they are the nested occurrence's (`List.cons` at
+    /// `Tree`).
+    pub member_levels: Vec<Level>,
+    pub member_params: Vec<Expr>,
 }
 
 /// The fields of a member's constructor: the binders of its type after the
@@ -966,6 +973,8 @@ impl<'e> Checker<'e> {
             out.push(DerivedRecursor {
                 typ,
                 rules,
+                member_levels: members[target_pos].source_levels.clone(),
+                member_params: members[target_pos].fixed_params.clone(),
                 level_params: level_params.clone(),
                 // Lean restores every recursor's metadata to the original
                 // declared group, even auxiliary `.rec_N` recursors.
@@ -1056,6 +1065,109 @@ impl<'e> Checker<'e> {
             Ok(())
         } else {
             reject("recursor type does not match reconstructed type")
+        }
+    }
+
+    /// Check one exported computation rule of the recursor `rname`, which
+    /// is in the environment with its reconstructed type and validated
+    /// rule list. The official kernel generates the rule and refuses an
+    /// export whose rule is another term. Here the rule is type checked and
+    /// then compared with iota as this checker performs it: for variables
+    /// `params motives minors fields`,
+    ///
+    /// ```text
+    /// rhs params motives minors fields  ≡  rec params motives minors indices (ctor params fields)
+    /// ```
+    ///
+    /// Type checking comes first: both sides may be proofs, and proof
+    /// irrelevance would equate an ill-typed rule with anything.
+    pub(crate) fn validate_recursor_rule(
+        &self,
+        rname: u32,
+        rule_pos: usize,
+        member_levels: &[Level],
+        member_params: &[Expr],
+    ) -> R<()> {
+        let Some(ConstantInfo::Recursor {
+            level_params,
+            typ,
+            num_params,
+            num_motives,
+            num_minors,
+            num_indices,
+            rules,
+            ..
+        }) = self.env.get(rname)
+        else {
+            return Err(TcError::Other("recursor rule check without its recursor".into()));
+        };
+        let Some(rule) = rules.get(rule_pos) else {
+            return Err(TcError::Other("recursor rule check without its rule".into()));
+        };
+        let rhs = &rule.rhs;
+        if !expr::is_closed(rhs) {
+            return reject("recursor rule has a loose bound variable");
+        }
+        let mut used = Vec::new();
+        collect_level_ids_expr(rhs, &mut used);
+        if used.iter().any(|id| !level_params.contains(id)) {
+            return reject("recursor rule uses an undeclared universe parameter");
+        }
+        // An exported rule that does not type check is a rejection whatever
+        // stopped the check (an undeclared constant is not an internal error
+        // here: the term is the export's).
+        self.infer_type(&Ctx::new(), rhs).map_err(|e| match e {
+            TcError::Other(msg) => TcError::Reject(format!("recursor rule does not type check: {msg}")),
+            e => e,
+        })?;
+
+        // params, motives, minors: the recursor's own leading binders.
+        let outer = num_params + num_motives + num_minors;
+        let mut ctx = Ctx::new();
+        let mut cur = typ.clone();
+        for _ in 0..outer {
+            let (_, dom, body) = self.ensure_pi(&ctx, &cur)?;
+            ctx.push(dom);
+            cur = body;
+        }
+        // The constructor at this member's parameters, then its fields.
+        let after_params = (num_motives + num_minors) as i32;
+        let ctor_params: Vec<Expr> =
+            member_params.iter().map(|p| expr::shift(p, after_params, 0)).collect();
+        let ctor = expr::const_(rule.ctor, member_levels.to_vec());
+        let mut fields_ty = self.infer_type(&ctx, &expr::apps(ctor.clone(), &ctor_params))?;
+        for _ in 0..rule.nfields {
+            let (_, dom, body) = self.ensure_pi(&ctx, &fields_ty)?;
+            ctx.push(dom);
+            fields_ty = body;
+        }
+        let depth = outer + rule.nfields;
+        let var = |i: u32| expr::bvar(depth - 1 - i);
+        let leading: Vec<Expr> = (0..outer).map(var).collect();
+        let fields: Vec<Expr> = (outer..depth).map(var).collect();
+        let ctor_params: Vec<Expr> = member_params
+            .iter()
+            .map(|p| expr::shift(p, after_params + rule.nfields as i32, 0))
+            .collect();
+        let major = expr::apps(expr::apps(ctor, &ctor_params), &fields);
+        // The indices are the last arguments of the major's type.
+        let major_ty = self.whnf(&ctx, &self.infer_type(&ctx, &major)?)?;
+        let (_, type_args) = expr::unfold_apps(&major_ty);
+        let Some(first_index) = type_args.len().checked_sub(*num_indices as usize) else {
+            return Err(TcError::Other("recursor rule check: major type has too few arguments".into()));
+        };
+        let us: Vec<Level> = level_params.iter().copied().map(level::param).collect();
+        let mut lhs_args = leading.clone();
+        lhs_args.extend_from_slice(&type_args[first_index..]);
+        lhs_args.push(major);
+        let lhs = expr::apps(expr::const_(rname, us), &lhs_args);
+        let mut rhs_args = leading;
+        rhs_args.extend(fields);
+        let applied = expr::apps(rhs.clone(), &rhs_args);
+        if self.is_def_eq(&ctx, &applied, &lhs)? {
+            Ok(())
+        } else {
+            reject("recursor rule is not the computation rule of its constructor")
         }
     }
 

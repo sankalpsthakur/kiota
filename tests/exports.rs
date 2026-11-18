@@ -152,6 +152,12 @@ fn recursor_type_reconstruction_alpha_renamed_auxiliary_accepts() {
     let expected = expr::instantiate_level_params(control.env.get(rec_name).unwrap().typ(), &subst);
     rec["levelParams"] = serde_json::json!([renamed]);
     replace_supplied_type(&mut parser, rec, renamed_supplied);
+    // The rules are terms over the same universe parameters.
+    for rule in rec["rules"].as_array_mut().unwrap() {
+        let rhs = parser.exprs[rule["rhs"].as_u64().unwrap() as usize].clone().unwrap();
+        rule["rhs"] = serde_json::json!(parser.exprs.len());
+        parser.exprs.push(Some(expr::instantiate_level_params(&rhs, &subst)));
+    }
     import_record(&mut parser, &record).expect("positional alpha-renaming accepts");
     let stored = parser.env.get(rec_name).unwrap();
     assert_eq!(stored.level_params(), &[renamed]);
@@ -1939,4 +1945,52 @@ fn a_mutual_block_with_an_empty_member_accepts() {
     for (ty, rec) in [("A", "A.rec"), ("B", "B.rec")] {
         assert_eq!(p.env.rec_of[&p.name_by_str[ty]], p.name_by_str[rec]);
     }
+}
+
+/// The official kernel generates each computation rule and refuses an
+/// export whose rule is another term. Nothing here reduces with an
+/// exported rule, so a wrong one was simply carried along: `N.rec`'s two
+/// rules with their right-hand sides exchanged were accepted as long as no
+/// later declaration depended on the difference. A rule is now type
+/// checked and compared with iota on its constructor applied to variables.
+#[test]
+fn an_exported_rule_must_be_the_computation_rule() {
+    assert_reject_exact(
+        "recursor-rule-rhs-exchanged.reject.ndjson",
+        "[N.rec] recursor rule is not the computation rule of its constructor",
+    );
+    // Genuine rules of every shape in the fixtures: enumerations, indexed
+    // families, K-like, nested auxiliaries, mutual blocks.
+    for name in [
+        "recursor-k-flag.accept.ndjson",
+        "recursor-rules-nested.accept.ndjson",
+        "mutual-with-empty-member.accept.ndjson",
+        "recursor-type-reconstruction.accept.ndjson",
+        "lean-value-two-list-specializations.accept.ndjson",
+    ] {
+        assert_accept(name);
+    }
+}
+
+/// `NestedRedex` (the arena's `nested-redex-aux` type) nests `List` at
+/// `(fun _ => NestedRedex) true` and at `NestedRedex`: two auxiliary types
+/// that are convertible and distinct, each with its recursor and its `nil`
+/// and `cons` minors. Which one a field is eliminated by is fixed by the
+/// declaration as written. Iota looked the recursor up by convertibility
+/// (first match) and the minor by the constructor's parameters as written
+/// in the major, so with `nil` minors 0 and 100 the recursor on `a []` was
+/// 101 instead of 1: the true theorem was rejected and
+/// `badA : viaA = 101 := Eq.refl 101` accepted, on an export that is
+/// lean4export's own apart from that last theorem.
+#[test]
+fn a_field_is_eliminated_by_the_auxiliary_recursor_of_its_written_type() {
+    assert_accept("nested-redex-two-recursors.accept.ndjson");
+    assert_reject_exact(
+        "nested-redex-wrong-auxiliary.reject.ndjson",
+        "[badA] theorem 114: value type does not match declared type",
+    );
+    assert_reject_exact(
+        "nested-redex-other-auxiliary.reject.ndjson",
+        "[badB] theorem 114: value type does not match declared type",
+    );
 }

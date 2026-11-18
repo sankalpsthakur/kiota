@@ -66,7 +66,22 @@
 {"lam": {"binderInfo": "default", "body": 40, "name": 3, "type": 19}, "ie": 41}
 {"lam": {"binderInfo": "default", "body": 41, "name": 2, "type": 10}, "ie": 42}
 {"lam": {"binderInfo": "default", "body": 42, "name": 6, "type": 8}, "ie": 43}
-{"inductive": {"ctors": [{"cidx": 0, "induct": 1, "isUnsafe": false, "levelParams": [], "name": 2, "numFields": 0, "numParams": 0, "type": 3}, {"cidx": 1, "induct": 1, "isUnsafe": false, "levelParams": [], "name": 3, "numFields": 1, "numParams": 0, "type": 6}], "recs": [{"all": [1], "isUnsafe": false, "k": false, "levelParams": [5], "name": 4, "numIndices": 0, "numMinors": 2, "numMotives": 1, "numParams": 0, "rules": [{"ctor": 2, "nfields": 0, "rhs": 30}, {"ctor": 3, "nfields": 1, "rhs": 43}], "type": 26}], "types": [{"all": [1], "ctors": [2, 3], "isRec": true, "isReflexive": false, "isUnsafe": false, "levelParams": [], "name": 1, "numIndices": 0, "numNested": 0, "numParams": 0, "type": 1}]}}
+{"bvar": 0, "ie": 420}
+{"bvar": 1, "ie": 421}
+{"bvar": 2, "ie": 422}
+{"bvar": 3, "ie": 423}
+{"const": {"name": 4, "us": [1]}, "ie": 424}
+{"app": {"fn": 424, "arg": 423}, "ie": 425}
+{"app": {"fn": 425, "arg": 422}, "ie": 426}
+{"app": {"fn": 426, "arg": 421}, "ie": 427}
+{"app": {"fn": 427, "arg": 420}, "ie": 428}
+{"app": {"fn": 421, "arg": 420}, "ie": 429}
+{"app": {"fn": 429, "arg": 428}, "ie": 430}
+{"lam": {"binderInfo": "default", "name": 8, "type": 3, "body": 430}, "ie": 431}
+{"lam": {"binderInfo": "default", "name": 3, "type": 19, "body": 431}, "ie": 432}
+{"lam": {"binderInfo": "default", "name": 2, "type": 10, "body": 432}, "ie": 433}
+{"lam": {"binderInfo": "default", "name": 6, "type": 8, "body": 433}, "ie": 434}
+{"inductive": {"ctors": [{"cidx": 0, "induct": 1, "isUnsafe": false, "levelParams": [], "name": 2, "numFields": 0, "numParams": 0, "type": 3}, {"cidx": 1, "induct": 1, "isUnsafe": false, "levelParams": [], "name": 3, "numFields": 1, "numParams": 0, "type": 6}], "recs": [{"all": [1], "isUnsafe": false, "k": false, "levelParams": [5], "name": 4, "numIndices": 0, "numMinors": 2, "numMotives": 1, "numParams": 0, "rules": [{"ctor": 2, "nfields": 0, "rhs": 30}, {"ctor": 3, "nfields": 1, "rhs": 434}], "type": 26}], "types": [{"all": [1], "ctors": [2, 3], "isRec": true, "isReflexive": false, "isUnsafe": false, "levelParams": [], "name": 1, "numIndices": 0, "numNested": 0, "numParams": 0, "type": 1}]}}
 {"const": {"name": 10, "us": []}, "ie": 44}
 {"forallE": {"binderInfo": "default", "body": 1, "name": 13, "type": 1}, "ie": 45}
 {"bvar": 0, "ie": 46}

@@ -8,9 +8,12 @@ Three fixtures are lean4export output and are not written here
   mutual-with-empty-member.accept     lean4export MutEmpty
   recursor-rules-nested.accept        lean4export NestRules -- Snd.good Snd.badTy Snd.badVal
   recursor-k-flag.accept              lean4export IdxRules
+  nested-redex-two-recursors.accept   lean4export NestedRedex2 -- viaB_true viaA_true
 The recursor rejects below are those exports with one field changed;
 recursor-rules-nested-base.ndjson is `lean4export NestRules -- Snd.badTy
-Snd.badVal`, i.e. the same export without the theorem `good`.
+Snd.badVal`, i.e. the same export without the theorem `good`, and
+nested-redex-false-base.ndjson is `lean4export NestedRedex2 -- viaB_falseTy
+ten viaA_falseTy hundredOne`.
 
 usage: python3 scripts/snd-fixtures/gen.py   (from the repository root)
 """
@@ -368,3 +371,28 @@ x.write("recursor-k-flag-lie.reject")
 x = Ex(os.path.join(OUT, "recursor-k-flag.accept.ndjson"))
 edit_rec(x, "Eq.rec", flip_k)
 x.write("recursor-k-flag-denied.reject")
+
+# The rules of N.rec with their right-hand sides exchanged (constructors
+# and field counts as generated): `N.rec z o N.z` would be `o`. No
+# declaration uses the recursor afterwards.
+x = Ex(os.path.join(OUT, "recursor-k-flag.accept.ndjson"))
+def swap_rhs(r):
+    a, b = r["rules"]
+    a["rhs"], b["rhs"] = b["rhs"], a["rhs"]
+edit_rec(x, "N.rec", swap_rhs)
+x.lines = x.lines[: next(i for i, ln in enumerate(x.lines) if '"name":%d,' % x.names["N.rec"] in ln and '"inductive"' in ln) + 1]
+x.write("recursor-rule-rhs-exchanged.reject")
+
+# `NestedRedex` nests `List` twice, at `(fun _ => NestedRedex) true` and at
+# `NestedRedex`: two auxiliary types, convertible and distinct. The export
+# is what lean4export writes; only the last theorem is added. `viaA` is the
+# recursor on `a []` with the `nil` minors 0 (first auxiliary) and 100
+# (second); it is 1, and `badA : viaA = 101 := Eq.refl 101` was accepted,
+# because `a`'s field was given the second auxiliary's `nil` minor.
+x = Ex(os.path.join(HERE, "nested-redex-false-base.ndjson"))
+x.thm("badA", decl_of(x, "viaA_falseTy")["value"], decl_of(x, "hundredOne")["value"])
+x.write("nested-redex-wrong-auxiliary.reject")
+# The mirror image through `b`, which was rejected before as well.
+x = Ex(os.path.join(HERE, "nested-redex-false-base.ndjson"))
+x.thm("badB", decl_of(x, "viaB_falseTy")["value"], decl_of(x, "ten")["value"])
+x.write("nested-redex-other-auxiliary.reject")

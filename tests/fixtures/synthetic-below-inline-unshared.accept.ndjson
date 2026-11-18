@@ -64,7 +64,22 @@
 {"lam": {"binderInfo": "default", "body": 39, "name": 3, "type": 18}, "ie": 40}
 {"lam": {"binderInfo": "default", "body": 40, "name": 2, "type": 9}, "ie": 41}
 {"lam": {"binderInfo": "default", "body": 41, "name": 17, "type": 7}, "ie": 42}
-{"inductive": {"ctors": [{"cidx": 0, "induct": 1, "isUnsafe": false, "levelParams": [], "name": 2, "numFields": 0, "numParams": 0, "type": 2}, {"cidx": 1, "induct": 1, "isUnsafe": false, "levelParams": [], "name": 3, "numFields": 1, "numParams": 0, "type": 5}], "recs": [{"all": [1], "isUnsafe": false, "k": false, "levelParams": [16], "name": 15, "numIndices": 0, "numMinors": 2, "numMotives": 1, "numParams": 0, "rules": [{"ctor": 2, "nfields": 0, "rhs": 29}, {"ctor": 3, "nfields": 1, "rhs": 42}], "type": 25}], "types": [{"all": [1], "ctors": [2, 3], "isRec": true, "isReflexive": false, "isUnsafe": false, "levelParams": [], "name": 1, "numIndices": 0, "numNested": 0, "numParams": 0, "type": 1}]}}
+{"bvar": 0, "ie": 127092}
+{"bvar": 1, "ie": 127093}
+{"bvar": 2, "ie": 127094}
+{"bvar": 3, "ie": 127095}
+{"const": {"name": 15, "us": [3]}, "ie": 127096}
+{"app": {"fn": 127096, "arg": 127095}, "ie": 127097}
+{"app": {"fn": 127097, "arg": 127094}, "ie": 127098}
+{"app": {"fn": 127098, "arg": 127093}, "ie": 127099}
+{"app": {"fn": 127099, "arg": 127092}, "ie": 127100}
+{"app": {"fn": 127093, "arg": 127092}, "ie": 127101}
+{"app": {"fn": 127101, "arg": 127100}, "ie": 127102}
+{"lam": {"binderInfo": "default", "name": 19, "type": 2, "body": 127102}, "ie": 127103}
+{"lam": {"binderInfo": "default", "name": 3, "type": 18, "body": 127103}, "ie": 127104}
+{"lam": {"binderInfo": "default", "name": 2, "type": 9, "body": 127104}, "ie": 127105}
+{"lam": {"binderInfo": "default", "name": 17, "type": 7, "body": 127105}, "ie": 127106}
+{"inductive": {"ctors": [{"cidx": 0, "induct": 1, "isUnsafe": false, "levelParams": [], "name": 2, "numFields": 0, "numParams": 0, "type": 2}, {"cidx": 1, "induct": 1, "isUnsafe": false, "levelParams": [], "name": 3, "numFields": 1, "numParams": 0, "type": 5}], "recs": [{"all": [1], "isUnsafe": false, "k": false, "levelParams": [16], "name": 15, "numIndices": 0, "numMinors": 2, "numMotives": 1, "numParams": 0, "rules": [{"ctor": 2, "nfields": 0, "rhs": 29}, {"ctor": 3, "nfields": 1, "rhs": 127106}], "type": 25}], "types": [{"all": [1], "ctors": [2, 3], "isRec": true, "isReflexive": false, "isUnsafe": false, "levelParams": [], "name": 1, "numIndices": 0, "numNested": 0, "numParams": 0, "type": 1}]}}
 {"const": {"name": 4, "us": []}, "ie": 43}
 {"forallE": {"binderInfo": "default", "body": 1, "name": 7, "type": 1}, "ie": 44}
 {"bvar": 0, "ie": 45}

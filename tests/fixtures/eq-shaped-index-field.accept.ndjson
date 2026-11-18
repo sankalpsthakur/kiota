@@ -40,4 +40,10 @@
 {"forallE":{"binderInfo":"default","body":26,"name":9,"type":1},"ie":27}
 {"forallE":{"binderInfo":"default","body":27,"name":6,"type":18},"ie":28}
 {"forallE":{"binderInfo":"default","body":28,"name":5,"type":11},"ie":29}
-{"inductive":{"types":[{"name":1,"levelParams":[],"type":2,"numParams":0,"numIndices":1,"all":[1],"ctors":[2],"isRec":false,"isReflexive":false,"isUnsafe":false,"numNested":0}],"ctors":[{"name":2,"levelParams":[],"type":6,"induct":1,"cidx":0,"numParams":0,"numFields":1,"isUnsafe":false}],"recs":[{"name":8,"levelParams":[4],"type":29,"all":[1],"numParams":0,"numIndices":1,"numMotives":1,"numMinors":1,"rules":[{"ctor":2,"nfields":1,"rhs":4}],"k":false,"isUnsafe":false}]}}
+{"bvar":1,"ie":30}
+{"bvar":0,"ie":31}
+{"app":{"fn":30,"arg":31},"ie":32}
+{"lam":{"binderInfo":"default","name":9,"type":1,"body":32},"ie":33}
+{"lam":{"binderInfo":"default","name":6,"type":18,"body":33},"ie":34}
+{"lam":{"binderInfo":"default","name":5,"type":11,"body":34},"ie":35}
+{"inductive":{"types":[{"name":1,"levelParams":[],"type":2,"numParams":0,"numIndices":1,"all":[1],"ctors":[2],"isRec":false,"isReflexive":false,"isUnsafe":false,"numNested":0}],"ctors":[{"name":2,"levelParams":[],"type":6,"induct":1,"cidx":0,"numParams":0,"numFields":1,"isUnsafe":false}],"recs":[{"name":8,"levelParams":[4],"type":29,"all":[1],"numParams":0,"numIndices":1,"numMotives":1,"numMinors":1,"rules":[{"ctor":2,"nfields":1,"rhs":35}],"k":false,"isUnsafe":false}]}}
