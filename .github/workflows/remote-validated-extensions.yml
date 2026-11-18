@@ -1,0 +1,95 @@
+name: remote-validated-extensions
+
+# snd/validated-extensions on every corpus, strict, one process each.
+#
+# strict: as remote-integrate4 ran origin/main (run 44380394633). On the five
+#   small corpora origin/main (606c3c0) is built too and run on the same
+#   runner, before and after, so that the two times share a machine.
+# trace:  KIOTA_EXT_TRACE, for which extension constants validated and how
+#   often each native rule fired.
+# Either fails if a constant with an extension name is turned away.
+on:
+  push:
+    branches: ['remote/validated-extensions-2026*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+  CL_EXPORT_RUN: 44328282978
+  BASE: 606c3c08f892243d83faadf33ae2acd8bf218f78
+  OFF: 'is not the constant the kernel assumes|does not give a literal the bytes'
+
+jobs:
+  full:
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [mathlib, cedar, cslib, std, init, con-leche]
+        mode: [strict, trace]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - uses: actions/checkout@v4
+        if: matrix.mode == 'strict' && matrix.corpus != 'mathlib'
+        with:
+          ref: ${{ env.BASE }}
+          path: base
+      - if: matrix.mode == 'strict' && matrix.corpus != 'mathlib'
+        run: cargo build --release --locked --manifest-path base/Cargo.toml
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ matrix.corpus == 'con-leche' && env.CL_EXPORT_RUN || env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Strict run
+        if: matrix.mode == 'strict'
+        env:
+          C: ${{ matrix.corpus }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          nproc; free -g | head -2
+          head -c 400 $C.ndjson | head -1
+          one() { # <label> <binary>
+            KIOTA_PROGRESS=1 /usr/bin/time -v -o time.txt timeout 20000 $2 $C.ndjson >/dev/null 2>err.txt; rc=$?
+            echo "$1 corpus=$C rc=$rc decls=$(grep -c '\[decl #' err.txt) last=$(grep -o '\[decl #[0-9]*\]' err.txt | tail -1) wall=$(grep Elapsed time.txt | awk '{print $NF}') user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') ext_off=$(grep -c -E "$OFF" err.txt) $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-300)" | tee -a "$GITHUB_STEP_SUMMARY"
+            return $rc
+          }
+          if [ -x base/target/release/kiota ]; then one BASE1 base/target/release/kiota; fi
+          one FULL ./target/release/kiota; rc=$?
+          cp err.txt head-err.txt
+          if [ -x base/target/release/kiota ]; then
+            one BASE2 base/target/release/kiota
+            if [ "$C" != cslib ]; then one FULL2 ./target/release/kiota; fi
+          fi
+          grep -E "$OFF" head-err.txt | head -40
+          test "$rc" = 0 && ! grep -q -E "$OFF" head-err.txt
+      - name: Trace run
+        if: matrix.mode == 'trace'
+        env:
+          C: ${{ matrix.corpus }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          KIOTA_EXT_TRACE=1 /usr/bin/time -v -o time.txt timeout 20000 ./target/release/kiota $C.ndjson >/dev/null 2>err.txt; rc=$?
+          echo "TRACE corpus=$C rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') ext_off=$(grep -c -E "$OFF" err.txt) on=[$(grep '^EXT on ' err.txt | sed 's/^EXT on //' | tr '\n' ',')] $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-300)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "TRACEFIRED corpus=$C $(grep '^EXT fired' err.txt)" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E "$OFF" err.txt | head -40
+          test "$rc" = 0 && ! grep -q -E "$OFF" err.txt
+
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release --locked 2>&1 | grep -E '^test result|FAILED|failed|panicked' | tee -a "$GITHUB_STEP_SUMMARY"
+      - run: cargo test --release --locked
