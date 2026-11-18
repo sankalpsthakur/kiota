@@ -917,6 +917,8 @@ pub fn instantiate(e: &Expr, args: &[Expr]) -> Expr {
         .try_with(|m| std::mem::take(&mut *m.borrow_mut()))
         .unwrap_or_default();
     let r = instantiate_core(e, args, 0, &mut memo);
+    crate::stats::inst_nodes_add(memo.misses);
+    memo.misses = 0;
     memo.clear();
     let _ = INST_SCRATCH.try_with(|m| *m.borrow_mut() = memo);
     r
@@ -943,6 +945,10 @@ struct SubstMemo {
     shift: u32,
     /// Indices of the occupied slots.
     filled: Vec<u32>,
+    /// Nodes this call substituted into (lookups that found nothing), for
+    /// the `inst_nodes` counter: added up here and reported once per call
+    /// instead of asking on every node whether counters are on.
+    misses: u64,
 }
 
 /// Slots of a new memo, and of one emptied after outgrowing the limit below.
@@ -971,6 +977,7 @@ impl SubstMemo {
             slots,
             shift: 64 - log2,
             filled: Vec::new(),
+            misses: 0,
         }
     }
 
@@ -1032,6 +1039,7 @@ impl SubstMemo {
         let log2 = 64 - self.shift + 1;
         let mut bigger = SubstMemo::with_slots_log2(log2);
         bigger.filled.reserve(self.filled.len() + 1);
+        bigger.misses = self.misses;
         let mask = bigger.slots.len() - 1;
         for &i in &self.filled {
             let s = &mut self.slots[i as usize];
@@ -1076,7 +1084,7 @@ fn instantiate_core(
     if let Some(r) = memo.get(id, depth) {
         return r.clone();
     }
-    crate::stats::inst_node();
+    memo.misses += 1;
     let r = match &***e {
         ExprData::BVar(i) => {
             if *i >= depth && ((*i - depth) as usize) < args.len() {
