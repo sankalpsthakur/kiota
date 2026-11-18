@@ -779,8 +779,13 @@ const INTERN_REPORT_EVERY: u64 = 100_000_000;
 /// compile time: the hash, the candidate comparison, the bvar summaries and
 /// the release of `d` on a hit each compile to the one arm that applies,
 /// instead of five dispatches on the kind per call.
+///
+/// `SITE` only tells the call sites apart. The closure below has one type
+/// per instantiation of this function, so with a distinct `SITE` each
+/// constructor gets its own copy of the lookup rather than a call into a
+/// shared one that has to dispatch on the kind again.
 #[inline(always)]
-fn intern_inline(d: ExprData) -> Expr {
+fn intern_inline<const SITE: u8>(d: ExprData) -> Expr {
     INTERN.with(|t| {
         let mut t = t.borrow_mut();
         t.calls += 1;
@@ -819,7 +824,7 @@ impl Interner {
 
 /// `intern` for a node whose kind is only known at run time.
 pub fn intern(d: ExprData) -> Expr {
-    intern_inline(d)
+    intern_inline::<0>(d)
 }
 
 pub fn intern_node_count() -> usize {
@@ -912,34 +917,34 @@ pub fn clear_subst_memos() {
 }
 
 pub fn bvar(i: u32) -> Expr {
-    intern_inline(ExprData::BVar(i))
+    intern_inline::<1>(ExprData::BVar(i))
 }
 pub fn sort(l: Level) -> Expr {
-    intern_inline(ExprData::Sort(l))
+    intern_inline::<2>(ExprData::Sort(l))
 }
 pub fn const_(n: u32, us: Vec<Level>) -> Expr {
-    intern_inline(ExprData::Const(n, Rc::new(us)))
+    intern_inline::<3>(ExprData::Const(n, Rc::new(us)))
 }
 pub fn app(f: Expr, a: Expr) -> Expr {
-    intern_inline(ExprData::App(f, a))
+    intern_inline::<4>(ExprData::App(f, a))
 }
 pub fn lam(bi: BinderInfo, ty: Expr, body: Expr) -> Expr {
-    intern_inline(ExprData::Lam(bi, ty, body))
+    intern_inline::<5>(ExprData::Lam(bi, ty, body))
 }
 pub fn pi(bi: BinderInfo, ty: Expr, body: Expr) -> Expr {
-    intern_inline(ExprData::Pi(bi, ty, body))
+    intern_inline::<6>(ExprData::Pi(bi, ty, body))
 }
 pub fn let_(ty: Expr, val: Expr, body: Expr) -> Expr {
-    intern_inline(ExprData::Let(ty, val, body))
+    intern_inline::<7>(ExprData::Let(ty, val, body))
 }
 pub fn proj(s: u32, i: u32, e: Expr) -> Expr {
-    intern_inline(ExprData::Proj(s, i, e))
+    intern_inline::<8>(ExprData::Proj(s, i, e))
 }
 pub fn lit_nat(n: num_bigint::BigUint) -> Expr {
-    intern_inline(ExprData::Lit(Lit::Nat(n)))
+    intern_inline::<9>(ExprData::Lit(Lit::Nat(n)))
 }
 pub fn lit_str(s: impl Into<String>) -> Expr {
-    intern_inline(ExprData::Lit(Lit::Str(Rc::new(s.into()))))
+    intern_inline::<10>(ExprData::Lit(Lit::Str(Rc::new(s.into()))))
 }
 
 /// True when `e` has no loose bvars.
