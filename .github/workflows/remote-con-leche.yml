@@ -1,13 +1,9 @@
-name: remote-con-leche
+name: remote-con-leche-cones
 
-# The con-leche arena test (leanprover/con-leche 78ded4b6, module
-# ConLecheTests, three export-decls; export built by run 44328282978,
-# sha256 b9ad1d95..., identical to the board's) and the standing corpora on
-# perf/ws-con-leche fd7248f (lazy pass leaves ite/dite/Decidable.decide to
-# lazy delta) plus the keep-going and slow-declaration diagnostics.
-#   fix2     this branch
-#   noshort  this branch with KIOTA_NO_DECIDE_SHORTCUT=1
-# Base and 132463b numbers on the same exports are in run 44331616042.
+# Finds the declarations of the con-leche arena export on which kiota
+# (perf/ws-con-leche fd7248f + diagnostics) spends over a second or grows the
+# resident set by 256 MB, and exports the dependency cone of the worst ones
+# as small standalone exports for local profiling.
 on:
   push:
     branches: ['remote/con-leche-2026*']
@@ -17,21 +13,21 @@ permissions:
   actions: read
 
 env:
+  SRC_URL: https://github.com/leanprover/con-leche
+  SRC_REV: 78ded4b6fc9a4d9ab809e8ca2c75c56537c41bff
   CL_EXPORT_RUN: 44328282978
-  EXPORTS_RUN: 44313744961
 
 jobs:
-  con-leche:
-    strategy:
-      fail-fast: false
-      matrix:
-        side: [fix2, noshort]
+  cones:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: kiota
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build (the arena's build line)
+      - name: Build kiota
+        working-directory: kiota
         run: |
           git log --oneline -1
           cargo build --release
@@ -40,84 +36,78 @@ jobs:
           name: export-con-leche
           run-id: ${{ env.CL_EXPORT_RUN }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Run
-        env:
-          SIDE: ${{ matrix.side }}
+      - name: Start kiota on the whole export (background)
         run: |
-          set +e
           sudo apt-get install -y zstd time >/dev/null
           zstd -d --rm con-leche.ndjson.zst -o con-leche.ndjson
-          sha256sum con-leche.ndjson; nproc; free -g | head -2
-          extra="A=1"; [ "$SIDE" = noshort ] && extra="KIOTA_NO_DECIDE_SHORTCUT=1"
+          ( KIOTA_KEEP_GOING=1 KIOTA_STATS=1 KIOTA_SLOW_MS=1000 /usr/bin/time -v -o time.txt ./kiota/target/release/kiota con-leche.ndjson >/dev/null 2>err.txt; echo $? > rc.txt ) &
+      - name: Install elan
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Source
+        run: |
+          mkdir -p work/src && cd work/src
+          git init -q && git remote add origin "$SRC_URL"
+          git fetch -q --depth 1 origin "$SRC_REV" && git checkout -q FETCH_HEAD
+      - name: Build lean4export (names read as dotted components, numbers numeric)
+        run: |
+          git clone -q --branch master https://github.com/leanprover/lean4export lean4export
+          cp work/src/lean-toolchain lean4export/lean-toolchain
+          cd lean4export && git rev-parse HEAD
+          python3 - <<'PY'
+          p='Main.lean'; s=open(p).read()
+          old='| some cs => cs.map fun c => Syntax.decodeNameLit ("`" ++ c) |>.get!'
+          assert old in s
+          new='| some cs => cs.map fun c => (c.splitOn ".").foldl (fun n k => match k.toNat? with | some i => Name.num n i | none => Name.str n k) Name.anonymous'
+          open(p,'w').write(s.replace(old,new))
+          PY
+          lake build
+      - name: Build module
+        working-directory: work/src
+        run: lake build ConLecheTests
+      - name: Wait for kiota, pick the worst declarations
+        run: |
+          while [ ! -f rc.txt ]; do sleep 10; done
           {
-            # the arena's own invocation, twice: verdict and cost without diagnostics (test timeout 720 s)
-            for i in 1 2; do
-              env $extra /usr/bin/time -v -o time.txt timeout 720 ./target/release/kiota con-leche.ndjson >out0.txt 2>err0.txt; rc=$?
-              echo "CL corpus=con-leche side=$SIDE mode=plain try=$i rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') sys=$(grep 'System time' time.txt | awk '{print $NF}') wall=$(grep 'Elapsed' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}')"
-              grep -E '^(REJECT|DECLINE|ERROR)' err0.txt | cut -c1-600
-            done
-            env $extra KIOTA_KEEP_GOING=1 KIOTA_STATS=1 KIOTA_SLOW_MS=1000 /usr/bin/time -v -o time.txt timeout 3000 ./target/release/kiota con-leche.ndjson >/dev/null 2>err.txt; rc=$?
-            echo "CL corpus=con-leche side=$SIDE mode=keep-going rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') wall=$(grep 'Elapsed' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') declines=$(grep -c '^DECLINE-CONT' err.txt) slow=$(grep -c '^SLOW' err.txt) $(grep -E '^STATS ' err.txt | tail -1)"
-            grep -E '^STATS[23]' err.txt | tail -2
-            grep -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-600 | head -100
-            echo "--- lazy retries"
-            grep -c '^LAZY_RETRY' err.txt
-            grep -E '^LAZY_RETRY' err.txt | cut -c1-260 | head -120
-            echo "--- declarations over 1000 ms or growing the resident set by 256 MB"
-            grep -E '^SLOW' err.txt | cut -c1-300 | head -400
+            echo "CL cones-run rc=$(cat rc.txt) user=$(grep 'User time' time.txt | awk '{print $NF}') wall=$(grep 'Elapsed' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') declines=$(grep -c '^DECLINE-CONT' err.txt) slow=$(grep -c '^SLOW' err.txt) $(grep -E '^STATS ' err.txt | tail -1)"
+            grep -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-400 | head -20
+            echo "--- slowest"
+            grep -E '^SLOW' err.txt | sed -E 's/.* ms=([0-9]+) .*/\1 &/' | sort -rn | head -40 | cut -c1-300
+            echo "--- resident set growth"
+            grep -E '^SLOW' err.txt | sed -E 's/.*rss_kb=([0-9]+)->([0-9]+).*/\1 \2 &/' | awk '{ if ($2-$1 > 262144) print ($2-$1), $0 }' | sort -rn | head -20 | cut -c1-300
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          zstd -q -10 err.txt -o kiota-stderr-$SIDE.txt.zst
+          # names: 8 slowest and 4 largest growers
+          { grep -E '^SLOW' err.txt | sed -E 's/.* ms=([0-9]+) .*/\1 &/' | sort -rn | head -8 | awk '{print $5}';
+            grep -E '^SLOW' err.txt | sed -E 's/.*rss_kb=([0-9]+)->([0-9]+).*/\1 \2 &/' | awk '{ if ($2-$1 > 262144) print ($2-$1), $6 }' | sort -rn | head -4 | awk '{print $2}'; } | awk '!seen[$0]++' > names.txt
+          cat names.txt
+          zstd -q -10 err.txt -o kiota-stderr.txt.zst
+      - name: Export cones
+        working-directory: work/src
+        run: |
+          set +e
+          X="$GITHUB_WORKSPACE/lean4export/.lake/build/bin/lean4export"
+          mkdir -p "$GITHUB_WORKSPACE/cones"
+          i=0
+          while read -r n; do
+            i=$((i+1))
+            lake env "$X" ConLecheTests -- "$n" > "$GITHUB_WORKSPACE/cones/cone-$i.ndjson"; rc=$?
+            echo "cone-$i rc=$rc lines=$(wc -l < "$GITHUB_WORKSPACE/cones/cone-$i.ndjson") bytes=$(stat -c %s "$GITHUB_WORKSPACE/cones/cone-$i.ndjson") $n" | tee -a "$GITHUB_WORKSPACE/cones/index.txt"
+          done < "$GITHUB_WORKSPACE/names.txt"
+          cd "$GITHUB_WORKSPACE/cones" && for f in cone-*.ndjson; do
+            KIOTA_STATS=1 KIOTA_SLOW_MS=1000 /usr/bin/time -v -o t.txt "$GITHUB_WORKSPACE/kiota/target/release/kiota" $f >/dev/null 2>e.txt
+            echo "$f rc=$? user=$(grep 'User time' t.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' t.txt | awk '{print $NF}') $(grep -E '^STATS ' e.txt | tail -1 | cut -c1-200)" | tee -a index.txt
+          done
+          rm -f t.txt e.txt
+          zstd -q -T0 -12 --rm cone-*.ndjson
+          cat index.txt >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: stderr-${{ matrix.side }}
-          path: kiota-stderr-*.txt.zst
+          name: hot-cones
+          path: |
+            cones/
+            kiota-stderr.txt.zst
           if-no-files-found: ignore
           retention-days: 30
-
-  corpus:
-    strategy:
-      fail-fast: false
-      matrix:
-        corpus: [init, std, cedar, cslib, mathlib]
-        side: [fix2]
-        include:
-          - corpus: init
-            side: noshort
-          - corpus: std
-            side: noshort
-    runs-on: ubuntu-latest
-    timeout-minutes: 355
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build
-        run: |
-          git log --oneline -1
-          cargo build --release --locked
-      - name: Free runner disk
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
-          df -h / | tail -1
-      - uses: actions/download-artifact@v4
-        with:
-          name: export-${{ matrix.corpus }}
-          run-id: ${{ env.EXPORTS_RUN }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Run
-        env:
-          SIDE: ${{ matrix.side }}
-          C: ${{ matrix.corpus }}
-        run: |
-          set +e
-          sudo apt-get install -y zstd time >/dev/null
-          zstd -d --rm $C.ndjson.zst -o $C.ndjson
-          extra="A=1"; [ "$SIDE" = noshort ] && extra="KIOTA_NO_DECIDE_SHORTCUT=1"
-          env $extra KIOTA_STATS=1 KIOTA_SLOW_MS=5000 /usr/bin/time -v -o time.txt ./target/release/kiota $C.ndjson >/dev/null 2>err.txt; rc=$?
-          {
-            echo "CL corpus=$C side=$SIDE rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') wall=$(grep 'Elapsed' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') lazy_retries=$(grep -c '^LAZY_RETRY' err.txt) $(grep -E '^STATS ' err.txt | tail -1)"
-            grep -E '^STATS[23]' err.txt | tail -2
-            grep -E '^LAZY_RETRY' err.txt | cut -c1-300 | head -40
-            grep -E '^SLOW' err.txt | cut -c1-300 | head -60
-            grep -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-600 | head -20
-          } | tee -a "$GITHUB_STEP_SUMMARY"
