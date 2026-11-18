@@ -92,7 +92,9 @@ thread_local! {
     /// (`note_xcache_recheck`).
     static XCACHE_RECHECKS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
     /// `KIOTA_XCACHE_VERIFY`: every cache hit is recomputed without the
-    /// caches and compared; the recomputed result is the one used.
+    /// caches and compared (`expr::same_structure`: after an interner reset
+    /// a cached result and a fresh one are equal without sharing nodes);
+    /// the recomputed result is the one used.
     static XVERIFY_ON: bool = std::env::var_os("KIOTA_XCACHE_VERIFY").is_some();
     /// Hits whose recomputation was another node, a failure, or `false`
     /// (infer, whnf, defeq).
@@ -1248,12 +1250,16 @@ impl<'e> Checker<'e> {
             self.unfold_cache.borrow_mut().clear();
             self.iota_value_cache.borrow_mut().clear();
             self.iota_lit_memo.borrow_mut().clear();
-            // The cross-declaration caches and the kept substitution memos
-            // hold strong references into the generation being dropped.
-            // Their keys are never-reused ids, so a stale entry cannot
-            // answer for another term, but it pins that generation and
-            // hands back nodes no new term is pointer-equal to.
-            xcache_clear();
+            // The kept substitution memos (`KIOTA_XMEMO`) hold strong
+            // references into the generation being dropped. Their keys are
+            // never-reused ids, so a stale entry cannot answer for another
+            // term, but it pins that generation and hands back nodes no
+            // new term is pointer-equal to. The cross-declaration caches
+            // are in the same position and are kept all the same: what they
+            // hold is still true of the terms the environment keeps alive,
+            // and emptying them here cost more than it saved (std, both
+            // flags: 899.1M node constructions emptied, 848.2M kept, 876.2M
+            // with the memos kept too).
             expr::clear_subst_memos();
             expr::intern_clear_if_large(INTERN_RESET);
             if std::env::var_os("KIOTA_INTERN_RESET_LOG").is_some() {
@@ -1517,7 +1523,7 @@ impl<'e> Checker<'e> {
                     if XVERIFY_ON.with(|b| *b) {
                         let fresh = with_xcache_suspended(|| self.infer_type_cached(ctx, e));
                         match &fresh {
-                            Ok(f) if Rc::ptr_eq(f, &t) => {}
+                            Ok(f) if expr::same_structure(f, &t) => {}
                             Ok(f) => self.xverify_mismatch(0, e, &self.pp_budget(&t, 8), &self.pp_budget(f, 8)),
                             Err(err) => self.xverify_mismatch(0, e, &self.pp_budget(&t, 8), &format!("{err:?}")),
                         }
@@ -2590,7 +2596,7 @@ impl<'e> Checker<'e> {
                 if XVERIFY_ON.with(|b| *b) {
                     let fresh = with_xcache_suspended(|| self.whnf_inner(ctx, e));
                     match &fresh {
-                        Ok(f) if Rc::ptr_eq(f, &r) => {}
+                        Ok(f) if expr::same_structure(f, &r) => {}
                         Ok(f) => self.xverify_mismatch(1, e, &self.pp_budget(&r, 8), &self.pp_budget(f, 8)),
                         Err(err) => self.xverify_mismatch(1, e, &self.pp_budget(&r, 8), &format!("{err:?}")),
                     }

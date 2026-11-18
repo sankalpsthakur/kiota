@@ -620,6 +620,47 @@ pub fn lit_str(s: impl Into<String>) -> Expr {
     intern(ExprData::Lit(Lit::Str(Rc::new(s.into()))))
 }
 
+/// Whether two terms are the same term, node for node. Within one interner
+/// generation that is pointer equality; this also answers for terms from
+/// different generations (`intern_clear_if_large`), which are equal without
+/// sharing a node. Walks each pair of nodes once.
+pub fn same_structure(a: &Expr, b: &Expr) -> bool {
+    let mut seen: rustc_hash::FxHashSet<(usize, usize)> = rustc_hash::FxHashSet::default();
+    let mut stack = vec![(a.clone(), b.clone())];
+    while let Some((x, y)) = stack.pop() {
+        if Rc::ptr_eq(&x, &y) || !seen.insert((identity(&x), identity(&y))) {
+            continue;
+        }
+        match (&x.data, &y.data) {
+            (ExprData::BVar(i), ExprData::BVar(j)) if i == j => {}
+            (ExprData::Sort(l), ExprData::Sort(m)) if l == m => {}
+            (ExprData::Const(n, us), ExprData::Const(m, vs)) if n == m && us == vs => {}
+            (ExprData::Lit(l), ExprData::Lit(m)) if l == m => {}
+            (ExprData::App(f, a), ExprData::App(g, b)) => {
+                stack.push((f.clone(), g.clone()));
+                stack.push((a.clone(), b.clone()));
+            }
+            (ExprData::Lam(bi, t, u), ExprData::Lam(bj, v, w))
+            | (ExprData::Pi(bi, t, u), ExprData::Pi(bj, v, w))
+                if bi == bj =>
+            {
+                stack.push((t.clone(), v.clone()));
+                stack.push((u.clone(), w.clone()));
+            }
+            (ExprData::Let(t, v, u), ExprData::Let(t2, v2, u2)) => {
+                stack.push((t.clone(), t2.clone()));
+                stack.push((v.clone(), v2.clone()));
+                stack.push((u.clone(), u2.clone()));
+            }
+            (ExprData::Proj(s, i, v), ExprData::Proj(s2, i2, v2)) if s == s2 && i == i2 => {
+                stack.push((v.clone(), v2.clone()));
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// True when `e` has no loose bvars.
 #[inline(always)]
 pub fn is_closed(e: &Expr) -> bool {
@@ -1242,3 +1283,21 @@ mod tests {
 #[cfg(test)]
 #[path = "expr/level_subst_tests.rs"]
 mod level_subst_tests;
+
+#[cfg(test)]
+mod same_structure_tests {
+    use super::*;
+
+    #[test]
+    fn equal_terms_from_two_interner_generations_are_the_same_structure() {
+        let build = |n: u32| app(lam(BinderInfo::Default, sort(crate::level::zero()), bvar(0)), const_(n, vec![]));
+        let old = build(7);
+        // Force a fresh table: the next `build(7)` allocates new nodes.
+        assert!(intern_clear_if_large(0));
+        let new = build(7);
+        assert!(!Rc::ptr_eq(&old, &new), "the reset should have dropped the old table");
+        assert!(same_structure(&old, &new));
+        assert!(!same_structure(&old, &build(8)));
+        assert!(!same_structure(&old, &lam(BinderInfo::Default, sort(crate::level::zero()), bvar(0))));
+    }
+}
