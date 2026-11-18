@@ -1852,6 +1852,78 @@ mod tests {
         assert!(!structurally_equal(&new, &app(new.clone(), bvar(0))));
     }
 
+    /// Two different nodes filed under one hash are told apart by
+    /// `Shape::is` alone: the probe's `slot.hash == h` passes, so whatever
+    /// `is` overlooks (a binder's info, an application's function) would be
+    /// handed back as the other node. The table's own hashes do not collide
+    /// on demand, so each shape is filed here under a hash of the test's
+    /// choosing.
+    #[test]
+    fn nodes_filed_under_one_hash_are_told_apart_by_their_shape() {
+        const H: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut t = Interner::default();
+        // Leaves first, each under its own hash, so the children below are
+        // distinct nodes.
+        let x = t.intern(BVarShape(0), 1 << 40);
+        let y = t.intern(BVarShape(1), 2 << 40);
+        let z = t.intern(BVarShape(2), 3 << 40);
+        assert!(!Rc::ptr_eq(&x, &y) && !Rc::ptr_eq(&y, &z) && !Rc::ptr_eq(&x, &z));
+        let before = t.len();
+
+        // Every pair below differs in exactly one field.
+        let lam_d = t.intern(LamShape(BinderInfo::Default, x.clone(), y.clone()), H);
+        let lam_i = t.intern(LamShape(BinderInfo::Implicit, x.clone(), y.clone()), H);
+        let lam_ty = t.intern(LamShape(BinderInfo::Default, z.clone(), y.clone()), H);
+        let lam_body = t.intern(LamShape(BinderInfo::Default, x.clone(), z.clone()), H);
+        let pi_d = t.intern(PiShape(BinderInfo::Default, x.clone(), y.clone()), H);
+        let pi_i = t.intern(PiShape(BinderInfo::Implicit, x.clone(), y.clone()), H);
+        let pi_ty = t.intern(PiShape(BinderInfo::Default, z.clone(), y.clone()), H);
+        let pi_body = t.intern(PiShape(BinderInfo::Default, x.clone(), z.clone()), H);
+        let app_xy = t.intern(AppShape(x.clone(), y.clone()), H);
+        let app_zy = t.intern(AppShape(z.clone(), y.clone()), H);
+        let app_xz = t.intern(AppShape(x.clone(), z.clone()), H);
+        let let_xyz = t.intern(LetShape(x.clone(), y.clone(), z.clone()), H);
+        let let_ty = t.intern(LetShape(y.clone(), y.clone(), z.clone()), H);
+        let let_val = t.intern(LetShape(x.clone(), x.clone(), z.clone()), H);
+        let let_body = t.intern(LetShape(x.clone(), y.clone(), y.clone()), H);
+        let proj = t.intern(ProjShape(3, 1, x.clone()), H);
+        let proj_s = t.intern(ProjShape(4, 1, x.clone()), H);
+        let proj_i = t.intern(ProjShape(3, 2, x.clone()), H);
+        let proj_v = t.intern(ProjShape(3, 1, y.clone()), H);
+        let all = [
+            &lam_d, &lam_i, &lam_ty, &lam_body, &pi_d, &pi_i, &pi_ty, &pi_body, &app_xy,
+            &app_zy, &app_xz, &let_xyz, &let_ty, &let_val, &let_body, &proj, &proj_s, &proj_i,
+            &proj_v,
+        ];
+        assert_eq!(t.len(), before + all.len(), "one node per distinct shape");
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert!(!Rc::ptr_eq(a, b), "two shapes under one hash became one node");
+            }
+        }
+        // Each node is what was asked for, not a neighbour's.
+        assert!(matches!(&**lam_d, ExprData::Lam(BinderInfo::Default, ty, body)
+            if Rc::ptr_eq(ty, &x) && Rc::ptr_eq(body, &y)));
+        assert!(matches!(&**lam_i, ExprData::Lam(BinderInfo::Implicit, ty, body)
+            if Rc::ptr_eq(ty, &x) && Rc::ptr_eq(body, &y)));
+        assert!(matches!(&**pi_i, ExprData::Pi(BinderInfo::Implicit, ty, body)
+            if Rc::ptr_eq(ty, &x) && Rc::ptr_eq(body, &y)));
+        assert!(matches!(&**app_xy, ExprData::App(f, a) if Rc::ptr_eq(f, &x) && Rc::ptr_eq(a, &y)));
+        assert!(matches!(&**app_zy, ExprData::App(f, a) if Rc::ptr_eq(f, &z) && Rc::ptr_eq(a, &y)));
+        assert!(matches!(&**app_xz, ExprData::App(f, a) if Rc::ptr_eq(f, &x) && Rc::ptr_eq(a, &z)));
+        // Asking again, behind the whole run of colliding slots, finds the
+        // same node and allocates nothing.
+        let n = t.len();
+        assert!(Rc::ptr_eq(&lam_i, &t.intern(LamShape(BinderInfo::Implicit, x.clone(), y.clone()), H)));
+        assert!(Rc::ptr_eq(&lam_d, &t.intern(LamShape(BinderInfo::Default, x.clone(), y.clone()), H)));
+        assert!(Rc::ptr_eq(&pi_i, &t.intern(PiShape(BinderInfo::Implicit, x.clone(), y.clone()), H)));
+        assert!(Rc::ptr_eq(&app_zy, &t.intern(AppShape(z.clone(), y.clone()), H)));
+        assert!(Rc::ptr_eq(&app_xz, &t.intern(AppShape(x.clone(), z.clone()), H)));
+        assert!(Rc::ptr_eq(&let_body, &t.intern(LetShape(x.clone(), y.clone(), y.clone()), H)));
+        assert!(Rc::ptr_eq(&proj_v, &t.intern(ProjShape(3, 1, y.clone()), H)));
+        assert_eq!(t.len(), n);
+    }
+
     #[test]
     fn intern_clear_if_large_is_a_noop_under_threshold() {
         let _ = const_(1, vec![]);
