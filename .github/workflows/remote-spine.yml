@@ -1,0 +1,59 @@
+name: remote-spine
+
+# Second run (App rule + projection field types): the on arms only; the off
+# arms are in the run of remote/ws-open-terms-20261118.
+# KIOTA_SPINE off / on, without and with the cross-declaration caches
+# (KIOTA_XCACHE + KIOTA_XMEMO): verdict, counters (deterministic), user time
+# and peak memory on init and std, same binary, same runner. The verify arm
+# recomputes every application spine one argument at a time and panics on a
+# difference. The last two arms run without counters, for user time only.
+on:
+  push:
+    branches: ['remote/ws-open-terms-2026*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+
+jobs:
+  spine:
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [init, std]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Arms
+        env:
+          C: ${{ matrix.corpus }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          arm() {
+            side=$1; stats=$2; shift 2
+            env "$@" $stats /usr/bin/time -v -o time.txt ./target/release/kiota $C.ndjson >/dev/null 2>err.txt; rc=$?
+            echo "SP1 corpus=$C side=$side rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -E '^STATS3' err.txt | tail -1) $(grep -E '^STATS ' err.txt | tail -1) $(grep -m1 -E '^(REJECT|DECLINE|ERROR)|panicked' err.txt | cut -c1-200)"
+            grep -E '^STATS[24567]' err.txt | sed "s/^/SP2 corpus=$C side=$side /"
+          }
+          {
+
+            arm spine KIOTA_STATS=1 KIOTA_SPINE=1
+
+            arm a_spine KIOTA_STATS=1 KIOTA_XCACHE=1 KIOTA_XMEMO=1 KIOTA_SPINE=1
+            arm a_spine_verify KIOTA_STATS=1 KIOTA_XCACHE=1 KIOTA_XMEMO=1 KIOTA_SPINE=1 KIOTA_SPINE_VERIFY=1
+
+            arm a_spine_time KIOTA_UNUSED=1 KIOTA_XCACHE=1 KIOTA_XMEMO=1 KIOTA_SPINE=1
+          } | tee -a "$GITHUB_STEP_SUMMARY"
