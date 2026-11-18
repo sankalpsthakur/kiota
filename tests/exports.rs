@@ -1623,3 +1623,18 @@ fn an_undeclared_universe_parameter_in_a_value_is_rejected() {
     );
     assert_accept("declared-universe-def-value.accept.ndjson");
 }
+
+/// `a >>> b` is `a / 2^b` whatever the size of `b`. A shift amount of 2^16
+/// or more used to yield 0, which made `2^70000 >>> 65536 = 0` provable.
+#[test]
+fn shifting_right_by_65536_or_more_is_still_division() {
+    assert_reject("nat-shift-right-large-amount.reject.ndjson");
+    assert_accept("nat-shift-right-large-amount.accept.ndjson");
+}
+
+/// A shift left past 100,000 bits is evaluated on the literal, as the
+/// official kernel does, instead of being unfolded bit by bit.
+#[test]
+fn shifting_left_by_600000_bits_is_evaluated() {
+    assert_accept("nat-shift-left-600k.accept.ndjson");
+}

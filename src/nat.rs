@@ -54,29 +54,37 @@ pub fn mod_values(a: &BigUint, b: &BigUint) -> BigUint {
     }
 }
 
-pub fn shift_left_values(a: &BigUint, b: &BigUint) -> Option<BigUint> {
-    if *b == BigUint::from(0u32) {
-        return Some(a.clone());
+/// Bits a computed literal may have. Past this the operation is left to
+/// the definition, which is to say it is not evaluated.
+const MAX_RESULT_BITS: u64 = 1 << 31;
+
+fn small(b: &BigUint) -> Option<u64> {
+    let digits = b.to_u64_digits();
+    match digits.len() {
+        0 => Some(0),
+        1 => Some(digits[0]),
+        _ => None,
     }
-    if b.bits() > 16 {
-        return None;
-    }
-    let shift = b.to_u64_digits().first().copied().unwrap_or(0) as usize;
-    if shift > 100_000 {
-        return None;
-    }
-    Some(a << shift)
 }
 
+pub fn shift_left_values(a: &BigUint, b: &BigUint) -> Option<BigUint> {
+    if a.bits() == 0 {
+        return Some(BigUint::from(0u32));
+    }
+    let shift = small(b)?;
+    if a.bits().checked_add(shift)? > MAX_RESULT_BITS {
+        return None;
+    }
+    Some(a << shift as usize)
+}
+
+/// `a >>> b` is `a / 2^b` for every `b`: zero exactly when `b` reaches the
+/// length of `a`, never because `b` alone is large.
 pub fn shift_right_values(a: &BigUint, b: &BigUint) -> BigUint {
-    if *b == BigUint::from(0u32) {
-        return a.clone();
+    match small(b) {
+        Some(shift) if shift < a.bits() => a >> shift as usize,
+        _ => BigUint::from(0u32),
     }
-    if b.bits() > 16 {
-        return BigUint::from(0u32);
-    }
-    let shift = b.to_u64_digits().first().copied().unwrap_or(0) as usize;
-    a >> shift
 }
 
 pub fn land_values(a: &BigUint, b: &BigUint) -> BigUint {
@@ -96,13 +104,17 @@ pub fn ble_values(a: &BigUint, b: &BigUint) -> bool {
 }
 
 pub fn pow_values(a: &BigUint, b: &BigUint) -> Option<BigUint> {
-    if *b == BigUint::from(0u32) {
+    if b.bits() == 0 {
         return Some(BigUint::from(1u32));
     }
-    if b.bits() > 16 {
+    if a.bits() <= 1 {
+        // 0 and 1 are their own powers.
+        return Some(a.clone());
+    }
+    let exp = u32::try_from(small(b)?).ok()?;
+    if a.bits().checked_mul(exp as u64)? > MAX_RESULT_BITS {
         return None;
     }
-    let exp = b.to_u64_digits().first().copied().unwrap_or(0) as u32;
     Some(a.pow(exp))
 }
 
@@ -359,5 +371,36 @@ mod tests {
             }
             _ => panic!("expected app"),
         }
+    }
+}
+
+#[cfg(test)]
+mod shift_bound_tests {
+    use super::*;
+
+    #[test]
+    fn shifting_right_by_a_large_amount_is_division_not_zero() {
+        let one = BigUint::from(1u32);
+        let a = &one << 70_000usize;
+        assert_eq!(shift_right_values(&a, &BigUint::from(65_536u32)), &one << 4_464usize);
+        assert_eq!(shift_right_values(&a, &BigUint::from(70_000u32)), one);
+        assert_eq!(shift_right_values(&a, &BigUint::from(70_001u32)), BigUint::from(0u32));
+        assert_eq!(shift_right_values(&a, &(&one << 80usize)), BigUint::from(0u32));
+    }
+
+    #[test]
+    fn shifting_left_past_one_hundred_thousand_bits_is_evaluated() {
+        let one = BigUint::from(1u32);
+        assert_eq!(shift_left_values(&one, &BigUint::from(609_961u32)), Some(&one << 609_961usize));
+        assert_eq!(shift_left_values(&BigUint::from(0u32), &(&one << 80usize)), Some(BigUint::from(0u32)));
+        assert_eq!(shift_left_values(&one, &(&one << 40usize)), None);
+    }
+
+    #[test]
+    fn powers_are_bounded_by_the_size_of_the_result() {
+        let two = BigUint::from(2u32);
+        assert_eq!(pow_values(&two, &BigUint::from(70_000u32)), Some(BigUint::from(1u32) << 70_000usize));
+        assert_eq!(pow_values(&BigUint::from(1u32), &(BigUint::from(1u32) << 80usize)), Some(BigUint::from(1u32)));
+        assert_eq!(pow_values(&two, &(BigUint::from(1u32) << 40usize)), None);
     }
 }
