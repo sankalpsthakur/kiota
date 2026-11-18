@@ -864,11 +864,14 @@ impl Interner {
             );
         }
         if self.slots.len() > 1usize << retained_log2 {
-            let fresh = vec![EMPTY_SLOT; 1usize << retained_log2];
-            let old = std::mem::replace(&mut self.slots, fresh);
+            // The outsized array goes first, and with it every node only the
+            // table held: its replacement is allocated after that memory is
+            // back, not beside it (a quarter of a gigabyte on top of the
+            // peak, when the declaration that just ended is the largest).
+            self.slots = Vec::new();
+            self.slots = vec![EMPTY_SLOT; 1usize << retained_log2];
             self.shift = 64 - retained_log2;
             self.grow_at = self.policy.grow_at(retained_log2);
-            drop(old);
         } else if self.len != 0 {
             for slot in self.slots.iter_mut() {
                 slot.node = None;
