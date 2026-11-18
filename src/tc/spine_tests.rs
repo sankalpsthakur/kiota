@@ -436,3 +436,167 @@ fn verify_refuses_another_term() {
     assert!(on.is_def_eq(&ctx, &c(T), &unfolded).unwrap());
     on.spine_verify_same(&c(T), &unfolded, || "domain".to_owned());
 }
+
+/// Turns `KIOTA_XCACHE` on for the calling test's thread and empties the
+/// thread's cross-declaration spine states; puts both back when dropped.
+struct XcacheOn(bool);
+
+impl XcacheOn {
+    fn new() -> Self {
+        XSPINE.with(|m| m.borrow_mut().clear());
+        XcacheOn(XCACHE_ON.with(|b| b.replace(true)))
+    }
+}
+
+impl Drop for XcacheOn {
+    fn drop(&mut self) {
+        XCACHE_ON.with(|b| b.set(self.0));
+        XSPINE.with(|m| m.borrow_mut().clear());
+    }
+}
+
+fn xspine_has(e: &Expr) -> bool {
+    XSPINE.with(|m| m.borrow().contains_key(&Checker::ptr_key(e)))
+}
+
+/// A spine state outlives its declaration (`XSPINE`) only if the walk that
+/// made it checked the arguments and nothing the checker saw depended on
+/// the declaration under check. A later declaration resumes from it without
+/// looking at the arguments again, so an entry written past either
+/// condition would stand in for a check that never ran, or that ran against
+/// an environment the later declaration does not have.
+#[test]
+fn a_spine_state_crosses_declarations_only_if_checked_and_untainted() {
+    let (env, names) = fixture();
+    let (on, _) = pair(&env, &names);
+    let _xcache = XcacheOn::new();
+    let ctx = Ctx::new();
+
+    // A checked walk, nothing hidden: the state of each closed prefix is
+    // kept across declarations.
+    let good = expr::apps(c(G), &[c(Z), c(PZ)]);
+    on.infer_type(&ctx, &expr::app(good.clone(), c(O))).unwrap();
+    assert!(xspine_has(&good), "a checked, untainted state is kept");
+    let st = XSPINE.with(|m| m.borrow().get(&Checker::ptr_key(&good)).cloned()).unwrap();
+    assert!(st.checked);
+
+    // An infer-only walk does not look at the arguments (`po` is not a
+    // proof of `P z`): its states stay in the declaration.
+    let unchecked = expr::apps(c(G), &[c(Z), c(PO)]);
+    on.spine_verify.set(false);
+    on.with_infer_only(|| on.infer_type(&ctx, &expr::app(unchecked.clone(), c(O)))).unwrap();
+    on.spine_verify.set(true);
+    assert!(
+        on.spine_cache.borrow().contains_key(&(0, Checker::ptr_key(&unchecked))),
+        "the infer-only walk did record its state for this declaration"
+    );
+    assert!(!xspine_has(&unchecked), "an infer-only state must not cross declarations");
+    // `g z` is a prefix of both walks: what crosses is the checked walk's.
+    let shared = expr::app(c(G), c(Z));
+    assert!(XSPINE.with(|m| m.borrow().get(&Checker::ptr_key(&shared)).is_some_and(|st| st.checked)));
+    // And a check of the same spine is still a check.
+    assert!(is_reject(&on.infer_type(&ctx, &expr::app(unchecked.clone(), c(O)))));
+
+    // While `T` is the declaration under check it is hidden, and a result
+    // that met it is true of that state of the environment only. `f z o`
+    // needs `T` unfolded to a function type: the checker notes the taint
+    // and cannot go on.
+    on.declaring.set(Some(T));
+    assert!(!on.xcache_tainted.get());
+    assert!(is_reject(&on.infer_type(&ctx, &expr::apps(c(F), &[c(Z), c(O)]))));
+    assert!(on.xcache_tainted.get(), "meeting the hidden declaration taints");
+    // A checked walk after that is fine for this declaration and is not
+    // kept for the next.
+    let tainted = expr::apps(c(G), &[c(O), c(PO)]);
+    on.infer_type(&ctx, &expr::app(tainted.clone(), c(Z))).unwrap();
+    let st = on.spine_cache.borrow().get(&(0, Checker::ptr_key(&tainted))).cloned().unwrap();
+    assert!(st.checked);
+    assert!(!xspine_has(&tainted), "a state from a tainted checker must not cross declarations");
+    assert!(!xspine_has(&expr::app(c(G), c(O))));
+    on.declaring.set(None);
+}
+
+/// ```text
+/// structure D (n : N) : Prop where  a : N   b : (t : N) → P a   c : P n      dz : D z
+/// ```
+/// `a` is a data field that `b` mentions, under a binder. Nothing from `a`
+/// on may be projected out of a proof of `D n`: not `c` either, whose own
+/// type does not mention `a`. Which fields mention which is read off the
+/// constructor's telescope; with the one walk the parameters are still
+/// bound there, and the answer has to be the same.
+#[test]
+fn a_dependent_data_field_is_found_with_the_parameters_still_bound() {
+    const D: u32 = 17;
+    const D_MK: u32 = 18;
+    const D_Z: u32 = 19;
+    let (mut env, mut names) = fixture();
+    let v = expr::bvar;
+    let d_mk = pi(
+        c(N),
+        pi(
+            c(N),
+            pi(pi(c(N), expr::app(c(P), v(1))), pi(expr::app(c(P), v(2)), expr::app(c(D), v(3)))),
+        ),
+    );
+    env.insert(D, ConstantInfo::InductiveType {
+        level_params: vec![],
+        typ: pi(c(N), expr::sort(level::zero())),
+        num_params: 1,
+        num_indices: 0,
+        all: vec![D],
+        ctors: vec![D_MK],
+        is_rec: false,
+        is_unsafe: false,
+    });
+    env.insert(D_MK, ConstantInfo::Constructor {
+        level_params: vec![],
+        typ: d_mk.clone(),
+        induct: D,
+        cidx: 0,
+        num_params: 1,
+        num_fields: 3,
+        is_unsafe: false,
+    });
+    env.insert(D_Z, ConstantInfo::Axiom {
+        level_params: vec![],
+        typ: expr::app(c(D), c(Z)),
+        is_unsafe: false,
+    });
+    for name in ["D", "D.mk", "dz"] {
+        names.push(Rc::new(name.to_owned()));
+    }
+    let (on, off) = pair(&env, &names);
+    let ctx = Ctx::new();
+
+    // Field 1 mentions field 0; nothing else mentions an earlier field.
+    let under = Checker::proj_referenced_fields_under_params(&d_mk, 1, 3);
+    assert_eq!(under, Some(vec![0]));
+    let fields = off.proj_strip_params(&ctx, &d_mk, &[c(Z)]).unwrap();
+    assert_eq!(Checker::proj_referenced_fields(&fields, 3), vec![0]);
+    // `S`: `b : P a` mentions `a`, `c : Q a b` mentions both.
+    let s_mk = match env.get(S_MK) {
+        Some(ConstantInfo::Constructor { typ, .. }) => typ.clone(),
+        _ => unreachable!(),
+    };
+    assert_eq!(Checker::proj_referenced_fields_under_params(&s_mk, 1, 3), Some(vec![0, 0, 1]));
+    let s_fields = off.proj_strip_params(&ctx, &s_mk, &[c(Z)]).unwrap();
+    assert_eq!(Checker::proj_referenced_fields(&s_fields, 3), vec![0, 0, 1]);
+    // A telescope that is not a literal chain of `Pi`s that far is not
+    // read in place: the caller builds the instantiated one.
+    assert_eq!(Checker::proj_referenced_fields_under_params(&d_mk, 1, 4), None);
+    assert_eq!(Checker::proj_referenced_fields_under_params(&c(T), 1, 0), None);
+    assert_eq!(Checker::proj_referenced_fields_under_params(&pi(c(N), c(T)), 1, 1), None);
+    // The instantiated telescope, cut short, counts every earlier field.
+    assert_eq!(Checker::proj_referenced_fields(&fields, 4), vec![0, 0, 1, 2]);
+
+    // Closed major, and an open one under a binder (`x : D z ⊢ x.2`).
+    let dz = c(D_Z);
+    let mut open = Ctx::new();
+    open.push(expr::app(c(D), c(Z)));
+    for checker in [&on, &off] {
+        for idx in 0..3 {
+            assert!(is_reject(&checker.infer_type(&ctx, &expr::proj(D, idx, dz.clone()))), "field {idx}");
+            assert!(is_reject(&checker.infer_type(&open, &expr::proj(D, idx, v(0)))), "open, field {idx}");
+        }
+    }
+}
