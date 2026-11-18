@@ -1649,4 +1649,45 @@ fn a_prop_field_after_a_data_field_mentioned_under_a_binder_is_not_projected() {
         "proj-prop-after-dependent-data-under-binder.reject.ndjson",
         "[projProp6] cannot project a Prop field that comes after a dependent data field",
     );
+
+/// con-leche `ConLeche.Expr.wscopedBP.eq_1`, cut down to one file
+/// (`tests/fixtures/src/conleche-ite-open-hash-condition.lean`): `rfl`
+/// between `wscopedBP (.bvar i) d` and `if (E.bvar i).fvarB == 0 then true
+/// else true`. Unfolding the left side gives `ite c inst true (match …)`
+/// over the same condition, and Lean's lazy delta compares the two `ite`s
+/// argument by argument. The condition reads a packed `UInt64` hash word of
+/// an open term and cannot be evaluated: `whnf_core` deciding it (the
+/// `ite` shortcut) counted `x * 4294967296` down to the depth limit in both
+/// passes and the declaration was declined.
+#[test]
+fn rfl_between_ites_over_an_unevaluable_condition_accepts() {
+    assert_accept_deep("conleche-ite-open-hash-condition.accept.ndjson");
+}
+
+/// The reject twin: `(if b = true then true else false) = (if c = true then
+/// true else false)` by `rfl` for variables `b`, `c`. The official kernel
+/// rejects it; comparing `ite`s argument by argument must not accept it.
+#[test]
+fn ites_over_distinct_open_conditions_are_not_equal() {
+    assert_reject("ite-distinct-open-conditions.reject.ndjson");
+}
+
+/// The comparison inside con-leche `ConLeche.lpOfData_pack`
+/// (`tests/fixtures/src/conleche-decide-open-uint64-argument.lean`):
+/// `lpOfData w = (w % 2 == 1)` by `rfl` for a packed `UInt64` word of
+/// variables. Both sides become `decide (_ = _)` over the same open terms and
+/// Lean's lazy delta compares the arguments. `whnf_core` deciding the
+/// instance (the `Decidable.decide` shortcut) evaluated the word instead and
+/// counted `x * 4294967296` down to the depth limit in both passes.
+#[test]
+fn rfl_between_decides_over_an_unevaluable_instance_accepts() {
+    assert_accept_deep("conleche-decide-open-uint64-argument.accept.ndjson");
+}
+
+/// The reject twin: `decide (b = true) = decide (c = true)` by `rfl` for
+/// variables `b`, `c`. The official kernel rejects it; comparing `decide`s
+/// argument by argument must not accept it.
+#[test]
+fn decides_over_distinct_open_propositions_are_not_equal() {
+    assert_reject("decide-distinct-open-propositions.reject.ndjson");
 }
