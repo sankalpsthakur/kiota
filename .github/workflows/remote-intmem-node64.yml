@@ -1,0 +1,47 @@
+name: remote-intmem-node64
+
+# Experiment, not a candidate: the 64-byte node (perf/ws-interner-node64)
+# on top of snd/interner-memory, on the two cases near the 8 GiB limit.
+on:
+  push:
+    branches: ['remote/intmem-node64*']
+permissions:
+  contents: read
+env:
+  FIX_REF: 6eb1607
+jobs:
+  mem:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: |
+          set -euo pipefail
+          cargo build --release --locked; cp target/release/kiota kiota-node64
+          git worktree add --detach "$RUNNER_TEMP/fix" "$FIX_REF"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/fix-t" cargo build --release --locked --manifest-path "$RUNNER_TEMP/fix/Cargo.toml"
+          cp "$RUNNER_TEMP/fix-t/release/kiota" kiota-fix
+      - name: Measure
+        run: |
+          set +e
+          curl --fail -sL --retry 3 https://arena.lean-lang.org/lean-arena-tests.tar.gz -o t.tgz; mkdir suite; tar xzf t.tgz -C suite
+          sudo apt-get install -y time valgrind >/dev/null
+          nproc; grep -m1 'model name' /proc/cpuinfo
+          for t in magma-list-pair-n21 magma-list-deep-n36 magma-list-deep-n21 grind-ring-5; do
+            f=suite/good/perf/$t.ndjson
+            for arm in fix node64 node64 fix; do
+              /usr/bin/time -v -o time.txt timeout 300 ./kiota-$arm $f >/dev/null 2>err.txt; rc=$?
+              ( ulimit -v 8388608; timeout 300 ./kiota-$arm $f >/dev/null 2>err2.txt ); rc2=$?
+              echo "N64 test=$t arm=$arm rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_mb=$(( $(grep 'Maximum resident' time.txt | awk '{print $NF}') / 1024 )) capped_rc=$rc2 $(grep -m1 'memory allocation' err2.txt | cut -c1-80 | tr ' ' _)"
+            done
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+          for t in magma-list-deep-n21 grind-ring-5; do
+            for arm in fix node64; do
+              valgrind --tool=none ./kiota-$arm suite/good/perf/$t.ndjson >/dev/null 2>/dev/null
+              perf stat -e instructions:u -x, -o p.txt ./kiota-$arm suite/good/perf/$t.ndjson >/dev/null 2>/dev/null && echo "N64INS test=$t arm=$arm $(cat p.txt | tr '\n' ' ')"
+            done
+          done | tee -a "$GITHUB_STEP_SUMMARY"
