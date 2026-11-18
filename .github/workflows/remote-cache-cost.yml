@@ -4,7 +4,7 @@ name: remote-cache-cost
 # the same source with one rule switched off by a one-line patch.
 on:
   push:
-    branches: ['remote/cache-soundness-20261118b']
+    branches: ['remote/cache-soundness-20261118c']
 
 permissions:
   contents: read
@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [as-is, no-budget-guard, no-inductive-suspension]
+        variant: [no-xcache-clear-at-reset, no-clear-at-reset]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -29,11 +29,16 @@ jobs:
           V: ${{ matrix.variant }}
         run: |
           set -e
-          if [ $V = no-budget-guard ]; then
-            sed -i 's/!self.xcache_tainted.get() \&\& BUDGET_EVENTS.with(Cell::get) == self.budget_mark.get()/!self.xcache_tainted.get()/' src/tc.rs
+          if [ $V = no-xcache-clear-at-reset ]; then
+            sed -i '/^            xcache_clear();$/d' src/tc.rs
           fi
-          if [ $V = no-inductive-suspension ]; then
-            sed -i 's/let _no_xcache = crate::tc::XcacheSuspended::new();//' src/parser.rs
+          if [ $V = no-clear-at-reset ]; then
+            python3 - <<'PY'
+          p = 'src/tc.rs'; s = open(p).read()
+          old = "            xcache_clear();\n            expr::clear_subst_memos();\n            expr::intern_clear_if_large(INTERN_RESET);"
+          assert s.count(old) == 1
+          open(p, 'w').write(s.replace(old, "            expr::intern_clear_if_large(INTERN_RESET);"))
+          PY
           fi
           git diff --stat
       - run: cargo build --release --locked
