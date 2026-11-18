@@ -7,7 +7,8 @@
 # kiota-build.txt, whenever a step of the profile-guided one fails.
 #
 # Measured on GitHub runners, 2026-11-18 (kiota at e593b79 plus this build
-# line; instructions are cachegrind `I refs`, the same on every run):
+# line; instructions are cachegrind `I refs`, which two builds of one side
+# on different runners reproduce to about 0.02%):
 #   - the profile, arena's nix toolchain (rustc 1.95.0, LLVM 21.1.8), run
 #     44364015792: -11.7% instructions on the first fifth of init (inside
 #     the training export), -11.6% summed over twelve fixtures outside it
