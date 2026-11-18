@@ -1,0 +1,58 @@
+name: remote-pgo
+
+# The profile-guided build (trained on init, as in checker.yaml) against the
+# plain build, same runner: verdict, user time and peak memory per corpus.
+on:
+  push:
+    branches: ['remote/pgo-2026*']
+permissions:
+  contents: read
+  actions: read
+env:
+  EXPORTS_RUN: 44313744961
+  CL_EXPORT_RUN: 44328282978
+jobs:
+  pgo:
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [mathlib, cslib, cedar, std, con-leche]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ matrix.corpus == 'con-leche' && env.CL_EXPORT_RUN || env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build plain and profile-guided
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm init.ndjson.zst -o init.ndjson
+          cargo build --release --locked && cp target/release/kiota kiota-plain
+          RUSTFLAGS="-C profile-generate=$PWD/pgo --cfg kiota_pgo_gen" cargo build --release --locked --target-dir "$PWD/target-pgo-gen"
+          rm -rf "$PWD/pgo" "$PWD/pgo.profdata"
+          "$PWD/target-pgo-gen/release/kiota" init.ndjson >/dev/null 2>&1
+          P=$(ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-profdata | head -1)
+          "$P" merge -o "$PWD/pgo.profdata" "$PWD/pgo"
+          RUSTFLAGS="-C profile-use=$PWD/pgo.profdata" cargo build --release --locked && cp target/release/kiota kiota-pgo
+      - name: Run both
+        env:
+          C: ${{ matrix.corpus }}
+        run: |
+          set +e
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          for side in plain pgo; do
+            /usr/bin/time -v -o time.txt timeout 9000 ./kiota-$side $C.ndjson >/dev/null 2>err.txt; rc=$?
+            echo "PGO corpus=$C side=$side rc=$rc wall=$(grep Elapsed time.txt | awk '{print $NF}') user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-200)"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
