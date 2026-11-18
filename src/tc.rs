@@ -1624,6 +1624,7 @@ impl<'e> Checker<'e> {
         all: &[u32],
         params: &[Expr],
         major: &Expr,
+        large_elim: bool,
     ) -> R<Option<(u32, u32, Vec<Expr>, Vec<Level>)>> {
         let mt = match self.infer_type(ctx, major) {
             Ok(t) => t,
@@ -1638,8 +1639,12 @@ impl<'e> Checker<'e> {
             }
         };
         let mtw = self.whnf(ctx, &mt)?;
-        // Lean skips Prop structures (`is_prop` of the type). PSigma is Type.
-        if self.is_prop(ctx, &mtw)? {
+        // A structure in `Prop` is expanded only under a recursor that
+        // eliminates into `Sort u`: its fields are then all proofs, so
+        // `mk e.1 … e.n` is `e` by proof irrelevance and every projection
+        // is allowed. This is the official kernel's rule since lean4#15371;
+        // before it, Lean skipped every `Prop` structure. PSigma is Type.
+        if !large_elim && self.is_prop(ctx, &mtw)? {
             if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
                 eprintln!(
                     "IOTA to_ctor skip Prop structure ty={}",
@@ -2785,6 +2790,26 @@ impl<'e> Checker<'e> {
             }
             return Ok(core);
         }
+    }
+
+    /// A proof major, reduced only as far as naming its constructor: β/ζ/
+    /// proj/ι, and at most `PROOF_MAJOR_PEELS` unfoldings of a constant
+    /// head (definition or theorem). It always terminates; a major that
+    /// does not show a constructor this way leaves the recursor stuck, as
+    /// it is in the official kernel, which does not reduce it at all.
+    fn peel_proof_major(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        const PROOF_MAJOR_PEELS: u32 = 32;
+        let mut cur = self.whnf_core(ctx, e)?;
+        for _ in 0..PROOF_MAJOR_PEELS {
+            if self.is_ctor_or_nat_lit_head(&cur) {
+                break;
+            }
+            let (head, args) = expr::unfold_apps(&cur);
+            let ExprData::Const(n, us) = &**head else { break };
+            let Some(unfolded) = self.unfold_delta(*n, us, true)? else { break };
+            cur = self.whnf_core(ctx, &expr::apps(unfolded, &args))?;
+        }
+        Ok(cur)
     }
 
     /// beta/zeta/proj/iota reduction to whnf, WITHOUT unfolding delta.
@@ -4194,7 +4219,36 @@ impl<'e> Checker<'e> {
 
         let k_like = self.is_k_like(&all)?;
 
-        let major_w = self.whnf_major(ctx, major, rname)?;
+        // Whether this recursor eliminates into `Sort u`: it then has one
+        // universe parameter more than the block's first type (the official
+        // kernel's own test, see `to_cnstr_when_structure`).
+        let large_elim = match all.first().and_then(|i| self.env.get(*i)) {
+            Some(ConstantInfo::InductiveType { level_params: ind_lp, .. }) => {
+                level_params.len() != ind_lp.len()
+            }
+            _ => false,
+        };
+
+        // A major that is a proof is not reduced (lean4#15351): proofs need
+        // not have a weak head normal form, and data must not depend on
+        // finding one. Only a block declared in `Prop` can have such a
+        // major; there the major's own type decides, since an auxiliary
+        // recursor of a nested block eliminates a container that is data.
+        // What a proof major may still do is name its constructor through
+        // wrappers (`_proof_2 := Acc.intro …`), a bounded number of them.
+        let prop_block = match all.first().and_then(|i| self.env.get(*i)) {
+            Some(ConstantInfo::InductiveType { typ, .. }) => self.sort_codomain_is_prop(typ),
+            _ => false,
+        };
+        let major_is_proof = prop_block && {
+            let mt = self.infer_type(ctx, major)?;
+            self.is_prop(ctx, &mt)?
+        };
+        let major_w = if major_is_proof {
+            self.peel_proof_major(ctx, major)?
+        } else {
+            self.whnf_major(ctx, major, rname)?
+        };
 
         // Recursor-application memo: a `Nat.rec`/`brecOn` "below" step
         // recurs with the *same* (motive, minors) pointers and a strictly
@@ -4298,7 +4352,7 @@ impl<'e> Checker<'e> {
 
         let (cname, cnp, ctor_args, ctor_us) = if let Some(x) = ctor {
             x
-        } else if let Some(x) = self.to_ctor_when_structure(ctx, &all, params, &major_w)? {
+        } else if let Some(x) = self.to_ctor_when_structure(ctx, &all, params, &major_w, large_elim)? {
             if std::env::var_os("KIOTA_TRACE_IOTA").is_some() {
                 eprintln!(
                     "IOTA expand rec={} major={} → ctor {} nparams={} nfields={}",
