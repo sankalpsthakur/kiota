@@ -445,7 +445,7 @@ struct Slot {
 const EMPTY_SLOT: Slot = Slot { hash: 0, node: None };
 
 /// Entries of the recent-node table in front of the slot array (64 KiB).
-const FRONT_SLOTS_LOG2: u32 = 12;
+const FRONT_SLOTS_LOG2: u32 = 14;
 /// Slots a new table starts with (1 MiB). Small inputs stay cache-resident.
 const INITIAL_SLOTS_LOG2: u32 = 16;
 /// A table reset keeps its slots up to this size (256 MiB) and shrinks a
