@@ -24,7 +24,19 @@ pub fn enabled() -> bool {
     thread_local! {
         static ON: bool = std::env::var_os("KIOTA_STATS").is_some();
     }
-    ON.with(|b| *b)
+    ON.with(|b| *b) && !PAUSED.with(|p| p.get())
+}
+
+thread_local! {
+    static PAUSED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Stop or resume counting on this thread; returns the previous setting.
+/// The counters describe the checking of declarations. Work done between
+/// declarations (`tc::extensions`) is kept out of them so that they stay
+/// comparable across builds.
+pub fn pause(on: bool) -> bool {
+    PAUSED.with(|p| p.replace(on))
 }
 
 macro_rules! bump {
@@ -495,7 +507,7 @@ pub fn shortcut_enabled() -> bool {
         static ON: bool = std::env::var_os("KIOTA_SHORTCUT_JSON").is_some()
             || std::env::var_os("KIOTA_STATS").is_some();
     }
-    ON.with(|b| *b)
+    ON.with(|b| *b) && !PAUSED.with(|p| p.get())
 }
 
 macro_rules! sc_bump {

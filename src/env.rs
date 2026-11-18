@@ -135,8 +135,149 @@ impl ConstantInfo {
     }
 }
 
+/// A reduction the checker performs natively instead of by unfolding the
+/// constant's definition. Each is tied to one declared constant, and only
+/// once that declaration has been validated (`tc::extensions`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtOp {
+    NatAdd,
+    NatSub,
+    NatMul,
+    NatPow,
+    NatDiv,
+    NatMod,
+    NatModCore,
+    NatGcd,
+    NatBeq,
+    NatBle,
+    NatLand,
+    NatLor,
+    NatXor,
+    NatShiftLeft,
+    NatShiftRight,
+    Decide,
+    Ite,
+    Dite,
+}
+
+impl ExtOp {
+    pub const ALL: [ExtOp; 18] = [
+        ExtOp::NatAdd,
+        ExtOp::NatSub,
+        ExtOp::NatMul,
+        ExtOp::NatPow,
+        ExtOp::NatDiv,
+        ExtOp::NatMod,
+        ExtOp::NatModCore,
+        ExtOp::NatGcd,
+        ExtOp::NatBeq,
+        ExtOp::NatBle,
+        ExtOp::NatLand,
+        ExtOp::NatLor,
+        ExtOp::NatXor,
+        ExtOp::NatShiftLeft,
+        ExtOp::NatShiftRight,
+        ExtOp::Decide,
+        ExtOp::Ite,
+        ExtOp::Dite,
+    ];
+
+    /// The name Lean gives the constant the reduction belongs to.
+    pub fn spelling(self) -> &'static str {
+        match self {
+            ExtOp::NatAdd => "Nat.add",
+            ExtOp::NatSub => "Nat.sub",
+            ExtOp::NatMul => "Nat.mul",
+            ExtOp::NatPow => "Nat.pow",
+            ExtOp::NatDiv => "Nat.div",
+            ExtOp::NatMod => "Nat.mod",
+            ExtOp::NatModCore => "Nat.modCore",
+            ExtOp::NatGcd => "Nat.gcd",
+            ExtOp::NatBeq => "Nat.beq",
+            ExtOp::NatBle => "Nat.ble",
+            ExtOp::NatLand => "Nat.land",
+            ExtOp::NatLor => "Nat.lor",
+            ExtOp::NatXor => "Nat.xor",
+            ExtOp::NatShiftLeft => "Nat.shiftLeft",
+            ExtOp::NatShiftRight => "Nat.shiftRight",
+            ExtOp::Decide => "Decidable.decide",
+            ExtOp::Ite => "ite",
+            ExtOp::Dite => "dite",
+        }
+    }
+
+    pub fn from_spelling(s: &str) -> Option<ExtOp> {
+        ExtOp::ALL.iter().copied().find(|op| op.spelling() == s)
+    }
+}
+
+/// The constants the checker treats specially, by declaration index. A
+/// field is set only after the declaration it names has been validated
+/// against what the reduction assumes of it; until then, and for good if
+/// the validation fails, the constant is an ordinary one. Nothing in the
+/// checker asks what a constant is called.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Extensions {
+    /// The type of `Nat` literals.
+    pub nat: Option<u32>,
+    /// `Nat.zero` and `Nat.succ`: what a literal is made of.
+    pub nat_ctors: Option<(u32, u32)>,
+    /// A constant named `Nat` is declared and is not Lean's `Nat`.
+    pub nat_forged: bool,
+    pub bool_false: Option<u32>,
+    pub bool_true: Option<u32>,
+    pub decidable_is_false: Option<u32>,
+    pub decidable_is_true: Option<u32>,
+    /// `Nat.pred`, the right-hand side of the `Nat.sub` rule.
+    pub nat_pred: Option<u32>,
+    /// `Nat.bitwise`, which `Nat.land`, `Nat.lor` and `Nat.xor` are stated with.
+    pub nat_bitwise: Option<u32>,
+    /// The type of `String` literals.
+    pub string: Option<u32>,
+    /// A constant named `String` is declared and cannot be the literals' type.
+    pub string_forged: bool,
+    op_ids: [u32; ExtOp::ALL.len()],
+    op_kinds: [Option<ExtOp>; ExtOp::ALL.len()],
+    op_len: u8,
+}
+
+impl Extensions {
+    /// The native reduction, if any, enabled for the constant `n`.
+    #[inline]
+    pub fn op_of(&self, n: u32) -> Option<ExtOp> {
+        let len = self.op_len as usize;
+        let mut i = 0;
+        while i < len {
+            if self.op_ids[i] == n {
+                return self.op_kinds[i];
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// The constant `op` is enabled for.
+    pub fn id_of(&self, op: ExtOp) -> Option<u32> {
+        (0..self.op_len as usize)
+            .find(|i| self.op_kinds[*i] == Some(op))
+            .map(|i| self.op_ids[i])
+    }
+
+    pub fn enable(&mut self, op: ExtOp, n: u32) {
+        if self.id_of(op).is_some() {
+            return;
+        }
+        let i = self.op_len as usize;
+        self.op_ids[i] = n;
+        self.op_kinds[i] = Some(op);
+        self.op_len += 1;
+    }
+}
+
 #[derive(Default)]
 pub struct Environment {
+    /// Validated extension constants; see `Extensions`.
+    pub ext: Extensions,
     pub consts: FxHashMap<u32, ConstantInfo>,
     /// Inductive type name → recursor name, filled in by the parser.
     pub rec_of: FxHashMap<u32, u32>,

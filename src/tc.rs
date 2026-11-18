@@ -1,4 +1,4 @@
-use crate::env::{ConstantInfo, Environment, QuotKind, ReducibilityHints};
+use crate::env::{ConstantInfo, Environment, ExtOp, Extensions, QuotKind, ReducibilityHints};
 use crate::expr::{self, BinderInfo, Expr, ExprData, Lit};
 use crate::level::{self, Level};
 use crate::nat;
@@ -36,6 +36,7 @@ fn intern_reset_threshold() -> usize {
     })
 }
 
+pub mod extensions;
 mod recursor;
 #[cfg(test)]
 mod reclamation_tests;
@@ -282,8 +283,10 @@ struct SpineState {
 pub struct Checker<'e> {
     pub env: &'e Environment,
     pub names: &'e [std::rc::Rc<String>],
-    pub nat_ref: Option<u32>,
-    pub string_ref: Option<u32>,
+    /// The validated extension constants (`tc::extensions`). Every native
+    /// reduction and both literal types are looked up here by declaration
+    /// index; no path asks what a constant is called.
+    pub ext: Extensions,
     /// Cached once per environment by `native_string_projection_ok`.
     native_string_ok: std::cell::Cell<Option<bool>>,
     /// `(ctx_key, ptr) → WHNF`. `ctx_key` is 0 for closed terms, `ctx.id` for open.
@@ -785,17 +788,35 @@ fn local_ty(ctx: &Ctx, i: u32) -> Option<Expr> {
 }
 
 impl<'e> Checker<'e> {
+    /// A checker over a hand-built environment, for unit tests: the
+    /// extension constants are taken by name without validation
+    /// (`Extensions::trusting_names`), as every build did before
+    /// `tc::extensions`. Not compiled into the binary.
+    #[cfg(test)]
     pub fn new(
         env: &'e Environment,
         names: &'e [std::rc::Rc<String>],
         nat_ref: Option<u32>,
         string_ref: Option<u32>,
     ) -> Self {
+        let ext = extensions::trusting_names(env, names, nat_ref, string_ref);
+        Self::with_extensions(env, names, ext)
+    }
+
+    /// A checker for `env` with the extensions the parser has validated so far.
+    pub fn for_env(env: &'e Environment, names: &'e [std::rc::Rc<String>]) -> Self {
+        Self::with_extensions(env, names, env.ext)
+    }
+
+    pub fn with_extensions(
+        env: &'e Environment,
+        names: &'e [std::rc::Rc<String>],
+        ext: Extensions,
+    ) -> Self {
         Checker {
             env,
             names,
-            nat_ref,
-            string_ref,
+            ext,
             native_string_ok: std::cell::Cell::new(None),
             whnf_cache: RefCell::new(FxHashMap::default()),
             whnf_core_cache: RefCell::new(FxHashMap::default()),
@@ -1808,15 +1829,25 @@ impl<'e> Checker<'e> {
         Ok(lvl_at(S::INFER_CONST, ci.typ(), &subst))
     }
 
+    /// The type of a `Nat` literal: the validated `Nat`. A literal over a
+    /// constant that is merely named `Nat` has no type. Lean's kernel gives
+    /// it that constant, whatever it is, so `def Nat : Prop := False` makes
+    /// every numeral a proof of `False` there.
     fn nat_type(&self) -> R<Expr> {
-        match self.nat_ref {
+        match self.ext.nat {
             Some(n) => Ok(expr::const_(n, vec![])),
+            None if self.ext.nat_forged => {
+                reject("Nat literal, but the declared `Nat` is not the kernel's `Nat`")
+            }
             None => decline("Nat literal used but Nat type unavailable"),
         }
     }
     fn string_type(&self) -> R<Expr> {
-        match self.string_ref {
+        match self.ext.string {
             Some(n) => Ok(expr::const_(n, vec![])),
+            None if self.ext.string_forged => {
+                reject("String literal, but the declared `String` is not a structure in `Type`")
+            }
             None => decline("String literal used but String type unavailable"),
         }
     }
@@ -2147,14 +2178,10 @@ impl<'e> Checker<'e> {
         }
     }
 
+    /// `Nat.zero` and `Nat.succ` of the validated `Nat`.
+    #[inline]
     fn nat_ctors(&self) -> Option<(u32, u32)> {
-        let n = self.nat_ref?;
-        match self.env.get(n) {
-            Some(ConstantInfo::InductiveType { ctors, .. }) if ctors.len() == 2 => {
-                Some((ctors[0], ctors[1]))
-            }
-            _ => None,
-        }
+        self.ext.nat_ctors
     }
 
     fn is_non_rec_structure(&self, name: u32) -> bool {
@@ -5918,9 +5945,11 @@ impl<'e> Checker<'e> {
             ExprData::Const(n, _) => *n,
             _ => return Ok(None),
         };
-        let name = self.name_str(n);
-        match name {
-            "Nat.succ" if !args.is_empty() => {
+        if self.ext.nat_ctors.is_some_and(|(_, succ)| succ == n) {
+            if args.is_empty() {
+                return Ok(None);
+            }
+            {
                 // Like Lean's `reduce_nat`, leave a term with free variables
                 // alone: `succ x` is already weak head normal. Normalizing an
                 // open argument recursed once per unit of a literal, since
@@ -5943,9 +5972,14 @@ impl<'e> Checker<'e> {
                         return Ok(Some(expr::apps(r, &args[1..])));
                     }
                 }
-                Ok(None)
+                return Ok(None);
             }
-            "Nat.add" if args.len() >= 2 => {
+        }
+        let Some(op) = self.ext.op_of(n) else {
+            return Ok(None);
+        };
+        match op {
+            ExtOp::NatAdd if args.len() >= 2 => {
                 let a = self.reduce_nat_arg(ctx, &args[0])?;
                 let b = self.reduce_nat_arg(ctx, &args[1])?;
                 if let (Some(x), Some(y)) = (nat::as_lit(&a), nat::as_lit(&b)) {
@@ -5984,7 +6018,7 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
-            "Nat.mul" if args.len() >= 2 => {
+            ExtOp::NatMul if args.len() >= 2 => {
                 let a = self.reduce_nat_arg(ctx, &args[0])?;
                 let b = self.reduce_nat_arg(ctx, &args[1])?;
                 if let (Some(x), Some(y)) = (nat::as_lit(&a), nat::as_lit(&b)) {
@@ -6014,14 +6048,14 @@ impl<'e> Checker<'e> {
                 }
                 if let Some(p) = nat::pred(&b, zero, succ) {
                     let mul = expr::apps(expr::const_(n, vec![]), &[a.clone(), p]);
-                    if let Some(add) = self.find_name("Nat.add") {
+                    if let Some(add) = self.ext.id_of(ExtOp::NatAdd) {
                         let r = expr::apps(expr::const_(add, vec![]), &[mul, a]);
                         return Ok(Some(expr::apps(r, &args[2..])));
                     }
                 }
                 Ok(None)
             }
-            "Nat.sub" if args.len() >= 2 => {
+            ExtOp::NatSub if args.len() >= 2 => {
                 let a = self.reduce_nat_arg(ctx, &args[0])?;
                 let b = self.reduce_nat_arg(ctx, &args[1])?;
                 if let (Some(x), Some(y)) = (nat::as_lit(&a), nat::as_lit(&b)) {
@@ -6038,7 +6072,7 @@ impl<'e> Checker<'e> {
                         return Ok(None);
                     }
                     if let Some(pb) = nat::pred(&b, zero, succ) {
-                        if let Some(pred) = self.find_name("Nat.pred") {
+                        if let Some(pred) = self.ext.nat_pred {
                             let sub = expr::apps(expr::const_(n, vec![]), &[a, pb]);
                             let r = expr::app(expr::const_(pred, vec![]), sub);
                             return Ok(Some(expr::apps(r, &args[2..])));
@@ -6047,7 +6081,7 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
-            "Nat.pow" if args.len() >= 2 => {
+            ExtOp::NatPow if args.len() >= 2 => {
                 let a = self.reduce_nat_arg(ctx, &args[0])?;
                 let b = self.reduce_nat_arg(ctx, &args[1])?;
                 let (va, vb) = if let Some((zero, succ)) = self.nat_ctors() {
@@ -6071,14 +6105,14 @@ impl<'e> Checker<'e> {
                 }
                 if let Some(p) = nat::pred(&b, zero, succ) {
                     let pow = expr::apps(expr::const_(n, vec![]), &[a.clone(), p]);
-                    if let Some(mul) = self.find_name("Nat.mul") {
+                    if let Some(mul) = self.ext.id_of(ExtOp::NatMul) {
                         let r = expr::apps(expr::const_(mul, vec![]), &[pow, a]);
                         return Ok(Some(expr::apps(r, &args[2..])));
                     }
                 }
                 Ok(None)
             }
-            "Nat.div" if args.len() >= 2 => {
+            ExtOp::NatDiv if args.len() >= 2 => {
                 let a = self.reduce_nat_arg(ctx, &args[0])?;
                 let b = self.reduce_nat_arg(ctx, &args[1])?;
                 if let (Some(x), Some(y)) = (nat::as_lit(&a), nat::as_lit(&b)) {
@@ -6096,7 +6130,7 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
-            "Nat.mod" | "Nat.modCore" if args.len() >= 2 => {
+            ExtOp::NatMod | ExtOp::NatModCore if args.len() >= 2 => {
                 let a = self.reduce_nat_arg(ctx, &args[0])?;
                 let b = self.reduce_nat_arg(ctx, &args[1])?;
                 if let (Some(x), Some(y)) = (nat::as_lit(&a), nat::as_lit(&b)) {
@@ -6114,7 +6148,7 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
-            "Nat.shiftLeft" if args.len() >= 2 => {
+            ExtOp::NatShiftLeft if args.len() >= 2 => {
                 let a = self.reduce_nat_arg(ctx, &args[0])?;
                 let b = self.reduce_nat_arg(ctx, &args[1])?;
                 let (va, vb) = if let Some((zero, succ)) = self.nat_ctors() {
@@ -6132,7 +6166,7 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
-            "Nat.shiftRight" if args.len() >= 2 => {
+            ExtOp::NatShiftRight if args.len() >= 2 => {
                 let a = self.reduce_nat_arg(ctx, &args[0])?;
                 let b = self.reduce_nat_arg(ctx, &args[1])?;
                 let (va, vb) = if let Some((zero, succ)) = self.nat_ctors() {
@@ -6149,7 +6183,7 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
-            "Nat.land" if args.len() >= 2 => {
+            ExtOp::NatLand if args.len() >= 2 => {
                 let a = self.reduce_nat_arg(ctx, &args[0])?;
                 let b = self.reduce_nat_arg(ctx, &args[1])?;
                 let (va, vb) = if let Some((zero, succ)) = self.nat_ctors() {
@@ -6166,7 +6200,7 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
-            "Nat.lor" if args.len() >= 2 => {
+            ExtOp::NatLor if args.len() >= 2 => {
                 let a = self.reduce_nat_arg(ctx, &args[0])?;
                 let b = self.reduce_nat_arg(ctx, &args[1])?;
                 let (va, vb) = if let Some((zero, succ)) = self.nat_ctors() {
@@ -6183,7 +6217,7 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
-            "Nat.xor" if args.len() >= 2 => {
+            ExtOp::NatXor if args.len() >= 2 => {
                 let a = self.reduce_nat_arg(ctx, &args[0])?;
                 let b = self.reduce_nat_arg(ctx, &args[1])?;
                 let (va, vb) = if let Some((zero, succ)) = self.nat_ctors() {
@@ -6200,17 +6234,7 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
-            "HAdd.hAdd" | "Add.add" | "HMul.hMul" | "Mul.mul" | "HPow.hPow" | "Pow.pow"
-            | "HSub.hSub" | "Sub.sub" | "HMod.hMod" | "Mod.mod" | "HDiv.hDiv" | "Div.div"
-            | "HShiftLeft.hShiftLeft" | "ShiftLeft.shiftLeft" | "HShiftRight.hShiftRight" | "ShiftRight.shiftRight"
-                if args.len() >= 2 =>
-            {
-                if let Some(r) = self.try_hbin_nat(ctx, name, args)? {
-                    return Ok(Some(r));
-                }
-                Ok(None)
-            }
-            "Nat.ble" if args.len() >= 2 => {
+            ExtOp::NatBle if args.len() >= 2 => {
                 let a = self.reduce_nat_arg(ctx, &args[0])?;
                 let b = self.reduce_nat_arg(ctx, &args[1])?;
                 let (va, vb) = if let Some((zero, succ)) = self.nat_ctors() {
@@ -6222,18 +6246,18 @@ impl<'e> Checker<'e> {
                     (nat::as_lit(&a).cloned(), nat::as_lit(&b).cloned())
                 };
                 if let (Some(x), Some(y)) = (va, vb) {
-                    let tname = if nat::ble_values(&x, &y) {
-                        "Bool.true"
+                    let b = if nat::ble_values(&x, &y) {
+                        self.ext.bool_true
                     } else {
-                        "Bool.false"
+                        self.ext.bool_false
                     };
-                    if let Some(bn) = self.find_name(tname) {
+                    if let Some(bn) = b {
                         return Ok(Some(expr::apps(expr::const_(bn, vec![]), &args[2..])));
                     }
                 }
                 Ok(None)
             }
-            "Nat.beq" if args.len() >= 2 => {
+            ExtOp::NatBeq if args.len() >= 2 => {
                 let a = self.reduce_nat_arg(ctx, &args[0])?;
                 let b = self.reduce_nat_arg(ctx, &args[1])?;
                 let (va, vb) = if let Some((zero, succ)) = self.nat_ctors() {
@@ -6245,18 +6269,18 @@ impl<'e> Checker<'e> {
                     (nat::as_lit(&a).cloned(), nat::as_lit(&b).cloned())
                 };
                 if let (Some(x), Some(y)) = (va, vb) {
-                    let tname = if nat::beq_values(&x, &y) {
-                        "Bool.true"
+                    let b = if nat::beq_values(&x, &y) {
+                        self.ext.bool_true
                     } else {
-                        "Bool.false"
+                        self.ext.bool_false
                     };
-                    if let Some(bn) = self.find_name(tname) {
+                    if let Some(bn) = b {
                         return Ok(Some(expr::apps(expr::const_(bn, vec![]), &args[2..])));
                     }
                 }
                 Ok(None)
             }
-            "Decidable.decide" if args.len() >= 2 => {
+            ExtOp::Decide if args.len() >= 2 => {
                 // Like `ite`/`dite` (see `whnf_core_go`): an ordinary
                 // definition to Lean's `whnf_core`. con-leche's
                 // `lpOfData_pack` compares `w % 2 == 1` with `lpOfData w`,
@@ -6267,24 +6291,24 @@ impl<'e> Checker<'e> {
                     return Ok(None);
                 }
                 let inst = self.whnf(ctx, &args[1])?;
-                let (ih, _) = expr::unfold_apps(&inst);
-                let iname = match &**ih {
-                    ExprData::Const(n, _) => self.name_str(*n),
+                let (ih, iargs) = expr::unfold_apps(&inst);
+                let ictor = match &**ih {
+                    ExprData::Const(n, _) if iargs.len() == 2 => Some(*n),
                     _ => return Ok(None),
                 };
-                let tname = if iname == "Decidable.isTrue" {
-                    "Bool.true"
-                } else if iname == "Decidable.isFalse" {
-                    "Bool.false"
+                let b = if ictor == self.ext.decidable_is_true {
+                    self.ext.bool_true
+                } else if ictor == self.ext.decidable_is_false {
+                    self.ext.bool_false
                 } else {
                     return Ok(None);
                 };
-                if let Some(bn) = self.find_name(tname) {
+                if let Some(bn) = b {
                     return Ok(Some(expr::apps(expr::const_(bn, vec![]), &args[2..])));
                 }
                 Ok(None)
             }
-            "Nat.gcd" if args.len() >= 2 => {
+            ExtOp::NatGcd if args.len() >= 2 => {
                 if let (Some(a), Some(b)) = (
                     self.closed_nat_value(ctx, &args[0])?,
                     self.closed_nat_value(ctx, &args[1])?,
@@ -6301,12 +6325,6 @@ impl<'e> Checker<'e> {
     }
 
 
-    /// Class methods `HAdd.hAdd` / `Add.add` / `HMul.hMul` / `Mul.mul` on `Nat`.
-    fn try_hbin_nat(&self, _ctx: &Ctx, _name: &str, _args: &[Expr]) -> R<Option<Expr>> {
-        // A carrier type does not identify the selected operation instance.
-        // Expose the actual class-method definition/projection in ordinary WHNF.
-        Ok(None)
-    }
 
 
 
@@ -6316,30 +6334,28 @@ impl<'e> Checker<'e> {
             ExprData::Const(n, _) => *n,
             _ => return Ok(None),
         };
-        let name = self.name_str(n);
-        let is_dite = name == "dite";
-        let is_ite = name == "ite";
-        if !is_dite && !is_ite {
-            return Ok(None);
-        }
+        let is_dite = match self.ext.op_of(n) {
+            Some(ExtOp::Dite) => true,
+            Some(ExtOp::Ite) => false,
+            _ => return Ok(None),
+        };
         if args.len() < 5 {
             return Ok(None);
         }
         let inst = self.whnf(ctx, &args[2])?;
         let (ih, iargs) = expr::unfold_apps(&inst);
-        let iname = match &**ih {
-            ExprData::Const(cn, _) => self.name_str(*cn),
+        // `Decidable.isTrue p h` or `Decidable.isFalse p h`, the shape the
+        // rules were validated at (`extensions::validate_ite`).
+        let ictor = match &**ih {
+            ExprData::Const(cn, _) if iargs.len() == 2 => Some(*cn),
             _ => return Ok(None),
         };
-        let is_true = iname == "Decidable.isTrue";
-        let is_false = iname == "Decidable.isFalse";
+        let is_true = ictor == self.ext.decidable_is_true;
+        let is_false = ictor == self.ext.decidable_is_false;
         if !is_true && !is_false {
             return Ok(None);
         }
-        let proof = match iargs.last() {
-            Some(p) => p.clone(),
-            None => return Ok(None),
-        };
+        let proof = iargs[1].clone();
         let branch = if is_true { &args[3] } else { &args[4] };
         let reduced = if is_dite {
             expr::app(branch.clone(), proof)
@@ -6383,11 +6399,15 @@ impl<'e> Checker<'e> {
 
 
 
-    fn find_name(&self, s: &str) -> Option<u32> {
+    /// The declared constant spelled `s`. Only `string_to_byte_array` asks,
+    /// and what it builds from the answers is used only after
+    /// `check_native_string_projection` has type-checked it.
+    fn find_declared(&self, s: &str) -> Option<u32> {
         self.names
             .iter()
-            .position(|n| n.as_str() == s)
-            .map(|i| i as u32)
+            .enumerate()
+            .find(|(i, n)| n.as_str() == s && self.env.get(*i as u32).is_some())
+            .map(|(i, _)| i as u32)
     }
 
 
@@ -6436,7 +6456,7 @@ impl<'e> Checker<'e> {
     /// check fails or cannot finish, the projection stays unreduced, which
     /// can only cost an accept.
     fn native_string_projection_ok(&self, sname: u32) -> bool {
-        if self.string_ref != Some(sname) || self.name_str(sname) != "String" {
+        if self.ext.string != Some(sname) {
             return false;
         }
         if let Some(ok) = self.native_string_ok.get() {
@@ -6490,14 +6510,14 @@ impl<'e> Checker<'e> {
     }
 
     fn string_to_byte_array(&self, s: &str) -> Option<Expr> {
-        let ba_mk = self.find_name("ByteArray.mk")?;
-        let arr_mk = self.find_name("Array.mk")?;
-        let uint8 = self.find_name("UInt8")?;
-        let list_nil = self.find_name("List.nil")?;
-        let list_cons = self.find_name("List.cons")?;
+        let ba_mk = self.find_declared("ByteArray.mk")?;
+        let arr_mk = self.find_declared("Array.mk")?;
+        let uint8 = self.find_declared("UInt8")?;
+        let list_nil = self.find_declared("List.nil")?;
+        let list_cons = self.find_declared("List.cons")?;
         let uint8_ty = expr::const_(uint8, vec![]);
         let mut list = expr::app(expr::const_(list_nil, vec![level::zero()]), uint8_ty.clone());
-        let u8_of_nat = self.find_name("UInt8.ofNat");
+        let u8_of_nat = self.find_declared("UInt8.ofNat");
         for b in s.as_bytes().iter().rev() {
             let nat_lit = expr::lit_nat(num_bigint::BigUint::from(*b));
             let uint8_val = if let Some(uon) = u8_of_nat {

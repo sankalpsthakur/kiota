@@ -840,14 +840,12 @@ impl Parser {
                 "inductive group is missing recursors".into(),
             ));
         }
-        let nat_ref = self.declared("Nat");
-        let string_ref = self.declared("String");
         for &name in &type_names {
-            Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
+            Checker::for_env(&self.env, &self.names).with_proof_store(self.proofs.as_ref())
                 .check_inductive_group_structure(name)?;
         }
         let supplied_level_params = pending_recs[0].level_params.clone();
-        let derived = Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
+        let derived = Checker::for_env(&self.env, &self.names).with_proof_store(self.proofs.as_ref())
             .reconstruct_recursors(&type_names, &supplied_level_params)?;
         if pending_recs.len() != derived.len() {
             return Err(TcError::Reject(format!(
@@ -885,7 +883,7 @@ impl Parser {
                     "recursor `{rname}` metadata does not match reconstruction"
                 )));
             }
-            Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
+            Checker::for_env(&self.env, &self.names).with_proof_store(self.proofs.as_ref())
                 .validate_reconstructed_type(
                     &r.supplied_type,
                     &r.level_params,
@@ -1360,19 +1358,29 @@ impl Parser {
                     .and_then(|x| x.as_array())
                     .map(|a| a.iter().map(|t| Self::get_u32(t, "name")).collect())
                     .unwrap_or_default();
-                let nat_ref = self.name_by_str.get("Nat").copied();
-                let string_ref = self.name_by_str.get("String").copied();
-                for n in names {
-                    Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
+                for &n in &names {
+                    Checker::for_env(&self.env, &self.names).with_proof_store(self.proofs.as_ref())
                         .check_inductive_group(n)
                         .map_err(|e| self.annotate(n, e))?;
                 }
                 Ok(())
             })();
-            if result.is_err() {
-                undo.rollback(&mut self.env);
-            }
-            return result.map(|()| true);
+            return match result {
+                Ok(()) => {
+                    // Every name the block declares: a constructor or
+                    // recursor called `Nat` is not the kernel's `Nat` either.
+                    for key in ["types", "ctors", "recs"] {
+                        for record in d.get(key).and_then(|x| x.as_array()).into_iter().flatten() {
+                            self.note_declared(Self::get_u32(record, "name"));
+                        }
+                    }
+                    Ok(true)
+                }
+                Err(e) => {
+                    undo.rollback(&mut self.env);
+                    Err(e)
+                }
+            };
         }
         Ok(false)
     }
@@ -1435,13 +1443,24 @@ impl Parser {
                 }
             }
         }
-        let nat_ref = self.declared("Nat");
-        let string_ref = self.declared("String");
-        Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
+        Checker::for_env(&self.env, &self.names).with_proof_store(self.proofs.as_ref())
             .check_decl(name, kind)
             .map_err(|e| self.annotate(name, e))?;
+        self.note_declared(name);
         self.release_theorem_value(name);
         Ok(())
+    }
+
+    /// `name` has been admitted and checked. If it carries the name of a
+    /// constant the checker reduces natively, find out whether it is that
+    /// constant (`tc::extensions`); the reduction is on from the next
+    /// declaration if so, and never otherwise.
+    fn note_declared(&mut self, name: u32) {
+        if let Some(ext) =
+            crate::tc::extensions::on_declared(&self.env, &self.names, self.proofs.as_ref(), name)
+        {
+            self.env.ext = ext;
+        }
     }
 
     /// `annotate` with the record's own `name`, for errors raised while a
