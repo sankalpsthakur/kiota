@@ -146,7 +146,6 @@ pub enum ExtOp {
     NatPow,
     NatDiv,
     NatMod,
-    NatModCore,
     NatGcd,
     NatBeq,
     NatBle,
@@ -161,14 +160,13 @@ pub enum ExtOp {
 }
 
 impl ExtOp {
-    pub const ALL: [ExtOp; 18] = [
+    pub const ALL: [ExtOp; 17] = [
         ExtOp::NatAdd,
         ExtOp::NatSub,
         ExtOp::NatMul,
         ExtOp::NatPow,
         ExtOp::NatDiv,
         ExtOp::NatMod,
-        ExtOp::NatModCore,
         ExtOp::NatGcd,
         ExtOp::NatBeq,
         ExtOp::NatBle,
@@ -191,7 +189,6 @@ impl ExtOp {
             ExtOp::NatPow => "Nat.pow",
             ExtOp::NatDiv => "Nat.div",
             ExtOp::NatMod => "Nat.mod",
-            ExtOp::NatModCore => "Nat.modCore",
             ExtOp::NatGcd => "Nat.gcd",
             ExtOp::NatBeq => "Nat.beq",
             ExtOp::NatBle => "Nat.ble",

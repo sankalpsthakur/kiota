@@ -67,7 +67,6 @@ fn forged_nat_operations_do_not_get_their_native_rules() {
         ("forged-nat-div.reject.ndjson", ExtOp::NatDiv),
         ("forged-nat-mod.reject.ndjson", ExtOp::NatMod),
         ("forged-nat-gcd.reject.ndjson", ExtOp::NatGcd),
-        ("forged-nat-modcore.reject.ndjson", ExtOp::NatModCore),
         // Its own equations hold over the forged `Nat.div` they mention.
         ("forged-nat-shiftright.reject.ndjson", ExtOp::NatShiftRight),
         // `Nat.bitwise and` over a `Nat.bitwise` that returns its first number.
@@ -141,6 +140,14 @@ fn an_operation_is_only_as_good_as_the_one_it_is_stated_with() {
 fn a_bitwise_operation_with_the_wrong_truth_table_gets_no_rule() {
     let parser = reject_at_the_theorem("forged-nat-lor-wrong-table.reject.ndjson");
     assert!(parser.env.ext.id_of(ExtOp::NatLor).is_none());
+}
+
+/// `Nat.modCore` has no native rule (Lean's kernel has none either): a
+/// `Nat.modCore` that returns its first argument is what it says it is, and
+/// `Nat.modCore 7 4 = 3` is false for it.
+#[test]
+fn nat_mod_core_reduces_by_its_definition_only() {
+    reject_at_the_theorem("forged-nat-modcore.reject.ndjson");
 }
 
 /// `ite` with its branches exchanged: `ite True (isTrue _) true false` is
@@ -259,8 +266,8 @@ fn every_extension_the_rat_fixture_declares_validates() {
     assert!(ext.id_of(ExtOp::NatAdd).is_some() && ext.id_of(ExtOp::Decide).is_some());
 }
 
-/// The hole that remains, kept honest. `Nat.div`, `Nat.mod`, `Nat.modCore`,
-/// `Nat.gcd` and `Nat.bitwise` are validated for kind, type and their values
+/// The hole that remains, kept honest. `Nat.div`, `Nat.mod`, `Nat.gcd` and
+/// `Nat.bitwise` are validated for kind, type and their values
 /// on small numerals, not for their recursion. `ForgedLarge.lean` declares a
 /// `Nat.div` that is division up to a dividend of 16 and `0` beyond: it gets
 /// the native rule, and `Nat.div 1000 10 = 100` is accepted, as Lean's own

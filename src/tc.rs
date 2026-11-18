@@ -6140,7 +6140,7 @@ impl<'e> Checker<'e> {
                 }
                 Ok(None)
             }
-            ExtOp::NatMod | ExtOp::NatModCore if args.len() >= 2 => {
+            ExtOp::NatMod if args.len() >= 2 => {
                 let a = self.reduce_nat_arg(ctx, &args[0])?;
                 let b = self.reduce_nat_arg(ctx, &args[1])?;
                 if let (Some(x), Some(y)) = (nat::as_lit(&a), nat::as_lit(&b)) {

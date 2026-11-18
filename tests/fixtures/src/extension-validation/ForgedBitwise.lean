@@ -1,9 +1,11 @@
 /-
 `Nat.bitwise` here ignores its function and returns its first number, and
-`Nat.modCore` returns its first argument. Both are definitions of the right
-type, which is all that is checked of them, so the native rules stated with
-them are on: `Nat.land := Nat.bitwise and` has the right truth table. The
-`Nat.lor` below is `Nat.bitwise and`, the wrong table, and gets no rule.
+`Nat.modCore` returns its first argument.
+
+`Nat.land := Nat.bitwise and` has the right truth table, and is turned away
+all the same: over this `Nat.bitwise` it does not compute what the native
+rule does on small numerals (`land 1 0` is `1`). The `Nat.lor` below is
+`Nat.bitwise and`, the wrong table. `Nat.modCore` has no native rule at all.
 -/
 prelude
 set_option autoImplicit false

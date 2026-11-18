@@ -35,8 +35,8 @@
 //!   a term. A string literal has a type only after that.
 //! * `Nat.land`, `Nat.lor`, `Nat.xor`: `Nat.bitwise f` for an `f` with the
 //!   right truth table.
-//! * `Nat.div`, `Nat.mod`, `Nat.modCore`, `Nat.gcd`, and `Nat.bitwise`
-//!   through the three operations above: a definition of the right type
+//! * `Nat.div`, `Nat.mod`, `Nat.gcd`, and `Nat.bitwise` through the three
+//!   operations above: a definition of the right type
 //!   that reduces, by itself, to what the native rule computes on a grid of
 //!   numerals up to 13. That turns away a definition that is plainly
 //!   something else; it is not a proof. Their recursions are by fuel or
@@ -45,6 +45,11 @@
 //!   definition that is right on the grid and wrong beyond it still gets the
 //!   rule (`forged-nat-div-beyond-the-grid.hole.ndjson`). Lean's kernel
 //!   trusts all of these names outright.
+//!
+//! `Nat.modCore` had a native rule here (that of `Nat.mod`) and has none in
+//! Lean's kernel. It never fired on mathlib, cslib, cedar, std, init or
+//! con-leche, or on any file of the arena suite, and is gone: `Nat.modCore`
+//! reduces by its definition, as it does for Lean.
 //!
 //! The equations are checked with the extension under validation still off,
 //! so they are statements about the declared definition and nothing else.
@@ -669,7 +674,7 @@ impl Validator<'_> {
             // The name is trusted much as in Lean's kernel: a definition of
             // the right type that computes what the native rule does at a
             // grid of small numerals. That is evidence, not a proof.
-            ExtOp::NatDiv | ExtOp::NatMod | ExtOp::NatModCore | ExtOp::NatGcd => {
+            ExtOp::NatDiv | ExtOp::NatMod | ExtOp::NatGcd => {
                 self.monomorphic_def(f, &nat2nat)?;
                 let native: fn(&BigUint, &BigUint) -> BigUint = match op {
                     ExtOp::NatDiv => nat::div_values,
