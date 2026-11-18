@@ -1714,9 +1714,10 @@ fn a_wrong_leaf_under_a_chain_filed_after_the_table_grew_rejects() {
         .stack_size(1024 * 1024 * 1024)
         .spawn(|| check_file(&fixture("intern-table-chains.reject.ndjson")))
         .expect("spawn deep-stack test thread");
+    // `KIOTA_NBE=1` (a mode of the arena gate) words it "... mismatch (nbe)".
     match handle.join().expect("deep-stack test thread panicked") {
         Err(TcError::Reject(message))
-            if message == "[d230] application argument type mismatch" => {}
+            if message.starts_with("[d230] application argument type mismatch") => {}
         other => panic!("the wrong leaf should reject d230, got {other:?}"),
     }
 }
