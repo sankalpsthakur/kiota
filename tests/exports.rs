@@ -1638,3 +1638,25 @@ fn shifting_right_by_65536_or_more_is_still_division() {
 fn shifting_left_by_600000_bits_is_evaluated() {
     assert_accept("nat-shift-left-600k.accept.ndjson");
 }
+
+/// con-leche `ConLeche.Expr.wscopedBP.eq_1`, cut down to one file
+/// (`tests/fixtures/src/conleche-ite-open-hash-condition.lean`): `rfl`
+/// between `wscopedBP (.bvar i) d` and `if (E.bvar i).fvarB == 0 then true
+/// else true`. Unfolding the left side gives `ite c inst true (match …)`
+/// over the same condition, and Lean's lazy delta compares the two `ite`s
+/// argument by argument. The condition reads a packed `UInt64` hash word of
+/// an open term and cannot be evaluated: `whnf_core` deciding it (the
+/// `ite` shortcut) counted `x * 4294967296` down to the depth limit in both
+/// passes and the declaration was declined.
+#[test]
+fn rfl_between_ites_over_an_unevaluable_condition_accepts() {
+    assert_accept_deep("conleche-ite-open-hash-condition.accept.ndjson");
+}
+
+/// The reject twin: `(if b = true then true else false) = (if c = true then
+/// true else false)` by `rfl` for variables `b`, `c`. The official kernel
+/// rejects it; comparing `ite`s argument by argument must not accept it.
+#[test]
+fn ites_over_distinct_open_conditions_are_not_equal() {
+    assert_reject("ite-distinct-open-conditions.reject.ndjson");
+}
