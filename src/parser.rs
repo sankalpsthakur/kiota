@@ -25,10 +25,10 @@ pub struct Parser {
     /// the expressions and the levels only ever hold the first index a
     /// name was given.
     name_canon: Vec<u32>,
-    /// Some export index is a second index for its name. Then the
-    /// pre-pass's "no expression refers to this constant" is not about
+    /// How many export indices are a second index for their name. With any,
+    /// the pre-pass's "no expression refers to this constant" is not about
     /// names any more, and `release_theorem_value` stops relying on it.
-    aliased_names: bool,
+    aliased_names: u32,
     /// The export's levels by index; `None` before the index's `il` line.
     pub levels: Vec<Option<Level>>,
     /// The export's expression nodes by index. A slot is `None` before its
@@ -176,7 +176,7 @@ impl Parser {
             names: vec![Rc::new(String::new())], // index 0 = anonymous
             name_by_str: FxHashMap::default(),
             name_canon: vec![0],
-            aliased_names: false,
+            aliased_names: 0,
             levels: vec![Some(level::zero())], // index 0 = zero
             exprs: Vec::new(),
             env: Environment::default(),
@@ -393,7 +393,7 @@ impl Parser {
             NO_NAME => match known {
                 Some(first) => {
                     self.name_canon[idx as usize] = first;
-                    self.aliased_names = true;
+                    self.aliased_names += 1;
                 }
                 None => {
                     self.name_canon[idx as usize] = idx;
@@ -1297,6 +1297,12 @@ impl Parser {
         let file = std::fs::File::open(path).map_err(|e| TcError::Other(format!("io: {e}")))?;
         let r = self.run(std::io::BufReader::with_capacity(1 << 22, file));
         if std::env::var_os("KIOTA_PROGRESS").is_some() {
+            eprintln!(
+                "NAMES names={} second_indices={} table={}",
+                self.name_by_str.len(),
+                self.aliased_names,
+                self.name_canon.len()
+            );
             if let Some(store) = self.proofs.as_ref() {
                 eprintln!(
                     "PROOFSTORE theorems={} bytes={} loads={}",
@@ -1376,7 +1382,7 @@ impl Parser {
         let Some(lt) = self.lifetimes.as_ref() else { return };
         // The pre-pass knows which name indices the expressions mention, and
         // an index is the name only while no name has a second index.
-        if self.aliased_names || lt.name_referenced(name) {
+        if self.aliased_names > 0 || lt.name_referenced(name) {
             return;
         }
         if let Some(ConstantInfo::Theorem { value, .. }) = self.env.consts.get_mut(&name) {
