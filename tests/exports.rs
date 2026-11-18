@@ -1693,3 +1693,127 @@ fn a_prop_field_after_a_data_field_mentioned_under_a_binder_is_not_projected() {
         "[projProp6] cannot project a Prop field that comes after a dependent data field",
     );
 }
+
+// ---- Inductive admission audit (docs/inductive-audit.md) ----
+//
+// Every `ind-*` and `rec-rules-*` fixture carries the recursors kiota itself
+// reconstructs, so a reject below is the named check firing and not a
+// mismatched recursor. The declarations are replayed through the official
+// kernel in `tests/fixtures/src/inductive-audit.lean`.
+
+/// `check_constructors`: a field's sort must be at most the type's for every
+/// universe assignment. Only closed numerals and exact successors used to be
+/// compared, so `T.{u,v} : Type u | mk : Type v → T`, `Type u` inside
+/// `Type u` and a `Type` field in `Sort u` were admitted.
+#[test]
+fn a_constructor_field_universe_is_compared_for_every_assignment() {
+    for name in [
+        "ind-field-univ-other-param.reject.ndjson",
+        "ind-field-univ-same-param.reject.ndjson",
+        "ind-field-univ-sort-param.reject.ndjson",
+    ] {
+        assert_reject_exact(name, "constructor field universe is too big for the inductive type");
+    }
+    // `Sort u` in `Sort (max u v + 1)`, and `Ax.{u} : Sort u` in
+    // `Sort (max 1 u)`.
+    assert_accept("ind-field-univ-max.accept.ndjson");
+    assert_accept("ind-field-univ-max-one-param.accept.ndjson");
+}
+
+/// `check_uniform_ind_occs` (Lean 4.34): occurrences of a type being declared
+/// are judged as written. `(fun _ => N) (T N)` reduces away, `T ((fun x => x)
+/// α)` and, for a unit `U`, `T b` are convertible to `T α`/`T a`, a nested
+/// `Lu T.{v,u}` swaps the universe parameters, and a constructor type that is
+/// a redex hides its parameters; reduction made all five look uniform.
+#[test]
+fn occurrences_of_the_declared_type_are_uniform_as_written() {
+    for name in [
+        "ind-occ-erased-nonuniform.reject.ndjson",
+        "ind-occ-beta-param.reject.ndjson",
+        "ind-occ-unit-eta-param.reject.ndjson",
+        "ind-occ-nested-wrong-levels.reject.ndjson",
+        "ind-ctor-type-redex.reject.ndjson",
+    ] {
+        assert_reject_exact(
+            name,
+            "invalid occurrence of an inductive type being declared: it must be applied to the declaration's parameters and universe levels",
+        );
+    }
+    // The same vanishing field with the parameter itself: `(fun _ => N) (T α)`.
+    assert_accept("ind-occ-erased-uniform.accept.ndjson");
+}
+
+/// The official kernel checks the types' signatures before the block exists
+/// and the constructor types with only the types added. With the whole block
+/// installed first, `Bx : A → Type` next to `A` in one block (an
+/// inductive-inductive form) and a field mentioning the block's own
+/// constructor `T.a` were well typed.
+#[test]
+fn a_block_does_not_refer_to_what_it_is_still_declaring() {
+    assert_reject_exact(
+        "ind-type-names-sibling.reject.ndjson",
+        "inductive type's signature refers to the declaration being defined",
+    );
+    assert_reject_exact(
+        "ind-ctor-names-own-ctor.reject.ndjson",
+        "constructor type refers to a constructor of the declaration being defined",
+    );
+    // An ordinary mutual pair: constructors mention the sibling type.
+    assert_accept("ind-mutual-params.accept.ndjson");
+}
+
+/// `numFields` is the constructor type's binder count after the parameters.
+/// Exported as 0 for `S | mk : B2 → S`, it made `S` unit-like, and
+/// `∀ x y : S, x = y` held by `rfl`.
+#[test]
+fn constructor_num_fields_is_derived_from_the_constructor_type() {
+    assert_reject_exact(
+        "ind-ctor-numfields-zero.reject.ndjson",
+        "constructor numFields does not match its type",
+    );
+    // The honest `S`, with structure eta: `∀ x : S, x = S.mk x.1`.
+    assert_accept("ind-struct-eta.accept.ndjson");
+}
+
+/// `isRec` is whether a constructor binder mentions, as written, a type of
+/// the block. Exported as false for `T | mk : T → T`, it turned on structure
+/// eta for a recursive type; exported as true it turns eta off.
+#[test]
+fn is_rec_is_derived_from_the_constructors() {
+    for name in [
+        "ind-isrec-false-struct-eta.reject.ndjson",
+        "ind-isrec-true-lie.reject.ndjson",
+    ] {
+        assert_reject_exact(name, "inductive type's isRec flag does not match its constructors");
+    }
+    // The kernel's flag is syntactic: the occurrence in
+    // `(fun _ => N) (T → N)` vanishes under reduction and still counts.
+    assert_accept("ind-isrec-erased-occurrence.accept.ndjson");
+}
+
+#[test]
+fn a_constructor_is_listed_once() {
+    assert_reject_exact(
+        "ind-dup-ctor-in-list.reject.ndjson",
+        "duplicate constructor name in inductive declaration",
+    );
+}
+
+/// A recursor's rules are its member's constructors in order, each with its
+/// field count. The list was stored as exported; `rec_of` and the minor index
+/// read it.
+#[test]
+fn recursor_rules_are_the_member_constructors_in_order() {
+    for (name, rec) in [
+        ("rec-rules-swapped.reject.ndjson", "B2.rec"),
+        ("rec-rules-dropped.reject.ndjson", "B2.rec"),
+        ("rec-rules-nfields.reject.ndjson", "T.rec"),
+        ("rec-rules-mutual-crossed.reject.ndjson", "A.rec"),
+        ("rec-rules-nested-order.reject.ndjson", "Tree.rec_1"),
+    ] {
+        assert_reject_exact(name, &format!("recursor `{rec}` rules do not match its constructors"));
+    }
+    assert_accept("rec-rules.accept.ndjson");
+    assert_accept("rec-rules-mutual.accept.ndjson");
+    assert_accept("rec-rules-nested.accept.ndjson");
+}
