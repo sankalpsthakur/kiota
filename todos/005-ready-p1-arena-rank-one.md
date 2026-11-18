@@ -487,8 +487,10 @@ normalizing the `Decidable` instance, and `def_eq_main_path_lazy` opens with
 `Nat.mul x 4294967296` with `x` stuck unfolds to
 `Nat.add (Nat.mul x 4294967295) x`, the Nat extension normalizes the first
 argument, and the literal is counted down one `succ` per nested `whnf_core`
-to CORE_DEPTH (8192). The official kernel's `whnf` would recurse the same
-way if it were ever asked for that term; it is not.
+to CORE_DEPTH (8192). Read from `type_checker.cpp` (`reduce_bin_nat_op`
+normalizes its first argument), not measured: the official kernel's `whnf`
+would recurse the same way if it were ever asked for that term; its
+`lazy_delta_reduction` compares the arguments first and never asks.
 
 Fix. Under LAZY_MAIN_PATH `whnf_core` leaves `ite`, `dite` and
 `Decidable.decide` to δ and the `Decidable.rec` ι. The eager pass is
@@ -503,39 +505,46 @@ Measured (GitHub runners, the arena's build line `cargo build --release`):
 | 44331616042 | base e593b79 | decline (rc 2) at `wscopedBP.eq_1` | 3.3 | 0:03 | 0.38 GB | 82 |
 | 44331616042 | 132463b (`ite`/`dite`) | decline (rc 2) at `lpOfData_pack` | 58.8 | 0:59 | 0.86 GB | 1 |
 | 44344203853 | fd7248f (+`decide`) | accept (rc 0), twice | 480, 556 | 8:04, 9:20 | 13.07 GB | 0 |
-| 44344203853 | fd7248f, `KIOTA_NO_DECIDE_SHORTCUT=1` | timeout at 720 s, twice | 714 | 12:00 | 13.5 GB | 0 (accept in 754 s uncapped) |
+| 44344203853 | fd7248f, `KIOTA_NO_DECIDE_SHORTCUT=1` | timeout at 720 s, twice | 714 | 12:00 | 13.5 GB | 0 (accept in 754 s uncapped, 1 retry) |
 
 fd7248f on con-leche: 82 lazy retries, all accepted;
 intern_calls=2,025,649,823. Standing corpora at fd7248f against base, same
 exports (run 44313744961): init, std, cedar, cslib all rc 0 with every
 STATS counter identical to base (intern_calls 540,395,910 / 1,105,416,459 /
-1,390,747,875 / 7,315,777,664) and zero lazy retries. mathlib at fd7248f
+1,390,747,875 / 7,315,777,664) and zero lazy retries: the eager pass is
+untouched, and those corpora never enter the changed path. What exercises
+it: the 82 con-leche retries, the four fixtures, and every reject case
+(an eager reject is re-checked lazily): 84 `bad/*` of the arena small
+suite and the reject fixtures, all still rejected with the flag off and on
+(303 local cases, 0 mismatches). mathlib base: rc 0, 6393 s user,
+intern_calls 38,765,422,045 (run 44331616042). mathlib at fd7248f
 was still running when this was written (run 44344203853, job
 "corpus (mathlib, fix2)"; base and 132463b in run 44331616042).
 
 Open:
 - Margin. The arena's timeout for this test is 720 s; 484-560 s wall on a
-  GitHub runner is inside it, but runners vary by 30%. Two declarations
+  GitHub runner is inside it, but runners vary by 30%, and the same binary
+  on the same file took 16:31 wall (761 s user) while sharing its runner
+  with a `lake build` (run 44346066557). Two declarations
   the eager pass accepts take 227 s of it and all of the memory above
   4.5 GB: `ConLeche.Model.fixCtorData_of` (130 s, +2.8 GB) and
   `ConLeche.Cached.defeqLoopI_congr` (97 s, +9.0 GB, the 13 GB peak).
   Both predate this change (main on 2026-10-20: 12.8 GB peak). The
   official kernel checks the whole test in 69 s at 0.93 GB.
-- The eager shortcuts stay: with all three off in the eager pass
-  (`KIOTA_NO_DECIDE_SHORTCUT=1`) nothing declines and nothing is retried,
-  but `ConLeche.ensureSortIO_def` alone takes 238 s and 6.7 GB, and the
-  test times out.
-- The eager pass's verdict on `ConLeche.ensureSortIO_def` depends on the
-  export it is read from. In the arena export it is accepted outright (no
-  retry, under a second). In the cone of a later declaration exported on
-  its own (run 44346066557, artifact `hot-cones`: cone-8, 787,289 lines,
-  `ensureSortIO_def` is declaration #4965; also cone-1) the eager pass
-  declines it with "defeq depth limit" and the lazy retry accepts it in
-  176-327 s at +6.5 GB, on e593b79 and fd7248f alike (run 44356145912).
-  Counters repeat exactly for a given file, so it is the input's order or
-  numbering, not chance; the cause is not known. It is the same
-  declaration that costs 238 s with the eager shortcuts off.
+- One declaration, `ConLeche.ensureSortIO_def` (`cases f <;> rfl`), is
+  accepted by the eager pass in under a second in the arena export, and
+  in two other settings is declined by it with "defeq depth limit" and
+  accepted by the lazy retry at 176-327 s and about +6.5 GB:
+  (a) with the eager shortcuts off (`KIOTA_NO_DECIDE_SHORTCUT=1`: the one
+  retry of that run, 238 s, and the reason the test then times out), so
+  the eager shortcuts stay;
+  (b) with the shortcuts on, when it is read from the cone of a later
+  declaration exported on its own (run 44346066557, artifact `hot-cones`:
+  cone-8, 787,289 lines, declaration #4965; also cone-1), on e593b79 and
+  fd7248f alike (run 44356145912). Counters repeat exactly for a given
+  file, so (b) follows from the input's order or numbering, not chance;
+  why the eager pass reaches the depth limit there is not known.
 - `whnf_core` in the lazy pass still runs the Nat extension on open terms,
   which Lean's `lazy_delta_reduction` only does for closed ones
-  (`!has_fvar`); no declaration in con-leche or the standing corpora needs
-  that changed.
+  (`!has_fvar`); no declaration in con-leche, init, std, cedar or cslib
+  needs that changed.
