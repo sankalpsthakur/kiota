@@ -383,6 +383,8 @@ struct Slot {
 
 const EMPTY_SLOT: Slot = Slot { hash: 0, node: None };
 
+/// Entries of the recent-node table in front of the slot array (64 KiB).
+const FRONT_SLOTS_LOG2: u32 = 12;
 /// Slots a new table starts with (1 MiB). Small inputs stay cache-resident.
 const INITIAL_SLOTS_LOG2: u32 = 16;
 /// A table reset keeps its slots up to this size (256 MiB) and shrinks a
@@ -400,6 +402,9 @@ const RETAINED_SLOTS_LOG2: u32 = 24;
 /// so the table is not regrown (and its pages not re-faulted) after every
 /// reset.
 struct Interner {
+    /// The most recent node filed or found under each `FRONT_SLOTS_LOG2`-bit
+    /// hash prefix. See `Interner::intern`.
+    front: Vec<Slot>,
     slots: Vec<Slot>,
     /// `64 - log2(slots.len())`: the index is the top bits of the hash.
     shift: u32,
@@ -428,6 +433,7 @@ impl Interner {
     fn with_slots_log2(log2: u32) -> Self {
         let n = 1usize << log2;
         Interner {
+            front: vec![EMPTY_SLOT; 1usize << FRONT_SLOTS_LOG2],
             slots: vec![EMPTY_SLOT; n],
             shift: 64 - log2,
             len: 0,
@@ -446,9 +452,30 @@ impl Interner {
         id
     }
 
+    /// Most lookups ask for a node that was built or found a moment ago
+    /// (on the fixtures a 4096-entry table of the latest node per hash
+    /// prefix answers about 60% of all calls). The slot array is far larger
+    /// than any cache once a few hundred thousand nodes are filed, so each
+    /// probe of it is a memory round trip; `front` is 64 KiB and stays
+    /// cache-resident.
+    ///
+    /// `front` only ever holds nodes that are in `slots`, and a structure
+    /// has one node in `slots`, so a `front` answer is the node the probe
+    /// would have returned. `clear` empties both.
     #[inline(always)]
     fn intern(&mut self, d: ExprData) -> Expr {
         let h = hash_node(&d);
+        let fi = (h >> (64 - FRONT_SLOTS_LOG2)) as usize;
+        {
+            let recent = &self.front[fi];
+            if recent.hash == h {
+                if let Some(e) = &recent.node {
+                    if node_eq(&d, e) {
+                        return e.clone();
+                    }
+                }
+            }
+        }
         let mask = self.slots.len() - 1;
         let mut i = (h >> self.shift) as usize;
         loop {
@@ -457,7 +484,12 @@ impl Interner {
                 None => break,
                 Some(e) => {
                     if slot.hash == h && node_eq(&d, e) {
-                        return e.clone();
+                        let e = e.clone();
+                        self.front[fi] = Slot {
+                            hash: h,
+                            node: Some(e.clone()),
+                        };
+                        return e;
                     }
                 }
             }
@@ -466,6 +498,10 @@ impl Interner {
         let id = self.take_id();
         let e = alloc_node_with(d, id);
         self.slots[i] = Slot {
+            hash: h,
+            node: Some(e.clone()),
+        };
+        self.front[fi] = Slot {
             hash: h,
             node: Some(e.clone()),
         };
@@ -506,6 +542,10 @@ impl Interner {
     /// (unless it outgrew `RETAINED_SLOTS_LOG2`), so the refill neither
     /// re-allocates nor re-files anything.
     fn clear(&mut self) {
+        // First, so that `front` never names a node `slots` has let go.
+        for recent in self.front.iter_mut() {
+            *recent = EMPTY_SLOT;
+        }
         if self.slots.len() > 1usize << RETAINED_SLOTS_LOG2 {
             let fresh = Interner::with_slots_log2(RETAINED_SLOTS_LOG2);
             let old = std::mem::replace(&mut self.slots, fresh.slots);
