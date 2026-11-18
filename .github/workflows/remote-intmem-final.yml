@@ -1,0 +1,163 @@
+name: remote-intmem-final
+
+# snd/interner-memory on every corpus (strict, one process each, with the
+# table's history), against main on std, init and cedar (peak memory and
+# counters), on the heavy perf cases against main and the tree before the
+# table rewrite, and through the arena gate's 8 GiB limit.
+on:
+  push:
+    branches: ['remote/intmem-final*']
+permissions:
+  contents: read
+  actions: read
+env:
+  EXPORTS_RUN: 44313744961
+  CL_EXPORT_RUN: 44328282978
+  MAIN_REF: 606c3c08f892243d83faadf33ae2acd8bf218f78
+  PRE_REF: 6a39271
+jobs:
+  full:
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [mathlib, cedar, cslib, std, init, con-leche]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ matrix.corpus == 'con-leche' && env.CL_EXPORT_RUN || env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Strict run
+        env:
+          C: ${{ matrix.corpus }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          nproc; grep -m1 'model name' /proc/cpuinfo; free -g | head -2
+          KIOTA_PROGRESS=1 KIOTA_INTERN_TABLE_LOG=1 /usr/bin/time -v -o time.txt timeout 20000 ./target/release/kiota $C.ndjson >/dev/null 2>err.txt; rc=$?
+          echo "FULL corpus=$C rc=$rc decls=$(grep -c '\[decl #' err.txt) last=$(grep -o '\[decl #[0-9]*\]' err.txt | tail -1) wall=$(grep Elapsed time.txt | awk '{print $NF}') user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-300)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "TABLE corpus=$C grows=$(grep -c '^INTERN_TABLE grow' err.txt) resets=$(grep -c '^INTERN_TABLE reset' err.txt) largest_grow=$(grep '^INTERN_TABLE grow' err.txt | sed 's/.*nodes=\([0-9]*\).*/\1 &/' | sort -n | tail -1 | cut -d' ' -f3-4 | tr ' ' ,) largest_reset=$(grep '^INTERN_TABLE reset' err.txt | sed 's/.*nodes=\([0-9]*\).*/\1 &/' | sort -n | tail -1 | cut -d' ' -f3-4 | tr ' ' ,) dense_grows=$(grep '^INTERN_TABLE grow' err.txt | grep -c -E '2\^(2[5-9]|3[0-9])→')" | tee -a "$GITHUB_STEP_SUMMARY"
+  ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [std, init, cedar]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build both
+        run: |
+          set -euo pipefail
+          cargo build --release --locked; cp target/release/kiota kiota-new
+          git worktree add --detach "$RUNNER_TEMP/main" "$MAIN_REF"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/main-t" cargo build --release --locked --manifest-path "$RUNNER_TEMP/main/Cargo.toml"
+          cp "$RUNNER_TEMP/main-t/release/kiota" kiota-main
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Peak memory and counters, main and new
+        env:
+          C: ${{ matrix.corpus }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          nproc; grep -m1 'model name' /proc/cpuinfo
+          i=0
+          for side in main new new main; do
+            i=$((i+1))
+            KIOTA_STATS=1 KIOTA_INTERN_RESET_LOG=1 /usr/bin/time -v -o time.txt ./kiota-$side $C.ndjson >/dev/null 2>err-$side.txt; rc=$?
+            echo "STAT corpus=$C run=$i side=$side rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') resets=$(grep -c '^INTERN_RESET' err-$side.txt) $(grep -E '^STATS ' err-$side.txt | tail -1) $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err-$side.txt | cut -c1-100)"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E '^(STATS|INTERN_RESET|REJECT|DECLINE|ERROR)' err-main.txt > a.txt
+          grep -E '^(STATS|INTERN_RESET|REJECT|DECLINE|ERROR)' err-new.txt > b.txt
+          if cmp -s a.txt b.txt; then echo "STATCMP corpus=$C IDENTICAL lines=$(wc -l < a.txt)"; else echo "STATCMP corpus=$C DIFFERENT"; diff a.txt b.txt | head -20; fi | tee -a "$GITHUB_STEP_SUMMARY"
+  mem:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: |
+          set -euo pipefail
+          cargo build --release --locked; cp target/release/kiota kiota-new
+          for pair in pre:$PRE_REF main:$MAIN_REF; do
+            side=${pair%%:*}; rev=${pair##*:}
+            git worktree add --detach "$RUNNER_TEMP/$side" "$rev"
+            CARGO_TARGET_DIR="$RUNNER_TEMP/$side-t" cargo build --release --locked --manifest-path "$RUNNER_TEMP/$side/Cargo.toml"
+            cp "$RUNNER_TEMP/$side-t/release/kiota" kiota-$side
+          done
+      - name: Measure
+        run: |
+          set +e
+          curl --fail -sL --retry 3 https://arena.lean-lang.org/lean-arena-tests.tar.gz -o t.tgz; mkdir suite; tar xzf t.tgz -C suite
+          sudo apt-get install -y time >/dev/null
+          nproc; grep -m1 'model name' /proc/cpuinfo; free -g | head -2
+          one() { # test arm cap|nocap
+            t=$1; arm=$2; f=suite/good/perf/$t.ndjson; bin=kiota-$arm
+            /usr/bin/time -v -o time.txt timeout 300 ./$bin $f >/dev/null 2>err.txt; rc=$?
+            line="MEM test=$t arm=$arm rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') sys=$(grep 'System time' time.txt | awk '{print $NF}') maxrss_mb=$(( $(grep 'Maximum resident' time.txt | awk '{print $NF}') / 1024 ))"
+            if [ "$3" = cap ]; then
+              ( ulimit -v 8388608; timeout 300 ./$bin $f >/dev/null 2>err2.txt ); rc2=$?
+              line="$line capped_rc=$rc2 $(grep -m1 'memory allocation' err2.txt | cut -c1-80 | tr ' ' _)"
+              KIOTA_STATS=1 KIOTA_INTERN_TABLE_LOG=1 timeout 300 ./$bin $f >/dev/null 2>err3.txt
+              grep -E '^(STATS|REJECT|DECLINE|ERROR)' err3.txt > stats-$t-$arm.txt
+              line="$line $(grep -E '^STATS ' err3.txt | tail -1 | grep -o 'intern_calls.*' | tr ' ' ,) last_grow=$(grep '^INTERN_TABLE grow' err3.txt | tail -1 | cut -d' ' -f3-4 | tr ' ' ,)"
+            fi
+            echo "$line"
+          }
+          {
+            for arm in pre main new; do one magma-list-deep-n36 $arm cap; done
+            for arm in new main main new new main pre; do one magma-list-deep-n36 $arm nocap; done
+            for t in magma-list-pair-n21 magma-list-deep-n21 gf3-matrix-product grind-ring-5; do
+              for arm in pre main new; do one $t $arm cap; done
+            done
+            for arm in new main main new new main; do one magma-list-deep-n21 $arm nocap; done
+            for arm in new main main new; do one magma-list-pair-n21 $arm nocap; done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          for t in magma-list-deep-n36 magma-list-pair-n21 magma-list-deep-n21 gf3-matrix-product grind-ring-5; do
+            if cmp -s stats-$t-main.txt stats-$t-new.txt; then echo "STATCMP test=$t IDENTICAL lines=$(wc -l < stats-$t-main.txt)"; else echo "STATCMP test=$t DIFFERENT"; diff stats-$t-main.txt stats-$t-new.txt | head -6; fi
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: |
+          set -euo pipefail
+          cargo build --release --locked; cp target/release/kiota kiota-new
+          git worktree add --detach "$RUNNER_TEMP/main" "$MAIN_REF"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/main-t" cargo build --release --locked --manifest-path "$RUNNER_TEMP/main/Cargo.toml"
+          cp "$RUNNER_TEMP/main-t/release/kiota" kiota-main
+      - name: Arena small suite under the gate's 8 GiB limit, main and new
+        run: |
+          set +e
+          curl --fail -sL --retry 3 https://arena.lean-lang.org/lean-arena-tests.tar.gz -o tests.tar.gz
+          for side in new main; do
+            python3 scripts/arena_gate.py --binary kiota-$side --archive tests.tar.gz --output report-$side --mode default --min-good 119 --min-bad 70 --memory-mib 8192 > gate-$side.txt 2>&1; rc=$?
+            echo "GATE side=$side rc=$rc pass=$(grep -c '^PASS default' gate-$side.txt) fail=$(grep -c '^FAIL default' gate-$side.txt)"
+            grep '^FAIL default' gate-$side.txt | sed "s/^/GATE side=$side /"
+            grep -E '^PASS default good/perf/magma' gate-$side.txt | sed "s/^/GATE side=$side /"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E '^(PASS|FAIL) default' gate-main.txt | sed 's/: \([a-z]*\) .*/: \1/' | sort > v-main.txt
+          grep -E '^(PASS|FAIL) default' gate-new.txt | sed 's/: \([a-z]*\) .*/: \1/' | sort > v-new.txt
+          echo "GATEDIFF main-vs-new (lines only in one side):"; diff v-main.txt v-new.txt | tee -a "$GITHUB_STEP_SUMMARY"
