@@ -60,7 +60,7 @@ jobs:
           p='Main.lean'; s=open(p).read()
           old='| some cs => cs.map fun c => Syntax.decodeNameLit ("`" ++ c) |>.get!'
           assert old in s
-          new='| some cs => cs.map fun c => (c.splitOn ".").foldl (fun n k => match k.toNat? with | some i => Name.num n i | none => Name.str n k) Name.anonymous'
+          new='| some cs => cs.map fun (c : String) => (c.splitOn ".").foldl (fun (n : Name) (k : String) => match k.toNat? with | some i => Name.num n i | none => Name.str n k) Name.anonymous'
           open(p,'w').write(s.replace(old,new))
           PY
           lake build
