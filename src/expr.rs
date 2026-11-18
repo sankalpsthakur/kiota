@@ -835,8 +835,38 @@ pub fn instantiate(e: &Expr, args: &[Expr]) -> Expr {
     // full traversal. The grind perf tests amplify a shared simp-lemma
     // application thousands of times; keying on (node, depth) — args are
     // fixed within one call — visits each unique node once.
-    let mut memo = rustc_hash::FxHashMap::default();
-    instantiate_core(e, args, 0, &mut memo)
+    //
+    // The memo is per call, but its allocation is not: a fresh map grew
+    // from nothing on every substitution (allocate, re-file, free, several
+    // times over for a body of a few dozen nodes). The map is borrowed from
+    // a thread-local and handed back empty, so the entries, the hits and
+    // the misses of every call are exactly what a fresh map would give.
+    if loose_bvar_range(e) == 0 {
+        // What `instantiate_core` answers at depth 0, before any memo use.
+        return e.clone();
+    }
+    let mut memo = INST_SCRATCH
+        .try_with(|m| std::mem::take(&mut *m.borrow_mut()))
+        .unwrap_or_default();
+    let r = instantiate_core(e, args, 0, &mut memo);
+    // Emptying a map costs its capacity, not its length, so a map one large
+    // body stretched is dropped instead of being re-emptied by every small
+    // substitution after it.
+    if memo.capacity() <= INST_SCRATCH_KEEP {
+        memo.clear();
+        let _ = INST_SCRATCH.try_with(|m| *m.borrow_mut() = memo);
+    }
+    r
+}
+
+/// Largest capacity (entries) of the substitution memo that is kept for
+/// the next `instantiate` call.
+const INST_SCRATCH_KEEP: usize = 1 << 10;
+
+thread_local! {
+    /// The emptied memo of the last `instantiate` call, for its allocation.
+    static INST_SCRATCH: RefCell<FxHashMap<(usize, u32), Expr>> =
+        RefCell::new(FxHashMap::default());
 }
 
 fn instantiate_core(
@@ -1510,6 +1540,58 @@ mod tests {
             ),
             _ => proj(0, 0, gen(seed, depth - 1)),
         }
+    }
+
+    /// `instantiate` borrows its memo's allocation from the previous call.
+    /// Whatever the previous call left behind (small, large enough to be
+    /// dropped, or nothing), every call must answer as a fresh memo would.
+    #[test]
+    fn instantiate_memo_reuse_never_changes_substitution() {
+        let mut seed = 0xD1CE_5EED_u64;
+        // A body with far more distinct open nodes than the kept capacity.
+        let mut wide = bvar(0);
+        for i in 0..(4 * INST_SCRATCH_KEEP as u32) {
+            wide = app(wide, app(bvar(1), lit_nat(BigUint::from(i))));
+        }
+        let a0 = const_(5, vec![]);
+        let a1 = lam(BinderInfo::Default, s0(), bvar(0));
+        for round in 0..60 {
+            let e = gen(&mut seed, 5);
+            let x = gen(&mut seed, 2);
+            for args in [vec![x.clone()], vec![x.clone(), a1.clone()]] {
+                assert!(
+                    Rc::ptr_eq(&instantiate(&e, &args), &instantiate_ref(&e, &args, 0)),
+                    "round {round}: reused memo changed a result"
+                );
+            }
+            if round % 7 == 0 {
+                // Stretch the memo past what is kept, then carry on.
+                let args = [a0.clone(), a1.clone()];
+                assert!(Rc::ptr_eq(
+                    &instantiate(&wide, &args),
+                    &instantiate_ref(&wide, &args, 0)
+                ));
+            }
+            // A closed term comes back as itself, whatever the arguments.
+            let closed = lam(BinderInfo::Default, s0(), app(bvar(0), a0.clone()));
+            assert!(Rc::ptr_eq(&instantiate(&closed, &[x]), &closed));
+        }
+    }
+
+    /// The same shared subterm under two binder depths must be substituted
+    /// per depth: the memo key carries the depth, and a reused allocation
+    /// must not carry entries from one call into the next.
+    #[test]
+    fn instantiate_memo_does_not_leak_between_calls() {
+        let shared = app(bvar(0), bvar(1));
+        let body = app(shared.clone(), lam(BinderInfo::Default, s0(), shared.clone()));
+        let c1 = const_(21, vec![]);
+        let c2 = const_(22, vec![]);
+        let r1 = instantiate(&body, std::slice::from_ref(&c1));
+        let r2 = instantiate(&body, std::slice::from_ref(&c2));
+        assert!(Rc::ptr_eq(&r1, &instantiate_ref(&body, std::slice::from_ref(&c1), 0)));
+        assert!(Rc::ptr_eq(&r2, &instantiate_ref(&body, std::slice::from_ref(&c2), 0)));
+        assert!(!Rc::ptr_eq(&r1, &r2), "the second call saw the first call's entries");
     }
 
     #[test]
