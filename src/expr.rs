@@ -880,16 +880,35 @@ pub fn warm_intern(n: u32) {
     let _ = e;
 }
 
+/// Largest capacity (entries) a per-declaration memo keeps between
+/// declarations.
+const MEMO_KEEP_CAPACITY: usize = 1 << 12;
+
+/// Empty a per-declaration memo.
+///
+/// `HashMap::clear` sweeps the map's whole allocation whatever it holds, so
+/// a map that one large declaration stretched to millions of entries would
+/// charge that sweep to every declaration after it. Such a map is released
+/// instead and grows again on demand; a small one keeps its allocation.
+/// Either way the map is empty afterwards and nothing reads its capacity.
+pub fn clear_memo<K, V, S: Default>(m: &mut std::collections::HashMap<K, V, S>) {
+    if m.capacity() > MEMO_KEEP_CAPACITY {
+        *m = Default::default();
+    } else {
+        m.clear();
+    }
+}
+
 /// Drop per-decl substitution memos. The intern table stays: env terms
 /// live there. These two maps grow with every `shift`/`instantiate_level_params`
 /// and were never cleared, so std `#18000` hung after 18k decls of residue.
 pub fn clear_subst_memos() {
-    LEVEL_INST_MEMO.with(|m| m.borrow_mut().clear());
+    LEVEL_INST_MEMO.with(|m| clear_memo(&mut m.borrow_mut()));
     // Clear the memo first: IDs can be reused only after its entries are gone.
-    LEVEL_SUBST_IDS.with(|m| m.borrow_mut().clear());
-    SHIFT_MEMO.with(|m| m.borrow_mut().clear());
-    INST1_MEMO.with(|m| m.borrow_mut().clear());
-    USED_SET_MEMO.with(|m| m.borrow_mut().clear());
+    LEVEL_SUBST_IDS.with(|m| clear_memo(&mut m.borrow_mut()));
+    SHIFT_MEMO.with(|m| clear_memo(&mut m.borrow_mut()));
+    INST1_MEMO.with(|m| clear_memo(&mut m.borrow_mut()));
+    USED_SET_MEMO.with(|m| clear_memo(&mut m.borrow_mut()));
 }
 
 pub fn bvar(i: u32) -> Expr {

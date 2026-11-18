@@ -848,7 +848,7 @@ impl<'e> Checker<'e> {
         // probe. Those maps otherwise hold one extra decl of residue while
         // `type_is_multiarg_prop_structure` runs.
         expr::clear_subst_memos();
-        CTX_IDS.with(|m| m.borrow_mut().clear());
+        CTX_IDS.with(|m| expr::clear_memo(&mut m.borrow_mut()));
         CTX_NEXT.with(|c| c.set(1));
         CORE_ABORTED.with(|a| a.set(false));
         crate::stats::set_theorem_delta_scope(self.name_str(name));
@@ -1005,12 +1005,12 @@ impl<'e> Checker<'e> {
         // declaration. Keeping them across decls is how `#3491`–`#3495`
         // grew from ~0.9 GB to multi-GB before the next omega proof.
         expr::clear_subst_memos();
-        CTX_IDS.with(|m| m.borrow_mut().clear());
+        CTX_IDS.with(|m| expr::clear_memo(&mut m.borrow_mut()));
         CTX_NEXT.with(|c| c.set(1));
-        self.whnf_cache.borrow_mut().clear();
-        self.whnf_core_cache.borrow_mut().clear();
-        self.defeq_cache.borrow_mut().clear();
-        self.infer_cache.borrow_mut().clear();
+        expr::clear_memo(&mut self.whnf_cache.borrow_mut());
+        expr::clear_memo(&mut self.whnf_core_cache.borrow_mut());
+        expr::clear_memo(&mut self.defeq_cache.borrow_mut());
+        expr::clear_memo(&mut self.infer_cache.borrow_mut());
         // `ctx_key`s (via `CTX_NEXT`, reset above) are reused across
         // declarations, so a stale eager-namespace entry from the last
         // declaration would be keyed identically but mean something
@@ -1018,10 +1018,10 @@ impl<'e> Checker<'e> {
         // Keys now use non-recycled allocation IDs, not allocator addresses;
         // clearing still bounds retained results and preserves declaration
         // boundaries between conversion modes.
-        self.eager_whnf_cache.borrow_mut().clear();
-        self.eager_whnf_core_cache.borrow_mut().clear();
-        self.eager_defeq_cache.borrow_mut().clear();
-        self.eager_infer_cache.borrow_mut().clear();
+        expr::clear_memo(&mut self.eager_whnf_cache.borrow_mut());
+        expr::clear_memo(&mut self.eager_whnf_core_cache.borrow_mut());
+        expr::clear_memo(&mut self.eager_defeq_cache.borrow_mut());
+        expr::clear_memo(&mut self.eager_infer_cache.borrow_mut());
         // The hash-cons table itself is the one node-lifetime root the
         // above never bounded: it holds a strong `Rc` to every distinct
         // `Expr` ever built, for the life of the process, regardless of
