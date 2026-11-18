@@ -272,7 +272,7 @@ pub fn structurally_equal(a: &Expr, b: &Expr) -> bool {
         if Rc::ptr_eq(&a, &b) {
             continue;
         }
-        if a.loose != b.loose || a.used_bvars != b.used_bvars {
+        if a.loose() != b.loose() || a.used_bvars != b.used_bvars {
             return false;
         }
         if !seen.insert((identity(&a), identity(&b))) {
@@ -2037,7 +2037,7 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     fn a_node_is_56_bytes_and_a_slot_is_16() {
         assert_eq!(std::mem::size_of::<ExprData>(), 32);
-        assert_eq!(std::mem::size_of::<ExprNode>(), 56);
+        assert_eq!(std::mem::size_of::<ExprNode>(), 48);
         assert_eq!(std::mem::size_of::<Slot>(), 16);
     }
 
