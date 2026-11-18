@@ -1088,11 +1088,13 @@ pub fn instantiate(e: &Expr, args: &[Expr]) -> Expr {
     // application thousands of times; keying on (node, depth) — args are
     // fixed within one call — visits each unique node once.
     //
-    // The memo is per call, but its allocation is not: a fresh map grew
-    // from nothing on every substitution (allocate, re-file, free, several
-    // times over for a body of a few dozen nodes). The map is borrowed from
-    // a thread-local and handed back empty, so the entries, the hits and
-    // the misses of every call are exactly what a fresh map would give.
+    // The memo is per call, but its storage is not: a fresh map grew from
+    // nothing on every substitution (allocate, re-file, free, several times
+    // over for a body of a few dozen nodes), and emptying a kept map cost
+    // its capacity however few entries the call made. `SubstMemo` is taken
+    // from a thread-local, remembers which slots it filled, and empties
+    // exactly those. The entries, the hits and the misses of every call are
+    // what a fresh map would give.
     if loose_bvar_range(e) == 0 {
         // What `instantiate_core` answers at depth 0, before any memo use.
         return e.clone();
@@ -1101,31 +1103,162 @@ pub fn instantiate(e: &Expr, args: &[Expr]) -> Expr {
         .try_with(|m| std::mem::take(&mut *m.borrow_mut()))
         .unwrap_or_default();
     let r = instantiate_core(e, args, 0, &mut memo);
-    // Emptying a map costs its capacity, not its length, so a map one large
-    // body stretched is dropped instead of being re-emptied by every small
-    // substitution after it.
-    if memo.capacity() <= INST_SCRATCH_KEEP {
-        memo.clear();
-        let _ = INST_SCRATCH.try_with(|m| *m.borrow_mut() = memo);
-    }
+    crate::stats::inst_nodes_add(memo.misses);
+    memo.misses = 0;
+    memo.clear();
+    let _ = INST_SCRATCH.try_with(|m| *m.borrow_mut() = memo);
     r
 }
 
-/// Largest capacity (entries) of the substitution memo that is kept for
-/// the next `instantiate` call.
-const INST_SCRATCH_KEEP: usize = 1 << 10;
-
 thread_local! {
-    /// The emptied memo of the last `instantiate` call, for its allocation.
-    static INST_SCRATCH: RefCell<FxHashMap<(usize, u32), Expr>> =
-        RefCell::new(FxHashMap::default());
+    /// The emptied memo of the last `instantiate` call, for its storage.
+    static INST_SCRATCH: RefCell<SubstMemo> = RefCell::new(SubstMemo::default());
+}
+
+struct SubstSlot {
+    id: usize,
+    depth: u32,
+    /// `None` marks an empty slot.
+    val: Option<Expr>,
+}
+
+/// One `instantiate` call's memo, `(node identity, depth) -> result`: open
+/// addressing with linear probing, plus the list of slots in use so that
+/// emptying costs the entries made and not the capacity.
+struct SubstMemo {
+    slots: Vec<SubstSlot>,
+    /// `64 - log2(slots.len())`.
+    shift: u32,
+    /// Indices of the occupied slots.
+    filled: Vec<u32>,
+    /// Nodes this call substituted into (lookups that found nothing), for
+    /// the `inst_nodes` counter: added up here and reported once per call
+    /// instead of asking on every node whether counters are on.
+    misses: u64,
+}
+
+/// Slots of a new memo, and of one emptied after outgrowing the limit below.
+const SUBST_MEMO_SLOTS_LOG2: u32 = 5;
+/// A memo stretched past this many slots by one large body goes back to the
+/// initial size, so the small substitutions after it probe a table that
+/// stays in the first-level cache.
+const SUBST_MEMO_KEEP_SLOTS: usize = 1 << 10;
+
+impl Default for SubstMemo {
+    fn default() -> Self {
+        SubstMemo::with_slots_log2(SUBST_MEMO_SLOTS_LOG2)
+    }
+}
+
+impl SubstMemo {
+    fn with_slots_log2(log2: u32) -> Self {
+        let n = 1usize << log2;
+        let mut slots = Vec::with_capacity(n);
+        slots.resize_with(n, || SubstSlot {
+            id: 0,
+            depth: 0,
+            val: None,
+        });
+        SubstMemo {
+            slots,
+            shift: 64 - log2,
+            filled: Vec::new(),
+            misses: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn start(&self, id: usize, depth: u32) -> usize {
+        (hash_mix(hash_mix(SEED_APP, id as u64), depth as u64) >> self.shift) as usize
+    }
+
+    #[inline]
+    fn get(&self, id: usize, depth: u32) -> Option<&Expr> {
+        let mask = self.slots.len() - 1;
+        let mut i = self.start(id, depth);
+        loop {
+            let s = &self.slots[i];
+            match &s.val {
+                None => return None,
+                Some(v) => {
+                    if s.id == id && s.depth == depth {
+                        return Some(v);
+                    }
+                }
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, id: usize, depth: u32, val: Expr) {
+        // At most half full, so a probe always ends at an empty slot.
+        if (self.filled.len() + 1) * 2 > self.slots.len() {
+            self.grow();
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = self.start(id, depth);
+        loop {
+            let s = &mut self.slots[i];
+            match &s.val {
+                None => break,
+                Some(_) => {
+                    if s.id == id && s.depth == depth {
+                        s.val = Some(val);
+                        return;
+                    }
+                }
+            }
+            i = (i + 1) & mask;
+        }
+        self.slots[i] = SubstSlot {
+            id,
+            depth,
+            val: Some(val),
+        };
+        self.filled.push(i as u32);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) {
+        let log2 = 64 - self.shift + 1;
+        let mut bigger = SubstMemo::with_slots_log2(log2);
+        bigger.filled.reserve(self.filled.len() + 1);
+        bigger.misses = self.misses;
+        let mask = bigger.slots.len() - 1;
+        for &i in &self.filled {
+            let s = &mut self.slots[i as usize];
+            let (id, depth) = (s.id, s.depth);
+            let val = s.val.take();
+            let mut j = bigger.start(id, depth);
+            while bigger.slots[j].val.is_some() {
+                j = (j + 1) & mask;
+            }
+            bigger.slots[j] = SubstSlot { id, depth, val };
+            bigger.filled.push(j as u32);
+        }
+        *self = bigger;
+    }
+
+    /// Release every entry.
+    #[inline]
+    fn clear(&mut self) {
+        if self.slots.len() > SUBST_MEMO_KEEP_SLOTS {
+            *self = SubstMemo::default();
+            return;
+        }
+        for i in self.filled.drain(..) {
+            self.slots[i as usize].val = None;
+        }
+    }
 }
 
 fn instantiate_core(
     e: &Expr,
     args: &[Expr],
     depth: u32,
-    memo: &mut rustc_hash::FxHashMap<(usize, u32), Expr>,
+    memo: &mut SubstMemo,
 ) -> Expr {
     // Every loose bvar is bound above `depth`, so neither the substitution nor
     // the renumbering below can reach into this subterm. Returning it whole is
@@ -1133,11 +1266,11 @@ fn instantiate_core(
     if loose_bvar_range(e) <= depth {
         return e.clone();
     }
-    let key = (identity(e), depth);
-    if let Some(r) = memo.get(&key) {
+    let id = identity(e);
+    if let Some(r) = memo.get(id, depth) {
         return r.clone();
     }
-    crate::stats::inst_node();
+    memo.misses += 1;
     let r = match &***e {
         ExprData::BVar(i) => {
             if *i >= depth && ((*i - depth) as usize) < args.len() {
@@ -1171,7 +1304,7 @@ fn instantiate_core(
         ),
         ExprData::Proj(s, i, v) => proj(*s, *i, instantiate_core(v, args, depth, memo)),
     };
-    memo.insert(key, r.clone());
+    memo.insert(id, depth, r.clone());
     r
 }
 
@@ -1866,7 +1999,7 @@ mod tests {
         let mut seed = 0xD1CE_5EED_u64;
         // A body with far more distinct open nodes than the kept capacity.
         let mut wide = bvar(0);
-        for i in 0..(4 * INST_SCRATCH_KEEP as u32) {
+        for i in 0..(4 * SUBST_MEMO_KEEP_SLOTS as u32) {
             wide = app(wide, app(bvar(1), lit_nat(BigUint::from(i))));
         }
         let a0 = const_(5, vec![]);
