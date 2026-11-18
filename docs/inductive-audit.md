@@ -25,7 +25,7 @@ only in the export (`numFields`, `isRec`, rule lists) it is the honest
 declaration's values plus, where one exists, a theorem the official kernel
 refuses.
 
-144 probes (`probes.py`). On 606c3c0, 24 declarations or theorems the
+150 probes (`probes.py`). On 606c3c0, 24 declarations or theorems the
 official kernel refuses were accepted, and 14 exports whose only fault is a
 forged `isRec`, `numFields` or rule list were accepted as written. On this
 branch 23 of the 24 and all 14 are refused, and kiota agrees with the
@@ -89,9 +89,9 @@ All need no forged prelude. "Fixture" names are under `tests/fixtures/`.
 |---|---|---|---|---|
 | Every occurrence is applied to the parameters and levels, as written | `check_uniform_ind_occs`, :134 (4.34) | `S` `check_uniform_ind_occs` | `D1`–`D7`, `D10`, `E8`, `E22`, `H7`, `M3`; `ind-occ-*` | agree. Before: `D2`, `D4`, `D7`, `D10`, `E8`, `H7` accepted |
 | An occurrence that `whnf` removes is no occurrence for positivity | `check_positivity` starts with `whnf`, :437 | `S` `positivity_whnf` | `D8`, `D9`; `ind-occ-erased-uniform.accept`; arena `vanishing-occurrence` | agree |
-| No occurrence in a binder domain of a field | :441 | `check_arg_positive_in` "non-positive" | `sanity_neg`, tutorial 054, 057, 117 | agree |
+| No occurrence in a binder domain of a field, also when it shows only after unfolding a definition, and also when unfolding the domain would remove it | :441 | `check_arg_positive_in` "non-positive" | `sanity_neg`, `N1`, `N3`, `N5`, tutorial 054, 057, 117; arena `positivity-whnf` | agree |
 | Otherwise the field ends in a valid application of a declared type | :447 | `check_positive_spine`, `check_uniform_i` | `H16`, tutorial 118 | agree |
-| Reflexive occurrences | allowed | allowed | `H15`, `E20` | agree |
+| Reflexive occurrences | allowed | allowed | `H15`, `E20`, `N2` | agree |
 | Nested: `I Ds is`, `I` an earlier inductive, some `D` mentions the block; found as written | `is_nested_inductive_app`, :1023 | `S` `check_nested_functor` (after `whnf`), `R` `scan_nested_expr` (as written) | `E5`, `E9`, `E10`, `E12`, `E16`, `E19`, `E21`, `E23`; `ind-nested-identity-redex.accept`; arena `nested-redex-aux` | agree, same number of motives |
 | Nested only after unfolding is not nested | `check_positivity` "non valid occurrence" | `R` "recursive field does not exactly match a reconstructed member specialization" | `E1`, `E4` | agree (refused in reconstruction) |
 | Nested parameters hold no constructor-local variable | :1049 | `R` "parameters contain constructor-local variables" | `E2b` | agree |
