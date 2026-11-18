@@ -6503,10 +6503,10 @@ impl<'e> Checker<'e> {
                 extensions::trace_string_bytes(false);
                 false
             }
-            Some(Err(_)) => {
-                self.native_string_ok.set(None);
-                return false;
-            }
+            // An abort says nothing about the environment: off for this
+            // declaration (the cell is already `Some(false)`), asked again
+            // by the next one.
+            Some(Err(_)) => return false,
         };
         self.native_string_ok.set(Some(ok));
         ok

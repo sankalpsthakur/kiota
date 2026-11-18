@@ -1439,6 +1439,9 @@ impl Parser {
         if let Ok(min) = std::env::var("KIOTA_MIN_DECL") {
             if let Ok(min_n) = min.parse::<usize>() {
                 if self.decl_count < min_n {
+                    // Skipped, not unknown: later declarations still need
+                    // the literal types and native rules it may carry.
+                    self.note_declared(name);
                     return Ok(());
                 }
             }

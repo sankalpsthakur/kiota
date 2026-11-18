@@ -80,6 +80,12 @@ Exit codes:
 
 Set `KIOTA_DEBUG=1` to print both sides of an application-type mismatch.
 
+`KIOTA_EXT_TRACE=1` prints one `EXT on <name>` line for each constant whose
+native reduction was enabled (`Nat.add`, `ite`, …; see `src/tc/extensions.rs`)
+and, at exit, how often each native rule fired. A constant that carries one of
+those names without being the constant the rule assumes is reported on stderr
+without the variable; that never happens on an export of Lean's own prelude.
+
 `KIOTA_RECLAIM=1` enables experimental weak interning and eviction of disposable
 memo tables. It is off by default. Persistent expression keys use allocation IDs
 that are never recycled; eviction does not clear universe-substitution identity
@@ -95,6 +101,7 @@ If you are exploring kernel implementation rather than just running the binary, 
 - `src/tc.rs` — type checking and definitional equality
 - `src/expr.rs` — term representation / interning
 - `src/nat.rs` — exact natural-number reductions
+- `src/tc/extensions.rs` — which declarations get those reductions, and the `ite`/`decide` shortcuts: each is validated when it is declared, never taken by name
 - `src/parser.rs` — exported-term ingestion
 - `src/stats.rs` — checker statistics
 
