@@ -567,6 +567,19 @@ pub fn warm_intern(n: u32) {
 /// Drop per-decl substitution memos. The intern table stays: env terms
 /// live there. These two maps grow with every `shift`/`instantiate_level_params`
 /// and were never cleared, so std `#18000` hung after 18k decls of residue.
+/// The substitution memos are pure functions of never-reused node
+/// identities, so they may outlive a declaration; this empties them only
+/// once they hold more than `cap` entries together.
+pub fn clear_subst_memos_if_large(cap: usize) {
+    let n = LEVEL_INST_MEMO.with(|m| m.borrow().len())
+        + SHIFT_MEMO.with(|m| m.borrow().len())
+        + INST1_MEMO.with(|m| m.borrow().len())
+        + USED_SET_MEMO.with(|m| m.borrow().len());
+    if n > cap {
+        clear_subst_memos();
+    }
+}
+
 pub fn clear_subst_memos() {
     LEVEL_INST_MEMO.with(|m| m.borrow_mut().clear());
     // Clear the memo first: IDs can be reused only after its entries are gone.

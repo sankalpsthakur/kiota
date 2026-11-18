@@ -77,6 +77,10 @@ thread_local! {
     static XINFER: RefCell<FxHashMap<usize, (Expr, bool)>> = RefCell::new(FxHashMap::default());
     static XWHNF: RefCell<FxHashMap<usize, Expr>> = RefCell::new(FxHashMap::default());
     static XCACHE_ON: bool = std::env::var_os("KIOTA_XCACHE").is_some();
+    static XMEMO_ON: bool = std::env::var_os("KIOTA_XMEMO").is_some();
+    /// Closed pairs proved definitionally equal. Only `true` is kept: an
+    /// equality once derived stays derivable as the environment grows.
+    static XDEFEQ: RefCell<rustc_hash::FxHashSet<(usize, usize)>> = RefCell::new(Default::default());
     static XCACHE_HITS: Cell<u64> = const { Cell::new(0) };
     /// Unreduced same-const App congruence (`try_unreduced` + `is_def_eq_core`
     /// pairwise) nested 15+ deep on class spines walks the *tree*, not the
@@ -857,7 +861,11 @@ impl<'e> Checker<'e> {
         // Drop the previous decl's subst/ctx intern before any WHNF/shape
         // probe. Those maps otherwise hold one extra decl of residue while
         // `type_is_multiarg_prop_structure` runs.
-        expr::clear_subst_memos();
+        if XMEMO_ON.with(|b| *b) {
+            expr::clear_subst_memos_if_large(XCACHE_CAP);
+        } else {
+            expr::clear_subst_memos();
+        }
         CTX_IDS.with(|m| m.borrow_mut().clear());
         CTX_NEXT.with(|c| c.set(1));
         CORE_ABORTED.with(|a| a.set(false));
@@ -1014,7 +1022,11 @@ impl<'e> Checker<'e> {
         // Pointer-keyed WHNF/defeq/infer caches are only useful inside one
         // declaration. Keeping them across decls is how `#3491`–`#3495`
         // grew from ~0.9 GB to multi-GB before the next omega proof.
-        expr::clear_subst_memos();
+        if XMEMO_ON.with(|b| *b) {
+            expr::clear_subst_memos_if_large(XCACHE_CAP);
+        } else {
+            expr::clear_subst_memos();
+        }
         CTX_IDS.with(|m| m.borrow_mut().clear());
         CTX_NEXT.with(|c| c.set(1));
         self.whnf_cache.borrow_mut().clear();
@@ -3560,6 +3572,15 @@ impl<'e> Checker<'e> {
         }
     }
     fn defeq_cache_insert(&self, force_eager: bool, key: (u64, usize, usize), v: bool) {
+        if v && key.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b) {
+            XDEFEQ.with(|m| {
+                let mut m = m.borrow_mut();
+                if m.len() >= XCACHE_CAP {
+                    m.clear();
+                }
+                m.insert((key.1, key.2));
+            });
+        }
         if force_eager {
             expr::memo_insert(&mut self.eager_defeq_cache.borrow_mut(), key, v);
         } else {
@@ -3669,6 +3690,12 @@ impl<'e> Checker<'e> {
         if let Some(r) = self.defeq_cache_get(force_eager, &key) {
             crate::stats::defeq_hit();
             return Ok(r);
+        }
+        if key.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b)
+            && XDEFEQ.with(|m| m.borrow().contains(&(key.1, key.2)))
+        {
+            XCACHE_HITS.with(|c| c.set(c.get() + 1));
+            return Ok(true);
         }
         crate::stats::miss(2, key.0, key.1, key.2);
         // Proof irrelevance before app congruence. Typeclass instances are
