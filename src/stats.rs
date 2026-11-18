@@ -94,10 +94,11 @@ pub fn report() {
         g(&WHNF_HITS), g(&DEFEQ_HITS), arr(&CLOSED_MISS), arr(&CLOSED_XHIT), arr(&OPEN_MISS),
     );
     eprintln!(
-        "STATS3 xcache_hits={} xcache_rechecks={} xcache_recheck_accepts={}",
+        "STATS3 xcache_hits={} xcache_rechecks={} xcache_recheck_accepts={} xverify_mismatch={}",
         crate::tc::xcache_hits(),
         crate::tc::xcache_rechecks().0,
-        crate::tc::xcache_rechecks().1
+        crate::tc::xcache_rechecks().1,
+        crate::tc::xverify_mismatches().iter().sum::<u64>()
     );
     eprintln!(
         "STATS infer={} infer_hit={} whnf={} defeq={} inst_nodes={} shift_nodes={} ctx_clones={} intern_calls={} live_nodes={}",

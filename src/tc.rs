@@ -91,6 +91,12 @@ thread_local! {
     /// failed after a cache hit, and how many of those then passed
     /// (`note_xcache_recheck`).
     static XCACHE_RECHECKS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    /// `KIOTA_XCACHE_VERIFY`: every cache hit is recomputed without the
+    /// caches and compared; the recomputed result is the one used.
+    static XVERIFY_ON: bool = std::env::var_os("KIOTA_XCACHE_VERIFY").is_some();
+    /// Hits whose recomputation was another node, a failure, or `false`
+    /// (infer, whnf, defeq).
+    static XVERIFY_MISMATCH: [Cell<u64>; 3] = const { [Cell::new(0), Cell::new(0), Cell::new(0)] };
     static XMEMO_ON: bool = std::env::var_os("KIOTA_XMEMO").is_some();
     /// Closed pairs proved definitionally equal. Only `true` is kept: an
     /// equality once derived stays derivable as the environment grows.
@@ -211,6 +217,22 @@ fn note_xcache_recheck(accepted: bool) {
         let (n, ok) = c.get();
         c.set((n + 1, ok + accepted as u64));
     });
+}
+
+pub fn xverify_mismatches() -> [u64; 3] {
+    XVERIFY_MISMATCH.with(|c| [c[0].get(), c[1].get(), c[2].get()])
+}
+
+/// The one line a `KIOTA_XCACHE_VERIFY` run ends with.
+pub fn xverify_report() {
+    if XVERIFY_ON.with(|b| *b) {
+        eprintln!(
+            "XVERIFY hits={} mismatch(infer,whnf,defeq)={:?} rechecks={:?}",
+            xcache_hits(),
+            xverify_mismatches(),
+            xcache_rechecks()
+        );
+    }
 }
 
 /// Whether the cross-declaration caches may be read and written right now.
@@ -951,6 +973,23 @@ impl<'e> Checker<'e> {
         !self.xcache_tainted.get() && BUDGET_EVENTS.with(Cell::get) == self.budget_mark.get()
     }
 
+    /// `KIOTA_XCACHE_VERIFY`: a hit was recomputed without the caches and
+    /// the two differ. kind: 0 infer, 1 whnf, 2 defeq.
+    fn xverify_mismatch(&self, kind: usize, term: &Expr, cached: &str, fresh: &str) {
+        let n = XVERIFY_MISMATCH.with(|c| {
+            c[kind].set(c[kind].get() + 1);
+            c[0].get() + c[1].get() + c[2].get()
+        });
+        if n <= 20 {
+            let decl = self.declaring.get().map(|d| self.name_str(d).to_string()).unwrap_or_default();
+            eprintln!(
+                "XVERIFY_MISMATCH kind={} decl=`{decl}` term={} cached={cached} fresh={fresh}",
+                ["infer", "whnf", "defeq"][kind],
+                self.pp_budget(term, 8),
+            );
+        }
+    }
+
     pub fn check_decl(&self, name: u32, kind: &str) -> R<()> {
         let hits = XCACHE_HITS.with(Cell::get);
         match self.check_decl_once(name, kind) {
@@ -1475,6 +1514,15 @@ impl<'e> Checker<'e> {
             if let Some((t, checked)) = hit {
                 if infer_only || checked {
                     XCACHE_HITS.with(|c| c.set(c.get() + 1));
+                    if XVERIFY_ON.with(|b| *b) {
+                        let fresh = with_xcache_suspended(|| self.infer_type_cached(ctx, e));
+                        match &fresh {
+                            Ok(f) if Rc::ptr_eq(f, &t) => {}
+                            Ok(f) => self.xverify_mismatch(0, e, &self.pp_budget(&t, 8), &self.pp_budget(f, 8)),
+                            Err(err) => self.xverify_mismatch(0, e, &self.pp_budget(&t, 8), &format!("{err:?}")),
+                        }
+                        return fresh;
+                    }
                     cache_ref.borrow_mut().insert(key, (t.clone(), checked));
                     return Ok(t);
                 }
@@ -2539,6 +2587,15 @@ impl<'e> Checker<'e> {
         if xcache {
             if let Some(r) = XWHNF.with(|m| m.borrow().get(&k.1).cloned()) {
                 XCACHE_HITS.with(|c| c.set(c.get() + 1));
+                if XVERIFY_ON.with(|b| *b) {
+                    let fresh = with_xcache_suspended(|| self.whnf_inner(ctx, e));
+                    match &fresh {
+                        Ok(f) if Rc::ptr_eq(f, &r) => {}
+                        Ok(f) => self.xverify_mismatch(1, e, &self.pp_budget(&r, 8), &self.pp_budget(f, 8)),
+                        Err(err) => self.xverify_mismatch(1, e, &self.pp_budget(&r, 8), &format!("{err:?}")),
+                    }
+                    return fresh;
+                }
                 self.whnf_cache_insert(force_eager, k, r.clone());
                 return Ok(r);
             }
@@ -3854,6 +3911,15 @@ impl<'e> Checker<'e> {
             && XDEFEQ.with(|m| m.borrow().contains(&(key.1, key.2)))
         {
             XCACHE_HITS.with(|c| c.set(c.get() + 1));
+            if XVERIFY_ON.with(|b| *b) {
+                let fresh = with_xcache_suspended(|| self.is_def_eq_inner_body(ctx, a, b));
+                match &fresh {
+                    Ok(true) => {}
+                    Ok(false) => self.xverify_mismatch(2, a, "true", &format!("false against {}", self.pp_budget(b, 8))),
+                    Err(err) => self.xverify_mismatch(2, a, "true", &format!("{err:?}")),
+                }
+                return fresh;
+            }
             return Ok(true);
         }
         crate::stats::miss(2, key.0, key.1, key.2);

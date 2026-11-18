@@ -76,6 +76,7 @@ fn main() {
                 }
             });
             kiota::stats::report();
+            tc::xverify_report();
             kiota::stats::report_shortcuts();
             let result = match outcome {
                 Ok(r) => r,

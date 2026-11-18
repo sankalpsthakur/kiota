@@ -159,3 +159,31 @@ fn a_failure_after_a_cache_hit_is_decided_again_without_the_caches() {
     assert_eq!(stat(&without, "xcache_hits"), 0);
     assert_eq!(stat(&without, "xcache_rechecks"), 0);
 }
+
+/// `KIOTA_XCACHE_VERIFY` recomputes every cache hit without the caches. No
+/// fixture may hold a hit whose recomputation is another term, a failure,
+/// or `false`.
+#[test]
+fn no_fixture_has_a_cache_hit_that_a_fresh_computation_contradicts() {
+    let mut files = Vec::new();
+    ndjson_under(&fixtures_dir(), &mut files);
+    let mut bad = Vec::new();
+    let mut hits = 0u64;
+    for path in &files {
+        let run = check(path, &["KIOTA_XCACHE", "KIOTA_XCACHE_VERIFY"], false);
+        let Some(line) = run.stderr.lines().find(|l| l.starts_with("XVERIFY ")) else {
+            bad.push(format!("{}: no XVERIFY line", path.display()));
+            continue;
+        };
+        if !line.contains("mismatch(infer,whnf,defeq)=[0, 0, 0]") {
+            bad.push(format!("{}: {line}", path.display()));
+        }
+        hits += line
+            .split_whitespace()
+            .find_map(|f| f.strip_prefix("hits="))
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+    }
+    assert!(bad.is_empty(), "stale cache hits:\n{}", bad.join("\n"));
+    assert!(hits > 1000, "the fixtures no longer exercise the caches ({hits} hits)");
+}
