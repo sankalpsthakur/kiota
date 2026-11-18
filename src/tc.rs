@@ -6694,15 +6694,10 @@ impl<'e> Checker<'e> {
         // independent of what a member's `all` list claims comes first.
         self.check_inductive_block_syntax(&all, num_params, &shared_lp)?;
         // Shared parameter telescope, taken from the first type's arity.
-        // `elim_nested_inductive_fn::get_params` reads it off the first type
-        // without reducing, so the parameters must be manifest binders.
         let mut param_ctx: Ctx = Ctx::new();
         let mut cur = typ.clone();
         for _ in 0..num_params {
-            let ExprData::Pi(_, dom, body) = &**cur else {
-                return reject("inductive type does not start with its declared parameters");
-            };
-            let (dom, body) = (dom.clone(), body.clone());
+            let (_, dom, body) = self.ensure_pi(&param_ctx, &cur)?;
             param_ctx.push(dom);
             cur = body;
         }
@@ -6782,12 +6777,6 @@ impl<'e> Checker<'e> {
                 if c_np != num_params {
                     return reject("constructor numParams does not match inductive type");
                 }
-                // `declare_constructors`: the field count is the number of
-                // manifest binders after the parameters.  Structure eta and
-                // projections read it, so it cannot be taken on trust.
-                if Self::manifest_arity(&c_typ) != num_params as u64 + c_nf as u64 {
-                    return reject("constructor numFields does not match its type");
-                }
                 let mut c2: Ctx = Ctx::new();
                 let mut cur2 = c_typ.clone();
                 for i in 0..num_params {
@@ -6803,6 +6792,12 @@ impl<'e> Checker<'e> {
                     }
                     c2.push(dom);
                     cur2 = body;
+                }
+                // `declare_constructors`: the field count is the number of
+                // manifest binders after the parameters.  Structure eta and
+                // projections read it, so it cannot be taken on trust.
+                if Self::manifest_arity(&cur2) != c_nf as u64 {
+                    return reject("constructor numFields does not match its type");
                 }
                 loop {
                     // Only walk *manifest* Pis — do not whnf the constructor type
@@ -6992,10 +6987,21 @@ impl<'e> Checker<'e> {
     ///   the block, and the constructor types with only the block's types
     ///   added (`check_inductive_types`, `check_constructors`), so neither
     ///   may name a constant this block introduces beyond that;
+    /// - the first type shows the declaration's parameters as binders
+    ///   (`get_params`);
     /// - a type lists each constructor once (`check_constructors`);
     /// - occurrences of the types being declared are uniform
     ///   (`check_uniform_ind_occs`).
     fn check_inductive_block_syntax(&self, all: &[u32], num_params: u32, lps: &[u32]) -> R<()> {
+        // `elim_nested_inductive_fn::get_params` reads the parameters off
+        // the *first* type without reducing.  The other members' parameters
+        // are reached modulo `whnf` (`check_inductive_types`), so only the
+        // first signature has to show them as binders.
+        if let Some(ConstantInfo::InductiveType { typ, .. }) = all.first().and_then(|t| self.env.get(*t)) {
+            if Self::manifest_arity(typ) < num_params as u64 {
+                return reject("inductive type does not start with its declared parameters");
+            }
+        }
         let mut block_ctors: Vec<u32> = Vec::new();
         for tname in all {
             if let Some(ConstantInfo::InductiveType { ctors, .. }) = self.env.get(*tname) {

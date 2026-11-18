@@ -118,3 +118,26 @@ def tryAdd (label : String) (decl : Declaration) : CoreM Unit := do
 #eval show CoreM Unit from do
   tryAdd "rec-rules-nested-order.reject#0" (.inductDecl [] 1 [{name := `Zq27.L, type := (.forallE `a (.sort (.succ .zero)) (.sort (.succ .zero)) .default), ctors := [{name := `Zq27.L.nil, type := (.forallE `a (.sort (.succ .zero)) (.app (.const `Zq27.L []) (.bvar 0)) .default)}, {name := `Zq27.L.cons, type := (.forallE `a (.sort (.succ .zero)) (.forallE `a (.bvar 0) (.forallE `a (.app (.const `Zq27.L []) (.bvar 1)) (.app (.const `Zq27.L []) (.bvar 2)) .default) .default) .default)}]}] false)
 
+#eval show CoreM Unit from do
+  tryAdd "ind-ctor-type-identity-redex.reject#0" (.inductDecl [] 1 [{name := `Zq28.T, type := (.forallE `a (.sort (.succ .zero)) (.sort (.succ .zero)) .default), ctors := [{name := `Zq28.T.mk, type := (.app (.lam `a (.sort (.succ (.succ .zero))) (.bvar 0) .default) (.forallE `a (.sort (.succ .zero)) (.app (.const `Zq28.T []) (.bvar 0)) .default))}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-first-sig-identity-redex.reject#0" (.inductDecl [] 1 [{name := `Zq29.T, type := (.app (.lam `a (.sort (.succ (.succ (.succ .zero)))) (.bvar 0) .default) (.forallE `a (.sort (.succ .zero)) (.sort (.succ .zero)) .default)), ctors := [{name := `Zq29.T.mk, type := (.forallE `a (.sort (.succ .zero)) (.app (.const `Zq29.T []) (.bvar 0)) .default)}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-first-sig-via-def.reject#0" (.defnDecl {name := `Zq30.BSig, levelParams := [], type := (.sort (.succ (.succ .zero))), value := (.forallE `a (.sort (.succ .zero)) (.sort (.succ .zero)) .default), hints := .abbrev, safety := .safe})
+  tryAdd "ind-first-sig-via-def.reject#1" (.inductDecl [] 1 [{name := `Zq30.Bt, type := (.const `Zq30.BSig []), ctors := [{name := `Zq30.Bt.b, type := (.forallE `a (.sort (.succ .zero)) (.app (.const `Zq30.Bt []) (.bvar 0)) .default)}]}, {name := `Zq30.A, type := (.forallE `a (.sort (.succ .zero)) (.sort (.succ .zero)) .default), ctors := [{name := `Zq30.A.a, type := (.forallE `a (.sort (.succ .zero)) (.forallE `a (.app (.const `Zq30.Bt []) (.bvar 0)) (.app (.const `Zq30.A []) (.bvar 1)) .default) .default)}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-later-sig-via-def.accept#0" (.defnDecl {name := `Zq31.BSig, levelParams := [], type := (.sort (.succ (.succ .zero))), value := (.forallE `a (.sort (.succ .zero)) (.sort (.succ .zero)) .default), hints := .abbrev, safety := .safe})
+  tryAdd "ind-later-sig-via-def.accept#1" (.inductDecl [] 1 [{name := `Zq31.A, type := (.forallE `a (.sort (.succ .zero)) (.sort (.succ .zero)) .default), ctors := [{name := `Zq31.A.a, type := (.forallE `a (.sort (.succ .zero)) (.forallE `a (.app (.const `Zq31.Bt []) (.bvar 0)) (.app (.const `Zq31.A []) (.bvar 1)) .default) .default)}]}, {name := `Zq31.Bt, type := (.const `Zq31.BSig []), ctors := [{name := `Zq31.Bt.b, type := (.forallE `a (.sort (.succ .zero)) (.app (.const `Zq31.Bt []) (.bvar 0)) .default)}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-index-sig-via-def.accept#0" (.inductDecl [] 0 [{name := `Zq32.N, type := (.sort (.succ .zero)), ctors := [{name := `Zq32.N.z, type := (.const `Zq32.N [])}, {name := `Zq32.N.s, type := (.forallE `a (.const `Zq32.N []) (.const `Zq32.N []) .default)}]}] false)
+  tryAdd "ind-index-sig-via-def.accept#1" (.defnDecl {name := `Zq32.G, levelParams := [], type := (.sort (.succ (.succ .zero))), value := (.forallE `a (.const `Zq32.N []) (.sort (.succ .zero)) .default), hints := .abbrev, safety := .safe})
+  tryAdd "ind-index-sig-via-def.accept#2" (.inductDecl [] 1 [{name := `Zq32.T, type := (.forallE `a (.sort (.succ .zero)) (.const `Zq32.G []) .default), ctors := [{name := `Zq32.T.mk, type := (.forallE `a (.sort (.succ .zero)) (.app (.app (.const `Zq32.T []) (.bvar 0)) (.const `Zq32.N.z [])) .default)}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-nested-identity-redex.accept#0" (.inductDecl [] 1 [{name := `Zq33.L, type := (.forallE `a (.sort (.succ .zero)) (.sort (.succ .zero)) .default), ctors := [{name := `Zq33.L.nil, type := (.forallE `a (.sort (.succ .zero)) (.app (.const `Zq33.L []) (.bvar 0)) .default)}, {name := `Zq33.L.cons, type := (.forallE `a (.sort (.succ .zero)) (.forallE `a (.bvar 0) (.forallE `a (.app (.const `Zq33.L []) (.bvar 1)) (.app (.const `Zq33.L []) (.bvar 2)) .default) .default) .default)}]}] false)
+  tryAdd "ind-nested-identity-redex.accept#1" (.inductDecl [] 0 [{name := `Zq33.T, type := (.sort (.succ .zero)), ctors := [{name := `Zq33.T.mk, type := (.forallE `a (.app (.lam `a (.sort (.succ .zero)) (.bvar 0) .default) (.app (.const `Zq33.L []) (.const `Zq33.T []))) (.const `Zq33.T []) .default)}]}] false)
+

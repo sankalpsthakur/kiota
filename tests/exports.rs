@@ -1817,3 +1817,39 @@ fn recursor_rules_are_the_member_constructors_in_order() {
     assert_accept("rec-rules-mutual.accept.ndjson");
     assert_accept("rec-rules-nested.accept.ndjson");
 }
+
+/// `elim_nested_inductive_fn::get_params` reads the parameters off the first
+/// type and off every constructor type without reducing. An identity redex
+/// around either, or a first signature that is a constant unfolding to the
+/// parameter binder, used to be reduced and admitted; in each the occurrence
+/// of `T` is uniform as written, so nothing else stops it.
+#[test]
+fn parameters_are_manifest_binders_of_the_first_type_and_of_constructor_types() {
+    assert_reject_exact(
+        "ind-ctor-type-identity-redex.reject.ndjson",
+        "constructor type does not start with the inductive type's parameters",
+    );
+    for name in [
+        "ind-first-sig-identity-redex.reject.ndjson",
+        "ind-first-sig-via-def.reject.ndjson",
+    ] {
+        assert_reject_exact(name, "inductive type does not start with its declared parameters");
+    }
+    // The other members' parameters, and any member's indices, are reached
+    // modulo `whnf` (`check_inductive_types`): the same mutual pair with the
+    // constant-typed member second, and an index behind a constant.
+    assert_accept("ind-later-sig-via-def.accept.ndjson");
+    assert_accept("ind-index-sig-via-def.accept.ndjson");
+}
+
+/// Nested occurrences are found in the constructor type as written, so
+/// `(fun x => x) (L T)` is one: `T.rec` has a second motive for `L T`.
+#[test]
+fn a_nested_occurrence_under_a_redex_is_still_nested() {
+    let parser = parse_accept("ind-nested-identity-redex.accept.ndjson");
+    let rec = parser.name_by_str["T.rec"];
+    let ConstantInfo::Recursor { num_motives, num_minors, .. } = parser.env.get(rec).unwrap() else {
+        panic!("expected a recursor");
+    };
+    assert_eq!((*num_motives, *num_minors), (2, 3));
+}
