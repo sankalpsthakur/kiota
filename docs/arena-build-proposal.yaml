@@ -5,6 +5,27 @@
 # is a placeholder). The build is profile-guided, trained on the arena's own
 # init export, and falls back to the plain release build, stating why in
 # kiota-build.txt, whenever a step of the profile-guided one fails.
+#
+# Measured on GitHub runners, 2026-11-18 (kiota at e593b79 plus this build
+# line; instructions are cachegrind `I refs`, the same on every run):
+#   - the profile, arena's nix toolchain (rustc 1.95.0, LLVM 21.1.8), run
+#     44364015792: -11.7% instructions on the first fifth of init (inside
+#     the training export), -11.6% summed over twelve fixtures outside it
+#     (-4.7% to -17.0% each);
+#   - the profile, rustup stable 1.100, run 44344781467: -11.0% on all of
+#     init (665.69G -> 592.73G);
+#   - `-C target-cpu`, measured as x86-64-v3 because valgrind cannot run the
+#     runners' native AVX-512: a further 1.1 to 1.4 points of instructions
+#     on both toolchains. In user time native+pgo was not faster than pgo
+#     alone (run 44354976061, init, six interleaved cycles: plain 757.0 s,
+#     pgo 717.3 s, x86-64-v3+pgo 731.1 s, native+pgo 738.8 s in total);
+#   - a larger inline threshold adds nothing on top of the profile.
+# The CPU line can be changed to "-C target-cpu=x86-64-v3" or "" without
+# touching anything else; the arena's lka.py built and ran all three
+# (native under the arena's flake in run 44344781467, the other two under
+# rustup in run 44354976061). The binary built with CPU=native runs only on
+# the machine that built it; the last step of `pgo` runs it on init there
+# and a failure ends in the plain build.
 description: |
   **kiota** — a from-scratch Lean 4 kernel in Rust that re-derives
   K-likeness and ι instead of trusting those export fields. Not a
