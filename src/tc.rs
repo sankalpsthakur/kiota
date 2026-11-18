@@ -1694,10 +1694,12 @@ impl<'e> Checker<'e> {
     /// `KIOTA_SPINE_VERIFY`: `got` (the one-walk term) must be the term the
     /// one-argument rule built. The two are one node while every node
     /// involved comes from one generation of the intern table. Past an
-    /// interner reset (4M nodes, at a declaration boundary) a memo or cache
+    /// interner reset (4M nodes, at a declaration boundary) they can be two
+    /// allocations of one term: the one-argument rule lifts an open argument
+    /// under the binders still ahead and lowers it again, building it anew
+    /// where the walk puts in the argument as it stands, and a memo or cache
     /// entry kept across declarations (`KIOTA_XMEMO`, `KIOTA_XCACHE`) hands
-    /// one side a node from before the reset where the other side rebuilds
-    /// it, so the same term in another allocation is counted, not refused.
+    /// one side a node from before the reset. That is counted, not refused.
     /// A different term panics.
     fn spine_verify_same(&self, got: &Expr, want: &Expr, what: impl FnOnce() -> String) {
         let same_node = Rc::ptr_eq(got, want);

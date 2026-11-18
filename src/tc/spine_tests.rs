@@ -389,6 +389,41 @@ fn verify_takes_the_same_term_in_another_allocation() {
     assert!(is_reject(&on.infer_type(&ctx, &bad)));
 }
 
+/// The same with nothing kept across the reset. The one-argument rule
+/// substitutes `a` under the binder of `b` and then lowers it again, which
+/// builds `a` anew through the intern table; the walk puts in the argument
+/// as it stands. An argument allocated before the reset (every node of the
+/// declaration being checked, when the reset is at its start) then has a
+/// second allocation on the one-argument side.
+#[test]
+fn verify_takes_an_argument_the_one_argument_rule_rebuilt() {
+    let (env, names) = fixture();
+    let (on, off) = pair(&env, &names);
+    // n a : N, b : P a, c : Q a b  ⊢  S.mk n a b c : S n
+    let v = expr::bvar;
+    let mut ctx = Ctx::new();
+    ctx.push(c(N));
+    ctx.push(c(N));
+    ctx.push(expr::app(c(P), v(0)));
+    ctx.push(expr::apps(c(Q), &[v(1), v(0)]));
+    let e = expr::apps(c(S_MK), &[v(3), v(2), v(1), v(0)]);
+    let [_, rebuilt0] = spine_verified();
+    let before = on.infer_type(&ctx, &e).unwrap();
+    assert_eq!(spine_verified()[1], rebuilt0, "one generation: one node per term");
+    // A declaration boundary past the reset threshold: nothing is kept.
+    on.infer_cache.borrow_mut().clear();
+    on.spine_cache.borrow_mut().clear();
+    on.whnf_cache.borrow_mut().clear();
+    expr::clear_subst_memos();
+    assert!(expr::intern_clear_if_large(0));
+    let after = on.infer_type(&ctx, &e).unwrap();
+    assert!(spine_verified()[1] > rebuilt0, "the domain of `c` holds `a` in two allocations");
+    assert!(expr::structurally_equal(&before, &after));
+    assert!(expr::structurally_equal(&after, &off.infer_type(&ctx, &e).unwrap()));
+    let bad = expr::apps(c(S_MK), &[v(3), v(2), v(1), v(1)]);
+    assert!(is_reject(&on.infer_type(&ctx, &bad)));
+}
+
 /// The verifier compares terms, not judgments: a definitionally equal but
 /// different term (`T` for `N → N`) is a divergence.
 #[test]
