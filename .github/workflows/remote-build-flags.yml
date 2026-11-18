@@ -1,0 +1,261 @@
+name: remote-build-flags
+
+# The arena build line. Four builds of the same source: plain release,
+# target-cpu=native, profile-guided (trained on init), and both.
+#   insn:    instruction counts under cachegrind (the board ranks on
+#            instructions; GitHub runners have no PMU for perf)
+#   time:    user time on std, all four on one runner, order rotated
+#   test:    the test suite built with the final flags
+#   e2e-*:   the proposed checkers/kiota.yaml run by the arena's own lka.py
+on:
+  push:
+    branches: ['remote/build-flags-2026*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+  FIXTURE: tests/fixtures/rat-instEncodable-and-rec-theorem-major.accept.ndjson
+  SMALL_TESTS: "tutorial init-prelude *constlevels* *level-imax-leq* *nat-rec-rules* *unit-rec-rule* *orphan-rec* *loose-bvar-value* *app-lam* *shared-subterm* *beta-ladder* *let-ladder*"
+
+jobs:
+  insn:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [plain, native, pgo, nativepgo, stalepgo]
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y zstd time valgrind >/dev/null
+          zstd -d --rm init.ndjson.zst -o init.ndjson
+          scripts/build-flags/build_side.sh "$SIDE" init.ndjson "kiota-$SIDE" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Instructions under cachegrind
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set +e
+          valgrind --version
+          lines=$(wc -l < init.ndjson)
+          head -n $((lines / 5)) init.ndjson > init-fifth.ndjson
+          count() {
+            work=$1; file=$2; limit=$3
+            KIOTA_STATS=1 timeout "$limit" valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null \
+              "./kiota-$SIDE" "$file" >/dev/null 2>"vg-$work.txt"; rc=$?
+            echo "INSN side=$SIDE work=$work rc=$rc Ir=$(grep -E 'I +refs:' "vg-$work.txt" | awk '{print $NF}' | tr -d ,) stats_md5=$(grep -E '^STATS' "vg-$work.txt" | md5sum | cut -c1-12) $(grep -E '^STATS ' "vg-$work.txt" | tail -n 1 | cut -c1-60)"
+            [ "$rc" = 0 ] || tail -n 5 "vg-$work.txt"
+          }
+          count fixture "$FIXTURE" 20m > out-fixture.txt &
+          count init-fifth init-fifth.ndjson 40m > out-fifth.txt &
+          count init init.ndjson 60m > out-init.txt &
+          wait
+          cat out-fixture.txt out-fifth.txt out-init.txt | tee -a "$GITHUB_STEP_SUMMARY"
+
+  time:
+    strategy:
+      fail-fast: false
+      matrix:
+        round: [1, 2, 3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-std
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the four sides
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm init.ndjson.zst -o init.ndjson
+          zstd -d --rm std.ndjson.zst -o std.ndjson
+          for side in plain native pgo nativepgo; do
+            scripts/build-flags/build_side.sh "$side" init.ndjson "kiota-$side"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: User time on std
+        env:
+          ROUND: ${{ matrix.round }}
+        run: |
+          set +e
+          case "$ROUND" in
+            1) order="plain native pgo nativepgo" ;;
+            2) order="nativepgo pgo native plain" ;;
+            *) order="pgo plain nativepgo native" ;;
+          esac
+          for side in $order; do
+            KIOTA_STATS=1 /usr/bin/time -v -o time.txt "./kiota-$side" std.ndjson >/dev/null 2>err.txt; rc=$?
+            echo "TIME corpus=std round=$ROUND side=$side rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') sys=$(grep 'System time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') stats_md5=$(grep -E '^STATS' err.txt | md5sum | cut -c1-12)"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Without the pgo-gen feature a run writes no profile
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-C profile-generate=$PWD/pgo-nofeature" cargo build --release --locked --target-dir t-nofeature 2>&1 | tail -n 1
+          mkdir -p pgo-nofeature
+          before=$(find pgo-nofeature -name '*.profraw' | wc -l)
+          rc=0; t-nofeature/release/kiota "$FIXTURE" >/dev/null 2>&1 || rc=$?
+          after=$(find pgo-nofeature -name '*.profraw' | wc -l)
+          echo "NOFEATURE rc=$rc profraw_before_run=$before profraw_after_run=$after" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Tests under target-cpu=native and profile-use
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm init.ndjson.zst -o init.ndjson
+          scripts/build-flags/build_side.sh nativepgo init.ndjson kiota-nativepgo
+          RUSTFLAGS="-C target-cpu=native -C profile-use=$PWD/pgo-nativepgo.profdata" cargo test --release --locked 2>&1 | grep -E "^test result|^error|FAILED|panicked|Running" | tee test.txt
+          echo "TESTS nativepgo passed=$(grep -c '^test result: ok' test.txt) failed=$(grep -c 'FAILED' test.txt || true)" | tee -a "$GITHUB_STEP_SUMMARY"
+          ! grep -q FAILED test.txt
+      - name: Tests under profile-use alone
+        run: |
+          set -euo pipefail
+          scripts/build-flags/build_side.sh pgo init.ndjson kiota-pgo
+          RUSTFLAGS="-C profile-use=$PWD/pgo-pgo.profdata" cargo test --release --locked 2>&1 | grep -E "^test result|^error|FAILED|panicked|Running" | tee test.txt
+          echo "TESTS pgo passed=$(grep -c '^test result: ok' test.txt) failed=$(grep -c 'FAILED' test.txt || true)" | tee -a "$GITHUB_STEP_SUMMARY"
+          ! grep -q FAILED test.txt
+
+  e2e-nix:
+    # The arena's own environment: its flake, its lka.py, its checker job's
+    # commands. Only the runner differs (no PMU here, so no instruction count).
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Arena checkout with the proposed checker file
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/leanprover/lean-kernel-arena arena
+          git -C arena log -1 --format='ARENA rev=%H date=%cI' | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 scripts/build-flags/arena_checker_yaml.py docs/arena-build-proposal.yaml "$GITHUB_SHA" arena/checkers/kiota.yaml
+          git -C arena diff --stat
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup nix shell
+        working-directory: arena
+        run: |
+          df -h / | tail -n 1
+          echo "TOOLS rustc=$(rustc --version) llvm=$(rustc -vV | grep LLVM) cargo=$(cargo --version) profdata=$(command -v llvm-profdata) $(llvm-profdata --version | grep -i version | head -n 1) sysroot_profdata=$(ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-profdata 2>/dev/null | wc -l) sh=$(readlink -f /bin/sh)" | tee -a "$GITHUB_STEP_SUMMARY"
+          perf stat -e instructions:u -- true 2>&1 | tail -n 8 || echo "PERF unavailable"
+        shell: 'nix develop -c bash -euxo pipefail {0}'
+      - name: Build checker
+        working-directory: arena
+        run: |
+          ./lka.py build-checker kiota
+          cat _build/checkers/kiota/src/kiota-build.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          ls -la _build/checkers/kiota/src/pgo _build/checkers/kiota/src/pgo.profdata _build/checkers/kiota/src/target/release/kiota || true
+          grep -qx 'KIOTA_BUILD=pgo' _build/checkers/kiota/src/kiota-build.txt
+        shell: 'nix develop -c bash -euxo pipefail {0}'
+      - name: Generate tests
+        working-directory: arena
+        run: |
+          set -f
+          ./lka.py build-test $SMALL_TESTS
+        shell: 'nix develop -c bash -euxo pipefail {0}'
+      - name: Run checker on tests
+        working-directory: arena
+        run: |
+          set -f
+          ./lka.py run --checker kiota --test init $SMALL_TESTS | tail -n 40
+        shell: 'nix develop -c bash -euxo pipefail {0}'
+      - name: Results
+        run: python3 scripts/build-flags/check_arena_results.py arena 20 | tee -a "$GITHUB_STEP_SUMMARY"
+
+  e2e-uv:
+    # Outside the arena's flake, through `uv run lka.py`.
+    #   fallback: no Lean toolchain at build time, so there is nothing to
+    #             train on and the block must end in the plain build
+    #   sysroot:  rustup's llvm-tools-preview, llvm-profdata found in the sysroot
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fallback, sysroot]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: ${{ matrix.variant == 'sysroot' && 'llvm-tools-preview' || '' }}
+      - name: Arena checkout with the proposed checker file
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y time >/dev/null
+          pipx install uv >/dev/null
+          git clone --depth 1 https://github.com/leanprover/lean-kernel-arena arena
+          python3 scripts/build-flags/arena_checker_yaml.py docs/arena-build-proposal.yaml "$GITHUB_SHA" arena/checkers/kiota.yaml
+          echo "TOOLS variant=${{ matrix.variant }} rustc=$(rustc --version) profdata_on_path=$(command -v llvm-profdata || echo none) sysroot_profdata=$(ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-profdata 2>/dev/null | wc -l) sh=$(readlink -f /bin/sh)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Lean toolchain manager (before the build)
+        if: matrix.variant == 'sysroot'
+        run: |
+          curl -sSf https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Build checker
+        working-directory: arena
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          uv run lka.py build-checker kiota
+          cat _build/checkers/kiota/src/kiota-build.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$VARIANT" = sysroot ]; then
+            grep -qx 'KIOTA_BUILD=pgo' _build/checkers/kiota/src/kiota-build.txt
+          else
+            grep -q '^KIOTA_BUILD=plain reason=' _build/checkers/kiota/src/kiota-build.txt
+          fi
+      - name: Lean toolchain manager (after the build)
+        if: matrix.variant == 'fallback'
+        run: |
+          curl -sSf https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Generate tests and run
+        working-directory: arena
+        run: |
+          set -euo pipefail
+          set -f
+          uv run lka.py build-test $SMALL_TESTS
+          uv run lka.py run --checker kiota --test $SMALL_TESTS | tail -n 40
+      - name: Results
+        run: python3 scripts/build-flags/check_arena_results.py arena 20 | tee -a "$GITHUB_STEP_SUMMARY"
