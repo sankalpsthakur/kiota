@@ -14,6 +14,12 @@ const T: u32 = 7;
 const F: u32 = 8;
 const Q: u32 = 9;
 const H: u32 = 10;
+const S: u32 = 11;
+const S_MK: u32 = 12;
+const S_Z: u32 = 13;
+const W: u32 = 14;
+const W_MK: u32 = 15;
+const W_Z: u32 = 16;
 
 fn c(i: u32) -> Expr {
     expr::const_(i, vec![])
@@ -32,6 +38,8 @@ fn lam(d: Expr, r: Expr) -> Expr {
 /// g : (n : N) → P n → N → N
 /// T : Type := N → N              f : N → T
 /// Q : (n : N) → P n → Prop       h : (n : N) → (p : P n) → Q n p
+/// structure S (n : N) : Type where  a : N   b : P a   c : Q a b     sz : S z
+/// structure W (n : N) : Prop where  a : N   b : P n                 wz : W z
 /// ```
 fn fixture() -> (Environment, Vec<Rc<String>>) {
     let mut env = Environment::default();
@@ -60,7 +68,69 @@ fn fixture() -> (Environment, Vec<Rc<String>>) {
         hints: ReducibilityHints::Regular(1),
         is_unsafe: false,
     });
-    let names = ["N", "z", "o", "P", "pz", "po", "g", "T", "f", "Q", "h"]
+    // S.mk : (n : N) → (a : N) → (b : P a) → (c : Q a b) → S n
+    env.insert(S, ConstantInfo::InductiveType {
+        level_params: vec![],
+        typ: pi(c(N), expr::sort(level::succ(level::zero()))),
+        num_params: 1,
+        num_indices: 0,
+        all: vec![S],
+        ctors: vec![S_MK],
+        is_rec: false,
+        is_unsafe: false,
+    });
+    env.insert(S_MK, ConstantInfo::Constructor {
+        level_params: vec![],
+        typ: pi(
+            c(N),
+            pi(
+                c(N),
+                pi(
+                    expr::app(c(P), v(0)),
+                    pi(expr::apps(c(Q), &[v(1), v(0)]), expr::app(c(S), v(3))),
+                ),
+            ),
+        ),
+        induct: S,
+        cidx: 0,
+        num_params: 1,
+        num_fields: 3,
+        is_unsafe: false,
+    });
+    env.insert(S_Z, ConstantInfo::Axiom {
+        level_params: vec![],
+        typ: expr::app(c(S), c(Z)),
+        is_unsafe: false,
+    });
+    // W.mk : (n : N) → (a : N) → (b : P n) → W n, a Prop with a data field.
+    env.insert(W, ConstantInfo::InductiveType {
+        level_params: vec![],
+        typ: pi(c(N), expr::sort(level::zero())),
+        num_params: 1,
+        num_indices: 0,
+        all: vec![W],
+        ctors: vec![W_MK],
+        is_rec: false,
+        is_unsafe: false,
+    });
+    env.insert(W_MK, ConstantInfo::Constructor {
+        level_params: vec![],
+        typ: pi(c(N), pi(c(N), pi(expr::app(c(P), v(1)), expr::app(c(W), v(2))))),
+        induct: W,
+        cidx: 0,
+        num_params: 1,
+        num_fields: 2,
+        is_unsafe: false,
+    });
+    env.insert(W_Z, ConstantInfo::Axiom {
+        level_params: vec![],
+        typ: expr::app(c(W), c(Z)),
+        is_unsafe: false,
+    });
+    let names = [
+        "N", "z", "o", "P", "pz", "po", "g", "T", "f", "Q", "h", "S", "S.mk", "sz", "W", "W.mk",
+        "wz",
+    ]
         .iter()
         .map(|name| Rc::new((*name).to_owned()))
         .collect();
@@ -236,4 +306,55 @@ fn spine_states_die_with_the_declaration() {
     // Checking any declaration starts from empty per-declaration caches.
     on.check_decl(PZ, "axiom").unwrap();
     assert!(!on.spine_cache.borrow().contains_key(&key));
+}
+
+#[test]
+fn projection_field_types_are_the_one_argument_rules_nodes() {
+    let (env, names) = fixture();
+    let (on, off) = pair(&env, &names);
+    let ctx = Ctx::new();
+    let v = expr::bvar;
+    let sz = c(S_Z);
+    let fld = |i, e: &Expr| expr::proj(S, i, e.clone());
+    for i in 0..3 {
+        let a = on.infer_type(&ctx, &fld(i, &sz)).unwrap();
+        let b = off.infer_type(&ctx, &fld(i, &sz)).unwrap();
+        assert!(Rc::ptr_eq(&a, &b), "field {i}: {} vs {}", on.pp(&a), on.pp(&b));
+    }
+    // Each field's type mentions the earlier fields as projections of `sz`.
+    let t1 = on.infer_type(&ctx, &fld(1, &sz)).unwrap();
+    assert!(Rc::ptr_eq(&t1, &expr::app(c(P), fld(0, &sz))));
+    let t2 = on.infer_type(&ctx, &fld(2, &sz)).unwrap();
+    assert!(Rc::ptr_eq(&t2, &expr::apps(c(Q), &[fld(0, &sz), fld(1, &sz)])));
+    // Under binders, with an open parameter: fun (n : N) (x : S n) => x.2
+    let open = lam(c(N), lam(expr::app(c(S), v(0)), fld(2, &v(0))));
+    let a = on.infer_type(&ctx, &open).unwrap();
+    let b = off.infer_type(&ctx, &open).unwrap();
+    assert!(Rc::ptr_eq(&a, &b), "{} vs {}", on.pp(&a), on.pp(&b));
+    // Out of range, and a projection used at the wrong type, still reject.
+    assert!(is_reject(&on.infer_type(&ctx, &fld(3, &sz))));
+    assert!(is_reject(&off.infer_type(&ctx, &fld(3, &sz))));
+    let misuse = expr::apps(c(G), &[c(Z), fld(1, &sz), c(O)]);
+    assert!(is_reject(&off.infer_type(&ctx, &misuse)));
+    assert!(is_reject(&on.infer_type(&ctx, &misuse)));
+    // Well typed: `sz.1 : P sz.0` is what `g sz.0` expects next.
+    let fine = expr::apps(c(G), &[fld(0, &sz), fld(1, &sz), c(O)]);
+    assert!(Rc::ptr_eq(&on.infer_type(&ctx, &fine).unwrap(), &off.infer_type(&ctx, &fine).unwrap()));
+}
+
+#[test]
+fn projection_out_of_a_prop_structure_keeps_its_restrictions() {
+    let (env, names) = fixture();
+    let (on, off) = pair(&env, &names);
+    let ctx = Ctx::new();
+    let wz = c(W_Z);
+    // The data field of a proof may not be projected; the proof field may.
+    let data = expr::proj(W, 0, wz.clone());
+    let proof = expr::proj(W, 1, wz);
+    assert!(is_reject(&off.infer_type(&ctx, &data)));
+    assert!(is_reject(&on.infer_type(&ctx, &data)));
+    let a = on.infer_type(&ctx, &proof).unwrap();
+    let b = off.infer_type(&ctx, &proof).unwrap();
+    assert!(Rc::ptr_eq(&a, &b));
+    assert!(Rc::ptr_eq(&a, &expr::app(c(P), c(Z))));
 }

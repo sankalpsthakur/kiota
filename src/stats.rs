@@ -272,6 +272,7 @@ pub fn decl_start(watermark: usize) {
     }
     WATERMARK.with(|c| c.set(watermark));
     SEEN_KEY.with(|m| m.borrow_mut().clear());
+    SPINE_SUBST_SEEN.with(|m| m.borrow_mut().clear());
     SITE.with(|c| c.set(site::CHECK_OTHER));
 }
 
@@ -340,6 +341,26 @@ pub fn whnf_miss(identity: usize, ctx_key: u64, full_ctx_id: u64, trivial: bool)
     }
 }
 
+thread_local! {
+    static SPINE_SUBST_SEEN: std::cell::RefCell<rustc_hash::FxHashSet<(usize, Vec<usize>)>> = std::cell::RefCell::new(Default::default());
+    static SPINE_SUBST: [Cell<u64>; 4] = const { [const { Cell::new(0) }; 4] };
+}
+
+/// One substitution of pending spine arguments into `term`. A repeat is the
+/// same term with the same arguments again in this declaration: a memo on
+/// that pair would have answered it. `nodes`: substitution nodes it built.
+pub fn spine_subst(term: usize, args: Vec<usize>, nodes: u64) {
+    if !enabled() || nodes == 0 {
+        return;
+    }
+    let fresh = SPINE_SUBST_SEEN.with(|m| m.borrow_mut().insert((term, args)));
+    let base = if fresh { 0 } else { 2 };
+    SPINE_SUBST.with(|t| {
+        t[base].set(t[base].get() + 1);
+        t[base + 1].set(t[base + 1].get() + nodes);
+    });
+}
+
 bump!(core_call, CORE_CALLS);
 bump!(core_hit, CORE_HITS);
 
@@ -385,6 +406,12 @@ fn report_sites() {
         g(&INFER_FALLBACK),
         g(&INFER_REKEY),
         g(&INFER_REKEY_CHECK),
+    );
+    let sp: Vec<u64> = (0..4).map(|j| SPINE_SUBST.with(|t| t[j].get())).collect();
+    eprintln!(
+        "STATS8 spine_subst first(calls,nodes)={:?} repeat_same_term_and_args(calls,nodes)={:?}",
+        &sp[0..2],
+        &sp[2..4],
     );
     let w: Vec<u64> = (0..4).map(|j| WHNF_MISS.with(|t| t[j].get())).collect();
     eprintln!(

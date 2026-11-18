@@ -1622,19 +1622,13 @@ impl<'e> Checker<'e> {
                 CORE_ABORTED.with(Cell::get) || WHNF_DEPTH.with(Cell::get) >= CONV_DEPTH;
             let dom = match &**ty {
                 ExprData::Pi(_, dom, body) if !must_reduce => {
-                    let d = {
-                        let _g = crate::stats::at(S::INFER_APP);
-                        expr::instantiate_rev(dom, &args[j..i])
-                    };
+                    let d = Self::spine_subst(S::INFER_APP, dom, &args[j..i]);
                     let body = body.clone();
                     ty = body;
                     d
                 }
                 _ => {
-                    let flushed = {
-                        let _g = crate::stats::at(S::INFER_APP);
-                        expr::instantiate_rev(&ty, &args[j..i])
-                    };
+                    let flushed = Self::spine_subst(S::INFER_APP, &ty, &args[j..i]);
                     let (_, dom, body) = self.ensure_pi(ctx, &flushed)?;
                     j = i;
                     ty = body;
@@ -1675,6 +1669,9 @@ impl<'e> Checker<'e> {
                 });
             }
             let mut cache = self.spine_cache.borrow_mut();
+            if expr::reclamation_enabled() && cache.len() >= 50_000 {
+                cache.clear();
+            }
             match cache.get(&key) {
                 // An infer-only walk never replaces a checked state.
                 Some(old) if old.checked && !st.checked => {}
@@ -1683,10 +1680,7 @@ impl<'e> Checker<'e> {
                 }
             }
         }
-        let result = {
-            let _g = crate::stats::at(S::INFER_APP);
-            expr::instantiate_rev(&ty, &args[j..i])
-        };
+        let result = Self::spine_subst(S::INFER_APP, &ty, &args[j..i]);
         if verify {
             let (reference, doms) = self.infer_app_one_at_a_time(ctx, e)?;
             assert!(
@@ -1709,6 +1703,22 @@ impl<'e> Checker<'e> {
             }
         }
         Ok(result)
+    }
+
+    /// `expr::instantiate_rev` for a telescope walk, charged to `site`.
+    fn spine_subst(site: u8, e: &Expr, pending: &[Expr]) -> Expr {
+        let _g = crate::stats::at(site);
+        if !crate::stats::enabled() {
+            return expr::instantiate_rev(e, pending);
+        }
+        let before = crate::stats::inst_nodes();
+        let r = expr::instantiate_rev(e, pending);
+        crate::stats::spine_subst(
+            expr::identity(e),
+            pending.iter().map(expr::identity).collect(),
+            crate::stats::inst_nodes() - before,
+        );
+        r
     }
 
     /// The one-argument rule's result type and domains for a spine,
@@ -1803,27 +1813,34 @@ impl<'e> Checker<'e> {
             return reject("projection index out of range");
         }
         let subst = level::subst_map(&ctor_lp, &us);
-        let mut ct = lvl_at(S::INFER_PROJ, &ctor_typ, &subst);
+        let ct = lvl_at(S::INFER_PROJ, &ctor_typ, &subst);
         // instantiate params
         if (args.len() as u32) < num_params {
             return reject("projection: too few params");
         }
-        for p in args.iter().take(num_params as usize) {
-            let (_, _dom, body) = self.ensure_pi(ctx, &ct)?;
-            ct = inst1_at(S::INFER_PROJ, &body, p);
-        }
-        // Every field's own type, substituting each earlier field with
-        // its own `proj sname i v` term as we walk the telescope — needed
-        // for *every* field (not only up to `idx`) to check the
-        // "dependent data field" rule below across the whole structure.
-        let mut doms: Vec<Expr> = Vec::with_capacity(num_fields as usize);
-        let mut cur = ct;
-        for i in 0..num_fields {
-            let (_, dom, body) = self.ensure_pi(ctx, &cur)?;
-            doms.push(dom.clone());
-            let proj_i = expr::proj(sname, i, v.clone());
-            cur = inst1_at(S::INFER_PROJ, &body, &proj_i);
-        }
+        let params = &args[..num_params as usize];
+        let spine =
+            self.spine.get() && !nbe::nbe_enabled() && !FORCE_EAGER_DEFEQ.with(Cell::get);
+        let doms = if spine {
+            let doms = self.proj_field_doms_one_walk(ctx, &ct, params, sname, num_fields, v)?;
+            if self.spine_verify.get() {
+                let reference =
+                    self.proj_field_doms_one_at_a_time(ctx, &ct, params, sname, num_fields, v)?;
+                assert_eq!(doms.len(), reference.len());
+                for (k, (d, r)) in doms.iter().zip(&reference).enumerate() {
+                    assert!(
+                        Rc::ptr_eq(d, r),
+                        "one-walk projection gave field {k} of {} the type {} instead of {}",
+                        self.name_str(sname),
+                        self.pp_budget(d, 40),
+                        self.pp_budget(r, 40),
+                    );
+                }
+            }
+            doms
+        } else {
+            self.proj_field_doms_one_at_a_time(ctx, &ct, params, sname, num_fields, v)?
+        };
         if self.is_prop_checked(ctx, &vtw)? {
             // Lean's kernel rejects a projection out of a Prop-valued,
             // single-constructor structure unless (a) the projected
@@ -1872,6 +1889,89 @@ impl<'e> Checker<'e> {
     /// built by `infer_proj`'s own substitution loop clones the same
     /// `Rc`). Used to find which earlier fields a later field's type
     /// actually mentions.
+    /// The type of every field of `v : S params`, from the constructor type
+    /// `ct`: each earlier field is replaced by its own `proj S i v` term as
+    /// the telescope is walked. All fields, not only up to the projected
+    /// one: the "dependent data field" rule reads the whole structure.
+    fn proj_field_doms_one_at_a_time(
+        &self,
+        ctx: &Ctx,
+        ct: &Expr,
+        params: &[Expr],
+        sname: u32,
+        num_fields: u32,
+        v: &Expr,
+    ) -> R<Vec<Expr>> {
+        let mut ct = ct.clone();
+        for p in params {
+            let (_, _dom, body) = self.ensure_pi(ctx, &ct)?;
+            ct = inst1_at(S::INFER_PROJ, &body, p);
+        }
+        let mut doms: Vec<Expr> = Vec::with_capacity(num_fields as usize);
+        let mut cur = ct;
+        for i in 0..num_fields {
+            let (_, dom, body) = self.ensure_pi(ctx, &cur)?;
+            doms.push(dom.clone());
+            let proj_i = expr::proj(sname, i, v.clone());
+            cur = inst1_at(S::INFER_PROJ, &body, &proj_i);
+        }
+        Ok(doms)
+    }
+
+    /// `proj_field_doms_one_at_a_time` with the parameters and the earlier
+    /// fields' projections left pending, as `infer_app_spine` leaves a
+    /// spine's arguments (`KIOTA_SPINE`): each field type is instantiated
+    /// once, instead of the rest of the constructor telescope being rebuilt
+    /// per parameter and per field. The same field types, node for node.
+    fn proj_field_doms_one_walk(
+        &self,
+        ctx: &Ctx,
+        ct: &Expr,
+        params: &[Expr],
+        sname: u32,
+        num_fields: u32,
+        v: &Expr,
+    ) -> R<Vec<Expr>> {
+        let total = params.len() + num_fields as usize;
+        let mut pend: Vec<Expr> = Vec::with_capacity(total);
+        pend.extend_from_slice(params);
+        let mut doms: Vec<Expr> = Vec::with_capacity(num_fields as usize);
+        let mut ty = ct.clone();
+        // `pend[j..k]` are pending: `ty` sits under that many binders.
+        let mut j = 0usize;
+        for k in 0..total {
+            // See `infer_app_spine`: where the skipped `whnf` of a syntactic
+            // Pi would not be the identity, reduce as the old rule does.
+            let must_reduce =
+                CORE_ABORTED.with(Cell::get) || WHNF_DEPTH.with(Cell::get) >= CONV_DEPTH;
+            let field = k >= params.len();
+            let dom = match &**ty {
+                ExprData::Pi(_, dom, body) if !must_reduce => {
+                    let d = field.then(|| Self::spine_subst(S::INFER_PROJ, dom, &pend[j..k]));
+                    let body = body.clone();
+                    ty = body;
+                    d
+                }
+                _ => {
+                    let flushed = Self::spine_subst(S::INFER_PROJ, &ty, &pend[j..k]);
+                    let (_, dom, body) = self.ensure_pi(ctx, &flushed)?;
+                    j = k;
+                    ty = body;
+                    Some(dom)
+                }
+            };
+            if field {
+                doms.push(dom.expect("a field's domain"));
+                if k + 1 < total {
+                    let i = (k - params.len()) as u32;
+                    let _g = crate::stats::at(S::INFER_PROJ);
+                    pend.push(expr::proj(sname, i, v.clone()));
+                }
+            }
+        }
+        Ok(doms)
+    }
+
     fn collect_proj_indices(e: &Expr, sname: u32, v: &Expr, out: &mut Vec<u32>) {
         match &***e {
             ExprData::Proj(s, i, inner) if *s == sname && Rc::ptr_eq(inner, v) => out.push(*i),
