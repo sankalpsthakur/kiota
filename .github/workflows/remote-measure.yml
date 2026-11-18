@@ -1,0 +1,80 @@
+name: remote-measure
+
+# 1. counters: cache hit rates and cross-declaration repeats on init and std.
+# 2. build: plain release against target-cpu=native + PGO trained on init,
+#    user time on std, two rounds, same runner.
+on:
+  push:
+    branches: ['remote/measure-2026*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+
+jobs:
+  counters:
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [init, std]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Counters
+        env:
+          C: ${{ matrix.corpus }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          KIOTA_STATS=1 /usr/bin/time -v -o time.txt ./target/release/kiota $C.ndjson >/dev/null 2>err.txt; echo "rc=$?"
+          { echo "COUNTERS corpus=$C"; grep -E "^(STATS|STATS2|LIFETIMES|PROOFSTORE)" err.txt | tail -6; grep -E "Elapsed|User time|Maximum resident" time.txt; } | tee -a "$GITHUB_STEP_SUMMARY"
+  pgo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-std
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build plain, native, native+PGO
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm init.ndjson.zst -o init.ndjson
+          zstd -d --rm std.ndjson.zst -o std.ndjson
+          cargo build --release --locked && cp target/release/kiota kiota-plain
+          RUSTFLAGS="-C target-cpu=native" CARGO_TARGET_DIR=t-native cargo build --release --locked && cp t-native/release/kiota kiota-native
+          RUSTFLAGS="-C target-cpu=native -C profile-generate=$PWD/pgo" CARGO_TARGET_DIR=t-gen cargo build --release --locked
+          t-gen/release/kiota init.ndjson >/dev/null 2>&1 || true
+          PROFDATA=$(find "$(rustc --print sysroot)" -name llvm-profdata | head -1)
+          "$PROFDATA" merge -o pgo/merged.profdata pgo
+          RUSTFLAGS="-C target-cpu=native -C profile-use=$PWD/pgo/merged.profdata" CARGO_TARGET_DIR=t-pgo cargo build --release --locked && cp t-pgo/release/kiota kiota-pgo
+      - name: Time on std and init
+        run: |
+          set +e
+          for round in 1 2; do for c in std init; do for side in plain native pgo; do
+            /usr/bin/time -v -o time.txt ./kiota-$side $c.ndjson >/dev/null 2>err.txt; rc=$?
+            echo "BUILD corpus=$c round=$round side=$side rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') wall=$(grep Elapsed time.txt | awk '{print $NF}')"
+          done; done; done | tee -a "$GITHUB_STEP_SUMMARY"

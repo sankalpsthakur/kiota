@@ -1287,6 +1287,7 @@ impl<'e> Checker<'e> {
                 return Ok(t.clone());
             }
         }
+        crate::stats::miss(0, key.0, key.1, 0);
         let t = self.infer_type_uncached(ctx, e)?;
         let checked = !self.infer_only.get();
         {
@@ -2329,8 +2330,10 @@ impl<'e> Checker<'e> {
         // the normal one so a rescue still benefits from memoization.
         let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
         if let Some(r) = self.whnf_cache_get(force_eager, &k) {
+            crate::stats::whnf_hit();
             return Ok(r);
         }
+        crate::stats::miss(1, k.0, k.1, 0);
         let mut cur = e.clone();
         let r = loop {
             let core = self.whnf_core(ctx, &cur)?;
@@ -3584,8 +3587,10 @@ impl<'e> Checker<'e> {
         // non-forced lookup.
         let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
         if let Some(r) = self.defeq_cache_get(force_eager, &key) {
+            crate::stats::defeq_hit();
             return Ok(r);
         }
+        crate::stats::miss(2, key.0, key.1, key.2);
         // Proof irrelevance before app congruence. Typeclass instances are
         // proofs of a Prop (the class). Pairwise of `LawfulVecOperator.mk`
         // (7 args, nested ~15 deep) is a tree walk; PI compares the inferred

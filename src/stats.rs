@@ -12,6 +12,12 @@ thread_local! {
     static SHIFT_NODES: Cell<u64> = const { Cell::new(0) };
     static CTX_CLONES: Cell<u64> = const { Cell::new(0) };
     static INFER_HITS: Cell<u64> = const { Cell::new(0) };
+    static WHNF_HITS: Cell<u64> = const { Cell::new(0) };
+    static DEFEQ_HITS: Cell<u64> = const { Cell::new(0) };
+    static CLOSED_MISS: [Cell<u64>; 3] = const { [Cell::new(0), Cell::new(0), Cell::new(0)] };
+    static CLOSED_XHIT: [Cell<u64>; 3] = const { [Cell::new(0), Cell::new(0), Cell::new(0)] };
+    static OPEN_MISS: [Cell<u64>; 3] = const { [Cell::new(0), Cell::new(0), Cell::new(0)] };
+    static XSEEN: std::cell::RefCell<rustc_hash::FxHashSet<(u8, usize, usize)>> = std::cell::RefCell::new(Default::default());
 }
 
 pub fn enabled() -> bool {
@@ -39,6 +45,27 @@ bump!(inst_node, INST_NODES);
 bump!(shift_node, SHIFT_NODES);
 bump!(ctx_clone, CTX_CLONES);
 bump!(infer_hit, INFER_HITS);
+bump!(whnf_hit, WHNF_HITS);
+bump!(defeq_hit, DEFEQ_HITS);
+
+/// A per-declaration cache miss. Closed keys (context key 0) are looked up
+/// in a set that outlives the declaration: a repeat there is work a cache
+/// kept across declarations would have saved. kind: 0 infer, 1 whnf, 2 defeq.
+pub fn miss(kind: u8, ctx_key: u64, a: usize, b: usize) {
+    if !enabled() {
+        return;
+    }
+    if ctx_key != 0 {
+        OPEN_MISS.with(|c| c[kind as usize].set(c[kind as usize].get() + 1));
+        return;
+    }
+    let fresh = XSEEN.with(|s| s.borrow_mut().insert((kind, a, b)));
+    if fresh {
+        CLOSED_MISS.with(|c| c[kind as usize].set(c[kind as usize].get() + 1));
+    } else {
+        CLOSED_XHIT.with(|c| c[kind as usize].set(c[kind as usize].get() + 1));
+    }
+}
 
 pub fn inst_nodes() -> u64 {
     INST_NODES.with(|c| c.get())
@@ -61,6 +88,11 @@ pub fn report() {
         return;
     }
     let g = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|x| x.get());
+    let arr = |c: &'static std::thread::LocalKey<[Cell<u64>; 3]>| c.with(|x| [x[0].get(), x[1].get(), x[2].get()]);
+    eprintln!(
+        "STATS2 whnf_hit={} defeq_hit={} closed_first_miss(infer,whnf,defeq)={:?} closed_cross_decl_repeat={:?} open_miss={:?}",
+        g(&WHNF_HITS), g(&DEFEQ_HITS), arr(&CLOSED_MISS), arr(&CLOSED_XHIT), arr(&OPEN_MISS),
+    );
     eprintln!(
         "STATS infer={} infer_hit={} whnf={} defeq={} inst_nodes={} shift_nodes={} ctx_clones={} intern_calls={} live_nodes={}",
         g(&INFER_CALLS),
