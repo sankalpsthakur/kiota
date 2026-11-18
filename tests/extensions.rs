@@ -64,6 +64,14 @@ fn forged_nat_operations_do_not_get_their_native_rules() {
         ("forged-nat-land.reject.ndjson", ExtOp::NatLand),
         ("forged-nat-lor.reject.ndjson", ExtOp::NatLor),
         ("forged-nat-xor.reject.ndjson", ExtOp::NatXor),
+        ("forged-nat-div.reject.ndjson", ExtOp::NatDiv),
+        ("forged-nat-mod.reject.ndjson", ExtOp::NatMod),
+        ("forged-nat-gcd.reject.ndjson", ExtOp::NatGcd),
+        ("forged-nat-modcore.reject.ndjson", ExtOp::NatModCore),
+        // Its own equations hold over the forged `Nat.div` they mention.
+        ("forged-nat-shiftright.reject.ndjson", ExtOp::NatShiftRight),
+        // `Nat.bitwise and` over a `Nat.bitwise` that returns its first number.
+        ("forged-nat-bitwise.reject.ndjson", ExtOp::NatLand),
     ] {
         let parser = reject_at_the_theorem(file);
         assert!(parser.env.ext.id_of(op).is_none(), "{file}");
@@ -84,7 +92,6 @@ fn an_operation_is_only_as_good_as_the_one_it_is_stated_with() {
 #[test]
 fn a_bitwise_operation_with_the_wrong_truth_table_gets_no_rule() {
     let parser = reject_at_the_theorem("forged-nat-lor-wrong-table.reject.ndjson");
-    assert!(parser.env.ext.id_of(ExtOp::NatLand).is_some(), "`Nat.bitwise and` is `Nat.land`");
     assert!(parser.env.ext.id_of(ExtOp::NatLor).is_none());
 }
 
@@ -200,23 +207,16 @@ fn every_extension_the_rat_fixture_declares_validates() {
     assert!(ext.id_of(ExtOp::NatAdd).is_some() && ext.id_of(ExtOp::Decide).is_some());
 }
 
-/// Known holes, kept honest. `Nat.div`, `Nat.mod`, `Nat.modCore`, `Nat.gcd`
-/// and `Nat.bitwise` are validated for kind and type only (and
-/// `Nat.shiftRight` is stated with `Nat.div`), so a forged one still gets the
-/// native rule and these false theorems are accepted, as Lean's own kernel
-/// accepts them. When one of these recursions is validated its file becomes
-/// a `.reject` fixture and leaves this list.
+/// The hole that remains, kept honest. `Nat.div`, `Nat.mod`, `Nat.modCore`,
+/// `Nat.gcd` and `Nat.bitwise` are validated for kind, type and their values
+/// on small numerals, not for their recursion. `ForgedLarge.lean` declares a
+/// `Nat.div` that is division up to a dividend of 16 and `0` beyond: it gets
+/// the native rule, and `Nat.div 1000 10 = 100` is accepted, as Lean's own
+/// kernel accepts it. When the recursion is validated this file becomes a
+/// `.reject` fixture.
 #[test]
-fn the_recursions_trusted_by_name_are_still_holes() {
-    for file in [
-        "forged-nat-div.hole.ndjson",
-        "forged-nat-mod.hole.ndjson",
-        "forged-nat-modcore.hole.ndjson",
-        "forged-nat-gcd.hole.ndjson",
-        "forged-nat-shiftright.hole.ndjson",
-        "forged-nat-bitwise.hole.ndjson",
-    ] {
-        let (_, verdict) = check(file);
-        assert!(verdict.is_ok(), "{file} is no longer accepted: move it to the reject fixtures ({verdict:?})");
-    }
+fn a_division_that_is_wrong_only_on_large_numbers_is_still_a_hole() {
+    let (parser, verdict) = check("forged-nat-div-beyond-the-grid.hole.ndjson");
+    assert!(verdict.is_ok(), "no longer accepted: make it a reject fixture ({verdict:?})");
+    assert!(parser.env.ext.id_of(ExtOp::NatDiv).is_some());
 }

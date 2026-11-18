@@ -32,11 +32,16 @@
 //!   the validated `Decidable`, on variables.
 //! * `Nat.land`, `Nat.lor`, `Nat.xor`: `Nat.bitwise f` for an `f` with the
 //!   right truth table.
-//! * `Nat.div`, `Nat.mod`, `Nat.modCore`, `Nat.gcd`, `Nat.bitwise`: a
-//!   definition of the right type and no more. Their recursions are by fuel
-//!   or well-founded, and the equations that pin them down (lean4lean's
-//!   `checkNatFuelRec`, `unfoldNatWellFounded`) are not ported. For these the
-//!   checker trusts the name exactly as Lean's kernel does.
+//! * `Nat.div`, `Nat.mod`, `Nat.modCore`, `Nat.gcd`, and `Nat.bitwise`
+//!   through the three operations above: a definition of the right type
+//!   that reduces, by itself, to what the native rule computes on a grid of
+//!   numerals up to 13. That turns away a definition that is plainly
+//!   something else; it is not a proof. Their recursions are by fuel or
+//!   well-founded, and the equations that pin them down (lean4lean's
+//!   `checkNatFuelRec`, `unfoldNatWellFounded`) are not ported, so a
+//!   definition that is right on the grid and wrong beyond it still gets the
+//!   rule (`forged-nat-div-beyond-the-grid.hole.ndjson`). Lean's kernel
+//!   trusts all of these names outright.
 //!
 //! The equations are checked with the extension under validation still off,
 //! so they are statements about the declared definition and nothing else.
@@ -64,10 +69,10 @@ thread_local! {
 }
 
 /// A native rule fired; `op` is `None` for `Nat.succ`. Counted only under
-/// `KIOTA_EXT_TRACE`.
+/// `KIOTA_EXT_TRACE`, and not while a constant is being validated.
 #[inline]
 pub(super) fn fired(op: Option<ExtOp>) {
-    if trace_enabled() {
+    if trace_enabled() && !crate::stats::paused() {
         let i = match op {
             Some(op) => ExtOp::ALL.iter().position(|o| *o == op).unwrap_or(ExtOp::ALL.len()),
             None => ExtOp::ALL.len(),
@@ -542,15 +547,45 @@ impl Validator<'_> {
                     let (p, q) = (i & 2 != 0, i & 1 != 0);
                     self.equation("truth table", &expr::apps(g.clone(), &[b(p), b(q)]), &b(*want))?;
                 }
-                Ok(())
+                // `Nat.bitwise` itself is only known by its type; this is
+                // what ties it to the native rule.
+                let native: fn(&BigUint, &BigUint) -> BigUint = match op {
+                    ExtOp::NatLand => nat::land_values,
+                    ExtOp::NatLor => nat::lor_values,
+                    _ => nat::xor_values,
+                };
+                self.agrees_on_small_numerals(f, native)
             }
-            // The name is trusted, as in Lean's kernel: a definition of the
-            // right type and nothing more.
+            // The name is trusted much as in Lean's kernel: a definition of
+            // the right type that computes what the native rule does at a
+            // grid of small numerals. That is evidence, not a proof.
             ExtOp::NatDiv | ExtOp::NatMod | ExtOp::NatModCore | ExtOp::NatGcd => {
-                self.monomorphic_def(f, &nat2nat)
+                self.monomorphic_def(f, &nat2nat)?;
+                let native: fn(&BigUint, &BigUint) -> BigUint = match op {
+                    ExtOp::NatDiv => nat::div_values,
+                    ExtOp::NatGcd => num_bigint_gcd,
+                    _ => nat::mod_values,
+                };
+                self.agrees_on_small_numerals(f, native)
             }
             ExtOp::Ite | ExtOp::Dite | ExtOp::Decide => unreachable!(),
         }
+    }
+
+    /// `f a b` reduces, by its own definition, to what the native rule
+    /// computes, for every pair from a grid of small numbers: zero, one, a
+    /// divisor and a multiple, coprime pairs, both orders.
+    fn agrees_on_small_numerals(&self, f: u32, native: fn(&BigUint, &BigUint) -> BigUint) -> V {
+        const GRID: [u32; 6] = [0, 1, 2, 3, 6, 13];
+        for a in GRID {
+            for b in GRID {
+                let (a, b) = (BigUint::from(a), BigUint::from(b));
+                let lhs = expr::apps(c(f), &[expr::lit_nat(a.clone()), expr::lit_nat(b.clone())]);
+                let rhs = expr::lit_nat(native(&a, &b));
+                self.equation(&format!("its value at {a}, {b}"), &lhs, &rhs)?;
+            }
+        }
+        Ok(())
     }
 
     /// `ite c (isTrue h) t e ≡ t` and `ite c (isFalse h) t e ≡ e`, or for

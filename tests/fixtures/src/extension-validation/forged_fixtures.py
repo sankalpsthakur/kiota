@@ -152,8 +152,8 @@ def literal_is_zero(base, out, thm):
 
 def main():
     src, dst = sys.argv[1], sys.argv[2]
-    forged, ctors, genuine, bitwise = (
-        f"{src}/{m}.base.ndjson" for m in ("Forged", "ForgedCtors", "Genuine", "ForgedBitwise")
+    forged, ctors, genuine, bitwise, large = (
+        f"{src}/{m}.base.ndjson" for m in ("Forged", "ForgedCtors", "Genuine", "ForgedBitwise", "ForgedLarge")
     )
     big = 2**200
 
@@ -163,22 +163,24 @@ def main():
         ("shiftLeft", 1, 4, 16), ("shiftRight", 16, 4, 1), ("div", 6, 2, 3),
         ("mod", 7, 4, 3), ("gcd", 4, 6, 2), ("land", 6, 3, 2), ("lor", 4, 1, 5), ("xor", 6, 3, 5),
     ]:
-        # `div`, `mod`, `gcd` are validated for kind and type only, and
-        # `shiftRight` is stated with `div`: these four are still accepted.
-        kind = "hole" if op in ("div", "mod", "gcd", "shiftRight") else "reject"
-        nat_op(forged, f"{dst}/forged-nat-{op.lower()}.{kind}.ndjson", "Forged.bad", f"Nat.{op}", a, b, r)
+        nat_op(forged, f"{dst}/forged-nat-{op.lower()}.reject.ndjson", "Forged.bad", f"Nat.{op}", a, b, r)
     nat_op(forged, f"{dst}/forged-nat-beq.reject.ndjson", "Forged.bad", "Nat.beq", 2, 3, "Bool.false", ty="Bool")
     nat_op(forged, f"{dst}/forged-nat-ble.reject.ndjson", "Forged.bad", "Nat.ble", 2, 3, "Bool.true", ty="Bool")
     ite_true(forged, f"{dst}/forged-ite-swapped.reject.ndjson", "Forged.bad")
     dite_true(forged, f"{dst}/forged-dite-axiom.reject.ndjson", "Forged.bad")
     decide_true(forged, f"{dst}/forged-decide-swapped.reject.ndjson", "Forged.bad")
 
-    # ForgedBitwise.lean: `Nat.lor` is `Nat.bitwise and`, so it gets no rule
-    # and `lor 4 1` is what that `bitwise` makes it, `4`. `Nat.land` has the
-    # right table over a `Nat.bitwise` nobody validated: still accepted.
+    # ForgedBitwise.lean: `Nat.lor` is `Nat.bitwise and`, the wrong table.
+    # `Nat.land` has the right table over a `Nat.bitwise` that returns its
+    # first number, and is wrong at `1, 0`.
     nat_op(bitwise, f"{dst}/forged-nat-lor-wrong-table.reject.ndjson", "Forged.bad", "Nat.lor", 4, 1, 5)
-    nat_op(bitwise, f"{dst}/forged-nat-bitwise.hole.ndjson", "Forged.bad", "Nat.land", 6, 3, 2)
-    nat_op(bitwise, f"{dst}/forged-nat-modcore.hole.ndjson", "Forged.bad", "Nat.modCore", 7, 4, 3)
+    nat_op(bitwise, f"{dst}/forged-nat-bitwise.reject.ndjson", "Forged.bad", "Nat.land", 6, 3, 2)
+    nat_op(bitwise, f"{dst}/forged-nat-modcore.reject.ndjson", "Forged.bad", "Nat.modCore", 7, 4, 3)
+
+    # ForgedLarge.lean: a `Nat.div` that is division up to 16. It agrees with
+    # the native rule wherever the validation looks, so this false theorem
+    # is still accepted: the hole that remains.
+    nat_op(large, f"{dst}/forged-nat-div-beyond-the-grid.hole.ndjson", "Forged.bad", "Nat.div", 1000, 10, 100)
 
     # Decidable.isTrue is an axiom in ForgedCtors.lean; nothing reduces at it.
     ite_true(ctors, f"{dst}/forged-decidable-istrue-axiom-ite.reject.ndjson", "Forged.bad")

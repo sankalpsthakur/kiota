@@ -39,6 +39,10 @@ pub fn pause(on: bool) -> bool {
     PAUSED.with(|p| p.replace(on))
 }
 
+pub fn paused() -> bool {
+    PAUSED.with(|p| p.get())
+}
+
 macro_rules! bump {
     ($name:ident, $cell:ident) => {
         #[inline(always)]
