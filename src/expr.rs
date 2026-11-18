@@ -236,6 +236,7 @@ fn used_shift_binder(u: u64) -> u64 {
 }
 
 /// Computed once per node from children that already carry their own bits.
+#[inline(always)]
 fn used_of(d: &ExprData) -> u64 {
     match d {
         ExprData::BVar(i) => {
@@ -259,6 +260,7 @@ fn used_of(d: &ExprData) -> u64 {
 }
 
 /// Computed once per node, from children that already carry their own range.
+#[inline(always)]
 fn loose_of(d: &ExprData) -> u32 {
     match d {
         ExprData::BVar(i) => *i + 1,
@@ -301,7 +303,7 @@ const SEED_STR: u64 = 0xbf58_476d_1ce4_e5b9;
 /// their content, so the cost does not depend on term size. Only the lookup
 /// structure reads this value: every candidate is confirmed by `node_eq`,
 /// so the function is free to change without changing any result.
-#[inline]
+#[inline(always)]
 fn hash_node(d: &ExprData) -> u64 {
     match d {
         ExprData::BVar(i) => hash_mix(SEED_BVAR, *i as u64),
@@ -346,6 +348,7 @@ fn hash_node(d: &ExprData) -> u64 {
     }
 }
 
+#[inline(always)]
 fn node_eq(a: &ExprData, b: &ExprData) -> bool {
     match (a, b) {
         (ExprData::BVar(i), ExprData::BVar(j)) => i == j,
@@ -403,6 +406,8 @@ struct Interner {
     len: usize,
     /// Grow once `len` passes this (5/8 of the slots).
     grow_at: usize,
+    /// The identity the next allocated node gets. Never reset: see `identity`.
+    next_id: usize,
     /// `intern` calls on this thread, in either mode.
     calls: u64,
     /// The call count at which the next progress line is printed.
@@ -427,13 +432,21 @@ impl Interner {
             shift: 64 - log2,
             len: 0,
             grow_at: n / 8 * 5,
+            next_id: 1,
             calls: 0,
             next_report: INTERN_REPORT_EVERY,
             weak_mode: reclamation_enabled(),
         }
     }
 
-    #[inline]
+    #[inline(always)]
+    fn take_id(&mut self) -> usize {
+        let id = self.next_id;
+        self.next_id = id.checked_add(1).expect("expression identity exhausted");
+        id
+    }
+
+    #[inline(always)]
     fn intern(&mut self, d: ExprData) -> Expr {
         let h = hash_node(&d);
         let mask = self.slots.len() - 1;
@@ -450,7 +463,8 @@ impl Interner {
             }
             i = (i + 1) & mask;
         }
-        let e = alloc_node(d);
+        let id = self.take_id();
+        let e = alloc_node_with(d, id);
         self.slots[i] = Slot {
             hash: h,
             node: Some(e.clone()),
@@ -507,15 +521,19 @@ impl Interner {
     }
 }
 
+/// Allocate a node outside the strong table (`KIOTA_RECLAIM` and tests).
+/// Identities come from the one counter either way.
 fn alloc_node(d: ExprData) -> Expr {
+    let id = INTERN.with(|t| t.borrow_mut().take_id());
+    alloc_node_with(d, id)
+}
+
+#[inline(always)]
+fn alloc_node_with(d: ExprData, identity: usize) -> Expr {
     let loose = loose_of(&d);
     let used_bvars = used_of(&d);
     Rc::new(ExprNode {
-        identity: NEXT_NODE_ID.with(|next| {
-            let id = next.get();
-            next.set(id.checked_add(1).expect("expression identity exhausted"));
-            id
-        }),
+        identity,
         data: d,
         loose,
         used_bvars,
@@ -523,7 +541,6 @@ fn alloc_node(d: ExprData) -> Expr {
 }
 
 thread_local! {
-    static NEXT_NODE_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
     static INTERN: RefCell<Interner> = RefCell::new(Interner::default());
     static WEAK_INTERN: RefCell<reclaim::WeakInterner> = RefCell::new(reclaim::WeakInterner::default());
     static LEVEL_INST_MEMO: RefCell<FxHashMap<(usize, usize), Expr>> =
@@ -646,28 +663,53 @@ pub fn bits_to_list(mut bits: u64, base: u32) -> Vec<u32> {
 /// A progress line on stderr every this many `intern` calls.
 const INTERN_REPORT_EVERY: u64 = 100_000_000;
 
-pub fn intern(d: ExprData) -> Expr {
+/// Look `d` up, allocating it if it is new.
+///
+/// Inlined into every constructor below, where the node's kind is known at
+/// compile time: the hash, the candidate comparison, the bvar summaries and
+/// the release of `d` on a hit each compile to the one arm that applies,
+/// instead of five dispatches on the kind per call.
+#[inline(always)]
+fn intern_inline(d: ExprData) -> Expr {
     INTERN.with(|t| {
         let mut t = t.borrow_mut();
         t.calls += 1;
         if t.calls == t.next_report {
-            t.next_report += INTERN_REPORT_EVERY;
-            let n = t.calls;
-            let nodes = if t.weak_mode {
-                WEAK_INTERN.with(|w| w.borrow().len())
-            } else {
-                t.len()
-            };
-            eprintln!("INTERN_CALLS {n} nodes={nodes}");
-            let _ = std::io::Write::flush(&mut std::io::stderr());
+            t.report();
         }
         if t.weak_mode {
             drop(t);
-            WEAK_INTERN.with(|t| t.borrow_mut().intern(d))
-        } else {
-            t.intern(d)
+            return intern_weak(d);
         }
+        t.intern(d)
     })
+}
+
+#[cold]
+#[inline(never)]
+fn intern_weak(d: ExprData) -> Expr {
+    WEAK_INTERN.with(|t| t.borrow_mut().intern(d))
+}
+
+impl Interner {
+    #[cold]
+    #[inline(never)]
+    fn report(&mut self) {
+        self.next_report += INTERN_REPORT_EVERY;
+        let n = self.calls;
+        let nodes = if self.weak_mode {
+            WEAK_INTERN.with(|w| w.borrow().len())
+        } else {
+            self.len()
+        };
+        eprintln!("INTERN_CALLS {n} nodes={nodes}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+}
+
+/// `intern` for a node whose kind is only known at run time.
+pub fn intern(d: ExprData) -> Expr {
+    intern_inline(d)
 }
 
 pub fn intern_node_count() -> usize {
@@ -741,34 +783,34 @@ pub fn clear_subst_memos() {
 }
 
 pub fn bvar(i: u32) -> Expr {
-    intern(ExprData::BVar(i))
+    intern_inline(ExprData::BVar(i))
 }
 pub fn sort(l: Level) -> Expr {
-    intern(ExprData::Sort(l))
+    intern_inline(ExprData::Sort(l))
 }
 pub fn const_(n: u32, us: Vec<Level>) -> Expr {
-    intern(ExprData::Const(n, Rc::new(us)))
+    intern_inline(ExprData::Const(n, Rc::new(us)))
 }
 pub fn app(f: Expr, a: Expr) -> Expr {
-    intern(ExprData::App(f, a))
+    intern_inline(ExprData::App(f, a))
 }
 pub fn lam(bi: BinderInfo, ty: Expr, body: Expr) -> Expr {
-    intern(ExprData::Lam(bi, ty, body))
+    intern_inline(ExprData::Lam(bi, ty, body))
 }
 pub fn pi(bi: BinderInfo, ty: Expr, body: Expr) -> Expr {
-    intern(ExprData::Pi(bi, ty, body))
+    intern_inline(ExprData::Pi(bi, ty, body))
 }
 pub fn let_(ty: Expr, val: Expr, body: Expr) -> Expr {
-    intern(ExprData::Let(ty, val, body))
+    intern_inline(ExprData::Let(ty, val, body))
 }
 pub fn proj(s: u32, i: u32, e: Expr) -> Expr {
-    intern(ExprData::Proj(s, i, e))
+    intern_inline(ExprData::Proj(s, i, e))
 }
 pub fn lit_nat(n: num_bigint::BigUint) -> Expr {
-    intern(ExprData::Lit(Lit::Nat(n)))
+    intern_inline(ExprData::Lit(Lit::Nat(n)))
 }
 pub fn lit_str(s: impl Into<String>) -> Expr {
-    intern(ExprData::Lit(Lit::Str(Rc::new(s.into()))))
+    intern_inline(ExprData::Lit(Lit::Str(Rc::new(s.into()))))
 }
 
 /// True when `e` has no loose bvars.
