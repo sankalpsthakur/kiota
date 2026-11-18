@@ -1,0 +1,59 @@
+name: remote-paired-corpus
+
+# Same-runner timing of init and std: main a8aadd8, the universe + shift
+# fixes (07367f0) and this commit (eta before unfold), two rounds, alternating.
+on:
+  push:
+    branches: ['remote/paired-2026*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+
+jobs:
+  paired:
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [init, std]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build three binaries
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          cp target/release/kiota ./kiota-new
+          for pair in old:a8aadd8 mid:07367f0; do
+            side=${pair%%:*}; rev=${pair##*:}
+            git worktree add --detach "$RUNNER_TEMP/$side" "$rev"
+            CARGO_TARGET_DIR="$RUNNER_TEMP/$side-target" cargo build --release --locked --manifest-path "$RUNNER_TEMP/$side/Cargo.toml"
+            cp "$RUNNER_TEMP/$side-target/release/kiota" ./kiota-$side
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Paired runs
+        env:
+          C: ${{ matrix.corpus }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          nproc; free -g
+          for round in 1 2; do
+            for side in old mid new; do
+              /usr/bin/time -v -o time.txt timeout 3000 ./kiota-$side $C.ndjson >/dev/null 2>err.txt; rc=$?
+              echo "PAIRED corpus=$C round=$round side=$side rc=$rc wall=$(grep 'Elapsed' time.txt | awk '{print $NF}') user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-120)"
+            done
+          done | tee paired.txt
+          cat paired.txt >> "$GITHUB_STEP_SUMMARY"
