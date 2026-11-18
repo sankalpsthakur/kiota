@@ -1,0 +1,48 @@
+name: remote-interner-profile
+
+# perf task-clock profile of std on this branch's build (flat, by symbol).
+on:
+  push:
+    branches: ['remote/interner-profile-2026*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build (release, frame pointers, line tables)
+        run: RUSTFLAGS="-C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --locked 2>&1 | tail -1
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-std
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install perf
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" >/dev/null \
+            || sudo apt-get install -y -qq zstd linux-tools-common linux-tools-generic >/dev/null
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf | head -1); echo "PERF=$PERF" >> "$GITHUB_ENV"; "$PERF" --version
+      - name: Profile std
+        run: |
+          zstd -d --rm std.ndjson.zst -o std.ndjson
+          set +e
+          "$PERF" record -F 499 -g --call-graph fp -o perf.data -- ./target/release/kiota std.ndjson >out.txt 2>err.txt
+          echo "kiota/perf rc=$?"
+          set -e
+          "$PERF" report -i perf.data --stdio --no-children --sort symbol --percent-limit 0.3 -g none 2>/dev/null | grep -v '^$' | head -110 > flat.txt
+          "$PERF" report -i perf.data --stdio --children --sort symbol --percent-limit 1.5 -g none 2>/dev/null | grep -v '^$' | head -90 > children.txt
+          "$PERF" report -i perf.data --stdio --no-children --sort symbol,srcline --percent-limit 0.4 -g none 2>/dev/null | grep -v '^$' | head -130 > lines.txt || true
+          echo "=== FLAT"; cut -c1-200 flat.txt
+          echo "=== CHILDREN"; cut -c1-200 children.txt
+          echo "=== LINES"; cut -c1-260 lines.txt
