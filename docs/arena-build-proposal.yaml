@@ -1,12 +1,10 @@
 # Proposed checkers/kiota.yaml for leanprover/lean-kernel-arena.
 #
 # Only `build:` differs from the file on the arena's master (and `rev:`, which
-# must name a commit that has the `pgo-gen` cargo feature; REV below is a
-# placeholder). The build is profile-guided, trained on the arena's own init
-# export, and falls back to the plain release build, stating why in
+# must name a commit whose src/main.rs has the `kiota_pgo_gen` cfg; REV below
+# is a placeholder). The build is profile-guided, trained on the arena's own
+# init export, and falls back to the plain release build, stating why in
 # kiota-build.txt, whenever a step of the profile-guided one fails.
-#
-# How it is tested, and what it measures: docs/arena-build.md.
 description: |
   **kiota** — a from-scratch Lean 4 kernel in Rust that re-derives
   K-likeness and ι instead of trusting those export fields. Not a
@@ -28,8 +26,11 @@ build: |
     "$ROOT/lka.py" build-test init || return 1
     [ -s "$TRAIN" ] || return 1
     WHY="the instrumented build failed"
-    RUSTFLAGS="$CPU -C profile-generate=$PWD/pgo" cargo build --release --locked \
-      --features pgo-gen --target-dir "$PWD/target-pgo-gen" || return 1
+    # `--cfg kiota_pgo_gen` makes the binary write its profile (it ends through
+    # `_exit`). It is in RUSTFLAGS and not a cargo feature because the two
+    # builds must mangle names alike for the profile to apply.
+    RUSTFLAGS="$CPU -C profile-generate=$PWD/pgo --cfg kiota_pgo_gen" cargo build --release --locked \
+      --target-dir "$PWD/target-pgo-gen" || return 1
     # The build scripts cargo just ran were instrumented too and left their
     # own profiles here. Only the training run's may be merged.
     rm -rf "$PWD/pgo" "$PWD/pgo.profdata"
