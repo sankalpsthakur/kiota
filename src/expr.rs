@@ -353,6 +353,7 @@ impl Interner {
 }
 
 fn alloc_node(d: ExprData) -> Expr {
+    crate::stats::alloc_tick();
     let loose = loose_of(&d);
     let used_bvars = used_of(&d);
     Rc::new(ExprNode {
@@ -495,6 +496,7 @@ pub fn intern(d: ExprData) -> Expr {
         c.set(n);
         n
     });
+    crate::stats::intern_tick();
     if n % 100_000_000 == 0 {
         eprintln!("INTERN_CALLS {n} nodes={}", intern_node_count());
         let _ = std::io::Write::flush(&mut std::io::stderr());
@@ -504,6 +506,12 @@ pub fn intern(d: ExprData) -> Expr {
     } else {
         INTERN.with(|t| t.borrow_mut().intern(d))
     }
+}
+
+/// The identity the next freshly allocated node will get. Identities only
+/// grow, so this is a watermark: every node allocated later is at or past it.
+pub fn next_identity() -> usize {
+    NEXT_NODE_ID.with(|next| next.get())
 }
 
 pub fn intern_node_count() -> usize {
@@ -637,6 +645,11 @@ pub fn apps(f: Expr, args: &[Expr]) -> Expr {
 /// Shift free (>= cutoff) de Bruijn indices by `by` (can be used with negative
 /// effectively only in controlled contexts; we only ever shift up here).
 pub fn shift(e: &Expr, by: i32, cutoff: u32) -> Expr {
+    let _op = crate::stats::op(crate::stats::op::SHIFT);
+    shift_go(e, by, cutoff)
+}
+
+fn shift_go(e: &Expr, by: i32, cutoff: u32) -> Expr {
     if by == 0 {
         return e.clone();
     }
@@ -658,15 +671,15 @@ pub fn shift(e: &Expr, by: i32, cutoff: u32) -> Expr {
             }
         }
         ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => e.clone(),
-        ExprData::App(f, a) => app(shift(f, by, cutoff), shift(a, by, cutoff)),
-        ExprData::Lam(bi, ty, body) => lam(*bi, shift(ty, by, cutoff), shift(body, by, cutoff + 1)),
-        ExprData::Pi(bi, ty, body) => pi(*bi, shift(ty, by, cutoff), shift(body, by, cutoff + 1)),
+        ExprData::App(f, a) => app(shift_go(f, by, cutoff), shift_go(a, by, cutoff)),
+        ExprData::Lam(bi, ty, body) => lam(*bi, shift_go(ty, by, cutoff), shift_go(body, by, cutoff + 1)),
+        ExprData::Pi(bi, ty, body) => pi(*bi, shift_go(ty, by, cutoff), shift_go(body, by, cutoff + 1)),
         ExprData::Let(ty, val, body) => let_(
-            shift(ty, by, cutoff),
-            shift(val, by, cutoff),
-            shift(body, by, cutoff + 1),
+            shift_go(ty, by, cutoff),
+            shift_go(val, by, cutoff),
+            shift_go(body, by, cutoff + 1),
         ),
-        ExprData::Proj(s, i, v) => proj(*s, *i, shift(v, by, cutoff)),
+        ExprData::Proj(s, i, v) => proj(*s, *i, shift_go(v, by, cutoff)),
     };
     SHIFT_MEMO.with(|m| {
         memo_insert(&mut m.borrow_mut(), key, r.clone());
@@ -685,7 +698,17 @@ pub fn instantiate(e: &Expr, args: &[Expr]) -> Expr {
     // application thousands of times; keying on (node, depth) — args are
     // fixed within one call — visits each unique node once.
     let mut memo = rustc_hash::FxHashMap::default();
-    instantiate_core(e, args, 0, &mut memo)
+    if !crate::stats::enabled() {
+        return instantiate_core(e, args, 0, &mut memo);
+    }
+    let _op = crate::stats::op(crate::stats::op::INST);
+    let before = crate::stats::inst_nodes();
+    let r = instantiate_core(e, args, 0, &mut memo);
+    // The innermost argument is unused when the body never mentions bvar 0:
+    // the call then only renumbers the variables bound further out.
+    let unused = args.len() == 1 && used_bvars(e) != USED_OVERFLOW && used_bvars(e) & 1 == 0;
+    crate::stats::subst_call(false, unused, crate::stats::inst_nodes() - before);
+    r
 }
 
 fn instantiate_core(
@@ -746,6 +769,7 @@ fn instantiate_core(
 pub fn instantiate1(e: &Expr, arg: &Expr) -> Expr {
     let key = (ptr(e), ptr(arg));
     if let Some(r) = INST1_MEMO.with(|m| m.borrow().get(&key).cloned()) {
+        crate::stats::subst_call(true, false, 0);
         return r;
     }
     let r = instantiate(e, std::slice::from_ref(arg));
@@ -843,6 +867,7 @@ pub fn instantiate_level_params(e: &Expr, subst: &FxHashMap<u32, Level>) -> Expr
         return e.clone();
     }
     let id = LEVEL_SUBST_IDS.with(|ids| level_subst_id(subst, &mut ids.borrow_mut()));
+    let _op = crate::stats::op(crate::stats::op::LEVEL);
     instantiate_level_params_cached(e, subst, id)
 }
 

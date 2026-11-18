@@ -94,6 +94,7 @@ pub fn report() {
         g(&WHNF_HITS), g(&DEFEQ_HITS), arr(&CLOSED_MISS), arr(&CLOSED_XHIT), arr(&OPEN_MISS),
     );
     eprintln!("STATS3 xcache_hits={}", crate::tc::xcache_hits());
+    report_sites();
     eprintln!(
         "STATS infer={} infer_hit={} whnf={} defeq={} inst_nodes={} shift_nodes={} ctx_clones={} intern_calls={} live_nodes={}",
         g(&INFER_CALLS),
@@ -105,6 +106,294 @@ pub fn report() {
         g(&CTX_CLONES),
         crate::expr::intern_calls(),
         crate::expr::intern_node_count(),
+    );
+}
+
+// ---------------------------------------------------------------------
+// Call-site attribution (`KIOTA_STATS=1`, STATS4..STATS7 lines).
+//
+// Every interned node is charged to the checker call site that asked for
+// it (`site`) and to the primitive that built it (`op`). A site tag is set
+// only around the substitution call itself, never across the recursive
+// inference or reduction of the same arm, so a row is that site's own work.
+
+pub mod site {
+    pub const PARSE: u8 = 0;
+    pub const CHECK_OTHER: u8 = 1;
+    pub const INFER_APP: u8 = 2;
+    pub const INFER_LET: u8 = 3;
+    pub const INFER_CONST: u8 = 4;
+    pub const INFER_PROJ: u8 = 5;
+    pub const DEFEQ_ARGS: u8 = 6;
+    pub const LAZY_HEAD: u8 = 7;
+    pub const WHNF_BETA: u8 = 8;
+    pub const WHNF_ZETA: u8 = 9;
+    pub const DEFEQ_LET: u8 = 10;
+    pub const UNFOLD: u8 = 11;
+    pub const LOCAL_TY: u8 = 12;
+    pub const ETA: u8 = 13;
+    pub const IOTA: u8 = 14;
+    pub const WHNF_MAJOR: u8 = 15;
+    pub const APPS: u8 = 16;
+    pub const INFER_LAM_PI: u8 = 17;
+    pub const N: usize = 18;
+    pub const NAMES: [&str; N] = [
+        "parse", "check_other", "infer_app", "infer_let", "infer_const", "infer_proj",
+        "defeq_args", "lazy_head", "whnf_beta", "whnf_zeta", "defeq_let", "unfold",
+        "local_ty", "eta", "iota", "whnf_major", "apps", "infer_lam_pi",
+    ];
+}
+
+pub mod op {
+    pub const DIRECT: u8 = 0;
+    pub const INST: u8 = 1;
+    pub const SHIFT: u8 = 2;
+    pub const LEVEL: u8 = 3;
+    pub const N: usize = 4;
+    pub const NAMES: [&str; N] = ["direct", "inst", "shift", "level"];
+}
+
+const KINDS: [&str; 9] = ["bvar", "sort", "const", "app", "lam", "pi", "let", "proj", "lit"];
+
+thread_local! {
+    static SITE: Cell<u8> = const { Cell::new(0) };
+    static OP: Cell<u8> = const { Cell::new(0) };
+    static INTERN_BY: [Cell<u64>; site::N * op::N] = const { [const { Cell::new(0) }; site::N * op::N] };
+    static ALLOC_BY: [Cell<u64>; site::N * op::N] = const { [const { Cell::new(0) }; site::N * op::N] };
+    /// Per site: instantiate calls, `instantiate1` memo hits, calls whose
+    /// argument the body never mentions, substitution nodes those built.
+    static SUBST_CALLS: [Cell<u64>; site::N] = const { [const { Cell::new(0) }; site::N] };
+    static SUBST_MEMO_HITS: [Cell<u64>; site::N] = const { [const { Cell::new(0) }; site::N] };
+    static SUBST_UNUSED: [Cell<u64>; site::N] = const { [const { Cell::new(0) }; site::N] };
+    static SUBST_UNUSED_NODES: [Cell<u64>; site::N] = const { [const { Cell::new(0) }; site::N] };
+    static SUBST_NODES: [Cell<u64>; site::N] = const { [const { Cell::new(0) }; site::N] };
+    /// kind(9) x open(2) x derived(2) x infer_only(2)
+    static INFER_MISS: [Cell<u64>; 72] = const { [const { Cell::new(0) }; 72] };
+    static INFER_UPGRADE: Cell<u64> = const { Cell::new(0) };
+    static INFER_FALLBACK: Cell<u64> = const { Cell::new(0) };
+    static INFER_REKEY: Cell<u64> = const { Cell::new(0) };
+    static INFER_REKEY_CHECK: Cell<u64> = const { Cell::new(0) };
+    /// open(2) x derived(2)
+    static WHNF_MISS: [Cell<u64>; 4] = const { [const { Cell::new(0) }; 4] };
+    static WHNF_FALLBACK: Cell<u64> = const { Cell::new(0) };
+    static WHNF_TRIVIAL: Cell<u64> = const { Cell::new(0) };
+    static CORE_CALLS: Cell<u64> = const { Cell::new(0) };
+    static CORE_HITS: Cell<u64> = const { Cell::new(0) };
+    static WATERMARK: Cell<usize> = const { Cell::new(usize::MAX) };
+    static SEEN_KEY: std::cell::RefCell<rustc_hash::FxHashMap<usize, u64>> = std::cell::RefCell::new(Default::default());
+}
+
+/// Restores the previous site tag when dropped.
+pub struct SiteGuard(u8);
+
+impl Drop for SiteGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.0 != u8::MAX {
+            SITE.with(|c| c.set(self.0));
+        }
+    }
+}
+
+#[inline(always)]
+pub fn at(s: u8) -> SiteGuard {
+    if !enabled() {
+        return SiteGuard(u8::MAX);
+    }
+    SiteGuard(SITE.with(|c| c.replace(s)))
+}
+
+/// Restores the previous primitive tag when dropped.
+pub struct OpGuard(u8);
+
+impl Drop for OpGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.0 != u8::MAX {
+            OP.with(|c| c.set(self.0));
+        }
+    }
+}
+
+#[inline(always)]
+pub fn op(o: u8) -> OpGuard {
+    if !enabled() {
+        return OpGuard(u8::MAX);
+    }
+    OpGuard(OP.with(|c| c.replace(o)))
+}
+
+#[inline(always)]
+fn cell_index() -> usize {
+    SITE.with(|c| c.get()) as usize * op::N + OP.with(|c| c.get()) as usize
+}
+
+#[inline(always)]
+pub fn intern_tick() {
+    if enabled() {
+        let i = cell_index();
+        INTERN_BY.with(|t| t[i].set(t[i].get() + 1));
+    }
+}
+
+#[inline(always)]
+pub fn alloc_tick() {
+    if enabled() {
+        let i = cell_index();
+        ALLOC_BY.with(|t| t[i].set(t[i].get() + 1));
+    }
+}
+
+/// One `instantiate`/`instantiate1` call at the current site. `memo_hit`:
+/// answered by the `instantiate1` memo. `unused`: the body does not mention
+/// the bound variable, so the call only renumbers. `nodes`: substitution
+/// nodes it visited.
+pub fn subst_call(memo_hit: bool, unused: bool, nodes: u64) {
+    if !enabled() {
+        return;
+    }
+    let s = SITE.with(|c| c.get()) as usize;
+    SUBST_CALLS.with(|t| t[s].set(t[s].get() + 1));
+    if memo_hit {
+        SUBST_MEMO_HITS.with(|t| t[s].set(t[s].get() + 1));
+    }
+    if unused {
+        SUBST_UNUSED.with(|t| t[s].set(t[s].get() + 1));
+        SUBST_UNUSED_NODES.with(|t| t[s].set(t[s].get() + nodes));
+    }
+    SUBST_NODES.with(|t| t[s].set(t[s].get() + nodes));
+}
+
+/// Start of a declaration's check: nodes with an identity at or past
+/// `watermark` were built while checking it rather than read from the export.
+pub fn decl_start(watermark: usize) {
+    if !enabled() {
+        return;
+    }
+    WATERMARK.with(|c| c.set(watermark));
+    SEEN_KEY.with(|m| m.borrow_mut().clear());
+    SITE.with(|c| c.set(site::CHECK_OTHER));
+}
+
+pub fn decl_end() {
+    if enabled() {
+        SITE.with(|c| c.set(site::PARSE));
+        WATERMARK.with(|c| c.set(usize::MAX));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn infer_miss(
+    kind: u8,
+    identity: usize,
+    ctx_key: u64,
+    full_ctx_id: u64,
+    infer_only: bool,
+    upgrade: bool,
+) {
+    if !enabled() {
+        return;
+    }
+    let open = ctx_key != 0;
+    let derived = identity >= WATERMARK.with(|c| c.get());
+    let i = ((kind as usize * 2 + open as usize) * 2 + derived as usize) * 2 + infer_only as usize;
+    INFER_MISS.with(|t| t[i].set(t[i].get() + 1));
+    if upgrade {
+        INFER_UPGRADE.with(|c| c.set(c.get() + 1));
+    }
+    if open {
+        if ctx_key == full_ctx_id {
+            INFER_FALLBACK.with(|c| c.set(c.get() + 1));
+        }
+        let rekey = SEEN_KEY.with(|m| {
+            let mut m = m.borrow_mut();
+            match m.get(&identity) {
+                Some(k) => *k != ctx_key,
+                None => {
+                    m.insert(identity, ctx_key);
+                    false
+                }
+            }
+        });
+        if rekey {
+            INFER_REKEY.with(|c| c.set(c.get() + 1));
+            if !infer_only {
+                INFER_REKEY_CHECK.with(|c| c.set(c.get() + 1));
+            }
+        }
+    }
+}
+
+pub fn whnf_miss(identity: usize, ctx_key: u64, full_ctx_id: u64, trivial: bool) {
+    if !enabled() {
+        return;
+    }
+    let open = ctx_key != 0;
+    let derived = identity >= WATERMARK.with(|c| c.get());
+    let i = open as usize * 2 + derived as usize;
+    WHNF_MISS.with(|t| t[i].set(t[i].get() + 1));
+    if open && ctx_key == full_ctx_id {
+        WHNF_FALLBACK.with(|c| c.set(c.get() + 1));
+    }
+    if trivial {
+        WHNF_TRIVIAL.with(|c| c.set(c.get() + 1));
+    }
+}
+
+bump!(core_call, CORE_CALLS);
+bump!(core_hit, CORE_HITS);
+
+fn report_sites() {
+    let g = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|x| x.get());
+    for s in 0..site::N {
+        let row: Vec<u64> = (0..op::N).map(|o| INTERN_BY.with(|t| t[s * op::N + o].get())).collect();
+        let new: Vec<u64> = (0..op::N).map(|o| ALLOC_BY.with(|t| t[s * op::N + o].get())).collect();
+        let calls = SUBST_CALLS.with(|t| t[s].get());
+        if row.iter().sum::<u64>() == 0 && calls == 0 {
+            continue;
+        }
+        eprintln!(
+            "STATS4 site={} interns(direct,inst,shift,level)={:?} new_nodes={:?} subst_calls={} memo_hits={} subst_nodes={} unused_arg_calls={} unused_arg_nodes={}",
+            site::NAMES[s],
+            row,
+            new,
+            calls,
+            SUBST_MEMO_HITS.with(|t| t[s].get()),
+            SUBST_NODES.with(|t| t[s].get()),
+            SUBST_UNUSED.with(|t| t[s].get()),
+            SUBST_UNUSED_NODES.with(|t| t[s].get()),
+        );
+    }
+    // kind: [closed/export, closed/derived, open/export, open/derived] x [check, infer_only]
+    for k in 0..9 {
+        let cells: Vec<u64> = (0..8).map(|j| INFER_MISS.with(|t| t[k * 8 + j].get())).collect();
+        if cells.iter().sum::<u64>() == 0 {
+            continue;
+        }
+        eprintln!(
+            "STATS5 infer_miss kind={} closed_export(check,only)={:?} closed_derived={:?} open_export={:?} open_derived={:?}",
+            KINDS[k],
+            &cells[0..2],
+            &cells[2..4],
+            &cells[4..6],
+            &cells[6..8],
+        );
+    }
+    eprintln!(
+        "STATS6 infer_upgrade_unchecked_to_checked={} infer_open_key_is_full_ctx={} infer_open_rekey={} infer_open_rekey_check_mode={}",
+        g(&INFER_UPGRADE),
+        g(&INFER_FALLBACK),
+        g(&INFER_REKEY),
+        g(&INFER_REKEY_CHECK),
+    );
+    let w: Vec<u64> = (0..4).map(|j| WHNF_MISS.with(|t| t[j].get())).collect();
+    eprintln!(
+        "STATS7 whnf_miss(closed_export,closed_derived,open_export,open_derived)={:?} whnf_open_key_is_full_ctx={} whnf_miss_already_pi_sort_lam={} whnf_core_calls={} whnf_core_hits={}",
+        w,
+        g(&WHNF_FALLBACK),
+        g(&WHNF_TRIVIAL),
+        g(&CORE_CALLS),
+        g(&CORE_HITS),
     );
 }
 

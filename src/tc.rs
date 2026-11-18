@@ -670,13 +670,61 @@ pub(crate) fn expr_dag_size(e: &Expr, cap: u32) -> u32 {
     seen.len() as u32
 }
 
+use crate::stats::site as S;
+
+// Substitution entry points that charge their work to a call site in the
+// `KIOTA_STATS` tables. With the counters off the guard is a no-op.
+#[inline(always)]
+fn inst1_at(s: u8, body: &Expr, arg: &Expr) -> Expr {
+    let _g = crate::stats::at(s);
+    expr::instantiate1(body, arg)
+}
+
+#[inline(always)]
+fn inst_at(s: u8, e: &Expr, args: &[Expr]) -> Expr {
+    let _g = crate::stats::at(s);
+    expr::instantiate(e, args)
+}
+
+#[inline(always)]
+fn shift_at(s: u8, e: &Expr, by: i32, cutoff: u32) -> Expr {
+    let _g = crate::stats::at(s);
+    expr::shift(e, by, cutoff)
+}
+
+#[inline(always)]
+fn lvl_at(s: u8, e: &Expr, subst: &FxHashMap<u32, Level>) -> Expr {
+    let _g = crate::stats::at(s);
+    expr::instantiate_level_params(e, subst)
+}
+
+#[inline(always)]
+fn apps_at(s: u8, f: Expr, args: &[Expr]) -> Expr {
+    let _g = crate::stats::at(s);
+    expr::apps(f, args)
+}
+
+fn expr_kind(e: &Expr) -> u8 {
+    match &***e {
+        ExprData::BVar(_) => 0,
+        ExprData::Sort(_) => 1,
+        ExprData::Const(..) => 2,
+        ExprData::App(..) => 3,
+        ExprData::Lam(..) => 4,
+        ExprData::Pi(..) => 5,
+        ExprData::Let(..) => 6,
+        ExprData::Proj(..) => 7,
+        ExprData::Lit(_) => 8,
+    }
+}
+
 fn local_ty(ctx: &Ctx, i: u32) -> Option<Expr> {
     let n = ctx.len();
     if (i as usize) >= n {
         return None;
     }
     let raw = &ctx[n - 1 - i as usize];
-    Some(expr::shift(raw, i as i32 + 1, 0))
+    Some(shift_at(S::LOCAL_TY, raw, i as i32 + 1, 0))
 }
 
 impl<'e> Checker<'e> {
@@ -853,6 +901,13 @@ impl<'e> Checker<'e> {
     }
 
     fn check_decl_once(&self, name: u32, kind: &str) -> R<()> {
+        crate::stats::decl_start(expr::next_identity());
+        let r = self.check_decl_once_go(name, kind);
+        crate::stats::decl_end();
+        r
+    }
+
+    fn check_decl_once_go(&self, name: u32, kind: &str) -> R<()> {
         self.conversion_trace_reported.set(false);
         let ci = self
             .env
@@ -1180,7 +1235,7 @@ impl<'e> Checker<'e> {
                 return Ok(core);
             };
             let (_, args) = expr::unfold_apps(&core);
-            let next = expr::apps(unfolded, &args);
+            let next = apps_at(S::APPS, unfolded, &args);
             if Rc::ptr_eq(&next, &cur) {
                 return Ok(core);
             }
@@ -1204,7 +1259,7 @@ impl<'e> Checker<'e> {
             let Some(unfolded) = self.unfold_def(*n, us)? else {
                 return Ok(w);
             };
-            let next = expr::apps(unfolded, &args);
+            let next = apps_at(S::APPS, unfolded, &args);
             let core = self.whnf_core(ctx, &next)?;
             if Rc::ptr_eq(&core, &w) {
                 return Ok(w);
@@ -1333,6 +1388,10 @@ impl<'e> Checker<'e> {
             }
         }
         crate::stats::miss(0, key.0, key.1, 0);
+        if crate::stats::enabled() {
+            let upgrade = !infer_only && cache_ref.borrow().contains_key(&key);
+            crate::stats::infer_miss(expr_kind(e), key.1, key.0, ctx.id, infer_only, upgrade);
+        }
         let t = self.infer_type_uncached(ctx, e)?;
         let checked = !self.infer_only.get();
         if xcache && checked && !self.xcache_tainted.get() {
@@ -1395,7 +1454,7 @@ impl<'e> Checker<'e> {
                         return reject("application argument type mismatch");
                     }
                 }
-                Ok(expr::instantiate1(&body, a))
+                Ok(inst1_at(S::INFER_APP, &body, a))
             }
             ExprData::Lam(bi, ty, body) => {
                 let tt = self.infer_type(ctx, ty)?;
@@ -1406,7 +1465,7 @@ impl<'e> Checker<'e> {
                 };
                 ctx2.push(ty.clone());
                 let bt = self.infer_type(&ctx2, body)?;
-                Ok(expr::pi(*bi, ty.clone(), bt))
+                Ok({ let _g = crate::stats::at(S::INFER_LAM_PI); expr::pi(*bi, ty.clone(), bt) })
             }
             ExprData::Pi(_bi, ty, body) => {
                 let tt = self.infer_type(ctx, ty)?;
@@ -1427,7 +1486,7 @@ impl<'e> Checker<'e> {
                 if !self.is_def_eq(ctx, &vt, ty)? {
                     return reject("let value type mismatch");
                 }
-                let b = expr::instantiate1(body, val);
+                let b = inst1_at(S::INFER_LET, body, val);
                 self.infer_type(ctx, &b)
             }
             ExprData::Proj(sname, idx, v) => self.infer_proj(ctx, *sname, *idx, v),
@@ -1452,7 +1511,7 @@ impl<'e> Checker<'e> {
             return reject("universe param count mismatch");
         }
         let subst = level::subst_map(lp, us);
-        Ok(expr::instantiate_level_params(ci.typ(), &subst))
+        Ok(lvl_at(S::INFER_CONST, ci.typ(), &subst))
     }
 
     fn nat_type(&self) -> R<Expr> {
@@ -1512,14 +1571,14 @@ impl<'e> Checker<'e> {
             return reject("projection index out of range");
         }
         let subst = level::subst_map(&ctor_lp, &us);
-        let mut ct = expr::instantiate_level_params(&ctor_typ, &subst);
+        let mut ct = lvl_at(S::INFER_PROJ, &ctor_typ, &subst);
         // instantiate params
         if (args.len() as u32) < num_params {
             return reject("projection: too few params");
         }
         for p in args.iter().take(num_params as usize) {
             let (_, _dom, body) = self.ensure_pi(ctx, &ct)?;
-            ct = expr::instantiate1(&body, p);
+            ct = inst1_at(S::INFER_PROJ, &body, p);
         }
         // Every field's own type, substituting each earlier field with
         // its own `proj sname i v` term as we walk the telescope — needed
@@ -1531,7 +1590,7 @@ impl<'e> Checker<'e> {
             let (_, dom, body) = self.ensure_pi(ctx, &cur)?;
             doms.push(dom.clone());
             let proj_i = expr::proj(sname, i, v.clone());
-            cur = expr::instantiate1(&body, &proj_i);
+            cur = inst1_at(S::INFER_PROJ, &body, &proj_i);
         }
         if self.is_prop_checked(ctx, &vtw)? {
             // Lean's kernel rejects a projection out of a Prop-valued,
@@ -2325,7 +2384,7 @@ impl<'e> Checker<'e> {
                 );
             }
             if pi || ip {
-                ty = expr::instantiate1(&body, &a1[i]);
+                ty = inst1_at(S::DEFEQ_ARGS, &body, &a1[i]);
                 i += 1;
                 continue;
             }
@@ -2335,7 +2394,7 @@ impl<'e> Checker<'e> {
                 }
                 return Ok(false);
             }
-            ty = expr::instantiate1(&body, &a1[i]);
+            ty = inst1_at(S::DEFEQ_ARGS, &body, &a1[i]);
             i += 1;
         }
         Ok(true)
@@ -2396,6 +2455,10 @@ impl<'e> Checker<'e> {
             }
         }
         crate::stats::miss(1, k.0, k.1, 0);
+        if crate::stats::enabled() {
+            let trivial = matches!(&***e, ExprData::Pi(..) | ExprData::Sort(_) | ExprData::Lam(..));
+            crate::stats::whnf_miss(k.1, k.0, ctx.id, trivial);
+        }
         let mut cur = e.clone();
         let r = loop {
             let core = self.whnf_core(ctx, &cur)?;
@@ -2404,7 +2467,7 @@ impl<'e> Checker<'e> {
                 if self.eager_whnf_unfolds(*n) {
                     if let Some(unfolded) = self.unfold_delta(*n, us, true)? {
                         let (_, args) = expr::unfold_apps(&core);
-                        let next = expr::apps(unfolded, &args);
+                        let next = apps_at(S::APPS, unfolded, &args);
                         if Rc::ptr_eq(&next, &cur) {
                             break core;
                         }
@@ -2456,13 +2519,13 @@ impl<'e> Checker<'e> {
         let (head, args) = expr::unfold_apps(e);
         match &**head {
             ExprData::Const(n, us) => {
-                Ok(self.unfold_def(*n, us)?.map(|body| expr::apps(body, &args)))
+                Ok(self.unfold_def(*n, us)?.map(|body| apps_at(S::APPS, body, &args)))
             }
             ExprData::Lam(_, _, body) if !args.is_empty() => {
-                Ok(Some(expr::apps(expr::instantiate1(body, &args[0]), &args[1..])))
+                Ok(Some(apps_at(S::APPS, inst1_at(S::LAZY_HEAD, body, &args[0]), &args[1..])))
             }
             ExprData::Let(_, value, body) => {
-                Ok(Some(expr::apps(expr::instantiate1(body, value), &args)))
+                Ok(Some(apps_at(S::APPS, inst1_at(S::LAZY_HEAD, body, value), &args)))
             }
             ExprData::Proj(sname, idx, major) => {
                 let (ctor, fields) = expr::unfold_apps(major);
@@ -2470,19 +2533,19 @@ impl<'e> Checker<'e> {
                     if let Some(ConstantInfo::Constructor {induct, num_params, ..}) = self.env.get(*cname) {
                         let field = (*num_params + *idx) as usize;
                         if *induct == *sname && field < fields.len() {
-                            return Ok(Some(expr::apps(fields[field].clone(), &args)));
+                            return Ok(Some(apps_at(S::APPS, fields[field].clone(), &args)));
                         }
                     }
                 }
                 if let ExprData::Lit(Lit::Str(s)) = &***major {
                     if *idx == 0 && self.native_string_projection_ok(*sname) {
                         if let Some(bytes) = self.string_to_byte_array(s) {
-                            return Ok(Some(expr::apps(bytes, &args)));
+                            return Ok(Some(apps_at(S::APPS, bytes, &args)));
                         }
                     }
                 }
                 Ok(self.lazy_head_step(major, fuel - 1)?
-                    .map(|next| expr::apps(expr::proj(*sname, *idx, next), &args)))
+                    .map(|next| apps_at(S::APPS, expr::proj(*sname, *idx, next), &args)))
             }
             _ => Ok(None),
         }
@@ -2629,7 +2692,7 @@ impl<'e> Checker<'e> {
         let (head, args) = expr::unfold_apps(e);
         let unfolded = match &**head {
             ExprData::Const(n, us) => match self.unfold_def(*n, us)? {
-                Some(body) => expr::apps(body, &args),
+                Some(body) => apps_at(S::APPS, body, &args),
                 None => return Ok(None),
             },
             _ => e.clone(),
@@ -2839,7 +2902,7 @@ impl<'e> Checker<'e> {
             if let ExprData::Const(n, us) = &**head {
                 let (_, args) = expr::unfold_apps(&core);
                 if let Some(unfolded) = self.unfold_def(*n, us)? {
-                    cur = expr::apps(unfolded, &args);
+                    cur = apps_at(S::APPS, unfolded, &args);
                     continue;
                 }
                 if thm_major {
@@ -2848,13 +2911,13 @@ impl<'e> Checker<'e> {
                         let mut i = 0;
                         while i < args.len() {
                             if let ExprData::Lam(_, _, b) = &**body {
-                                body = expr::instantiate1(b, &args[i]);
+                                body = inst1_at(S::WHNF_MAJOR, b, &args[i]);
                                 i += 1;
                             } else {
                                 break;
                             }
                         }
-                        let next = expr::apps(body, &args[i..]);
+                        let next = apps_at(S::APPS, body, &args[i..]);
                         if self.is_ctor_or_nat_lit_head(&next) {
                             cur = next;
                             continue;
@@ -2881,7 +2944,7 @@ impl<'e> Checker<'e> {
             let (head, args) = expr::unfold_apps(&cur);
             let ExprData::Const(n, us) = &**head else { break };
             let Some(unfolded) = self.unfold_delta(*n, us, true)? else { break };
-            cur = self.whnf_core(ctx, &expr::apps(unfolded, &args))?;
+            cur = self.whnf_core(ctx, &apps_at(S::APPS, unfolded, &args))?;
         }
         Ok(cur)
     }
@@ -2908,7 +2971,7 @@ impl<'e> Checker<'e> {
     fn cheap_zeta(e: &Expr) -> Expr {
         let mut cur = e.clone();
         while let ExprData::Let(_, val, body) = &**cur {
-            cur = expr::instantiate1(body, val);
+            cur = inst1_at(S::WHNF_ZETA, body, val);
         }
         cur
     }
@@ -2944,9 +3007,11 @@ impl<'e> Checker<'e> {
             return Ok(e);
         }
         let k = Self::whnf_cache_key(ctx, &e);
+        crate::stats::core_call();
         // See `whnf`'s `force_eager` comment just above it.
         let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
         if let Some(r) = self.whnf_core_cache_get(force_eager, &k) {
+            crate::stats::core_hit();
             CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
             return Ok(r);
         }
@@ -2971,7 +3036,7 @@ impl<'e> Checker<'e> {
                         // that stuck as App(Let, minor), so Bind.bind minors
                         // (`p.1` vs unpacked) never converted (#81930).
                         ExprData::Let(_, _, _) => {
-                            cur = expr::apps(Self::cheap_zeta(&head), &args);
+                            cur = apps_at(S::APPS, Self::cheap_zeta(&head), &args);
                             continue;
                         }
                         ExprData::Lam(_, _, _) => {
@@ -2992,8 +3057,8 @@ impl<'e> Checker<'e> {
                             // instantiate consumed args (reverse order: last-bound first)
                             let mut rev: Vec<Expr> = consumed.to_vec();
                             rev.reverse();
-                            let reduced = expr::instantiate(&body, &rev);
-                            cur = expr::apps(reduced, rest);
+                            let reduced = inst_at(S::WHNF_BETA, &body, &rev);
+                            cur = apps_at(S::APPS, reduced, rest);
                             continue;
                         }
                         // Class projections: `HAdd.hAdd` / `OfNat.ofNat` unfold to
@@ -3014,7 +3079,7 @@ impl<'e> Checker<'e> {
                                     if *induct == *sname {
                                         let fi = (*num_params + *idx) as usize;
                                         if fi < pargs.len() {
-                                            cur = expr::apps(pargs[fi].clone(), &args);
+                                            cur = apps_at(S::APPS, pargs[fi].clone(), &args);
                                             continue;
                                         }
                                     }
@@ -3023,7 +3088,7 @@ impl<'e> Checker<'e> {
                             if let ExprData::Lit(Lit::Str(s)) = &**vw {
                                 if *idx == 0 && self.native_string_projection_ok(*sname) {
                                     if let Some(ba) = self.string_to_byte_array(s) {
-                                        cur = expr::apps(ba, &args);
+                                        cur = apps_at(S::APPS, ba, &args);
                                         continue;
                                     }
                                 }
@@ -3056,7 +3121,7 @@ impl<'e> Checker<'e> {
                     }
                 }
                 ExprData::Let(_, val, body) => {
-                    cur = expr::instantiate1(body, val);
+                    cur = inst1_at(S::WHNF_ZETA, body, val);
                     continue;
                 }
                 ExprData::Proj(sname, idx, v) => {
@@ -3108,7 +3173,7 @@ impl<'e> Checker<'e> {
         let ExprData::Const(n, us) = &**h else {
             return Ok(None);
         };
-        Ok(self.unfold_def(*n, us)?.map(|u| expr::apps(u, &args)))
+        Ok(self.unfold_def(*n, us)?.map(|u| apps_at(S::APPS, u, &args)))
     }
 
     fn unfold_def(&self, n: u32, us: &[Level]) -> R<Option<Expr>> {
@@ -3127,7 +3192,7 @@ impl<'e> Checker<'e> {
                     return Ok(Some(r.clone()));
                 }
                 let subst = level::subst_map(level_params, us);
-                let r = expr::instantiate_level_params(value, &subst);
+                let r = lvl_at(S::UNFOLD, value, &subst);
                 self.unfold_cache.borrow_mut().insert(key, r.clone());
                 Ok(Some(r))
             }
@@ -3159,7 +3224,7 @@ impl<'e> Checker<'e> {
                     return Ok(Some(r.clone()));
                 }
                 let subst = level::subst_map(level_params, us);
-                let r = expr::instantiate_level_params(value, &subst);
+                let r = lvl_at(S::UNFOLD, value, &subst);
                 self.unfold_cache.borrow_mut().insert(key, r.clone());
                 Ok(Some(r))
             }
@@ -3183,7 +3248,7 @@ impl<'e> Checker<'e> {
                     }
                 };
                 let subst = level::subst_map(level_params, us);
-                let r = expr::instantiate_level_params(&value, &subst);
+                let r = lvl_at(S::UNFOLD, &value, &subst);
                 self.unfold_cache.borrow_mut().insert(key, r.clone());
                 Ok(Some(r))
             }
@@ -3966,10 +4031,10 @@ impl<'e> Checker<'e> {
         // Structural match without delta.
         match (&***a, &***b) {
             (ExprData::Let(_, v, body), _) => {
-                return self.is_def_eq(ctx, &expr::instantiate1(body, v), b);
+                return self.is_def_eq(ctx, &inst1_at(S::DEFEQ_LET, body, v), b);
             }
             (_, ExprData::Let(_, v, body)) => {
-                return self.is_def_eq(ctx, a, &expr::instantiate1(body, v));
+                return self.is_def_eq(ctx, a, &inst1_at(S::DEFEQ_LET, body, v));
             }
             (ExprData::Sort(l1), ExprData::Sort(l2)) => return Ok(level::is_def_eq(l1, l2)),
             (ExprData::BVar(i), ExprData::BVar(j)) if i == j => return Ok(true),
@@ -4049,7 +4114,7 @@ impl<'e> Checker<'e> {
         // Eta for lambdas: one side a lambda, other not -> eta-expand other.
         if let (ExprData::Lam(_, t1, _), _) = (&***a, &***b) {
             if !matches!(&***b, ExprData::Lam(_, _, _)) {
-                let b_app = expr::app(expr::shift(b, 1, 0), expr::bvar(0));
+                let b_app = expr::app(shift_at(S::ETA, b, 1, 0), expr::bvar(0));
                 let mut ctx2 = {
                     crate::stats::ctx_clone();
                     ctx.clone()
@@ -4065,7 +4130,7 @@ impl<'e> Checker<'e> {
         }
         if let (_, ExprData::Lam(_, t2, _)) = (&***a, &***b) {
             if !matches!(&***a, ExprData::Lam(_, _, _)) {
-                let a_app = expr::app(expr::shift(a, 1, 0), expr::bvar(0));
+                let a_app = expr::app(shift_at(S::ETA, a, 1, 0), expr::bvar(0));
                 let mut ctx2 = {
                     crate::stats::ctx_clone();
                     ctx.clone()
@@ -4196,7 +4261,7 @@ impl<'e> Checker<'e> {
                 us,
                 crate::stats::theorem_delta_in_scope() && self.delta_body_is_small(*n),
             )? {
-                return Ok(expr::apps(u, &args));
+                return Ok(apps_at(S::APPS, u, &args));
             }
         }
         Ok(e.clone())
@@ -4525,7 +4590,7 @@ impl<'e> Checker<'e> {
                 expr::memo_insert(&mut self.iota_lit_memo.borrow_mut(), key, rhs.clone());
             }
         }
-        Ok(Some(expr::apps(rhs, rest)))
+        Ok(Some(apps_at(S::IOTA, rhs, rest)))
     }
 
     /// Test/diagnostic accessor for `iota_lit_memo_misses`.
@@ -4656,10 +4721,10 @@ impl<'e> Checker<'e> {
         match &**thead {
             ExprData::Const(n, us) if *n == tname => {
                 let subst = level::subst_map(&ctor_lp, us);
-                let mut ct = expr::instantiate_level_params(&ctor_typ, &subst);
+                let mut ct = lvl_at(S::IOTA, &ctor_typ, &subst);
                 for p in params {
                     match self.ensure_pi(ctx, &ct) {
-                        Ok((_, _, body)) => ct = expr::instantiate1(&body, p),
+                        Ok((_, _, body)) => ct = inst1_at(S::IOTA, &body, p),
                         Err(_) => return Ok(None),
                     }
                 }
@@ -4757,7 +4822,7 @@ impl<'e> Checker<'e> {
                 continue;
             }
             let subst = level::subst_map(&rec_level_params, us);
-            let typ = expr::instantiate_level_params(&typ, &subst);
+            let typ = lvl_at(S::IOTA, &typ, &subst);
             // `typ` is `rec`'s own closed declared type — still `Π`-headed
             // over its params, not yet a term "under" any loose bvars —
             // so `instantiate` (which substitutes loose bvars, not `Pi`
@@ -4786,7 +4851,7 @@ impl<'e> Checker<'e> {
                 continue;
             }
             let params_rev: Vec<Expr> = params.iter().rev().cloned().collect();
-            let mut cur = expr::instantiate(&cur, &params_rev);
+            let mut cur = inst_at(S::IOTA, &cur, &params_rev);
             for _ in 0..(num_motives + num_minors + num_indices) {
                 match &**cur {
                     ExprData::Pi(_, _, body) => cur = body.clone(),
@@ -4816,7 +4881,7 @@ impl<'e> Checker<'e> {
             // premise's own type, so there is nothing here to
             // substitute, only to un-nest.
             let peeled = (num_motives + num_minors + num_indices) as i32;
-            let major_dom = expr::shift(&major_dom, -peeled, 0);
+            let major_dom = shift_at(S::IOTA, &major_dom, -peeled, 0);
             let (mh, margs) = expr::unfold_apps(&major_dom);
             if let ExprData::Const(c, _) = &**mh {
                 if *c == target && margs.len() >= target_args.len() {
@@ -4905,7 +4970,7 @@ impl<'e> Checker<'e> {
             return None;
         }
         let subst = level::subst_map(rec_level_params, us);
-        let typ = expr::instantiate_level_params(&typ, &subst);
+        let typ = lvl_at(S::IOTA, &typ, &subst);
         // `instantiate` substitutes *loose* bvars — a no-op on `typ` as a
         // whole, since it's the recursor's own closed, Pi-wrapped declared
         // type (`loose_bvar_range(typ) == 0`). The params (e.g. LCNF
@@ -4936,7 +5001,7 @@ impl<'e> Checker<'e> {
         // `instantiate` substitutes bvar 0 (innermost) with `args[0]`, so
         // reverse before substituting into the now-loose body.
         let params_rev: Vec<Expr> = params.iter().rev().cloned().collect();
-        let mut cur = expr::instantiate(&cur, &params_rev);
+        let mut cur = inst_at(S::IOTA, &cur, &params_rev);
         for _ in 0..num_motives {
             match &**cur {
                 ExprData::Pi(_, _, body) => cur = body.clone(),
@@ -5111,12 +5176,12 @@ impl<'e> Checker<'e> {
         // `ctor_us`, the constructor's own universe args at its
         // application site — not `us` (see the call site's own comment).
         let subst = level::subst_map(&ctor_lp, ctor_us);
-        let mut ct = expr::instantiate_level_params(&ctor_typ, &subst);
+        let mut ct = lvl_at(S::IOTA, &ctor_typ, &subst);
         // Nested ctors (Array.mk, List.cons) carry their own params on the
         // major; the outer recursor's params may be empty (Syntax).
         for p in ctor_params {
             let (_, _, body) = self.ensure_pi(ctx, &ct)?;
-            ct = expr::instantiate1(&body, p);
+            ct = inst1_at(S::IOTA, &body, p);
         }
         // Lean iota: apply every constructor field first, then one rec-call
         // per recursive field, in field order. Interleaving (field, rec, field)
@@ -5141,7 +5206,7 @@ impl<'e> Checker<'e> {
             // checked one binder too deep — the whole spine came out with
             // indices uniformly off by one, which is how Init's
             // Array.foldlM_toList.aux._unary failed.
-            ct = expr::instantiate1(&body, f);
+            ct = inst1_at(S::IOTA, &body, f);
         }
         for rec_call in rec_calls {
             result = expr::app(result, rec_call);
@@ -5205,7 +5270,7 @@ impl<'e> Checker<'e> {
                 return Ok(None);
             }
             for (p_field, p_rec) in iargs[..nparams].iter().zip(params.iter()) {
-                let p_rec_shifted = expr::shift(p_rec, shift_by, 0);
+                let p_rec_shifted = shift_at(S::IOTA, p_rec, shift_by, 0);
                 if !self.is_def_eq(&tctx, p_field, &p_rec_shifted)? {
                     return Ok(None);
                 }
@@ -5232,7 +5297,7 @@ impl<'e> Checker<'e> {
             // type this ran on.
             let shifted_params: Vec<Expr> = params
                 .iter()
-                .map(|p| expr::shift(p, shift_by, 0))
+                .map(|p| shift_at(S::IOTA, p, shift_by, 0))
                 .collect();
             self.nested_rec_for_type(&tctx, rname, us, &shifted_params, target, &iargs)
         } {
@@ -5255,12 +5320,12 @@ impl<'e> Checker<'e> {
             // lambda instead of a fully-reduced value, which is what
             // `Cedar.SymCC.TermType.ofType`'s own `.fst`/`.snd`
             // projections out of that stuck lambda then reject on).
-            (nrec, params.iter().map(|p| expr::shift(p, shift_by, 0)).collect(), &[][..])
+            (nrec, params.iter().map(|p| shift_at(S::IOTA, p, shift_by, 0)).collect(), &[][..])
         } else if self.occurs_any(&ty, all) {
             // Fallback for a shape `nested_rec_for_type` doesn't parse
             // cleanly: the older, name-only search, unchanged.
             if let Some(nrec) = self.nested_rec_for(target, rname) {
-                (nrec, params.iter().map(|p| expr::shift(p, shift_by, 0)).collect(), &[][..])
+                (nrec, params.iter().map(|p| shift_at(S::IOTA, p, shift_by, 0)).collect(), &[][..])
             } else {
                 return Ok(None);
             }
@@ -5273,15 +5338,15 @@ impl<'e> Checker<'e> {
             rec_app = expr::app(rec_app, p);
         }
         for m in motives {
-            rec_app = expr::app(rec_app, expr::shift(m, shift_by, 0));
+            rec_app = expr::app(rec_app, shift_at(S::IOTA, m, shift_by, 0));
         }
         for m in minors {
-            rec_app = expr::app(rec_app, expr::shift(m, shift_by, 0));
+            rec_app = expr::app(rec_app, shift_at(S::IOTA, m, shift_by, 0));
         }
         for ix in indices {
             rec_app = expr::app(rec_app, ix.clone());
         }
-        let mut fapp = expr::shift(field, binders.len() as i32, 0);
+        let mut fapp = shift_at(S::IOTA, field, binders.len() as i32, 0);
         for i in (0..binders.len()).rev() {
             fapp = expr::app(fapp, expr::bvar(i as u32));
         }
