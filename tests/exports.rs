@@ -1638,3 +1638,12 @@ fn shifting_right_by_65536_or_more_is_still_division() {
 fn shifting_left_by_600000_bits_is_evaluated() {
     assert_accept("nat-shift-left-600k.accept.ndjson");
 }
+
+/// Two name indices spell `Nat`, one of them never declared. Every check
+/// must type a literal by the declared constant; the inductive check went
+/// by the last index with the spelling and rejected `mk : P 5 -> T`.
+#[test]
+fn nat_literal_in_a_constructor_under_a_duplicate_nat_spelling_accepts() {
+    assert_accept("nat-literal-under-duplicate-nat-spelling.accept.ndjson");
+    assert_accept("nat-literal-under-duplicate-nat-spelling-inductive-only.accept.ndjson");
+}

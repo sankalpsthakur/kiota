@@ -1375,8 +1375,12 @@ impl Parser {
                     .and_then(|x| x.as_array())
                     .map(|a| a.iter().map(|t| Self::get_u32(t, "name")).collect())
                     .unwrap_or_default();
-                let nat_ref = self.name_by_str.get("Nat").copied();
-                let string_ref = self.name_by_str.get("String").copied();
+                // Through the declared constant, like every other by-name
+                // lookup, not the last name index with the spelling: a
+                // checker handed another index types literals differently
+                // from the checkers before and after it.
+                let nat_ref = self.declared("Nat");
+                let string_ref = self.declared("String");
                 for n in names {
                     Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
                         .check_inductive_group(n)
