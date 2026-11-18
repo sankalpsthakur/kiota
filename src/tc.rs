@@ -392,7 +392,7 @@ thread_local! {
 }
 
 /// Intern `(parent_id, type ptr)` to a context id. Shared by full `ctx.id`
-/// and by suffix keys (the k innermost binders of an open term).
+/// (suffix keys were dropped: nothing read them).
 fn intern_ctx_id(parent: u64, ty_ptr: usize) -> u64 {
     intern_ctx_binding_id(parent, u32::MAX, ty_ptr)
 }
@@ -419,9 +419,6 @@ fn intern_ctx_binding_id(parent: u64, index: u32, ty_ptr: usize) -> u64 {
 /// that built it. Equal ids therefore imply equal contexts; distinct ids for
 /// equal contexts would only cost a cache miss, and interning rules that out.
 ///
-/// `suffix[k]` is the interned id of the **k innermost** binder types
-/// (`suffix[0] = 0`). A term with `loose = k` only reads those k binders,
-/// so infer/defeq can key on `suffix[k]` instead of the full telescope.
 #[derive(Clone)]
 struct Ctx {
     /// Invariant: only ever extended through `push`, which keeps `id` in step.
@@ -430,7 +427,6 @@ struct Ctx {
     /// inferred under other bindings — a false accept, silently.
     tys: Vec<Expr>,
     id: u64,
-    suffix: Vec<u64>,
 }
 
 impl Default for Ctx {
@@ -438,7 +434,6 @@ impl Default for Ctx {
         Ctx {
             tys: Vec::new(),
             id: 0,
-            suffix: vec![0],
         }
     }
 }
@@ -450,17 +445,7 @@ impl Ctx {
 
     fn push(&mut self, ty: Expr) {
         let ty_ptr = expr::identity(&ty);
-        let new_id = intern_ctx_id(self.id, ty_ptr);
-        let mut suffix = vec![0];
-        suffix.push(intern_ctx_id(0, ty_ptr));
-        for k in 1..self.tys.len() {
-            suffix.push(intern_ctx_id(self.suffix[k], ty_ptr));
-        }
-        if !self.tys.is_empty() {
-            suffix.push(new_id);
-        }
-        self.id = new_id;
-        self.suffix = suffix;
+        self.id = intern_ctx_id(self.id, ty_ptr);
         self.tys.push(ty);
     }
 
@@ -600,11 +585,6 @@ impl Ctx {
             id = intern_ctx_binding_id(id, i, ty_ptr);
         }
         id
-    }
-
-    fn suffix_key(&self, k: usize) -> u64 {
-        let k = k.min(self.tys.len());
-        self.suffix.get(k).copied().unwrap_or(self.id)
     }
 
     fn len(&self) -> usize {
@@ -1567,7 +1547,7 @@ impl<'e> Checker<'e> {
         let mut tail: Vec<((u64, usize), Expr)> = Vec::new();
         let mut cur = e.clone();
         let mut ty;
-        let mut pending;
+        let pending;
         loop {
             let ExprData::App(f, a) = &**cur else {
                 ty = self.infer_type(ctx, &cur)?;
