@@ -1,0 +1,80 @@
+name: remote-build-flags-suite
+
+# The arena's published small suite under each candidate build, verdicts
+# against the plain build on the same runner.
+on:
+  push:
+    branches: ['remote/build-flags-2026*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+  FIXTURE: tests/fixtures/rat-instEncodable-and-rec-theorem-major.accept.ndjson
+  SMALL_TESTS: "tutorial init-prelude *constlevels* *level-imax-leq* *nat-rec-rules* *unit-rec-rule* *orphan-rec* *loose-bvar-value* *app-lam* *shared-subterm* *beta-ladder* *let-ladder*"
+
+jobs:
+  suite:
+    # Every file of the arena's published small suite, the side's exit code
+    # against what the directory says (bad: 1, good: 0) and against plain
+    # on the same runner.
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [pgo, native+pgo, pgo+inline2000]
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the sides
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm init.ndjson.zst -o init.ndjson
+          for side in plain "$SIDE"; do
+            scripts/build-flags/build_side.sh "$side" init.ndjson "kiota-$side"
+          done
+      - name: Published small suite
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          # The step's shell is `bash -e`; a rejecting checker exits 1.
+          set +e -uo pipefail
+          mkdir suite
+          curl --fail --location --retry 3 --max-time 120 --proto '=https' \
+            https://arena.lean-lang.org/lean-arena-tests.tar.gz -o tests.tar.gz
+          tar -xzf tests.tar.gz -C suite
+          find suite -name '*.ndjson' | LC_ALL=C sort > files.txt
+          echo "SUITE files=$(wc -l < files.txt) good=$(grep -c '/good/' files.txt) bad=$(grep -c '/bad/' files.txt) sha=$(sha256sum tests.tar.gz | cut -c1-12)" | tee -a "$GITHUB_STEP_SUMMARY"
+          run_side() {
+            while IFS= read -r f; do
+              timeout 600 "./kiota-$1" "$f" >/dev/null 2>&1; echo "$? $f"
+            done < files.txt > "codes-$1.txt"
+          }
+          run_side plain & run_side "$SIDE" & wait
+          rc=0
+          for side in plain "$SIDE"; do
+            wrong=$(awk '{want = ($2 ~ /\/bad\//) ? 1 : 0; if ($1 != want) n++} END{print n+0}' "codes-$side.txt")
+            wrong_accept=$(awk '$2 ~ /\/bad\// && $1 == 0 {n++} END{print n+0}' "codes-$side.txt")
+            differ=$(diff codes-plain.txt "codes-$side.txt" | grep -c '^>' || true)
+            ran=$(wc -l < "codes-$side.txt")
+            echo "SUITE side=$side files=$ran not_as_expected=$wrong wrong_accepts=$wrong_accept differ_from_plain=$differ" | tee -a "$GITHUB_STEP_SUMMARY"
+            [ "$differ" = 0 ] && [ "$wrong_accept" = 0 ] && [ "$ran" = "$(wc -l < files.txt)" ] || rc=1
+          done
+          awk '{want = ($2 ~ /\/bad\//) ? 1 : 0; if ($1 != want) print "SUITE_UNEXPECTED side=plain rc=" $1, $2}' codes-plain.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          diff codes-plain.txt "codes-$SIDE.txt" | sed "s/^/SUITE_DIFF $SIDE /" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
