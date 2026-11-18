@@ -1,0 +1,80 @@
+name: remote-spine
+
+# KIOTA_SPINE off / on, without and with the cross-declaration caches
+# (KIOTA_XCACHE, KIOTA_XMEMO), on init and std, same binary per job.
+#   counters: verdict and KIOTA_STATS counters (deterministic).
+#   verify:   KIOTA_SPINE_VERIFY recomputes every spine and projection
+#             telescope one argument at a time and panics on another term;
+#             STATS9 counts same node / same term in another allocation.
+#             Run with no cache, XCACHE only, XMEMO only, and both.
+#   time:     no counters; user time and peak memory.
+on:
+  push:
+    branches: ['remote/ws-open-terms-2026*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+
+jobs:
+  spine:
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [init, std]
+        group: [counters, verify, time]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Arms
+        env:
+          C: ${{ matrix.corpus }}
+          G: ${{ matrix.group }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          arm() {
+            side=$1; shift
+            env "$@" /usr/bin/time -v -o time.txt ./target/release/kiota $C.ndjson >/dev/null 2>err.txt; rc=$?
+            echo "SP1 corpus=$C side=$side rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -E '^STATS3' err.txt | tail -1) $(grep -E '^STATS ' err.txt | tail -1) $(grep -E '^STATS9' err.txt | tail -1) resets=$(grep -c '^INTERN_RESET' err.txt) decls=$(grep -c '^DECL ' err.txt)"
+            grep -E '^STATS[245678]' err.txt | sed "s/^/SP2 corpus=$C side=$side /"
+            if [ $rc -ne 0 ]; then
+              echo "SP3 corpus=$C side=$side last_decl: $(grep '^DECL ' err.txt | tail -1 | cut -c1-300)"
+              grep -v -E '^(DECL|STATS|INTERN_RESET)' err.txt | head -20 | cut -c1-4000 | sed "s/^/SP3 corpus=$C side=$side /"
+            fi
+          }
+          V="KIOTA_STATS=1 KIOTA_SPINE=1 KIOTA_SPINE_VERIFY=1 KIOTA_TRACE_DECL=1 KIOTA_INTERN_RESET_LOG=1"
+          {
+            case $G in
+              counters)
+                arm off KIOTA_STATS=1
+                arm spine KIOTA_STATS=1 KIOTA_SPINE=1
+                arm a KIOTA_STATS=1 KIOTA_XCACHE=1 KIOTA_XMEMO=1
+                arm a_spine KIOTA_STATS=1 KIOTA_XCACHE=1 KIOTA_XMEMO=1 KIOTA_SPINE=1
+                ;;
+              verify)
+                arm spine_verify $V
+                arm xcache_spine_verify $V KIOTA_XCACHE=1
+                arm xmemo_spine_verify $V KIOTA_XMEMO=1
+                arm a_spine_verify $V KIOTA_XCACHE=1 KIOTA_XMEMO=1
+                ;;
+              time)
+                arm off_time KIOTA_UNUSED=1
+                arm spine_time KIOTA_SPINE=1
+                arm a_time KIOTA_XCACHE=1 KIOTA_XMEMO=1
+                arm a_spine_time KIOTA_XCACHE=1 KIOTA_XMEMO=1 KIOTA_SPINE=1
+                ;;
+            esac
+          } | tee -a "$GITHUB_STEP_SUMMARY"
