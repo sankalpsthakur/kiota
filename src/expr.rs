@@ -980,16 +980,35 @@ pub fn warm_intern(n: u32) {
     let _ = e;
 }
 
+/// Largest capacity (entries) a per-declaration memo keeps between
+/// declarations.
+const MEMO_KEEP_CAPACITY: usize = 1 << 12;
+
+/// Empty a per-declaration memo.
+///
+/// `HashMap::clear` sweeps the map's whole allocation whatever it holds, so
+/// a map that one large declaration stretched to millions of entries would
+/// charge that sweep to every declaration after it. Such a map is released
+/// instead and grows again on demand; a small one keeps its allocation.
+/// Either way the map is empty afterwards and nothing reads its capacity.
+pub fn clear_memo<K, V, S: Default>(m: &mut std::collections::HashMap<K, V, S>) {
+    if m.capacity() > MEMO_KEEP_CAPACITY {
+        *m = Default::default();
+    } else {
+        m.clear();
+    }
+}
+
 /// Drop per-decl substitution memos. The intern table stays: env terms
 /// live there. These two maps grow with every `shift`/`instantiate_level_params`
 /// and were never cleared, so std `#18000` hung after 18k decls of residue.
 pub fn clear_subst_memos() {
-    LEVEL_INST_MEMO.with(|m| m.borrow_mut().clear());
+    LEVEL_INST_MEMO.with(|m| clear_memo(&mut m.borrow_mut()));
     // Clear the memo first: IDs can be reused only after its entries are gone.
-    LEVEL_SUBST_IDS.with(|m| m.borrow_mut().clear());
-    SHIFT_MEMO.with(|m| m.borrow_mut().clear());
-    INST1_MEMO.with(|m| m.borrow_mut().clear());
-    USED_SET_MEMO.with(|m| m.borrow_mut().clear());
+    LEVEL_SUBST_IDS.with(|m| clear_memo(&mut m.borrow_mut()));
+    SHIFT_MEMO.with(|m| clear_memo(&mut m.borrow_mut()));
+    INST1_MEMO.with(|m| clear_memo(&mut m.borrow_mut()));
+    USED_SET_MEMO.with(|m| clear_memo(&mut m.borrow_mut()));
 }
 
 pub fn bvar(i: u32) -> Expr {
@@ -1767,6 +1786,48 @@ mod tests {
         assert!(!Rc::ptr_eq(&app(c.clone(), x.clone()), &app(x.clone(), c.clone())));
         assert!(!Rc::ptr_eq(&lit_str("shape"), &lit_str("shapf")));
         assert!(!Rc::ptr_eq(&lit_nat(big.clone()), &lit_nat(big + 1u8)));
+    }
+
+    /// A per-declaration memo is empty after `clear_memo` whatever its
+    /// size. A small one keeps its allocation; one stretched past the limit
+    /// gives it back, so the next declarations do not sweep it.
+    #[test]
+    fn clear_memo_empties_and_releases_an_oversized_map() {
+        let mut small: FxHashMap<(usize, usize), Expr> = FxHashMap::default();
+        for i in 0..100usize {
+            small.insert((i, i), bvar(i as u32));
+        }
+        let kept = small.capacity();
+        clear_memo(&mut small);
+        assert!(small.is_empty());
+        assert_eq!(small.capacity(), kept, "a small memo keeps its allocation");
+
+        let mut large: FxHashMap<(usize, usize), Expr> = FxHashMap::default();
+        let held = bvar(7);
+        let before = Rc::strong_count(&held);
+        for i in 0..(4 * MEMO_KEEP_CAPACITY) {
+            large.insert((i, 0), held.clone());
+        }
+        assert!(large.capacity() > MEMO_KEEP_CAPACITY);
+        clear_memo(&mut large);
+        assert!(large.is_empty());
+        assert!(large.capacity() <= MEMO_KEEP_CAPACITY, "an oversized memo is released");
+        assert_eq!(Rc::strong_count(&held), before, "every entry was dropped");
+        // And it is usable again.
+        large.insert((1, 1), held.clone());
+        assert_eq!(large.len(), 1);
+
+        // The memos `clear_subst_memos` owns go through it.
+        let body = app(bvar(0), bvar(1));
+        for i in 0..(2 * MEMO_KEEP_CAPACITY as u32) {
+            let _ = instantiate1(&body, &lit_nat(BigUint::from(i)));
+        }
+        assert!(INST1_MEMO.with(|m| m.borrow().capacity()) > MEMO_KEEP_CAPACITY);
+        clear_subst_memos();
+        assert!(INST1_MEMO.with(|m| m.borrow().is_empty()));
+        assert!(INST1_MEMO.with(|m| m.borrow().capacity()) <= MEMO_KEEP_CAPACITY);
+        let c = const_(99, vec![]);
+        assert!(Rc::ptr_eq(&instantiate1(&body, &c), &app(c.clone(), bvar(0))));
     }
 
     #[test]
