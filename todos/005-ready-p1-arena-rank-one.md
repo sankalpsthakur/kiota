@@ -474,10 +474,12 @@ identical to the board's) are equation lemmas of functions guarded by a read
 of a packed `UInt64` field (`wscopedBP`, `leavesSubP`, `instantiate1P`,
 `abstractRangeP`, `abstract1P`, `allLevelParamsDefinedP`,
 `instantiate1LiftP`, `hasLooseBVarB`: `.eq_1`..`.eq_10`), plus
-`Expr.mkBvar_eq` and `lpOfData_pack`. Each is `rfl` between two terms that
-unfold to `ite c inst t e` (or `decide p`) over the same condition, and the
-condition reads `h * 4294967296 + ...` of an open term with an opaque
-`mixHash` inside. The official kernel's lazy delta compares the two
+`Expr.mkBvar_eq` (a `dite` on an index into a 4096-entry pool) and
+`lpOfData_pack`. Each equation lemma is `rfl` between two terms that
+unfold to `ite c inst t e` over the same condition (`decide p` in
+`lpOfData_pack`), and the condition reads `h * 4294967296 + ...` of an
+open term with an opaque `mixHash` inside. The official kernel's lazy
+delta compares the two
 applications argument by argument and never evaluates the condition.
 kiota's `whnf_core` decided `ite`/`dite`/`Decidable.decide` itself by
 normalizing the `Decidable` instance, and `def_eq_main_path_lazy` opens with
@@ -503,7 +505,7 @@ Measured (GitHub runners, the arena's build line `cargo build --release`):
 | 44344203853 | fd7248f (+`decide`) | accept (rc 0), twice | 480, 556 | 8:04, 9:20 | 13.07 GB | 0 |
 | 44344203853 | fd7248f, `KIOTA_NO_DECIDE_SHORTCUT=1` | timeout at 720 s, twice | 714 | 12:00 | 13.5 GB | 0 (accept in 754 s uncapped) |
 
-fd7248f on con-leche: 83 lazy retries, all accepted;
+fd7248f on con-leche: 82 lazy retries, all accepted;
 intern_calls=2,025,649,823. Standing corpora at fd7248f against base, same
 exports (run 44313744961): init, std, cedar, cslib all rc 0 with every
 STATS counter identical to base (intern_calls 540,395,910 / 1,105,416,459 /
@@ -523,6 +525,16 @@ Open:
   (`KIOTA_NO_DECIDE_SHORTCUT=1`) nothing declines and nothing is retried,
   but `ConLeche.ensureSortIO_def` alone takes 238 s and 6.7 GB, and the
   test times out.
+- The eager pass's verdict on `ConLeche.ensureSortIO_def` depends on the
+  export it is read from. In the arena export it is accepted outright (no
+  retry, under a second). In the cone of a later declaration exported on
+  its own (run 44346066557, artifact `hot-cones`: cone-8, 787,289 lines,
+  `ensureSortIO_def` is declaration #4965; also cone-1) the eager pass
+  declines it with "defeq depth limit" and the lazy retry accepts it in
+  176-327 s at +6.5 GB, on e593b79 and fd7248f alike (run 44356145912).
+  Counters repeat exactly for a given file, so it is the input's order or
+  numbering, not chance; the cause is not known. It is the same
+  declaration that costs 238 s with the eager shortcuts off.
 - `whnf_core` in the lazy pass still runs the Nat extension on open terms,
   which Lean's `lazy_delta_reduction` only does for closed ones
   (`!has_fvar`); no declaration in con-leche or the standing corpora needs
