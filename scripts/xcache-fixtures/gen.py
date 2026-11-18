@@ -134,6 +134,34 @@ FIXTURES = {
     "whnf-depth-cap-then-shallow.accept.ndjson": whnf_depth_cap_then_shallow,
 }
 
+
+
+def ctor_type_mentions_own_ctor():
+    """Not a cache case and not a fixture: an open finding about the checker.
+
+    inductive S | mk : ((fun (k : B -> S) => B) S.mk) -> S. The field type
+    mentions S.mk, the constructor being declared. The checker accepts it
+    with or without the cache flags (exit 0 on main 07367f0). What the
+    official kernel does with it has not been run; it checks constructor
+    types before the constructors are in the environment.
+    """
+    x = Export()
+    B, _, _, _, _ = x.enum2("B", "t", "f")
+    Bc = x.const(B)
+    x.name("S")
+    mk = x.name("S.mk")
+    x.name("S.rec")
+    Sc = x.const("S")
+    field = x.app(x.lam(x.pi(Bc, Sc, "b"), Bc, "k"), x.const(mk))
+    x.struct1("S", field)
+    return x
+
+
+# Written only when named on the command line.
+OPEN_FINDINGS = {
+    "open-finding-ctor-type-mentions-own-ctor.ndjson": ctor_type_mentions_own_ctor,
+}
+
 if __name__ == "__main__":
     out = sys.argv[1]
     only = sys.argv[2:]
@@ -142,3 +170,7 @@ if __name__ == "__main__":
             continue
         build().write(os.path.join(out, name))
         print(name)
+    for name, build in OPEN_FINDINGS.items():
+        if name in only:
+            build().write(os.path.join(out, name))
+            print(name)

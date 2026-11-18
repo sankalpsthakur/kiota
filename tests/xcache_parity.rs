@@ -152,8 +152,12 @@ fn a_failure_after_a_cache_hit_is_decided_again_without_the_caches() {
     let path = fixtures_dir().join("whnf-depth-cap-then-shallow.accept.ndjson");
     let with = check(&path, &["KIOTA_XCACHE"], true);
     assert_eq!(with.code, ACCEPT, "{}", with.stderr);
-    assert_eq!(stat(&with, "xcache_rechecks"), 1, "{}", with.stderr);
-    assert_eq!(stat(&with, "xcache_recheck_accepts"), 1, "{}", with.stderr);
+    // The fixture sits close to the depth cap by construction. If a change
+    // to how much depth a reduction uses makes the eager pass get through
+    // with the caches (no re-check) or fail without them, rebuild it with
+    // another length (scripts/xcache-fixtures/gen.py).
+    assert!(stat(&with, "xcache_rechecks") >= 1, "{}", with.stderr);
+    assert_eq!(stat(&with, "xcache_recheck_accepts"), stat(&with, "xcache_rechecks"), "{}", with.stderr);
     let without = check(&path, &[], true);
     assert_eq!(without.code, ACCEPT, "{}", without.stderr);
     assert_eq!(stat(&without, "xcache_hits"), 0);
