@@ -236,6 +236,7 @@ fn used_shift_binder(u: u64) -> u64 {
 }
 
 /// Computed once per node from children that already carry their own bits.
+#[inline(always)]
 fn used_of(d: &ExprData) -> u64 {
     match d {
         ExprData::BVar(i) => {
@@ -259,6 +260,7 @@ fn used_of(d: &ExprData) -> u64 {
 }
 
 /// Computed once per node, from children that already carry their own range.
+#[inline(always)]
 fn loose_of(d: &ExprData) -> u32 {
     match d {
         ExprData::BVar(i) => *i + 1,
@@ -297,55 +299,255 @@ const SEED_PROJ: u64 = 0x2545_f491_4f6c_dd1d;
 const SEED_NAT: u64 = 0x94d0_49bb_1331_11eb;
 const SEED_STR: u64 = 0xbf58_476d_1ce4_e5b9;
 
+// The hash of each kind, from its fields. `hash_node` and the `Shape` of the
+// kind both come here, so one structure has one hash however it arrives.
+#[inline(always)]
+fn hash_bvar(i: u32) -> u64 {
+    hash_mix(SEED_BVAR, i as u64)
+}
+#[inline(always)]
+fn hash_sort(l: &Level) -> u64 {
+    let mut h = FxHasher::default();
+    l.hash(&mut h);
+    hash_mix(SEED_SORT, h.finish())
+}
+#[inline(always)]
+fn hash_const(n: u32, us: &Rc<Vec<Level>>) -> u64 {
+    let mut h = FxHasher::default();
+    n.hash(&mut h);
+    us.hash(&mut h);
+    hash_mix(SEED_CONST, h.finish())
+}
+#[inline(always)]
+fn hash_app(f: &Expr, a: &Expr) -> u64 {
+    hash_mix(hash_mix(SEED_APP, ptr(f) as u64), ptr(a) as u64)
+}
+#[inline(always)]
+fn hash_binder(seed: u64, bi: BinderInfo, ty: &Expr, body: &Expr) -> u64 {
+    hash_mix(
+        hash_mix(seed.wrapping_add(bi as u64), ptr(ty) as u64),
+        ptr(body) as u64,
+    )
+}
+#[inline(always)]
+fn hash_let(ty: &Expr, val: &Expr, body: &Expr) -> u64 {
+    hash_mix(
+        hash_mix(hash_mix(SEED_LET, ptr(ty) as u64), ptr(val) as u64),
+        ptr(body) as u64,
+    )
+}
+#[inline(always)]
+fn hash_proj(s: u32, i: u32, v: &Expr) -> u64 {
+    hash_mix(
+        hash_mix(SEED_PROJ, ((s as u64) << 32) | i as u64),
+        ptr(v) as u64,
+    )
+}
+#[inline(always)]
+fn hash_nat(n: &BigUint) -> u64 {
+    let mut h = FxHasher::default();
+    n.hash(&mut h);
+    hash_mix(SEED_NAT, h.finish())
+}
+#[inline(always)]
+fn hash_str(s: &Rc<String>) -> u64 {
+    let mut h = FxHasher::default();
+    s.hash(&mut h);
+    hash_mix(SEED_STR, h.finish())
+}
+
 /// Structural hash of one node. Children contribute their identity, never
 /// their content, so the cost does not depend on term size. Only the lookup
 /// structure reads this value: every candidate is confirmed by `node_eq`,
 /// so the function is free to change without changing any result.
-#[inline]
+#[inline(always)]
 fn hash_node(d: &ExprData) -> u64 {
     match d {
-        ExprData::BVar(i) => hash_mix(SEED_BVAR, *i as u64),
-        ExprData::Sort(l) => {
-            let mut h = FxHasher::default();
-            l.hash(&mut h);
-            hash_mix(SEED_SORT, h.finish())
-        }
-        ExprData::Const(n, us) => {
-            let mut h = FxHasher::default();
-            n.hash(&mut h);
-            us.hash(&mut h);
-            hash_mix(SEED_CONST, h.finish())
-        }
-        ExprData::App(f, a) => hash_mix(hash_mix(SEED_APP, ptr(f) as u64), ptr(a) as u64),
-        ExprData::Lam(bi, ty, body) => hash_mix(
-            hash_mix(SEED_LAM.wrapping_add(*bi as u64), ptr(ty) as u64),
-            ptr(body) as u64,
-        ),
-        ExprData::Pi(bi, ty, body) => hash_mix(
-            hash_mix(SEED_PI.wrapping_add(*bi as u64), ptr(ty) as u64),
-            ptr(body) as u64,
-        ),
-        ExprData::Let(ty, val, body) => hash_mix(
-            hash_mix(hash_mix(SEED_LET, ptr(ty) as u64), ptr(val) as u64),
-            ptr(body) as u64,
-        ),
-        ExprData::Proj(s, i, v) => hash_mix(
-            hash_mix(SEED_PROJ, ((*s as u64) << 32) | *i as u64),
-            ptr(v) as u64,
-        ),
-        ExprData::Lit(Lit::Nat(n)) => {
-            let mut h = FxHasher::default();
-            n.hash(&mut h);
-            hash_mix(SEED_NAT, h.finish())
-        }
-        ExprData::Lit(Lit::Str(s)) => {
-            let mut h = FxHasher::default();
-            s.hash(&mut h);
-            hash_mix(SEED_STR, h.finish())
-        }
+        ExprData::BVar(i) => hash_bvar(*i),
+        ExprData::Sort(l) => hash_sort(l),
+        ExprData::Const(n, us) => hash_const(*n, us),
+        ExprData::App(f, a) => hash_app(f, a),
+        ExprData::Lam(bi, ty, body) => hash_binder(SEED_LAM, *bi, ty, body),
+        ExprData::Pi(bi, ty, body) => hash_binder(SEED_PI, *bi, ty, body),
+        ExprData::Let(ty, val, body) => hash_let(ty, val, body),
+        ExprData::Proj(s, i, v) => hash_proj(*s, *i, v),
+        ExprData::Lit(Lit::Nat(n)) => hash_nat(n),
+        ExprData::Lit(Lit::Str(s)) => hash_str(s),
     }
 }
 
+/// A node on its way into the table, its kind known at compile time.
+///
+/// A constructor knows which kind it builds. Going through `ExprData` made
+/// the lookup ask again, at run time, for the hash, for each candidate
+/// comparison and for the release of the unused fields. With one `Shape`
+/// per kind every constructor compiles to the code for its own kind, and
+/// the enum value is only built for a node that turns out to be new.
+trait Shape: Sized {
+    fn hash(&self) -> u64;
+    /// Whether `n` is this structure: same kind, same scalars, children
+    /// compared by identity (as `node_eq` compares them).
+    fn is(&self, n: &ExprData) -> bool;
+    fn into_data(self) -> ExprData;
+}
+
+struct BVarShape(u32);
+struct SortShape(Level);
+struct ConstShape(u32, Rc<Vec<Level>>);
+struct AppShape(Expr, Expr);
+struct LamShape(BinderInfo, Expr, Expr);
+struct PiShape(BinderInfo, Expr, Expr);
+struct LetShape(Expr, Expr, Expr);
+struct ProjShape(u32, u32, Expr);
+struct NatShape(BigUint);
+struct StrShape(Rc<String>);
+
+impl Shape for BVarShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_bvar(self.0)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::BVar(i) if *i == self.0)
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::BVar(self.0)
+    }
+}
+impl Shape for SortShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_sort(&self.0)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Sort(l) if *l == self.0)
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Sort(self.0)
+    }
+}
+impl Shape for ConstShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_const(self.0, &self.1)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Const(c, us) if *c == self.0 && *us == self.1)
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Const(self.0, self.1)
+    }
+}
+impl Shape for AppShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_app(&self.0, &self.1)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::App(f, a) if Rc::ptr_eq(f, &self.0) && Rc::ptr_eq(a, &self.1))
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::App(self.0, self.1)
+    }
+}
+impl Shape for LamShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_binder(SEED_LAM, self.0, &self.1, &self.2)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Lam(bi, ty, body)
+            if *bi == self.0 && Rc::ptr_eq(ty, &self.1) && Rc::ptr_eq(body, &self.2))
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Lam(self.0, self.1, self.2)
+    }
+}
+impl Shape for PiShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_binder(SEED_PI, self.0, &self.1, &self.2)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Pi(bi, ty, body)
+            if *bi == self.0 && Rc::ptr_eq(ty, &self.1) && Rc::ptr_eq(body, &self.2))
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Pi(self.0, self.1, self.2)
+    }
+}
+impl Shape for LetShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_let(&self.0, &self.1, &self.2)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Let(ty, val, body)
+            if Rc::ptr_eq(ty, &self.0) && Rc::ptr_eq(val, &self.1) && Rc::ptr_eq(body, &self.2))
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Let(self.0, self.1, self.2)
+    }
+}
+impl Shape for ProjShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_proj(self.0, self.1, &self.2)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Proj(s, i, v)
+            if *s == self.0 && *i == self.1 && Rc::ptr_eq(v, &self.2))
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Proj(self.0, self.1, self.2)
+    }
+}
+impl Shape for NatShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_nat(&self.0)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Lit(Lit::Nat(m)) if *m == self.0)
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Lit(Lit::Nat(self.0))
+    }
+}
+impl Shape for StrShape {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        hash_str(&self.0)
+    }
+    #[inline(always)]
+    fn is(&self, n: &ExprData) -> bool {
+        matches!(n, ExprData::Lit(Lit::Str(t)) if *t == self.0)
+    }
+    #[inline(always)]
+    fn into_data(self) -> ExprData {
+        ExprData::Lit(Lit::Str(self.0))
+    }
+}
+
+#[inline(always)]
 fn node_eq(a: &ExprData, b: &ExprData) -> bool {
     match (a, b) {
         (ExprData::BVar(i), ExprData::BVar(j)) => i == j,
@@ -403,6 +605,8 @@ struct Interner {
     len: usize,
     /// Grow once `len` passes this (5/8 of the slots).
     grow_at: usize,
+    /// The identity the next allocated node gets. Never reset: see `identity`.
+    next_id: usize,
     /// `intern` calls on this thread, in either mode.
     calls: u64,
     /// The call count at which the next progress line is printed.
@@ -427,15 +631,22 @@ impl Interner {
             shift: 64 - log2,
             len: 0,
             grow_at: n / 8 * 5,
+            next_id: 1,
             calls: 0,
             next_report: INTERN_REPORT_EVERY,
             weak_mode: reclamation_enabled(),
         }
     }
 
-    #[inline]
-    fn intern(&mut self, d: ExprData) -> Expr {
-        let h = hash_node(&d);
+    #[inline(always)]
+    fn take_id(&mut self) -> usize {
+        let id = self.next_id;
+        self.next_id = id.checked_add(1).expect("expression identity exhausted");
+        id
+    }
+
+    #[inline(always)]
+    fn intern<K: Shape>(&mut self, k: K, h: u64) -> Expr {
         let mask = self.slots.len() - 1;
         let mut i = (h >> self.shift) as usize;
         loop {
@@ -443,14 +654,15 @@ impl Interner {
             match &slot.node {
                 None => break,
                 Some(e) => {
-                    if slot.hash == h && node_eq(&d, e) {
+                    if slot.hash == h && k.is(e) {
                         return e.clone();
                     }
                 }
             }
             i = (i + 1) & mask;
         }
-        let e = alloc_node(d);
+        let id = self.take_id();
+        let e = alloc_node_with(k.into_data(), id);
         self.slots[i] = Slot {
             hash: h,
             node: Some(e.clone()),
@@ -507,15 +719,19 @@ impl Interner {
     }
 }
 
+/// Allocate a node outside the strong table (`KIOTA_RECLAIM` and tests).
+/// Identities come from the one counter either way.
 fn alloc_node(d: ExprData) -> Expr {
+    let id = INTERN.with(|t| t.borrow_mut().take_id());
+    alloc_node_with(d, id)
+}
+
+#[inline(always)]
+fn alloc_node_with(d: ExprData, identity: usize) -> Expr {
     let loose = loose_of(&d);
     let used_bvars = used_of(&d);
     Rc::new(ExprNode {
-        identity: NEXT_NODE_ID.with(|next| {
-            let id = next.get();
-            next.set(id.checked_add(1).expect("expression identity exhausted"));
-            id
-        }),
+        identity,
         data: d,
         loose,
         used_bvars,
@@ -523,7 +739,6 @@ fn alloc_node(d: ExprData) -> Expr {
 }
 
 thread_local! {
-    static NEXT_NODE_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
     static INTERN: RefCell<Interner> = RefCell::new(Interner::default());
     static WEAK_INTERN: RefCell<reclaim::WeakInterner> = RefCell::new(reclaim::WeakInterner::default());
     static LEVEL_INST_MEMO: RefCell<FxHashMap<(usize, usize), Expr>> =
@@ -646,28 +861,65 @@ pub fn bits_to_list(mut bits: u64, base: u32) -> Vec<u32> {
 /// A progress line on stderr every this many `intern` calls.
 const INTERN_REPORT_EVERY: u64 = 100_000_000;
 
-pub fn intern(d: ExprData) -> Expr {
+/// Look a node up, allocating it if it is new.
+///
+/// Inlined into every constructor below. `K` is the constructor's own
+/// `Shape`, so each gets a copy of the lookup compiled for its kind. The
+/// hash is taken first: it needs nothing from the table.
+#[inline(always)]
+fn intern_inline<K: Shape>(k: K) -> Expr {
+    let h = k.hash();
     INTERN.with(|t| {
         let mut t = t.borrow_mut();
         t.calls += 1;
         if t.calls == t.next_report {
-            t.next_report += INTERN_REPORT_EVERY;
-            let n = t.calls;
-            let nodes = if t.weak_mode {
-                WEAK_INTERN.with(|w| w.borrow().len())
-            } else {
-                t.len()
-            };
-            eprintln!("INTERN_CALLS {n} nodes={nodes}");
-            let _ = std::io::Write::flush(&mut std::io::stderr());
+            t.report();
         }
         if t.weak_mode {
             drop(t);
-            WEAK_INTERN.with(|t| t.borrow_mut().intern(d))
-        } else {
-            t.intern(d)
+            return intern_weak(k.into_data());
         }
+        t.intern(k, h)
     })
+}
+
+#[cold]
+#[inline(never)]
+fn intern_weak(d: ExprData) -> Expr {
+    WEAK_INTERN.with(|t| t.borrow_mut().intern(d))
+}
+
+impl Interner {
+    #[cold]
+    #[inline(never)]
+    fn report(&mut self) {
+        self.next_report += INTERN_REPORT_EVERY;
+        let n = self.calls;
+        let nodes = if self.weak_mode {
+            WEAK_INTERN.with(|w| w.borrow().len())
+        } else {
+            self.len()
+        };
+        eprintln!("INTERN_CALLS {n} nodes={nodes}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+}
+
+/// `intern` for a node whose kind is only known at run time: hand it to
+/// the constructor of its kind, the one way into the table.
+pub fn intern(d: ExprData) -> Expr {
+    match d {
+        ExprData::BVar(i) => bvar(i),
+        ExprData::Sort(l) => sort(l),
+        ExprData::Const(n, us) => intern_inline(ConstShape(n, us)),
+        ExprData::App(f, a) => app(f, a),
+        ExprData::Lam(bi, ty, body) => lam(bi, ty, body),
+        ExprData::Pi(bi, ty, body) => pi(bi, ty, body),
+        ExprData::Let(ty, val, body) => let_(ty, val, body),
+        ExprData::Proj(s, i, v) => proj(s, i, v),
+        ExprData::Lit(Lit::Nat(n)) => lit_nat(n),
+        ExprData::Lit(Lit::Str(s)) => intern_inline(StrShape(s)),
+    }
 }
 
 pub fn intern_node_count() -> usize {
@@ -741,34 +993,34 @@ pub fn clear_subst_memos() {
 }
 
 pub fn bvar(i: u32) -> Expr {
-    intern(ExprData::BVar(i))
+    intern_inline(BVarShape(i))
 }
 pub fn sort(l: Level) -> Expr {
-    intern(ExprData::Sort(l))
+    intern_inline(SortShape(l))
 }
 pub fn const_(n: u32, us: Vec<Level>) -> Expr {
-    intern(ExprData::Const(n, Rc::new(us)))
+    intern_inline(ConstShape(n, Rc::new(us)))
 }
 pub fn app(f: Expr, a: Expr) -> Expr {
-    intern(ExprData::App(f, a))
+    intern_inline(AppShape(f, a))
 }
 pub fn lam(bi: BinderInfo, ty: Expr, body: Expr) -> Expr {
-    intern(ExprData::Lam(bi, ty, body))
+    intern_inline(LamShape(bi, ty, body))
 }
 pub fn pi(bi: BinderInfo, ty: Expr, body: Expr) -> Expr {
-    intern(ExprData::Pi(bi, ty, body))
+    intern_inline(PiShape(bi, ty, body))
 }
 pub fn let_(ty: Expr, val: Expr, body: Expr) -> Expr {
-    intern(ExprData::Let(ty, val, body))
+    intern_inline(LetShape(ty, val, body))
 }
 pub fn proj(s: u32, i: u32, e: Expr) -> Expr {
-    intern(ExprData::Proj(s, i, e))
+    intern_inline(ProjShape(s, i, e))
 }
 pub fn lit_nat(n: num_bigint::BigUint) -> Expr {
-    intern(ExprData::Lit(Lit::Nat(n)))
+    intern_inline(NatShape(n))
 }
 pub fn lit_str(s: impl Into<String>) -> Expr {
-    intern(ExprData::Lit(Lit::Str(Rc::new(s.into()))))
+    intern_inline(StrShape(Rc::new(s.into())))
 }
 
 /// True when `e` has no loose bvars.
@@ -1318,6 +1570,70 @@ mod tests {
         for n in 0..1_000 {
             assert!(identity(&const_(n, vec![])) > original_id);
         }
+    }
+
+    /// Every kind has one way into the table. The constructors and the
+    /// run-time `intern` must agree on each kind, whichever of the two files
+    /// the node first, and the general `hash_node`/`node_eq` (which the
+    /// reclaiming table uses) must agree with the per-kind ones.
+    #[test]
+    fn constructors_and_run_time_intern_share_one_node_per_structure() {
+        let c = const_(97, vec![level::zero()]);
+        let x = bvar(5);
+        let us = Rc::new(vec![level::succ(level::zero())]);
+        let big = BigUint::from(u64::MAX) * BigUint::from(3u8);
+        // (built by the constructor, the same structure as `ExprData`)
+        let by_constructor: Vec<(Expr, ExprData)> = vec![
+            (bvar(41), ExprData::BVar(41)),
+            (sort(level::succ(level::zero())), ExprData::Sort(level::succ(level::zero()))),
+            (const_(98, (*us).clone()), ExprData::Const(98, us.clone())),
+            (app(c.clone(), x.clone()), ExprData::App(c.clone(), x.clone())),
+            (
+                lam(BinderInfo::Implicit, c.clone(), x.clone()),
+                ExprData::Lam(BinderInfo::Implicit, c.clone(), x.clone()),
+            ),
+            (
+                pi(BinderInfo::Implicit, c.clone(), x.clone()),
+                ExprData::Pi(BinderInfo::Implicit, c.clone(), x.clone()),
+            ),
+            (
+                let_(c.clone(), x.clone(), c.clone()),
+                ExprData::Let(c.clone(), x.clone(), c.clone()),
+            ),
+            (proj(3, 1, x.clone()), ExprData::Proj(3, 1, x.clone())),
+            (lit_nat(big.clone()), ExprData::Lit(Lit::Nat(big.clone()))),
+            (lit_str("shape"), ExprData::Lit(Lit::Str(Rc::new("shape".to_string())))),
+        ];
+        let before = intern_node_count();
+        for (i, (e, d)) in by_constructor.iter().enumerate() {
+            assert!(node_eq(d, e), "kind {i}: node_eq disagrees with the constructor");
+            assert_eq!(
+                hash_node(d),
+                hash_node(&e.data),
+                "kind {i}: equal structures, different hashes"
+            );
+            assert!(Rc::ptr_eq(e, &intern(d.clone())), "kind {i}: run-time intern made a second node");
+        }
+        assert_eq!(intern_node_count(), before, "a lookup allocated");
+        // The other order: `intern` files it, the constructor finds it.
+        let via_intern = intern(ExprData::App(x.clone(), c.clone()));
+        assert!(Rc::ptr_eq(&via_intern, &app(x.clone(), c.clone())));
+        let via_intern = intern(ExprData::Pi(BinderInfo::Default, x.clone(), c.clone()));
+        assert!(Rc::ptr_eq(&via_intern, &pi(BinderInfo::Default, x.clone(), c.clone())));
+        // Same children under a different kind or scalar is a different node.
+        assert!(!Rc::ptr_eq(
+            &lam(BinderInfo::Implicit, c.clone(), x.clone()),
+            &pi(BinderInfo::Implicit, c.clone(), x.clone())
+        ));
+        assert!(!Rc::ptr_eq(
+            &lam(BinderInfo::Implicit, c.clone(), x.clone()),
+            &lam(BinderInfo::Default, c.clone(), x.clone())
+        ));
+        assert!(!Rc::ptr_eq(&proj(3, 1, x.clone()), &proj(3, 2, x.clone())));
+        assert!(!Rc::ptr_eq(&proj(3, 1, x.clone()), &proj(4, 1, x.clone())));
+        assert!(!Rc::ptr_eq(&app(c.clone(), x.clone()), &app(x.clone(), c.clone())));
+        assert!(!Rc::ptr_eq(&lit_str("shape"), &lit_str("shapf")));
+        assert!(!Rc::ptr_eq(&lit_nat(big.clone()), &lit_nat(big + 1u8)));
     }
 
     #[test]
