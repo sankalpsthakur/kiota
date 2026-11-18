@@ -268,19 +268,20 @@ fn recursor_type_reconstruction_late_failure_rolls_back_ownership() {
     let auxiliary = parser.name_by_str["LALNest.rec_1"];
     let owner = parser.name_by_str["LALNest"];
     let mut missing_owner = original.clone();
-    // A nonempty rule list naming an earlier block's constructor claims no
-    // current owner. This reaches the missing-owner check after rec_group has
-    // been filled, rather than failing during type reconstruction.
+    // A rule list naming an earlier block's constructor would claim no
+    // current owner, and one naming the current constructor from the
+    // auxiliary recursor would claim it twice. Both used to reach the
+    // ownership checks after rec_group had been filled; the rule lists are
+    // now compared with the reconstructed members first, so they are refused
+    // there. Either way nothing of the block may remain.
     recursor_record(&mut missing_owner, main)["rules"][0]["ctor"] =
         serde_json::json!(parser.name_by_str["LALWrap.mk"]);
     let mut duplicate_owner = original.clone();
-    // Both recursors now claim the current constructor. Whichever comes first
-    // writes rec_of; the second fails, exercising rollback of that write too.
     recursor_record(&mut duplicate_owner, auxiliary)["rules"][0]["ctor"] =
         serde_json::json!(parser.name_by_str["LALNest.node"]);
     for (record, expected) in [
-        (missing_owner, "inductive `LALNest` is missing a recursor".to_string()),
-        (duplicate_owner, format!("duplicate recursor for type {owner}")),
+        (missing_owner, "recursor `LALNest.rec` rules do not match its constructors"),
+        (duplicate_owner, "recursor `LALNest.rec_1` rules do not match its constructors"),
     ] {
         assert!(matches!(import_record(&mut parser, &record), Err(TcError::Reject(m))
             if m == expected));

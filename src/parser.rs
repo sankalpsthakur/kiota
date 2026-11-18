@@ -885,6 +885,21 @@ impl Parser {
                     "recursor `{rname}` metadata does not match reconstruction"
                 )));
             }
+            // The kernel generates one computation rule per constructor of
+            // this member, in order.  Which rules a recursor lists decides
+            // which constructors it reduces on and which type it is the
+            // recursor of, so the list is compared, not trusted.
+            if r.rules.len() != d.rules.len()
+                || r
+                    .rules
+                    .iter()
+                    .zip(d.rules.iter())
+                    .any(|(rule, (ctor, nfields))| rule.ctor != *ctor || rule.nfields != *nfields)
+            {
+                return Err(TcError::Reject(format!(
+                    "recursor `{rname}` rules do not match its constructors"
+                )));
+            }
             Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
                 .validate_reconstructed_type(
                     &r.supplied_type,

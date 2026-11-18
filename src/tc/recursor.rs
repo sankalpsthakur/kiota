@@ -41,6 +41,9 @@ pub(crate) struct DerivedRecursor {
     pub num_motives: u32,
     pub num_minors: u32,
     pub k: bool,
+    /// This member's constructors with their field counts, in order: the
+    /// `(ctor, nfields)` of each computation rule the kernel generates.
+    pub rules: Vec<(u32, u32)>,
 }
 
 /// A binder whose type is expressed in the context formed by the preceding
@@ -947,6 +950,14 @@ impl<'e> Checker<'e> {
                 num_motives: members.len() as u32,
                 num_minors,
                 k,
+                rules: members[target_pos]
+                    .ctors
+                    .iter()
+                    .map(|c| {
+                        let arity = Checker::manifest_arity(&c.typ);
+                        (c.name, arity.saturating_sub(num_params as u64) as u32)
+                    })
+                    .collect(),
             });
         }
         Ok(out)
