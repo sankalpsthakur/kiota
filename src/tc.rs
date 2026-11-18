@@ -1250,16 +1250,22 @@ impl<'e> Checker<'e> {
             self.unfold_cache.borrow_mut().clear();
             self.iota_value_cache.borrow_mut().clear();
             self.iota_lit_memo.borrow_mut().clear();
-            // The kept substitution memos (`KIOTA_XMEMO`) hold strong
-            // references into the generation being dropped. Their keys are
-            // never-reused ids, so a stale entry cannot answer for another
-            // term, but it pins that generation and hands back nodes no
-            // new term is pointer-equal to. The cross-declaration caches
-            // are in the same position and are kept all the same: what they
-            // hold is still true of the terms the environment keeps alive,
-            // and emptying them here cost more than it saved (std, both
-            // flags: 899.1M node constructions emptied, 848.2M kept, 876.2M
-            // with the memos kept too).
+            // The cross-declaration caches and the kept substitution memos
+            // (`KIOTA_XMEMO`) hold strong references into the generation
+            // being dropped. Their keys are never-reused ids, so a stale
+            // entry cannot answer for another term; emptying them is not a
+            // soundness matter. It is a trade measured on std (both flags,
+            // node constructions / peak memory): emptied here 899.1M /
+            // 2.63 GB, caches kept and memos emptied 848.2M / 2.88 GB,
+            // both kept 876.2M / 3.25 GB (runs 44349579106, 44360762966).
+            // Kept caches pin every dropped generation, and before any of
+            // this was emptied cslib ran at twice the memory with the
+            // flag (7.68 GB against 3.54 GB, run 44324050017); emptied, it
+            // runs level (4.16 GB against 4.12 GB, run 44349579106). So
+            // they are emptied until keeping them is measured on cslib
+            // (run 44364184100, commit 00e4473): drop the `xcache_clear`
+            // line if that run's memory holds.
+            xcache_clear();
             expr::clear_subst_memos();
             expr::intern_clear_if_large(INTERN_RESET);
             if std::env::var_os("KIOTA_INTERN_RESET_LOG").is_some() {
