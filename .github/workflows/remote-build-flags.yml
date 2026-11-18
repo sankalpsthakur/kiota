@@ -1,0 +1,140 @@
+name: remote-build-flags
+
+# Round two of the arena build line: a raised inline threshold, alone and
+# under the profile, and target-cpu=x86-64-v3 as the stand-in for native that
+# valgrind can run. Round one (plain, native, pgo, native+pgo, and the arena
+# end-to-end jobs) is the run on remote/build-flags-20261118.
+on:
+  push:
+    branches: ['remote/build-flags-2026*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+  FIXTURE: tests/fixtures/rat-instEncodable-and-rec-theorem-major.accept.ndjson
+
+jobs:
+  insn:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [plain, pgo, inline1000, inline2000, inline5000, pgo+inline2000, pgo+inline5000, v3, v3+pgo+inline2000]
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y zstd time valgrind >/dev/null
+          zstd -d --rm init.ndjson.zst -o init.ndjson
+          scripts/build-flags/build_side.sh "$SIDE" init.ndjson "kiota-$SIDE" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Instructions under cachegrind
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set +e
+          lines=$(wc -l < init.ndjson)
+          head -n $((lines / 5)) init.ndjson > init-fifth.ndjson
+          count() {
+            work=$1; file=$2; limit=$3
+            KIOTA_STATS=1 timeout "$limit" valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null \
+              "./kiota-$SIDE" "$file" >/dev/null 2>"vg-$work.txt"; rc=$?
+            echo "INSN side=$SIDE work=$work rc=$rc Ir=$(grep -E 'I +refs:' "vg-$work.txt" | awk '{print $NF}' | tr -d ,) stats_md5=$(grep -E '^STATS' "vg-$work.txt" | md5sum | cut -c1-12) $(grep -E '^STATS ' "vg-$work.txt" | tail -n 1 | cut -c1-60)"
+            [ "$rc" = 0 ] || tail -n 5 "vg-$work.txt"
+          }
+          count fixture "$FIXTURE" 20m > out-fixture.txt &
+          count init-fifth init-fifth.ndjson 30m > out-fifth.txt &
+          wait
+          cat out-fixture.txt out-fifth.txt | tee -a "$GITHUB_STEP_SUMMARY"
+
+  time:
+    strategy:
+      fail-fast: false
+      matrix:
+        round: [1, 2, 3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-std
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the sides
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm init.ndjson.zst -o init.ndjson
+          zstd -d --rm std.ndjson.zst -o std.ndjson
+          for side in plain inline2000 pgo+inline2000 native+pgo+inline2000; do
+            scripts/build-flags/build_side.sh "$side" init.ndjson "kiota-$side"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: User time on std
+        env:
+          ROUND: ${{ matrix.round }}
+        run: |
+          set +e
+          case "$ROUND" in
+            1) order="plain inline2000 pgo+inline2000 native+pgo+inline2000" ;;
+            2) order="native+pgo+inline2000 pgo+inline2000 inline2000 plain" ;;
+            *) order="pgo+inline2000 plain native+pgo+inline2000 inline2000" ;;
+          esac
+          for side in $order; do
+            KIOTA_STATS=1 /usr/bin/time -v -o time.txt "./kiota-$side" std.ndjson >/dev/null 2>err.txt; rc=$?
+            echo "TIME corpus=std round=$ROUND side=$side rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') sys=$(grep 'System time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') stats_md5=$(grep -E '^STATS' err.txt | md5sum | cut -c1-12)"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [inline2000, pgo+inline2000, native+pgo+inline2000]
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tests under the side's flags
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm init.ndjson.zst -o init.ndjson
+          scripts/build-flags/build_side.sh "$SIDE" init.ndjson "kiota-$SIDE"
+          RUSTFLAGS="$(cat "kiota-$SIDE.rustflags")" cargo test --release --locked 2>&1 | grep -E "^test result|^error|FAILED|panicked|Running" | tee test.txt
+          echo "TESTS side=$SIDE suites_ok=$(grep -c '^test result: ok' test.txt) passed=$(grep '^test result' test.txt | awk '{s+=$4} END{print s}') failed=$(grep -c 'FAILED' test.txt || true)" | tee -a "$GITHUB_STEP_SUMMARY"
+          ! grep -q FAILED test.txt
