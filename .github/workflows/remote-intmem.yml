@@ -1,0 +1,101 @@
+name: remote-intmem
+
+# Experiment: hash-cons table load factor against peak memory and time on the
+# heavy perf cases, and the table's size history on std, init, cslib, cedar.
+on:
+  push:
+    branches: ['remote/intmem*']
+permissions:
+  contents: read
+  actions: read
+env:
+  EXPORTS_RUN: 44313744961
+jobs:
+  mem:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: |
+          set -euo pipefail
+          cargo build --release --locked; cp target/release/kiota kiota-knob
+          for pair in pre:6a39271 main:606c3c0; do
+            side=${pair%%:*}; rev=${pair##*:}
+            git worktree add --detach "$RUNNER_TEMP/$side" "$rev"
+            CARGO_TARGET_DIR="$RUNNER_TEMP/$side-t" cargo build --release --locked --manifest-path "$RUNNER_TEMP/$side/Cargo.toml"
+            cp "$RUNNER_TEMP/$side-t/release/kiota" kiota-$side
+          done
+      - name: Measure
+        run: |
+          set +e
+          curl --fail -sL --retry 3 https://arena.lean-lang.org/lean-arena-tests.tar.gz -o t.tgz; mkdir suite; tar xzf t.tgz -C suite
+          sudo apt-get install -y time >/dev/null
+          nproc; grep -m1 'model name' /proc/cpuinfo; free -g | head -2
+          one() { # test arm capped?
+            t=$1; arm=$2; f=suite/good/perf/$t.ndjson
+            bin=kiota-knob; extra="A=1"
+            case $arm in
+              pre) bin=kiota-pre;; main) bin=kiota-main;; k58) ;;
+              cut24) extra="KIOTA_X_LOAD16_BIG=14 KIOTA_X_BIG_LOG2=24";;
+              cut25) extra="KIOTA_X_LOAD16_BIG=14 KIOTA_X_BIG_LOG2=25";;
+              all78) extra="KIOTA_X_LOAD16=14";;
+              all34) extra="KIOTA_X_LOAD16=12";;
+            esac
+            env $extra KIOTA_X_GROWLOG=1 /usr/bin/time -v -o time.txt timeout 300 ./$bin $f >/dev/null 2>err.txt; rc=$?
+            line="MEM test=$t arm=$arm rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') sys=$(grep 'System time' time.txt | awk '{print $NF}') maxrss_mb=$(( $(grep 'Maximum resident' time.txt | awk '{print $NF}') / 1024 )) lastgrow=$(grep '^XGROW' err.txt | tail -1 | tr ' ' ,) $(grep -o 'INTERN_CALLS.*' err.txt | tail -1 | tr ' ' ,)"
+            if [ "$3" = cap ]; then
+              ( ulimit -v 8388608; env $extra timeout 300 ./$bin $f >/dev/null 2>err2.txt ); rc2=$?
+              line="$line capped_rc=$rc2 $(grep -m1 'memory allocation' err2.txt | cut -c1-80)"
+              env $extra KIOTA_STATS=1 timeout 300 ./$bin $f >/dev/null 2>err3.txt
+              grep -E '^(STATS|STATS2|STATS3|STATS4|STATS5|STATS6|STATS7|STATS8|REJECT|DECLINE|ERROR)' err3.txt > stats-$t-$arm.txt
+              line="$line $(grep -E '^STATS ' err3.txt | tail -1 | grep -o 'intern_calls.*' | tr ' ' ,)"
+            fi
+            echo "$line"
+          }
+          {
+            for arm in pre main k58 cut24 cut25 all78; do one magma-list-deep-n36 $arm cap; done
+            for arm in all78 cut25 cut24 main pre main cut25 cut24 all78; do one magma-list-deep-n36 $arm nocap; done
+            for t in magma-list-pair-n21 magma-list-deep-n21 gf3-matrix-product grind-ring-5; do
+              for arm in pre main cut24 cut25 all78; do one $t $arm cap; done
+            done
+            for arm in main all78 cut25 all78 main cut25; do one magma-list-deep-n21 $arm nocap; done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          for t in magma-list-deep-n36 magma-list-pair-n21 magma-list-deep-n21 gf3-matrix-product grind-ring-5; do
+            for arm in k58 cut24 cut25 all78; do
+              [ -f stats-$t-$arm.txt ] || continue
+              if cmp -s stats-$t-main.txt stats-$t-$arm.txt; then echo "STATCMP test=$t arm=$arm IDENTICAL lines=$(wc -l < stats-$t-main.txt)"; else echo "STATCMP test=$t arm=$arm DIFFERENT"; diff stats-$t-main.txt stats-$t-$arm.txt | head -6; fi
+            done
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+  table:
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [std, init, cslib, cedar]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Table history
+        env:
+          C: ${{ matrix.corpus }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          for arm in k58 cut24 all78; do
+            extra="A=1"; [ $arm = cut24 ] && extra="KIOTA_X_LOAD16_BIG=14 KIOTA_X_BIG_LOG2=24"; [ $arm = all78 ] && extra="KIOTA_X_LOAD16=14"
+            env $extra KIOTA_X_GROWLOG=1 /usr/bin/time -v -o time.txt ./target/release/kiota $C.ndjson >/dev/null 2>err.txt; rc=$?
+            echo "TABLE corpus=$C arm=$arm rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') grows=$(grep -c '^XGROW' err.txt) maxgrow=$(grep '^XGROW' err.txt | sort -t= -k2 -n | tail -1 | tr ' ' ,) clears=$(grep -c '^XCLEAR' err.txt) clear_hist=$(grep '^XCLEAR' err.txt | awk '{print $2}' | sort | uniq -c | tr -s ' ' | tr ' \n' ',;') maxclear=$(grep '^XCLEAR' err.txt | sed 's/.*len=//' | sort -n | tail -1)"
+            grep -n '^XGROW' err.txt | tail -4
+          done | tee -a "$GITHUB_STEP_SUMMARY"

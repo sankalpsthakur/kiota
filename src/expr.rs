@@ -676,6 +676,17 @@ impl Default for Interner {
     }
 }
 
+fn xgrow_at(log2: u32) -> usize {
+    fn knob(name: &str, d: usize) -> usize {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    }
+    let small = knob("KIOTA_X_LOAD16", 10);
+    let big = knob("KIOTA_X_LOAD16_BIG", small);
+    let cut = knob("KIOTA_X_BIG_LOG2", 0) as u32;
+    let n = 1usize << log2;
+    n / 16 * if log2 > cut { big } else { small }
+}
+
 impl Interner {
     fn with_slots_log2(log2: u32) -> Self {
         let n = 1usize << log2;
@@ -683,7 +694,7 @@ impl Interner {
             slots: vec![EMPTY_SLOT; n],
             shift: 64 - log2,
             len: 0,
-            grow_at: n / 8 * 5,
+            grow_at: xgrow_at(log2),
             next_id: 1,
             calls: 0,
             next_report: INTERN_REPORT_EVERY,
@@ -734,9 +745,12 @@ impl Interner {
     fn grow(&mut self) {
         let log2 = 64 - self.shift + 1;
         let n = 1usize << log2;
+        if std::env::var_os("KIOTA_X_GROWLOG").is_some() {
+            eprintln!("XGROW to_log2={log2} len={}", self.len);
+        }
         let old = std::mem::replace(&mut self.slots, vec![EMPTY_SLOT; n]);
         self.shift = 64 - log2;
-        self.grow_at = n / 8 * 5;
+        self.grow_at = xgrow_at(log2);
         let mask = n - 1;
         for slot in old {
             if slot.node.is_some() {
@@ -758,6 +772,9 @@ impl Interner {
     /// (unless it outgrew `RETAINED_SLOTS_LOG2`), so the refill neither
     /// re-allocates nor re-files anything.
     fn clear(&mut self) {
+        if std::env::var_os("KIOTA_X_GROWLOG").is_some() {
+            eprintln!("XCLEAR slots_log2={} len={}", 64 - self.shift, self.len);
+        }
         if self.slots.len() > 1usize << RETAINED_SLOTS_LOG2 {
             let fresh = Interner::with_slots_log2(RETAINED_SLOTS_LOG2);
             let old = std::mem::replace(&mut self.slots, fresh.slots);
