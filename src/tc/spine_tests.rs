@@ -1,0 +1,239 @@
+//! `infer_app_spine` (`KIOTA_SPINE`) against the one-argument rule.
+
+use super::*;
+use crate::env::ReducibilityHints;
+
+const N: u32 = 0;
+const Z: u32 = 1;
+const O: u32 = 2;
+const P: u32 = 3;
+const PZ: u32 = 4;
+const PO: u32 = 5;
+const G: u32 = 6;
+const T: u32 = 7;
+const F: u32 = 8;
+const Q: u32 = 9;
+const H: u32 = 10;
+
+fn c(i: u32) -> Expr {
+    expr::const_(i, vec![])
+}
+
+fn pi(d: Expr, r: Expr) -> Expr {
+    expr::pi(BinderInfo::Default, d, r)
+}
+
+fn lam(d: Expr, r: Expr) -> Expr {
+    expr::lam(BinderInfo::Default, d, r)
+}
+
+/// ```text
+/// N : Type        z o : N        P : N → Prop        pz : P z    po : P o
+/// g : (n : N) → P n → N → N
+/// T : Type := N → N              f : N → T
+/// Q : (n : N) → P n → Prop       h : (n : N) → (p : P n) → Q n p
+/// ```
+fn fixture() -> (Environment, Vec<Rc<String>>) {
+    let mut env = Environment::default();
+    let v = expr::bvar;
+    let type1 = expr::sort(level::succ(level::zero()));
+    let prop = expr::sort(level::zero());
+    let axioms = [
+        (N, type1.clone()),
+        (Z, c(N)),
+        (O, c(N)),
+        (P, pi(c(N), prop.clone())),
+        (PZ, expr::app(c(P), c(Z))),
+        (PO, expr::app(c(P), c(O))),
+        (G, pi(c(N), pi(expr::app(c(P), v(0)), pi(c(N), c(N))))),
+        (F, pi(c(N), c(T))),
+        (Q, pi(c(N), pi(expr::app(c(P), v(0)), prop))),
+        (H, pi(c(N), pi(expr::app(c(P), v(0)), expr::apps(c(Q), &[v(1), v(0)])))),
+    ];
+    for (name, typ) in axioms {
+        env.insert(name, ConstantInfo::Axiom { level_params: vec![], typ, is_unsafe: false });
+    }
+    env.insert(T, ConstantInfo::Def {
+        level_params: vec![],
+        typ: type1,
+        value: pi(c(N), c(N)),
+        hints: ReducibilityHints::Regular(1),
+        is_unsafe: false,
+    });
+    let names = ["N", "z", "o", "P", "pz", "po", "g", "T", "f", "Q", "h"]
+        .iter()
+        .map(|name| Rc::new((*name).to_owned()))
+        .collect();
+    (env, names)
+}
+
+/// A checker with the spine walk on (and verifying itself) and one with the
+/// one-argument rule, over the same environment.
+fn pair<'e>(env: &'e Environment, names: &'e [Rc<String>]) -> (Checker<'e>, Checker<'e>) {
+    let on = Checker::new(env, names, None, None);
+    on.spine.set(true);
+    on.spine_verify.set(true);
+    let off = Checker::new(env, names, None, None);
+    off.spine.set(false);
+    (on, off)
+}
+
+fn is_reject<X: std::fmt::Debug>(r: &R<X>) -> bool {
+    matches!(r, Err(TcError::Reject(_)))
+}
+
+#[test]
+fn spine_type_is_the_one_argument_rules_node() {
+    let (env, names) = fixture();
+    let (on, off) = pair(&env, &names);
+    let ctx = Ctx::new();
+    let terms = [
+        // Dependent domain: the second argument's type mentions the first.
+        expr::apps(c(G), &[c(Z), c(PZ), c(O)]),
+        // Dependent result.
+        expr::apps(c(H), &[c(O), c(PO)]),
+        // The second binder is reached only by unfolding `T`.
+        expr::apps(c(F), &[c(Z), c(O)]),
+        // Partial applications.
+        expr::apps(c(G), &[c(Z)]),
+        expr::apps(c(G), &[c(O), c(PO)]),
+        // A beta-redex head and an argument that is itself a spine.
+        expr::apps(lam(c(N), expr::apps(c(G), &[expr::bvar(0)])), &[c(Z), c(PZ), c(O)]),
+        expr::apps(c(G), &[c(Z), c(PZ), expr::apps(c(G), &[c(O), c(PO), c(Z)])]),
+    ];
+    for t in &terms {
+        let a = on.infer_type(&ctx, t).unwrap();
+        let b = off.infer_type(&ctx, t).unwrap();
+        assert!(Rc::ptr_eq(&a, &b), "{}: {} vs {}", on.pp(t), on.pp(&a), on.pp(&b));
+    }
+    let ty = on.infer_type(&ctx, &terms[0]).unwrap();
+    assert!(Rc::ptr_eq(&ty, &c(N)));
+    let ty = on.infer_type(&ctx, &terms[1]).unwrap();
+    assert!(Rc::ptr_eq(&ty, &expr::apps(c(Q), &[c(O), c(PO)])));
+}
+
+#[test]
+fn spine_rejects_a_wrong_argument_wherever_it_sits() {
+    let (env, names) = fixture();
+    let ctx = Ctx::new();
+    let bad = [
+        // Middle: `po : P o` where `P z` is expected.
+        expr::apps(c(G), &[c(Z), c(PO), c(O)]),
+        // Last: a proof where an `N` is expected.
+        expr::apps(c(G), &[c(Z), c(PZ), c(PZ)]),
+        // First.
+        expr::apps(c(G), &[c(PZ), c(PZ), c(O)]),
+        // After a binder reached by unfolding.
+        expr::apps(c(F), &[c(Z), c(PZ)]),
+        // One argument too many: `N` is not a function type.
+        expr::apps(c(G), &[c(Z), c(PZ), c(O), c(O)]),
+        // Wrong argument inside an argument.
+        expr::apps(c(G), &[c(Z), c(PZ), expr::apps(c(G), &[c(O), c(PZ), c(Z)])]),
+    ];
+    for t in &bad {
+        // Fresh checkers: nothing cached decides it.
+        let (on, off) = pair(&env, &names);
+        assert!(is_reject(&off.infer_type(&ctx, t)), "one-argument rule accepts {}", off.pp(t));
+        assert!(is_reject(&on.infer_type(&ctx, t)), "spine walk accepts {}", on.pp(t));
+        // And again, now that prefix states exist.
+        assert!(is_reject(&on.infer_type(&ctx, t)), "spine walk accepts {} on a retry", on.pp(t));
+    }
+}
+
+#[test]
+fn spine_under_binders_matches_and_rejects() {
+    let (env, names) = fixture();
+    let (on, off) = pair(&env, &names);
+    let ctx = Ctx::new();
+    let v = expr::bvar;
+    let p_of = |i| expr::app(c(P), v(i));
+    // fun (n : N) (hn : P n) (m : N) => g n hn m
+    let good = lam(c(N), lam(p_of(0), lam(c(N), expr::apps(c(G), &[v(2), v(1), v(0)]))));
+    // fun (n : N) (hn : P n) => h n hn : (n : N) → (hn : P n) → Q n hn
+    let good_dep = lam(c(N), lam(p_of(0), expr::apps(c(H), &[v(1), v(0)])));
+    for t in [&good, &good_dep] {
+        let a = on.infer_type(&ctx, t).unwrap();
+        let b = off.infer_type(&ctx, t).unwrap();
+        assert!(Rc::ptr_eq(&a, &b), "{} vs {}", on.pp(&a), on.pp(&b));
+    }
+    // fun (n k : N) (hn : P n) => g k hn n: `hn : P n` where `P k` is expected.
+    let bad = lam(c(N), lam(c(N), lam(p_of(1), expr::apps(c(G), &[v(1), v(0), v(2)]))));
+    assert!(is_reject(&off.infer_type(&ctx, &bad)));
+    assert!(is_reject(&on.infer_type(&ctx, &bad)));
+    // The same spine `g #1 #0 #2` is well typed where bvar 0 proves `P #1`:
+    // fun (n k : N) (hk : P k) => g k hk n. A state kept from the rejected
+    // context must not decide this one, nor the other way round.
+    let good_again = lam(c(N), lam(c(N), lam(p_of(0), expr::apps(c(G), &[v(1), v(0), v(2)]))));
+    let a = on.infer_type(&ctx, &good_again).unwrap();
+    let b = off.infer_type(&ctx, &good_again).unwrap();
+    assert!(Rc::ptr_eq(&a, &b));
+    assert!(is_reject(&on.infer_type(&ctx, &bad)));
+}
+
+#[test]
+fn spine_resumes_from_a_shared_prefix() {
+    let (env, names) = fixture();
+    let (on, off) = pair(&env, &names);
+    let ctx = Ctx::new();
+    let prefix = expr::apps(c(G), &[c(Z), c(PZ)]);
+    let first = expr::app(prefix.clone(), c(O));
+    let second = expr::app(prefix.clone(), c(Z));
+    on.infer_type(&ctx, &first).unwrap();
+    let key = (0, Checker::ptr_key(&prefix));
+    let st = on.spine_cache.borrow().get(&key).cloned().expect("state of the shared prefix");
+    assert!(st.checked);
+    // Two binders stepped over, none substituted: `N → N` under `n`, `hn`.
+    assert_eq!(st.pending, 2);
+    assert!(Rc::ptr_eq(&st.ty, &pi(c(N), c(N))));
+    let ty = on.infer_type(&ctx, &second).unwrap();
+    assert!(Rc::ptr_eq(&ty, &off.infer_type(&ctx, &second).unwrap()));
+    // The prefix on its own is the state with its pending arguments put in.
+    let pt = on.infer_type(&ctx, &prefix).unwrap();
+    assert!(Rc::ptr_eq(&pt, &off.infer_type(&ctx, &prefix).unwrap()));
+    assert!(Rc::ptr_eq(&pt, &pi(c(N), c(N))));
+    // A longer spine resumes from a whole term inferred earlier.
+    let longer = expr::app(expr::apps(c(F), &[c(Z)]), c(O));
+    on.infer_type(&ctx, &expr::apps(c(F), &[c(Z)])).unwrap();
+    let lt = on.infer_type(&ctx, &longer).unwrap();
+    assert!(Rc::ptr_eq(&lt, &c(N)));
+}
+
+#[test]
+fn an_infer_only_walk_does_not_stand_in_for_a_check() {
+    let (env, names) = fixture();
+    let (on, _) = pair(&env, &names);
+    // Infer-only on an ill-typed term is outside the one-argument rule's
+    // contract too; the verifier has nothing to say about it.
+    on.spine_verify.set(false);
+    let ctx = Ctx::new();
+    let bad = expr::apps(c(G), &[c(Z), c(PO), c(O)]);
+    // Infer-only does not look at the arguments, so it answers `N`.
+    let only = on.with_infer_only(|| on.infer_type(&ctx, &bad)).unwrap();
+    assert!(Rc::ptr_eq(&only, &c(N)));
+    let prefix = expr::apps(c(G), &[c(Z), c(PO)]);
+    let st = on.spine_cache.borrow().get(&(0, Checker::ptr_key(&prefix))).cloned().unwrap();
+    assert!(!st.checked);
+    // The check must not resume from that state or reuse that type.
+    assert!(is_reject(&on.infer_type(&ctx, &bad)));
+    assert!(is_reject(&on.infer_type(&ctx, &prefix)));
+    // A checked state survives a later infer-only walk over the same prefix.
+    let good_prefix = expr::apps(c(G), &[c(Z), c(PZ)]);
+    on.infer_type(&ctx, &expr::app(good_prefix.clone(), c(O))).unwrap();
+    on.with_infer_only(|| on.infer_type(&ctx, &expr::app(good_prefix.clone(), c(Z)))).unwrap();
+    let st = on.spine_cache.borrow().get(&(0, Checker::ptr_key(&good_prefix))).cloned().unwrap();
+    assert!(st.checked);
+}
+
+#[test]
+fn spine_states_die_with_the_declaration() {
+    let (env, names) = fixture();
+    let (on, _) = pair(&env, &names);
+    let ctx = Ctx::new();
+    let prefix = expr::apps(c(G), &[c(Z), c(PZ)]);
+    on.infer_type(&ctx, &expr::app(prefix.clone(), c(O))).unwrap();
+    let key = (0, Checker::ptr_key(&prefix));
+    assert!(on.spine_cache.borrow().contains_key(&key));
+    // Checking any declaration starts from empty per-declaration caches.
+    on.check_decl(PZ, "axiom").unwrap();
+    assert!(!on.spine_cache.borrow().contains_key(&key));
+}

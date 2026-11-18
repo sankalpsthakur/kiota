@@ -12,6 +12,8 @@ use std::rc::Rc;
 mod recursor;
 #[cfg(test)]
 mod reclamation_tests;
+#[cfg(test)]
+mod spine_tests;
 
 thread_local! {
     /// Recursion guard for `pub fn infer_type`'s `KIOTA_NBE=1` dispatch,
@@ -76,6 +78,13 @@ thread_local! {
     /// Keys are allocation identities, which are never reused.
     static XINFER: RefCell<FxHashMap<usize, (Expr, bool)>> = RefCell::new(FxHashMap::default());
     static XWHNF: RefCell<FxHashMap<usize, Expr>> = RefCell::new(FxHashMap::default());
+    /// `KIOTA_SPINE`: infer an application spine in one walk of the head's
+    /// Pi telescope (`infer_app_spine`). `KIOTA_SPINE_VERIFY` also recomputes
+    /// every spine's type one argument at a time and panics on a difference.
+    static SPINE_ON: bool = std::env::var_os("KIOTA_SPINE").is_some();
+    static SPINE_VERIFY_ON: bool = std::env::var_os("KIOTA_SPINE_VERIFY").is_some();
+    /// `XINFER`'s counterpart for spine states of closed prefixes.
+    static XSPINE: RefCell<FxHashMap<usize, SpineState>> = RefCell::new(FxHashMap::default());
     static XCACHE_ON: bool = std::env::var_os("KIOTA_XCACHE").is_some();
     static XMEMO_ON: bool = std::env::var_os("KIOTA_XMEMO").is_some();
     /// Closed pairs proved definitionally equal. Only `true` is kept: an
@@ -209,6 +218,18 @@ impl std::hash::Hash for ThunkPtrKey {
     }
 }
 
+/// Where the walk of an application spine stands after one of its prefixes
+/// `f a₁ … aₖ`: the prefix has type `ty[aₖ₋ₚ₊₁ … aₖ]`, where `ty` sits under
+/// `pending` binders of the head's telescope that have been stepped over but
+/// not substituted yet. `checked`: every argument up to `aₖ` was checked
+/// against its domain (not an infer-only walk).
+#[derive(Clone)]
+struct SpineState {
+    ty: Expr,
+    pending: u32,
+    checked: bool,
+}
+
 pub struct Checker<'e> {
     pub env: &'e Environment,
     pub names: &'e [std::rc::Rc<String>],
@@ -256,6 +277,13 @@ pub struct Checker<'e> {
     /// `(ctx, term) → (type, checked)`. InferOnly may read a Check entry;
     /// Check must not use an InferOnly entry (that skipped app-arg checks).
     infer_cache: RefCell<FxHashMap<(u64, usize), (Expr, bool)>>,
+    /// `(context key, application node) → SpineState`, the same key as
+    /// `infer_cache` and cleared with it. Only written with `spine` on.
+    spine_cache: RefCell<FxHashMap<(u64, usize), SpineState>>,
+    /// One-walk application inference (`infer_app_spine`); from `KIOTA_SPINE`.
+    spine: Cell<bool>,
+    /// Recompute every spine the old way and compare; `KIOTA_SPINE_VERIFY`.
+    spine_verify: Cell<bool>,
     /// Consts whose telescope has a Prop-inductive binder (`USquash`, `Eq`).
     /// Only those spines need `defeq_args`; everything else stays pairwise.
     proof_arg_cache: RefCell<FxHashMap<u32, bool>>,
@@ -748,6 +776,9 @@ impl<'e> Checker<'e> {
             eager_defeq_cache: RefCell::new(FxHashMap::default()),
             eager_infer_cache: RefCell::new(FxHashMap::default()),
             infer_cache: RefCell::new(FxHashMap::default()),
+            spine_cache: RefCell::new(FxHashMap::default()),
+            spine: Cell::new(SPINE_ON.with(|b| *b)),
+            spine_verify: Cell::new(SPINE_VERIFY_ON.with(|b| *b)),
             proof_arg_cache: RefCell::new(FxHashMap::default()),
             unfold_cache: RefCell::new(FxHashMap::default()),
             iota_value_cache: RefCell::new(FxHashMap::default()),
@@ -1088,6 +1119,7 @@ impl<'e> Checker<'e> {
         self.whnf_core_cache.borrow_mut().clear();
         self.defeq_cache.borrow_mut().clear();
         self.infer_cache.borrow_mut().clear();
+        self.spine_cache.borrow_mut().clear();
         // `ctx_key`s (via `CTX_NEXT`, reset above) are reused across
         // declarations, so a stale eager-namespace entry from the last
         // declaration would be keyed identically but mean something
@@ -1430,6 +1462,13 @@ impl<'e> Checker<'e> {
             }
             ExprData::Sort(l) => Ok(expr::sort(level::succ(l.clone()))),
             ExprData::Const(n, us) => self.infer_const(*n, us),
+            ExprData::App(..)
+                if self.spine.get()
+                    && !nbe::nbe_enabled()
+                    && !FORCE_EAGER_DEFEQ.with(Cell::get) =>
+            {
+                self.infer_app_spine(ctx, e)
+            }
             ExprData::App(f, a) => {
                 let ft = self.infer_type(ctx, f)?;
                 let (_, dom, body) = self.ensure_pi(ctx, &ft)?;
@@ -1493,6 +1532,199 @@ impl<'e> Checker<'e> {
             ExprData::Lit(Lit::Nat(_)) => Ok(self.nat_type()?),
             ExprData::Lit(Lit::Str(_)) => Ok(self.string_type()?),
         }
+    }
+
+    /// The type of an application `f a₁ … aₙ`, walking the telescope of
+    /// `f`'s type once (`KIOTA_SPINE`).
+    ///
+    /// The one-argument rule infers every prefix `f a₁ … aₖ` and substitutes
+    /// `aₖ` into the whole rest of the telescope, so a telescope node that
+    /// mentions an earlier binder or a variable of the context is rebuilt
+    /// once per later argument. Here the binders stepped over stay pending:
+    /// each domain is instantiated with the pending arguments when its
+    /// argument is checked, the result type once at the end, so each
+    /// telescope node is rebuilt at most once. Where the running type is not
+    /// syntactically a Pi the pending arguments are substituted and
+    /// `ensure_pi` reduces it, exactly where the one-argument rule would.
+    ///
+    /// Same judgments in the same order as the one-argument rule: argument
+    /// `aₖ` is inferred and compared with the same domain term (simultaneous
+    /// substitution of arguments that live in the context equals the
+    /// sequential one, and equal terms are one node), and the result is the
+    /// same node. `spine_verify` checks that on every spine.
+    ///
+    /// A shared prefix (`HAdd.hAdd ℕ ℕ ℕ inst x` under many `y`) is not
+    /// walked again: the state after each prefix is kept in `spine_cache`
+    /// under that prefix's own inference key, and a later spine resumes from
+    /// its longest prefix with a usable state. A state from an infer-only
+    /// walk is not used by a checking one.
+    fn infer_app_spine(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        let infer_only = self.infer_only.get();
+        let xcache = XCACHE_ON.with(|b| *b);
+        // Descend to the longest prefix with a usable state, or to the head.
+        // `tail` collects (key, argument) of the nodes above it, outermost
+        // first.
+        let mut tail: Vec<((u64, usize), Expr)> = Vec::new();
+        let mut cur = e.clone();
+        let mut ty;
+        let mut pending;
+        loop {
+            let ExprData::App(f, a) = &**cur else {
+                ty = self.infer_type(ctx, &cur)?;
+                pending = 0usize;
+                break;
+            };
+            let key = (ctx.term_ctx_key(&cur), Self::ptr_key(&cur));
+            let mut found = self.spine_cache.borrow().get(&key).cloned();
+            if found.is_none() && key.0 == 0 && xcache {
+                found = XSPINE.with(|m| m.borrow().get(&key.1).cloned());
+                if found.is_some() {
+                    XCACHE_HITS.with(|c| c.set(c.get() + 1));
+                }
+            }
+            if let Some(st) = found {
+                if infer_only || st.checked {
+                    ty = st.ty;
+                    pending = st.pending as usize;
+                    break;
+                }
+            }
+            tail.push((key, a.clone()));
+            let f = f.clone();
+            cur = f;
+        }
+        // `args`: the pending arguments of the prefix reached (they are its
+        // last `pending` arguments), then the arguments still to process.
+        let mut args: Vec<Expr> = Vec::with_capacity(pending + tail.len());
+        {
+            let mut node = cur.clone();
+            for _ in 0..pending {
+                let ExprData::App(f, a) = &**node else {
+                    return Err(TcError::Other("spine state outlived its prefix".into()));
+                };
+                args.push(a.clone());
+                let f = f.clone();
+                node = f;
+            }
+            args.reverse();
+        }
+        // `args[j..i]` are pending: `ty` sits under that many binders.
+        let mut j = 0usize;
+        let mut i = pending;
+        let verify = self.spine_verify.get();
+        let mut doms_used: Vec<Expr> = Vec::new();
+        while let Some((key, a)) = tail.pop() {
+            // The one-argument rule calls `whnf` on a type that is already a
+            // Pi; that call is the identity except that it declines at the
+            // depth limit and clears a pending core-depth abort. In those
+            // two states take the reducing path so it still does.
+            let must_reduce =
+                CORE_ABORTED.with(Cell::get) || WHNF_DEPTH.with(Cell::get) >= CONV_DEPTH;
+            let dom = match &**ty {
+                ExprData::Pi(_, dom, body) if !must_reduce => {
+                    let d = {
+                        let _g = crate::stats::at(S::INFER_APP);
+                        expr::instantiate_rev(dom, &args[j..i])
+                    };
+                    let body = body.clone();
+                    ty = body;
+                    d
+                }
+                _ => {
+                    let flushed = {
+                        let _g = crate::stats::at(S::INFER_APP);
+                        expr::instantiate_rev(&ty, &args[j..i])
+                    };
+                    let (_, dom, body) = self.ensure_pi(ctx, &flushed)?;
+                    j = i;
+                    ty = body;
+                    dom
+                }
+            };
+            if !infer_only {
+                let at = self.infer_type(ctx, &a)?;
+                if !self.is_def_eq(ctx, &at, &dom)? {
+                    if std::env::var_os("KIOTA_DEBUG").is_some() {
+                        return reject(format!(
+                            "application argument type mismatch\n  got:      {}\n  expected: {}\n  arg:      {}",
+                            self.pp(&at),
+                            self.pp(&dom),
+                            self.pp(&a),
+                        ));
+                    }
+                    return reject("application argument type mismatch");
+                }
+            }
+            if verify {
+                doms_used.push(dom);
+            }
+            args.push(a);
+            i += 1;
+            let st = SpineState {
+                ty: ty.clone(),
+                pending: (i - j) as u32,
+                checked: !infer_only,
+            };
+            if key.0 == 0 && xcache && st.checked && !self.xcache_tainted.get() {
+                XSPINE.with(|m| {
+                    let mut m = m.borrow_mut();
+                    if m.len() >= XCACHE_CAP {
+                        m.clear();
+                    }
+                    m.insert(key.1, st.clone());
+                });
+            }
+            let mut cache = self.spine_cache.borrow_mut();
+            match cache.get(&key) {
+                // An infer-only walk never replaces a checked state.
+                Some(old) if old.checked && !st.checked => {}
+                _ => {
+                    cache.insert(key, st);
+                }
+            }
+        }
+        let result = {
+            let _g = crate::stats::at(S::INFER_APP);
+            expr::instantiate_rev(&ty, &args[j..i])
+        };
+        if verify {
+            let (reference, doms) = self.infer_app_one_at_a_time(ctx, e)?;
+            assert!(
+                Rc::ptr_eq(&reference, &result),
+                "spine inference diverged from the one-argument rule on {}: {} vs {}",
+                self.pp_budget(e, 40),
+                self.pp_budget(&result, 40),
+                self.pp_budget(&reference, 40),
+            );
+            let skipped = doms.len() - doms_used.len();
+            for (k, d) in doms_used.iter().enumerate() {
+                assert!(
+                    Rc::ptr_eq(d, &doms[skipped + k]),
+                    "spine inference checked argument {} of {} against {} instead of {}",
+                    skipped + k,
+                    self.pp_budget(e, 40),
+                    self.pp_budget(d, 40),
+                    self.pp_budget(&doms[skipped + k], 40),
+                );
+            }
+        }
+        Ok(result)
+    }
+
+    /// The one-argument rule's result type and domains for a spine,
+    /// recomputed from the head with no spine state: `ensure_pi` and one
+    /// substitution per argument. The arguments are not checked again.
+    /// `spine_verify` only.
+    fn infer_app_one_at_a_time(&self, ctx: &Ctx, e: &Expr) -> R<(Expr, Vec<Expr>)> {
+        let (head, args) = expr::unfold_apps(e);
+        let mut ty = self.infer_type(ctx, &head)?;
+        let mut doms = Vec::with_capacity(args.len());
+        for a in &args {
+            let (_, dom, body) = self.ensure_pi(ctx, &ty)?;
+            doms.push(dom);
+            ty = expr::instantiate1(&body, a);
+        }
+        Ok((ty, doms))
     }
 
     fn infer_const(&self, n: u32, us: &[Level]) -> R<Expr> {

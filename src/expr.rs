@@ -717,6 +717,43 @@ fn instantiate_core(
     depth: u32,
     memo: &mut rustc_hash::FxHashMap<(usize, u32), Expr>,
 ) -> Expr {
+    instantiate_core_dir(e, args, false, depth, memo)
+}
+
+/// `instantiate` with the arguments in application order: `args[len-1]`
+/// replaces bvar 0 (Lean's `instantiate_rev`). `instantiate_rev(e, [a, b])`
+/// is `instantiate(e, [b, a])` without building the reversed list.
+pub fn instantiate_rev(e: &Expr, args: &[Expr]) -> Expr {
+    if args.is_empty() || loose_bvar_range(e) == 0 {
+        return e.clone();
+    }
+    // A bare variable (a telescope domain `α`) needs no memo table.
+    if let ExprData::BVar(i) = &***e {
+        let k = *i as usize;
+        return if k < args.len() {
+            args[args.len() - 1 - k].clone()
+        } else {
+            bvar(*i - args.len() as u32)
+        };
+    }
+    let mut memo = rustc_hash::FxHashMap::default();
+    if !crate::stats::enabled() {
+        return instantiate_core_dir(e, args, true, 0, &mut memo);
+    }
+    let _op = crate::stats::op(crate::stats::op::INST);
+    let before = crate::stats::inst_nodes();
+    let r = instantiate_core_dir(e, args, true, 0, &mut memo);
+    crate::stats::subst_call(false, false, crate::stats::inst_nodes() - before);
+    r
+}
+
+fn instantiate_core_dir(
+    e: &Expr,
+    args: &[Expr],
+    rev: bool,
+    depth: u32,
+    memo: &mut rustc_hash::FxHashMap<(usize, u32), Expr>,
+) -> Expr {
     // Every loose bvar is bound above `depth`, so neither the substitution nor
     // the renumbering below can reach into this subterm. Returning it whole is
     // what turns O(term size) per binder into O(path length).
@@ -730,36 +767,35 @@ fn instantiate_core(
     crate::stats::inst_node();
     let r = match &***e {
         ExprData::BVar(i) => {
-            if *i >= depth && ((*i - depth) as usize) < args.len() {
-                let a = &args[(*i - depth) as usize];
+            let k = (*i - depth) as usize;
+            if k < args.len() {
+                let a = if rev { &args[args.len() - 1 - k] } else { &args[k] };
                 shift(a, depth as i32, 0)
-            } else if *i >= depth {
-                bvar(*i - args.len() as u32)
             } else {
-                e.clone()
+                bvar(*i - args.len() as u32)
             }
         }
         ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => e.clone(),
         ExprData::App(f, a) => app(
-            instantiate_core(f, args, depth, memo),
-            instantiate_core(a, args, depth, memo),
+            instantiate_core_dir(f, args, rev, depth, memo),
+            instantiate_core_dir(a, args, rev, depth, memo),
         ),
         ExprData::Lam(bi, ty, body) => lam(
             *bi,
-            instantiate_core(ty, args, depth, memo),
-            instantiate_core(body, args, depth + 1, memo),
+            instantiate_core_dir(ty, args, rev, depth, memo),
+            instantiate_core_dir(body, args, rev, depth + 1, memo),
         ),
         ExprData::Pi(bi, ty, body) => pi(
             *bi,
-            instantiate_core(ty, args, depth, memo),
-            instantiate_core(body, args, depth + 1, memo),
+            instantiate_core_dir(ty, args, rev, depth, memo),
+            instantiate_core_dir(body, args, rev, depth + 1, memo),
         ),
         ExprData::Let(ty, val, body) => let_(
-            instantiate_core(ty, args, depth, memo),
-            instantiate_core(val, args, depth, memo),
-            instantiate_core(body, args, depth + 1, memo),
+            instantiate_core_dir(ty, args, rev, depth, memo),
+            instantiate_core_dir(val, args, rev, depth, memo),
+            instantiate_core_dir(body, args, rev, depth + 1, memo),
         ),
-        ExprData::Proj(s, i, v) => proj(*s, *i, instantiate_core(v, args, depth, memo)),
+        ExprData::Proj(s, i, v) => proj(*s, *i, instantiate_core_dir(v, args, rev, depth, memo)),
     };
     memo.insert(key, r.clone());
     r
@@ -1254,6 +1290,19 @@ mod tests {
                     "instantiate diverged from the reference"
                 );
             }
+            // Application order: the last argument replaces bvar 0.
+            for (fwd, rev) in [
+                (vec![a0.clone()], vec![a0.clone()]),
+                (vec![a0.clone(), a1.clone()], vec![a1.clone(), a0.clone()]),
+            ] {
+                assert!(
+                    Rc::ptr_eq(&instantiate_rev(&e, &rev), &instantiate_ref(&e, &fwd, 0)),
+                    "instantiate_rev diverged from the reference"
+                );
+                assert!(Rc::ptr_eq(&instantiate_rev(&bvar(0), &rev), &fwd[0]));
+                assert!(Rc::ptr_eq(&instantiate_rev(&bvar(7), &rev), &bvar(7 - rev.len() as u32)));
+            }
+            assert!(Rc::ptr_eq(&instantiate_rev(&e, &[]), &e));
             for cutoff in 0..4u32 {
                 assert!(
                     Rc::ptr_eq(&shift(&e, 2, cutoff), &shift_ref(&e, 2, cutoff)),
