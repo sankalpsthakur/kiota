@@ -445,7 +445,7 @@ struct Slot {
 const EMPTY_SLOT: Slot = Slot { hash: 0, node: None };
 
 /// Entries of the recent-node table in front of the slot array (64 KiB).
-const FRONT_SLOTS_LOG2: u32 = 14;
+const FRONT_SLOTS_LOG2: u32 = 12;
 /// Slots a new table starts with (1 MiB). Small inputs stay cache-resident.
 const INITIAL_SLOTS_LOG2: u32 = 16;
 /// A table reset keeps its slots up to this size (256 MiB) and shrinks a
@@ -610,16 +610,71 @@ impl Interner {
         }
         if self.slots.len() > 1usize << RETAINED_SLOTS_LOG2 {
             let fresh = Interner::with_slots_log2(RETAINED_SLOTS_LOG2);
-            let old = std::mem::replace(&mut self.slots, fresh.slots);
+            let mut old = std::mem::replace(&mut self.slots, fresh.slots);
             self.shift = fresh.shift;
             self.grow_at = fresh.grow_at;
-            drop(old);
+            release_slots(&mut old);
         } else if self.len != 0 {
-            for slot in self.slots.iter_mut() {
-                slot.node = None;
-            }
+            release_slots(&mut self.slots);
         }
         self.len = 0;
+    }
+}
+
+/// Nodes `release_slots` lets go of together.
+const RELEASE_BATCH: usize = 64;
+
+/// Empty every slot, releasing the table's reference to each node.
+///
+/// The slots are in hash order, so consecutive nodes are scattered over the
+/// whole heap, and releasing one reads the node and then its children's
+/// counters: dependent trips to memory, one node after another, for
+/// millions of nodes. Taking the nodes out a batch at a time and reading
+/// first every counter of the batch, then every child's counter, lets
+/// those trips overlap; only then is the batch released. The reads change
+/// nothing, and the nodes are released in the order the slots hold them.
+fn release_slots(slots: &mut [Slot]) {
+    #[inline(always)]
+    fn touch(e: &Expr) {
+        std::hint::black_box(Rc::strong_count(e));
+    }
+    let mut batch: Vec<Expr> = Vec::with_capacity(RELEASE_BATCH);
+    let mut rest = slots.iter_mut();
+    loop {
+        for slot in rest.by_ref() {
+            if let Some(e) = slot.node.take() {
+                batch.push(e);
+                if batch.len() == RELEASE_BATCH {
+                    break;
+                }
+            }
+        }
+        if batch.is_empty() {
+            return;
+        }
+        for e in &batch {
+            touch(e);
+        }
+        for e in &batch {
+            match &e.data {
+                ExprData::App(a, b) | ExprData::Lam(_, a, b) | ExprData::Pi(_, a, b) => {
+                    touch(a);
+                    touch(b);
+                }
+                ExprData::Let(a, b, c) => {
+                    touch(a);
+                    touch(b);
+                    touch(c);
+                }
+                ExprData::Proj(_, _, v) => touch(v),
+                ExprData::BVar(_)
+                | ExprData::Sort(_)
+                | ExprData::Const(_, _)
+                | ExprData::Lit(_) => {}
+            }
+        }
+        // In slot order, as a plain walk over the slots would.
+        batch.drain(..).for_each(drop);
     }
 }
 
