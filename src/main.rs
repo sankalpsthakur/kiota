@@ -78,6 +78,14 @@ fn main() {
             kiota::stats::report();
             kiota::stats::report_shortcuts();
             let result = match outcome {
+                Ok(Ok(())) => {
+                    let n = parser::KEEP_GOING_DECLINES.load(std::sync::atomic::Ordering::Relaxed);
+                    if n > 0 {
+                        Err(tc::TcError::Decline(format!("{n} declaration(s) declined (KIOTA_KEEP_GOING)")))
+                    } else {
+                        Ok(())
+                    }
+                }
                 Ok(r) => r,
                 Err(_) => Err(tc::TcError::Other("panic during checking".into())),
             };

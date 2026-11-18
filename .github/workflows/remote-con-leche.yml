@@ -1,0 +1,167 @@
+name: remote-con-leche
+
+# Builds leanprover/con-leche at the arena's pinned revision, exports the
+# arena test (tests/con-leche.yaml: module ConLecheTests, three export-decls)
+# and the cone of the declaration kiota declines, uploads both, and runs
+# kiota from this branch on them.
+on:
+  push:
+    branches: ['remote/con-leche-2026*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SRC_URL: https://github.com/leanprover/con-leche
+  SRC_REV: 78ded4b6fc9a4d9ab809e8ca2c75c56537c41bff
+
+jobs:
+  cone:
+    name: cone of wscopedBP.eq_1 (22 modules)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: kiota
+      - name: Install elan and zstd
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y zstd time >/dev/null
+      - name: Source
+        run: |
+          mkdir -p work/src && cd work/src
+          git init -q && git remote add origin "$SRC_URL"
+          git fetch -q --depth 1 origin "$SRC_REV" && git checkout -q FETCH_HEAD
+          cat lean-toolchain
+      - name: Build lean4export
+        run: |
+          git clone -q --branch master https://github.com/leanprover/lean4export lean4export
+          cp work/src/lean-toolchain lean4export/lean-toolchain
+          cd lean4export && git rev-parse HEAD && lake build
+      - name: Build the defining module
+        working-directory: work/src
+        run: lake build ConLeche.Cached.ExprOpsC ConLeche.Verify.Cached.OpsC
+      - name: Export cones
+        working-directory: work/src
+        run: |
+          set +e
+          X="$GITHUB_WORKSPACE/lean4export/.lake/build/bin/lean4export"
+          mkdir -p r
+          cat > Repro.lean <<'LEAN'
+          import ConLeche.Cached.ExprOpsC
+          theorem reproEq1 := @ConLeche.Expr.wscopedBP.eq_1
+          #print axioms reproEq1
+          #check @ConLeche.Expr.wscopedBP.eq_1
+          LEAN
+          sed -i 's/^          //' Repro.lean
+          lake env lean -o r/Repro.olean Repro.lean; echo "repro rc=$?"
+          lake env bash -c "LEAN_PATH=\$LEAN_PATH:$PWD/r $X Repro -- reproEq1 ConLeche.Expr.wscopedBP.eq_1" > "$GITHUB_WORKSPACE/cone-repro.ndjson"; echo "cone-repro rc=$?"
+          lake env "$X" ConLeche.Verify.Cached.OpsC -- ConLeche.Expr.wscopedBP.eq_1 > "$GITHUB_WORKSPACE/cone-opsc.ndjson"; echo "cone-opsc rc=$?"
+          lake env "$X" ConLeche.Cached.ExprOpsC -- ConLeche.Expr.wscopedBP.eq_1 > "$GITHUB_WORKSPACE/cone-exprops.ndjson"; echo "cone-exprops rc=$?"
+          lake env "$X" ConLeche.Cached.ExprOpsC -- ConLeche.Expr.wscopedBP_cut > "$GITHUB_WORKSPACE/cone-cut.ndjson"; echo "cone-cut rc=$?"
+          ls -la "$GITHUB_WORKSPACE"/cone-*.ndjson; wc -l "$GITHUB_WORKSPACE"/cone-*.ndjson
+      - name: Upload cones
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cones
+          path: cone-*.ndjson
+          if-no-files-found: ignore
+          retention-days: 30
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build kiota
+        working-directory: kiota
+        run: cargo build --release --locked
+      - name: Run kiota on the cones
+        run: |
+          set +e
+          for f in cone-*.ndjson; do
+            [ -s "$f" ] || continue
+            KIOTA_KEEP_GOING=1 /usr/bin/time -v -o time.txt kiota/target/release/kiota "$f" >/dev/null 2>err.txt; rc=$?
+            echo "CONE file=$f rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') decls=$(grep -c '"name"' "$f")"
+            grep -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-1500
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+
+  full:
+    name: full arena export
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: kiota
+      - name: Install elan and zstd
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y zstd time >/dev/null
+      - name: Source
+        run: |
+          mkdir -p work/src && cd work/src
+          git init -q && git remote add origin "$SRC_URL"
+          git fetch -q --depth 1 origin "$SRC_REV" && git checkout -q FETCH_HEAD
+      - name: Build lean4export
+        run: |
+          git clone -q --branch master https://github.com/leanprover/lean4export lean4export
+          cp work/src/lean-toolchain lean4export/lean-toolchain
+          cd lean4export && git rev-parse HEAD && lake build
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build kiota
+        working-directory: kiota
+        run: cargo build --release --locked
+      - name: Build module (lka.py)
+        working-directory: work/src
+        run: |
+          start=$(date +%s)
+          lake build ConLecheTests
+          echo "lake build seconds: $(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Export (lka.py run_lean4export)
+        working-directory: work/src
+        run: |
+          X="$GITHUB_WORKSPACE/lean4export/.lake/build/bin/lean4export"
+          lake env "$X" ConLecheTests -- ConLeche.model_exists ConLeche.no_proof_of_False ConLeche.Frontend.scanLineSpec_eq_scanLineFwd > "$GITHUB_WORKSPACE/con-leche.ndjson"
+          lake env "$X" ConLecheTests -- ConLeche.Expr.wscopedBP.eq_1 > "$GITHUB_WORKSPACE/cone-eq1-full.ndjson" || true
+          cd "$GITHUB_WORKSPACE"
+          ls -la *.ndjson; wc -l *.ndjson; sha256sum *.ndjson | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Run kiota (keep going, every decline)
+        run: |
+          set +e
+          KIOTA_KEEP_GOING=1 /usr/bin/time -v -o time.txt kiota/target/release/kiota con-leche.ndjson >/dev/null 2>err.txt; rc=$?
+          {
+            echo "FULL rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') wall=$(grep 'Elapsed' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}')"
+            echo "declines: $(grep -c '^DECLINE-CONT' err.txt)"
+            grep -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-1500 | head -200
+            tail -3 err.txt | cut -c1-300
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          KIOTA_KEEP_GOING=1 kiota/target/release/kiota cone-eq1-full.ndjson >/dev/null 2>err2.txt; echo "CONE-FULL rc=$?" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E '^(REJECT|DECLINE|ERROR)' err2.txt | cut -c1-1500 | tee -a "$GITHUB_STEP_SUMMARY"
+          zstd -q -T0 -10 err.txt -o kiota-stderr.txt.zst
+      - name: Compress
+        if: always()
+        run: |
+          for f in con-leche cone-eq1-full; do [ -f $f.ndjson ] && zstd -q -T0 -10 $f.ndjson -o $f.ndjson.zst; done; ls -la *.zst
+      - name: Upload full export
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: export-con-leche
+          path: con-leche.ndjson.zst
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 30
+      - name: Upload cone and stderr
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cone-eq1-full
+          path: |
+            cone-eq1-full.ndjson.zst
+            kiota-stderr.txt.zst
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 30

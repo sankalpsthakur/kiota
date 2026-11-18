@@ -1439,7 +1439,17 @@ impl Parser {
         let string_ref = self.declared("String");
         Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
             .check_decl(name, kind)
-            .map_err(|e| self.annotate(name, e))?;
+            .map_err(|e| self.annotate(name, e))
+            .or_else(|e| match e {
+                // Diagnostic only (remote branch): report every decline and
+                // carry on; the process still ends in a decline.
+                TcError::Decline(m) if std::env::var_os("KIOTA_KEEP_GOING").is_some() => {
+                    eprintln!("DECLINE-CONT #{}: {m}", self.decl_count);
+                    KEEP_GOING_DECLINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                }
+                e => Err(e),
+            })?;
         self.release_theorem_value(name);
         Ok(())
     }
@@ -1466,6 +1476,8 @@ impl Parser {
         }
     }
 }
+
+pub static KEEP_GOING_DECLINES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn kind_or_direct(_v: &Value) {}
 
