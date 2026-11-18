@@ -1,0 +1,89 @@
+name: remote-build-flags-nix
+
+# Every instruction count so far (runs 44344781467, 44354976061) came from
+# binaries built by rustup's stable toolchain. The arena builds inside its
+# flake's shell (an older rustc from nixpkgs, llvm-profdata from
+# llvmPackages). This run repeats plain / pgo / x86-64-v3+pgo with that
+# toolchain and counts instructions under cachegrind on the first fifth of
+# init (inside the training export) and on twelve fixtures (outside it).
+on:
+  push:
+    branches: ['remote/build-flags-20261118f']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+
+jobs:
+  nix-insn:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [plain, pgo, v3+pgo]
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Arena flake, export, host tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y zstd time valgrind >/dev/null
+          zstd -d --rm init.ndjson.zst -o init.ndjson
+          git clone --depth 1 https://github.com/leanprover/lean-kernel-arena arena
+          git -C arena log -1 --format='ARENA rev=%H date=%cI' | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build inside the arena's shell
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          echo "TOOLS rustc=$(rustc --version) llvm=$(rustc -vV | grep LLVM) cargo=$(cargo --version) profdata=$(command -v llvm-profdata) sysroot_profdata=$(ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-profdata 2>/dev/null | wc -l)" | tee -a "$GITHUB_STEP_SUMMARY"
+          scripts/build-flags/build_side.sh "$SIDE" init.ndjson "kiota-$SIDE" | tee -a "$GITHUB_STEP_SUMMARY"
+        shell: 'nix develop ./arena -c bash -euo pipefail {0}'
+      - name: Instructions under cachegrind
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set +e
+          probe=$(ls -S tests/fixtures/*.accept.ndjson | tail -n 1)
+          vg() { valgrind "$@"; }
+          vg --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null "./kiota-$SIDE" "$probe" >/dev/null 2>vg-probe.txt
+          if grep -qE 'I +refs:' vg-probe.txt; then
+            echo "VALGRIND from=apt $(valgrind --version)" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            tail -n 8 vg-probe.txt
+            vg() { nix shell --inputs-from ./arena nixpkgs#valgrind -c valgrind "$@"; }
+            echo "VALGRIND from=nix $(vg --version)" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          count() {
+            work=$1; file=$2; limit=$3
+            KIOTA_STATS=1 timeout "$limit" bash -c "$(declare -f vg); vg --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null './kiota-$SIDE' '$file'" >/dev/null 2>"vg-$work.txt"; rc=$?
+            echo "INSN toolchain=nix side=$SIDE work=$work rc=$rc Ir=$(grep -E 'I +refs:' "vg-$work.txt" | awk '{print $NF}' | tr -d ,) stats_md5=$(grep -E '^STATS' "vg-$work.txt" | md5sum | cut -c1-12)"
+          }
+          lines=$(wc -l < init.ndjson)
+          head -n $((lines / 5)) init.ndjson > init-fifth.ndjson
+          count init-fifth init-fifth.ndjson 40m > out-fifth.txt &
+          ls -S tests/fixtures/*.ndjson | grep -v 'nat-shift-right-large-amount.reject' | head -n 12 > fixtures.txt
+          n=0
+          while IFS= read -r f; do
+            n=$((n + 1))
+            count "fixture-$(basename "$f" | cut -c1-40)" "$f" 20m > "out-fx-$n.txt" &
+            [ $((n % 3)) = 0 ] && wait -n
+          done < fixtures.txt
+          for i in $(seq 1 "$n"); do
+            while [ ! -s "out-fx-$i.txt" ]; do sleep 5; done
+          done
+          cat out-fx-*.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "INSN_SUM toolchain=nix side=$SIDE work=fixtures files=$n Ir=$(cat out-fx-*.txt | grep -oE 'Ir=[0-9]+' | cut -d= -f2 | awk '{s+=$1} END{printf "%.0f", s}') rcs=$(cat out-fx-*.txt | grep -oE 'rc=[0-9]+' | sort | uniq -c | tr -s ' ' | tr '\n' ',')" | tee -a "$GITHUB_STEP_SUMMARY"
+          wait
+          cat out-fifth.txt | tee -a "$GITHUB_STEP_SUMMARY"
