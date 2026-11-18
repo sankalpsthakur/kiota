@@ -413,6 +413,10 @@ fn report_sites() {
         &sp[0..2],
         &sp[2..4],
     );
+    let [same, rebuilt] = crate::tc::spine_verified();
+    if same + rebuilt > 0 {
+        eprintln!("STATS9 spine_verify same_node={same} same_term_other_node={rebuilt}");
+    }
     let w: Vec<u64> = (0..4).map(|j| WHNF_MISS.with(|t| t[j].get())).collect();
     eprintln!(
         "STATS7 whnf_miss(closed_export,closed_derived,open_export,open_derived)={:?} whnf_open_key_is_full_ctx={} whnf_miss_already_pi_sort_lam={} whnf_core_calls={} whnf_core_hits={}",

@@ -83,6 +83,9 @@ thread_local! {
     /// every spine's type one argument at a time and panics on a difference.
     static SPINE_ON: bool = std::env::var_os("KIOTA_SPINE").is_some();
     static SPINE_VERIFY_ON: bool = std::env::var_os("KIOTA_SPINE_VERIFY").is_some();
+    /// `KIOTA_SPINE_VERIFY` comparisons: [the same node, an equal term in
+    /// another allocation]. A third outcome, a different term, panics.
+    static SPINE_VERIFIED: [Cell<u64>; 2] = const { [Cell::new(0), Cell::new(0)] };
     /// `XINFER`'s counterpart for spine states of closed prefixes.
     static XSPINE: RefCell<FxHashMap<usize, SpineState>> = RefCell::new(FxHashMap::default());
     static XCACHE_ON: bool = std::env::var_os("KIOTA_XCACHE").is_some();
@@ -190,6 +193,12 @@ fn num_bigint_gcd(a: &BigUint, b: &BigUint) -> BigUint {
 }
 /// Entries a cross-declaration cache holds before it is emptied.
 const XCACHE_CAP: usize = 4_000_000;
+
+/// `KIOTA_SPINE_VERIFY` comparisons so far: [same node, same term in another
+/// allocation].
+pub fn spine_verified() -> [u64; 2] {
+    SPINE_VERIFIED.with(|c| [c[0].get(), c[1].get()])
+}
 
 pub fn xcache_hits() -> u64 {
     XCACHE_HITS.with(Cell::get)
@@ -1530,8 +1539,10 @@ impl<'e> Checker<'e> {
     /// Same judgments in the same order as the one-argument rule: argument
     /// `aₖ` is inferred and compared with the same domain term (simultaneous
     /// substitution of arguments that live in the context equals the
-    /// sequential one, and equal terms are one node), and the result is the
-    /// same node. `spine_verify` checks that on every spine.
+    /// sequential one), and the result is the same term. `spine_verify`
+    /// checks that on every spine, term against term (`spine_verify_same`):
+    /// the two are also one node unless an interner reset lies between the
+    /// allocations.
     ///
     /// A shared prefix (`HAdd.hAdd ℕ ℕ ℕ inst x` under many `y`) is not
     /// walked again: the state after each prefix is kept in `spine_cache`
@@ -1663,26 +1674,45 @@ impl<'e> Checker<'e> {
         let result = Self::spine_subst(S::INFER_APP, &ty, &args[j..i]);
         if verify {
             let (reference, doms) = self.infer_app_one_at_a_time(ctx, e)?;
-            assert!(
-                Rc::ptr_eq(&reference, &result),
-                "spine inference diverged from the one-argument rule on {}: {} vs {}",
-                self.pp_budget(e, 40),
-                self.pp_budget(&result, 40),
-                self.pp_budget(&reference, 40),
-            );
+            self.spine_verify_same(&result, &reference, || {
+                format!("spine inference diverged from the one-argument rule on {}", self.pp_budget(e, 40))
+            });
             let skipped = doms.len() - doms_used.len();
             for (k, d) in doms_used.iter().enumerate() {
-                assert!(
-                    Rc::ptr_eq(d, &doms[skipped + k]),
-                    "spine inference checked argument {} of {} against {} instead of {}",
-                    skipped + k,
-                    self.pp_budget(e, 40),
-                    self.pp_budget(d, 40),
-                    self.pp_budget(&doms[skipped + k], 40),
-                );
+                self.spine_verify_same(d, &doms[skipped + k], || {
+                    format!(
+                        "spine inference checked argument {} of {} against another domain",
+                        skipped + k,
+                        self.pp_budget(e, 40)
+                    )
+                });
             }
         }
         Ok(result)
+    }
+
+    /// `KIOTA_SPINE_VERIFY`: `got` (the one-walk term) must be the term the
+    /// one-argument rule built. The two are one node while every node
+    /// involved comes from one generation of the intern table. Past an
+    /// interner reset (4M nodes, at a declaration boundary) a memo or cache
+    /// entry kept across declarations (`KIOTA_XMEMO`, `KIOTA_XCACHE`) hands
+    /// one side a node from before the reset where the other side rebuilds
+    /// it, so the same term in another allocation is counted, not refused.
+    /// A different term panics.
+    fn spine_verify_same(&self, got: &Expr, want: &Expr, what: impl FnOnce() -> String) {
+        let same_node = Rc::ptr_eq(got, want);
+        if !same_node && !expr::structurally_equal(got, want) {
+            panic!(
+                "{}: {} instead of {}",
+                what(),
+                self.pp_budget(got, 40),
+                self.pp_budget(want, 40)
+            );
+        }
+        SPINE_VERIFIED.with(|c| {
+            let c = &c[usize::from(!same_node)];
+            c.set(c.get() + 1);
+        });
     }
 
     /// `expr::instantiate_rev` for a telescope walk, charged to `site`.
@@ -1808,13 +1838,9 @@ impl<'e> Checker<'e> {
                     self.proj_field_doms_one_at_a_time(ctx, &ct, params, sname, num_fields, v)?;
                 assert_eq!(doms.len(), reference.len());
                 for (k, (d, r)) in doms.iter().zip(&reference).enumerate() {
-                    assert!(
-                        Rc::ptr_eq(d, r),
-                        "one-walk projection gave field {k} of {} the type {} instead of {}",
-                        self.name_str(sname),
-                        self.pp_budget(d, 40),
-                        self.pp_budget(r, 40),
-                    );
+                    self.spine_verify_same(d, r, || {
+                        format!("one-walk projection gave field {k} of {} another type", self.name_str(sname))
+                    });
                 }
             }
             doms

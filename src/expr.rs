@@ -146,6 +146,56 @@ pub fn identity(e: &Expr) -> usize {
     e.identity
 }
 
+/// Whether `a` and `b` are the same term, node for node, without relying on
+/// hash-consing. Two structurally equal terms are one allocation only while
+/// both were built through the same generation of the intern table: after
+/// `intern_clear_if_large` a term kept from before (a cache or memo entry
+/// that outlives the declaration) and its rebuilt copy are equal here and
+/// distinct by `Rc::ptr_eq`. Binder info is compared; it is part of the node.
+/// Visits each pair of distinct nodes once. Diagnostics and tests only.
+pub fn structurally_equal(a: &Expr, b: &Expr) -> bool {
+    let mut seen: rustc_hash::FxHashSet<(usize, usize)> = Default::default();
+    let mut stack: Vec<(Expr, Expr)> = vec![(a.clone(), b.clone())];
+    while let Some((a, b)) = stack.pop() {
+        if Rc::ptr_eq(&a, &b) {
+            continue;
+        }
+        if a.loose != b.loose || a.used_bvars != b.used_bvars {
+            return false;
+        }
+        if !seen.insert((identity(&a), identity(&b))) {
+            continue;
+        }
+        match (&**a, &**b) {
+            (ExprData::BVar(i), ExprData::BVar(j)) if i == j => {}
+            (ExprData::Sort(l), ExprData::Sort(m)) if l == m => {}
+            (ExprData::Const(n, us), ExprData::Const(m, vs)) if n == m && us == vs => {}
+            (ExprData::Lit(l), ExprData::Lit(m)) if l == m => {}
+            (ExprData::App(f, x), ExprData::App(g, y)) => {
+                stack.push((f.clone(), g.clone()));
+                stack.push((x.clone(), y.clone()));
+            }
+            (ExprData::Lam(bi, t, u), ExprData::Lam(bj, v, w))
+            | (ExprData::Pi(bi, t, u), ExprData::Pi(bj, v, w))
+                if bi == bj =>
+            {
+                stack.push((t.clone(), v.clone()));
+                stack.push((u.clone(), w.clone()));
+            }
+            (ExprData::Let(t, x, u), ExprData::Let(v, y, w)) => {
+                stack.push((t.clone(), v.clone()));
+                stack.push((x.clone(), y.clone()));
+                stack.push((u.clone(), w.clone()));
+            }
+            (ExprData::Proj(s, i, x), ExprData::Proj(t, j, y)) if s == t && i == j => {
+                stack.push((x.clone(), y.clone()));
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// The smallest `k` such that every loose bvar in `e` has index `< k`.
 /// Zero means `e` is closed.
 ///
@@ -1012,6 +1062,36 @@ mod tests {
             Rc::ptr_eq(&acc, &acc2),
             "primary intern map must still hash-cons after thousands of unique nodes"
         );
+    }
+
+    #[test]
+    fn structurally_equal_sees_through_an_interner_reset() {
+        let build = || {
+            let shared = app(const_(7, vec![crate::level::zero()]), bvar(1));
+            pi(
+                BinderInfo::Implicit,
+                app(shared.clone(), shared.clone()),
+                let_(sort(crate::level::zero()), proj(3, 1, bvar(0)), lam(BinderInfo::Default, shared, bvar(2))),
+            )
+        };
+        let old = build();
+        assert!(intern_clear_if_large(0));
+        let new = build();
+        assert!(!Rc::ptr_eq(&old, &new));
+        assert!(structurally_equal(&old, &new));
+        assert!(structurally_equal(&old, &old));
+        // One node apart, at each kind of position.
+        let other_binder = pi(BinderInfo::Default, app(bvar(0), bvar(0)), bvar(0));
+        let implicit = pi(BinderInfo::Implicit, app(bvar(0), bvar(0)), bvar(0));
+        assert!(!structurally_equal(&other_binder, &implicit));
+        assert!(!structurally_equal(&app(bvar(0), bvar(1)), &app(bvar(0), bvar(2))));
+        assert!(!structurally_equal(
+            &const_(7, vec![crate::level::zero()]),
+            &const_(7, vec![crate::level::succ(crate::level::zero())])
+        ));
+        assert!(!structurally_equal(&proj(3, 1, bvar(0)), &proj(3, 2, bvar(0))));
+        assert!(!structurally_equal(&lam(BinderInfo::Default, bvar(0), bvar(0)), &pi(BinderInfo::Default, bvar(0), bvar(0))));
+        assert!(!structurally_equal(&new, &app(new.clone(), bvar(0))));
     }
 
     #[test]

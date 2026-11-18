@@ -358,3 +358,46 @@ fn projection_out_of_a_prop_structure_keeps_its_restrictions() {
     assert!(Rc::ptr_eq(&a, &b));
     assert!(Rc::ptr_eq(&a, &expr::app(c(P), c(Z))));
 }
+
+/// Past an interner reset the one-walk rule and the one-argument rule can
+/// hold the same term in two allocations: here the substitution memo kept
+/// across the reset (`KIOTA_XMEMO`) answers the one-argument rule with the
+/// telescope it built before, and the walk builds the domain again. The
+/// verifier compares terms, so it counts that and goes on.
+#[test]
+fn verify_takes_the_same_term_in_another_allocation() {
+    let (env, names) = fixture();
+    let (on, off) = pair(&env, &names);
+    // Under binders `n : N`, `p : P n`, so no closed-term cache answers.
+    let mut ctx = Ctx::new();
+    ctx.push(c(N));
+    ctx.push(expr::app(c(P), expr::bvar(0)));
+    let e = expr::apps(c(H), &[expr::bvar(1), expr::bvar(0)]);
+    let before = on.infer_type(&ctx, &e).unwrap();
+    let [_, rebuilt0] = spine_verified();
+    // A declaration boundary past the reset threshold, memos kept.
+    on.infer_cache.borrow_mut().clear();
+    on.spine_cache.borrow_mut().clear();
+    assert!(expr::intern_clear_if_large(0));
+    let after = on.infer_type(&ctx, &e).unwrap();
+    let [_, rebuilt1] = spine_verified();
+    assert!(rebuilt1 > rebuilt0, "the walk rebuilt a domain the memo still held");
+    assert!(expr::structurally_equal(&before, &after));
+    assert!(expr::structurally_equal(&after, &off.infer_type(&ctx, &e).unwrap()));
+    // A wrong argument is still refused on that side of the reset.
+    let bad = expr::apps(c(H), &[expr::bvar(1), c(PO)]);
+    assert!(is_reject(&on.infer_type(&ctx, &bad)));
+}
+
+/// The verifier compares terms, not judgments: a definitionally equal but
+/// different term (`T` for `N → N`) is a divergence.
+#[test]
+#[should_panic(expected = "instead of")]
+fn verify_refuses_another_term() {
+    let (env, names) = fixture();
+    let (on, _) = pair(&env, &names);
+    let ctx = Ctx::new();
+    let unfolded = pi(c(N), c(N));
+    assert!(on.is_def_eq(&ctx, &c(T), &unfolded).unwrap());
+    on.spine_verify_same(&c(T), &unfolded, || "domain".to_owned());
+}
