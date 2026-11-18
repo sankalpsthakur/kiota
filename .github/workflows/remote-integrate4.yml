@@ -1,0 +1,42 @@
+name: remote-integrate4-spine
+
+# The integration branch on every corpus, strict, one process each.
+on:
+  push:
+    branches: ['remote/integrate4-2026*']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+  CL_EXPORT_RUN: 44328282978
+
+jobs:
+  full:
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [mathlib, cedar, cslib, std, init, con-leche]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ matrix.corpus == 'con-leche' && env.CL_EXPORT_RUN || env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Strict run
+        env:
+          C: ${{ matrix.corpus }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          nproc; free -g | head -2
+          KIOTA_SPINE=1 KIOTA_PROGRESS=1 /usr/bin/time -v -o time.txt timeout 20000 ./target/release/kiota $C.ndjson >/dev/null 2>err.txt; rc=$?
+          echo "FULLSPINE corpus=$C rc=$rc decls=$(grep -c '\[decl #' err.txt) last=$(grep -o '\[decl #[0-9]*\]' err.txt | tail -1) wall=$(grep Elapsed time.txt | awk '{print $NF}') user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-300)" | tee -a "$GITHUB_STEP_SUMMARY"
