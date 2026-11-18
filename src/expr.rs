@@ -200,6 +200,56 @@ pub fn identity(e: &Expr) -> usize {
     e.identity
 }
 
+/// Whether `a` and `b` are the same term, node for node, without relying on
+/// hash-consing. Two structurally equal terms are one allocation only while
+/// both were built through the same generation of the intern table: after
+/// `intern_clear_if_large` a term kept from before (a cache or memo entry
+/// that outlives the declaration) and its rebuilt copy are equal here and
+/// distinct by `Rc::ptr_eq`. Binder info is compared; it is part of the node.
+/// Visits each pair of distinct nodes once. Diagnostics and tests only.
+pub fn structurally_equal(a: &Expr, b: &Expr) -> bool {
+    let mut seen: rustc_hash::FxHashSet<(usize, usize)> = Default::default();
+    let mut stack: Vec<(Expr, Expr)> = vec![(a.clone(), b.clone())];
+    while let Some((a, b)) = stack.pop() {
+        if Rc::ptr_eq(&a, &b) {
+            continue;
+        }
+        if a.loose != b.loose || a.used_bvars != b.used_bvars {
+            return false;
+        }
+        if !seen.insert((identity(&a), identity(&b))) {
+            continue;
+        }
+        match (&**a, &**b) {
+            (ExprData::BVar(i), ExprData::BVar(j)) if i == j => {}
+            (ExprData::Sort(l), ExprData::Sort(m)) if l == m => {}
+            (ExprData::Const(n, us), ExprData::Const(m, vs)) if n == m && us == vs => {}
+            (ExprData::Lit(l), ExprData::Lit(m)) if l == m => {}
+            (ExprData::App(f, x), ExprData::App(g, y)) => {
+                stack.push((f.clone(), g.clone()));
+                stack.push((x.clone(), y.clone()));
+            }
+            (ExprData::Lam(bi, t, u), ExprData::Lam(bj, v, w))
+            | (ExprData::Pi(bi, t, u), ExprData::Pi(bj, v, w))
+                if bi == bj =>
+            {
+                stack.push((t.clone(), v.clone()));
+                stack.push((u.clone(), w.clone()));
+            }
+            (ExprData::Let(t, x, u), ExprData::Let(v, y, w)) => {
+                stack.push((t.clone(), v.clone()));
+                stack.push((x.clone(), y.clone()));
+                stack.push((u.clone(), w.clone()));
+            }
+            (ExprData::Proj(s, i, x), ExprData::Proj(t, j, y)) if s == t && i == j => {
+                stack.push((x.clone(), y.clone()));
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// The smallest `k` such that every loose bvar in `e` has index `< k`.
 /// Zero means `e` is closed.
 ///
@@ -615,6 +665,9 @@ struct Interner {
     /// nodes. Read once here so the hot path does not ask the environment's
     /// thread-local on every call.
     weak_mode: bool,
+    /// `KIOTA_STATS`, read once for the same reason: the per-call-site
+    /// counters are asked for on every `intern` call.
+    stats: bool,
 }
 
 impl Default for Interner {
@@ -635,6 +688,7 @@ impl Interner {
             calls: 0,
             next_report: INTERN_REPORT_EVERY,
             weak_mode: reclamation_enabled(),
+            stats: crate::stats::enabled(),
         }
     }
 
@@ -726,8 +780,11 @@ fn alloc_node(d: ExprData) -> Expr {
     alloc_node_with(d, id)
 }
 
+/// The one place a node is allocated, for the table's miss path and for
+/// `alloc_node` alike, so the `KIOTA_STATS` allocation count sees both.
 #[inline(always)]
 fn alloc_node_with(d: ExprData, identity: usize) -> Expr {
+    crate::stats::alloc_tick();
     let loose = loose_of(&d);
     let used_bvars = used_of(&d);
     Rc::new(ExprNode {
@@ -872,6 +929,11 @@ fn intern_inline<K: Shape>(k: K) -> Expr {
     INTERN.with(|t| {
         let mut t = t.borrow_mut();
         t.calls += 1;
+        if t.stats {
+            // Charged to the checker call site that asked, in either
+            // table mode.
+            crate::stats::intern_tick();
+        }
         if t.calls == t.next_report {
             t.report();
         }
@@ -920,6 +982,12 @@ pub fn intern(d: ExprData) -> Expr {
         ExprData::Lit(Lit::Nat(n)) => lit_nat(n),
         ExprData::Lit(Lit::Str(s)) => intern_inline(StrShape(s)),
     }
+}
+
+/// The identity the next freshly allocated node will get. Identities only
+/// grow, so this is a watermark: every node allocated later is at or past it.
+pub fn next_identity() -> usize {
+    INTERN.with(|t| t.borrow().next_id)
 }
 
 pub fn intern_node_count() -> usize {
@@ -1002,6 +1070,19 @@ pub fn clear_memo<K, V, S: Default>(m: &mut std::collections::HashMap<K, V, S>) 
 /// Drop per-decl substitution memos. The intern table stays: env terms
 /// live there. These two maps grow with every `shift`/`instantiate_level_params`
 /// and were never cleared, so std `#18000` hung after 18k decls of residue.
+/// The substitution memos are pure functions of never-reused node
+/// identities, so they may outlive a declaration; this empties them only
+/// once they hold more than `cap` entries together.
+pub fn clear_subst_memos_if_large(cap: usize) {
+    let n = LEVEL_INST_MEMO.with(|m| m.borrow().len())
+        + SHIFT_MEMO.with(|m| m.borrow().len())
+        + INST1_MEMO.with(|m| m.borrow().len())
+        + USED_SET_MEMO.with(|m| m.borrow().len());
+    if n > cap {
+        clear_subst_memos();
+    }
+}
+
 pub fn clear_subst_memos() {
     LEVEL_INST_MEMO.with(|m| clear_memo(&mut m.borrow_mut()));
     // Clear the memo first: IDs can be reused only after its entries are gone.
@@ -1059,6 +1140,11 @@ pub fn apps(f: Expr, args: &[Expr]) -> Expr {
 /// Shift free (>= cutoff) de Bruijn indices by `by` (can be used with negative
 /// effectively only in controlled contexts; we only ever shift up here).
 pub fn shift(e: &Expr, by: i32, cutoff: u32) -> Expr {
+    let _op = crate::stats::op(crate::stats::op::SHIFT);
+    shift_go(e, by, cutoff)
+}
+
+fn shift_go(e: &Expr, by: i32, cutoff: u32) -> Expr {
     if by == 0 {
         return e.clone();
     }
@@ -1080,15 +1166,15 @@ pub fn shift(e: &Expr, by: i32, cutoff: u32) -> Expr {
             }
         }
         ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => e.clone(),
-        ExprData::App(f, a) => app(shift(f, by, cutoff), shift(a, by, cutoff)),
-        ExprData::Lam(bi, ty, body) => lam(*bi, shift(ty, by, cutoff), shift(body, by, cutoff + 1)),
-        ExprData::Pi(bi, ty, body) => pi(*bi, shift(ty, by, cutoff), shift(body, by, cutoff + 1)),
+        ExprData::App(f, a) => app(shift_go(f, by, cutoff), shift_go(a, by, cutoff)),
+        ExprData::Lam(bi, ty, body) => lam(*bi, shift_go(ty, by, cutoff), shift_go(body, by, cutoff + 1)),
+        ExprData::Pi(bi, ty, body) => pi(*bi, shift_go(ty, by, cutoff), shift_go(body, by, cutoff + 1)),
         ExprData::Let(ty, val, body) => let_(
-            shift(ty, by, cutoff),
-            shift(val, by, cutoff),
-            shift(body, by, cutoff + 1),
+            shift_go(ty, by, cutoff),
+            shift_go(val, by, cutoff),
+            shift_go(body, by, cutoff + 1),
         ),
-        ExprData::Proj(s, i, v) => proj(*s, *i, shift(v, by, cutoff)),
+        ExprData::Proj(s, i, v) => proj(*s, *i, shift_go(v, by, cutoff)),
     };
     SHIFT_MEMO.with(|m| {
         memo_insert(&mut m.borrow_mut(), key, r.clone());
@@ -1114,19 +1200,46 @@ pub fn instantiate(e: &Expr, args: &[Expr]) -> Expr {
     // from a thread-local, remembers which slots it filled, and empties
     // exactly those. The entries, the hits and the misses of every call are
     // what a fresh map would give.
+    //
+    // Under `KIOTA_STATS` the call is also charged to the current call
+    // site: every call, the closed body included, with the nodes it
+    // substituted into (the memo's own miss count).
+    let stats = crate::stats::enabled();
+    // The innermost argument is unused when the body never mentions bvar 0:
+    // the call then only renumbers the variables bound further out.
+    let unused =
+        stats && args.len() == 1 && used_bvars(e) != USED_OVERFLOW && used_bvars(e) & 1 == 0;
     if loose_bvar_range(e) == 0 {
-        // What `instantiate_core` answers at depth 0, before any memo use.
+        // What `instantiate_core_dir` answers at depth 0, before any memo use.
+        if stats {
+            crate::stats::subst_call(false, unused, 0);
+        }
         return e.clone();
     }
+    let _op = crate::stats::op(crate::stats::op::INST);
+    let (r, nodes) = instantiate_with_scratch(e, args, false);
+    if stats {
+        crate::stats::subst_call(false, unused, nodes);
+    }
+    r
+}
+
+/// One substitution walk over `e` with the thread's kept memo: the result
+/// and the number of nodes substituted into, which is also what the call
+/// adds to the `inst_nodes` counter. `instantiate` and `instantiate_rev`
+/// both go through here, so the two cannot count or memoize differently.
+#[inline]
+fn instantiate_with_scratch(e: &Expr, args: &[Expr], rev: bool) -> (Expr, u64) {
     let mut memo = INST_SCRATCH
         .try_with(|m| std::mem::take(&mut *m.borrow_mut()))
         .unwrap_or_default();
-    let r = instantiate_core(e, args, 0, &mut memo);
-    crate::stats::inst_nodes_add(memo.misses);
+    let r = instantiate_core_dir(e, args, rev, 0, &mut memo);
+    let nodes = memo.misses;
+    crate::stats::inst_nodes_add(nodes);
     memo.misses = 0;
     memo.clear();
     let _ = INST_SCRATCH.try_with(|m| *m.borrow_mut() = memo);
-    r
+    (r, nodes)
 }
 
 thread_local! {
@@ -1273,9 +1386,34 @@ impl SubstMemo {
     }
 }
 
-fn instantiate_core(
+/// `instantiate` with the arguments in application order: `args[len-1]`
+/// replaces bvar 0 (Lean's `instantiate_rev`). `instantiate_rev(e, [a, b])`
+/// is `instantiate(e, [b, a])` without building the reversed list.
+pub fn instantiate_rev(e: &Expr, args: &[Expr]) -> Expr {
+    if args.is_empty() || loose_bvar_range(e) == 0 {
+        return e.clone();
+    }
+    // A bare variable (a telescope domain `α`) needs no memo table.
+    if let ExprData::BVar(i) = &***e {
+        let k = *i as usize;
+        return if k < args.len() {
+            args[args.len() - 1 - k].clone()
+        } else {
+            bvar(*i - args.len() as u32)
+        };
+    }
+    let _op = crate::stats::op(crate::stats::op::INST);
+    let (r, nodes) = instantiate_with_scratch(e, args, true);
+    if crate::stats::enabled() {
+        crate::stats::subst_call(false, false, nodes);
+    }
+    r
+}
+
+fn instantiate_core_dir(
     e: &Expr,
     args: &[Expr],
+    rev: bool,
     depth: u32,
     memo: &mut SubstMemo,
 ) -> Expr {
@@ -1292,36 +1430,35 @@ fn instantiate_core(
     memo.misses += 1;
     let r = match &***e {
         ExprData::BVar(i) => {
-            if *i >= depth && ((*i - depth) as usize) < args.len() {
-                let a = &args[(*i - depth) as usize];
+            let k = (*i - depth) as usize;
+            if k < args.len() {
+                let a = if rev { &args[args.len() - 1 - k] } else { &args[k] };
                 shift(a, depth as i32, 0)
-            } else if *i >= depth {
-                bvar(*i - args.len() as u32)
             } else {
-                e.clone()
+                bvar(*i - args.len() as u32)
             }
         }
         ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => e.clone(),
         ExprData::App(f, a) => app(
-            instantiate_core(f, args, depth, memo),
-            instantiate_core(a, args, depth, memo),
+            instantiate_core_dir(f, args, rev, depth, memo),
+            instantiate_core_dir(a, args, rev, depth, memo),
         ),
         ExprData::Lam(bi, ty, body) => lam(
             *bi,
-            instantiate_core(ty, args, depth, memo),
-            instantiate_core(body, args, depth + 1, memo),
+            instantiate_core_dir(ty, args, rev, depth, memo),
+            instantiate_core_dir(body, args, rev, depth + 1, memo),
         ),
         ExprData::Pi(bi, ty, body) => pi(
             *bi,
-            instantiate_core(ty, args, depth, memo),
-            instantiate_core(body, args, depth + 1, memo),
+            instantiate_core_dir(ty, args, rev, depth, memo),
+            instantiate_core_dir(body, args, rev, depth + 1, memo),
         ),
         ExprData::Let(ty, val, body) => let_(
-            instantiate_core(ty, args, depth, memo),
-            instantiate_core(val, args, depth, memo),
-            instantiate_core(body, args, depth + 1, memo),
+            instantiate_core_dir(ty, args, rev, depth, memo),
+            instantiate_core_dir(val, args, rev, depth, memo),
+            instantiate_core_dir(body, args, rev, depth + 1, memo),
         ),
-        ExprData::Proj(s, i, v) => proj(*s, *i, instantiate_core(v, args, depth, memo)),
+        ExprData::Proj(s, i, v) => proj(*s, *i, instantiate_core_dir(v, args, rev, depth, memo)),
     };
     memo.insert(id, depth, r.clone());
     r
@@ -1331,6 +1468,7 @@ fn instantiate_core(
 pub fn instantiate1(e: &Expr, arg: &Expr) -> Expr {
     let key = (ptr(e), ptr(arg));
     if let Some(r) = INST1_MEMO.with(|m| m.borrow().get(&key).cloned()) {
+        crate::stats::subst_call(true, false, 0);
         return r;
     }
     let r = instantiate(e, std::slice::from_ref(arg));
@@ -1428,6 +1566,7 @@ pub fn instantiate_level_params(e: &Expr, subst: &FxHashMap<u32, Level>) -> Expr
         return e.clone();
     }
     let id = LEVEL_SUBST_IDS.with(|ids| level_subst_id(subst, &mut ids.borrow_mut()));
+    let _op = crate::stats::op(crate::stats::op::LEVEL);
     instantiate_level_params_cached(e, subst, id)
 }
 
@@ -1681,6 +1820,36 @@ mod tests {
         assert!(intern_clear_if_large(0));
         assert!(weak.iter().all(|w| w.upgrade().is_none()));
         assert_eq!(intern_node_count(), 0);
+    }
+
+    #[test]
+    fn structurally_equal_sees_through_an_interner_reset() {
+        let build = || {
+            let shared = app(const_(7, vec![crate::level::zero()]), bvar(1));
+            pi(
+                BinderInfo::Implicit,
+                app(shared.clone(), shared.clone()),
+                let_(sort(crate::level::zero()), proj(3, 1, bvar(0)), lam(BinderInfo::Default, shared, bvar(2))),
+            )
+        };
+        let old = build();
+        assert!(intern_clear_if_large(0));
+        let new = build();
+        assert!(!Rc::ptr_eq(&old, &new));
+        assert!(structurally_equal(&old, &new));
+        assert!(structurally_equal(&old, &old));
+        // One node apart, at each kind of position.
+        let other_binder = pi(BinderInfo::Default, app(bvar(0), bvar(0)), bvar(0));
+        let implicit = pi(BinderInfo::Implicit, app(bvar(0), bvar(0)), bvar(0));
+        assert!(!structurally_equal(&other_binder, &implicit));
+        assert!(!structurally_equal(&app(bvar(0), bvar(1)), &app(bvar(0), bvar(2))));
+        assert!(!structurally_equal(
+            &const_(7, vec![crate::level::zero()]),
+            &const_(7, vec![crate::level::succ(crate::level::zero())])
+        ));
+        assert!(!structurally_equal(&proj(3, 1, bvar(0)), &proj(3, 2, bvar(0))));
+        assert!(!structurally_equal(&lam(BinderInfo::Default, bvar(0), bvar(0)), &pi(BinderInfo::Default, bvar(0), bvar(0))));
+        assert!(!structurally_equal(&new, &app(new.clone(), bvar(0))));
     }
 
     #[test]
@@ -1956,7 +2125,7 @@ mod tests {
     }
 
     /// Reference substitution with no short-circuit, used to prove the fast
-    /// path in `instantiate_core` never changes a result.
+    /// path in `instantiate_core_dir` never changes a result.
     fn instantiate_ref(e: &Expr, args: &[Expr], depth: u32) -> Expr {
         match &***e {
             ExprData::BVar(i) => {
@@ -2131,6 +2300,19 @@ mod tests {
                     "instantiate diverged from the reference"
                 );
             }
+            // Application order: the last argument replaces bvar 0.
+            for (fwd, rev) in [
+                (vec![a0.clone()], vec![a0.clone()]),
+                (vec![a0.clone(), a1.clone()], vec![a1.clone(), a0.clone()]),
+            ] {
+                assert!(
+                    Rc::ptr_eq(&instantiate_rev(&e, &rev), &instantiate_ref(&e, &fwd, 0)),
+                    "instantiate_rev diverged from the reference"
+                );
+                assert!(Rc::ptr_eq(&instantiate_rev(&bvar(0), &rev), &fwd[0]));
+                assert!(Rc::ptr_eq(&instantiate_rev(&bvar(7), &rev), &bvar(7 - rev.len() as u32)));
+            }
+            assert!(Rc::ptr_eq(&instantiate_rev(&e, &[]), &e));
             for cutoff in 0..4u32 {
                 assert!(
                     Rc::ptr_eq(&shift(&e, 2, cutoff), &shift_ref(&e, 2, cutoff)),

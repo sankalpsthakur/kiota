@@ -24,6 +24,8 @@ macro_rules! env_set {
 mod recursor;
 #[cfg(test)]
 mod reclamation_tests;
+#[cfg(test)]
+mod spine_tests;
 
 thread_local! {
     /// Recursion guard for `pub fn infer_type`'s `KIOTA_NBE=1` dispatch,
@@ -81,6 +83,29 @@ thread_local! {
     /// Set when `whnf_core` hits CONV_DEPTH. The abort is a Decline, never a
     /// stuck term cached or returned as WHNF (criterion 2).
     static CORE_ABORTED: Cell<bool> = const { Cell::new(false) };
+    /// Results on closed terms that outlive the declaration that computed
+    /// them (`KIOTA_XCACHE`). A closed term's type and weak head normal
+    /// form depend on the environment only, which only grows, so a result
+    /// is as true for a later declaration as for the one that found it.
+    /// Keys are allocation identities, which are never reused.
+    static XINFER: RefCell<FxHashMap<usize, (Expr, bool)>> = RefCell::new(FxHashMap::default());
+    static XWHNF: RefCell<FxHashMap<usize, Expr>> = RefCell::new(FxHashMap::default());
+    /// `KIOTA_SPINE`: infer an application spine in one walk of the head's
+    /// Pi telescope (`infer_app_spine`). `KIOTA_SPINE_VERIFY` also recomputes
+    /// every spine's type one argument at a time and panics on a difference.
+    static SPINE_ON: bool = std::env::var_os("KIOTA_SPINE").is_some();
+    static SPINE_VERIFY_ON: bool = std::env::var_os("KIOTA_SPINE_VERIFY").is_some();
+    /// `KIOTA_SPINE_VERIFY` comparisons: [the same node, an equal term in
+    /// another allocation]. A third outcome, a different term, panics.
+    static SPINE_VERIFIED: [Cell<u64>; 2] = const { [Cell::new(0), Cell::new(0)] };
+    /// `XINFER`'s counterpart for spine states of closed prefixes.
+    static XSPINE: RefCell<FxHashMap<usize, SpineState>> = RefCell::new(FxHashMap::default());
+    static XCACHE_ON: bool = std::env::var_os("KIOTA_XCACHE").is_some();
+    static XMEMO_ON: bool = std::env::var_os("KIOTA_XMEMO").is_some();
+    /// Closed pairs proved definitionally equal. Only `true` is kept: an
+    /// equality once derived stays derivable as the environment grows.
+    static XDEFEQ: RefCell<rustc_hash::FxHashSet<(usize, usize)>> = RefCell::new(Default::default());
+    static XCACHE_HITS: Cell<u64> = const { Cell::new(0) };
     /// Unreduced same-const App congruence (`try_unreduced` + `is_def_eq_core`
     /// pairwise) nested 15+ deep on class spines walks the *tree*, not the
     /// intern DAG — 7^15 at std `#18000` (`LawfulVecOperator.mk`). One level
@@ -187,6 +212,19 @@ fn num_bigint_gcd(a: &BigUint, b: &BigUint) -> BigUint {
     }
     x
 }
+/// Entries a cross-declaration cache holds before it is emptied.
+const XCACHE_CAP: usize = 4_000_000;
+
+/// `KIOTA_SPINE_VERIFY` comparisons so far: [same node, same term in another
+/// allocation].
+pub fn spine_verified() -> [u64; 2] {
+    SPINE_VERIFIED.with(|c| [c[0].get(), c[1].get()])
+}
+
+pub fn xcache_hits() -> u64 {
+    XCACHE_HITS.with(Cell::get)
+}
+
 fn decline<T>(msg: impl Into<String>) -> R<T> {
     DECLINE_SERIAL.with(|s| s.set(s.get() + 1));
     Err(TcError::Decline(msg.into()))
@@ -208,6 +246,18 @@ impl std::hash::Hash for ThunkPtrKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         (Rc::as_ptr(&self.0) as usize).hash(state)
     }
+}
+
+/// Where the walk of an application spine stands after one of its prefixes
+/// `f a₁ … aₖ`: the prefix has type `ty[aₖ₋ₚ₊₁ … aₖ]`, where `ty` sits under
+/// `pending` binders of the head's telescope that have been stepped over but
+/// not substituted yet. `checked`: every argument up to `aₖ` was checked
+/// against its domain (not an infer-only walk).
+#[derive(Clone)]
+struct SpineState {
+    ty: Expr,
+    pending: u32,
+    checked: bool,
 }
 
 pub struct Checker<'e> {
@@ -257,6 +307,13 @@ pub struct Checker<'e> {
     /// `(ctx, term) → (type, checked)`. InferOnly may read a Check entry;
     /// Check must not use an InferOnly entry (that skipped app-arg checks).
     infer_cache: RefCell<FxHashMap<(u64, usize), (Expr, bool)>>,
+    /// `(context key, application node) → SpineState`, the same key as
+    /// `infer_cache` and cleared with it. Only written with `spine` on.
+    spine_cache: RefCell<FxHashMap<(u64, usize), SpineState>>,
+    /// One-walk application inference (`infer_app_spine`); from `KIOTA_SPINE`.
+    spine: Cell<bool>,
+    /// Recompute every spine the old way and compare; `KIOTA_SPINE_VERIFY`.
+    spine_verify: Cell<bool>,
     /// Consts whose telescope has a Prop-inductive binder (`USquash`, `Eq`).
     /// Only those spines need `defeq_args`; everything else stays pairwise.
     proof_arg_cache: RefCell<FxHashMap<u32, bool>>,
@@ -306,6 +363,11 @@ pub struct Checker<'e> {
     /// (each one less than the last) that run has made (`HUGE_LIT_RUN`).
     fuel_nat_last: std::cell::RefCell<Option<num_bigint::BigUint>>,
     fuel_nat_run: std::cell::Cell<u32>,
+    /// Set once this declaration's own constant was met and left folded
+    /// (`unfold_def`'s self-reference guard). Results computed after that
+    /// may reflect the guard, so they stay out of the cross-declaration
+    /// caches.
+    xcache_tainted: std::cell::Cell<bool>,
     /// Lean `infer_only`: skip app-arg checks. Only for PI
     /// (`proofs_of_same_prop`) on already-checked terms.
     infer_only: std::cell::Cell<bool>,
@@ -360,7 +422,7 @@ thread_local! {
 }
 
 /// Intern `(parent_id, type ptr)` to a context id. Shared by full `ctx.id`
-/// and by suffix keys (the k innermost binders of an open term).
+/// (suffix keys were dropped: nothing read them).
 fn intern_ctx_id(parent: u64, ty_ptr: usize) -> u64 {
     intern_ctx_binding_id(parent, u32::MAX, ty_ptr)
 }
@@ -387,9 +449,6 @@ fn intern_ctx_binding_id(parent: u64, index: u32, ty_ptr: usize) -> u64 {
 /// that built it. Equal ids therefore imply equal contexts; distinct ids for
 /// equal contexts would only cost a cache miss, and interning rules that out.
 ///
-/// `suffix[k]` is the interned id of the **k innermost** binder types
-/// (`suffix[0] = 0`). A term with `loose = k` only reads those k binders,
-/// so infer/defeq can key on `suffix[k]` instead of the full telescope.
 #[derive(Clone)]
 struct Ctx {
     /// Invariant: only ever extended through `push`, which keeps `id` in step.
@@ -398,7 +457,6 @@ struct Ctx {
     /// inferred under other bindings — a false accept, silently.
     tys: Vec<Expr>,
     id: u64,
-    suffix: Vec<u64>,
 }
 
 impl Default for Ctx {
@@ -406,7 +464,6 @@ impl Default for Ctx {
         Ctx {
             tys: Vec::new(),
             id: 0,
-            suffix: vec![0],
         }
     }
 }
@@ -418,17 +475,7 @@ impl Ctx {
 
     fn push(&mut self, ty: Expr) {
         let ty_ptr = expr::identity(&ty);
-        let new_id = intern_ctx_id(self.id, ty_ptr);
-        let mut suffix = vec![0];
-        suffix.push(intern_ctx_id(0, ty_ptr));
-        for k in 1..self.tys.len() {
-            suffix.push(intern_ctx_id(self.suffix[k], ty_ptr));
-        }
-        if !self.tys.is_empty() {
-            suffix.push(new_id);
-        }
-        self.id = new_id;
-        self.suffix = suffix;
+        self.id = intern_ctx_id(self.id, ty_ptr);
         self.tys.push(ty);
     }
 
@@ -570,11 +617,6 @@ impl Ctx {
         id
     }
 
-    fn suffix_key(&self, k: usize) -> u64 {
-        let k = k.min(self.tys.len());
-        self.suffix.get(k).copied().unwrap_or(self.id)
-    }
-
     fn len(&self) -> usize {
         self.tys.len()
     }
@@ -666,13 +708,61 @@ pub(crate) fn expr_dag_size(e: &Expr, cap: u32) -> u32 {
     seen.len() as u32
 }
 
+use crate::stats::site as S;
+
+// Substitution entry points that charge their work to a call site in the
+// `KIOTA_STATS` tables. With the counters off the guard is a no-op.
+#[inline(always)]
+fn inst1_at(s: u8, body: &Expr, arg: &Expr) -> Expr {
+    let _g = crate::stats::at(s);
+    expr::instantiate1(body, arg)
+}
+
+#[inline(always)]
+fn inst_at(s: u8, e: &Expr, args: &[Expr]) -> Expr {
+    let _g = crate::stats::at(s);
+    expr::instantiate(e, args)
+}
+
+#[inline(always)]
+fn shift_at(s: u8, e: &Expr, by: i32, cutoff: u32) -> Expr {
+    let _g = crate::stats::at(s);
+    expr::shift(e, by, cutoff)
+}
+
+#[inline(always)]
+fn lvl_at(s: u8, e: &Expr, subst: &FxHashMap<u32, Level>) -> Expr {
+    let _g = crate::stats::at(s);
+    expr::instantiate_level_params(e, subst)
+}
+
+#[inline(always)]
+fn apps_at(s: u8, f: Expr, args: &[Expr]) -> Expr {
+    let _g = crate::stats::at(s);
+    expr::apps(f, args)
+}
+
+fn expr_kind(e: &Expr) -> u8 {
+    match &***e {
+        ExprData::BVar(_) => 0,
+        ExprData::Sort(_) => 1,
+        ExprData::Const(..) => 2,
+        ExprData::App(..) => 3,
+        ExprData::Lam(..) => 4,
+        ExprData::Pi(..) => 5,
+        ExprData::Let(..) => 6,
+        ExprData::Proj(..) => 7,
+        ExprData::Lit(_) => 8,
+    }
+}
+
 fn local_ty(ctx: &Ctx, i: u32) -> Option<Expr> {
     let n = ctx.len();
     if (i as usize) >= n {
         return None;
     }
     let raw = &ctx[n - 1 - i as usize];
-    Some(expr::shift(raw, i as i32 + 1, 0))
+    Some(shift_at(S::LOCAL_TY, raw, i as i32 + 1, 0))
 }
 
 impl<'e> Checker<'e> {
@@ -696,6 +786,9 @@ impl<'e> Checker<'e> {
             eager_defeq_cache: RefCell::new(FxHashMap::default()),
             eager_infer_cache: RefCell::new(FxHashMap::default()),
             infer_cache: RefCell::new(FxHashMap::default()),
+            spine_cache: RefCell::new(FxHashMap::default()),
+            spine: Cell::new(SPINE_ON.with(|b| *b)),
+            spine_verify: Cell::new(SPINE_VERIFY_ON.with(|b| *b)),
             proof_arg_cache: RefCell::new(FxHashMap::default()),
             unfold_cache: RefCell::new(FxHashMap::default()),
             iota_value_cache: RefCell::new(FxHashMap::default()),
@@ -711,6 +804,7 @@ impl<'e> Checker<'e> {
             fuel_nat_peels: std::cell::Cell::new(0),
             fuel_nat_last: std::cell::RefCell::new(None),
             fuel_nat_run: std::cell::Cell::new(0),
+            xcache_tainted: std::cell::Cell::new(false),
             infer_only: std::cell::Cell::new(false),
             decl_value_size: std::cell::Cell::new(0),
             checking_prop_structure: std::cell::Cell::new(false),
@@ -848,6 +942,13 @@ impl<'e> Checker<'e> {
     }
 
     fn check_decl_once(&self, name: u32, kind: &str) -> R<()> {
+        crate::stats::decl_start(expr::next_identity());
+        let r = self.check_decl_once_go(name, kind);
+        crate::stats::decl_end();
+        r
+    }
+
+    fn check_decl_once_go(&self, name: u32, kind: &str) -> R<()> {
         self.conversion_trace_reported.set(false);
         let ci = self
             .env
@@ -856,7 +957,11 @@ impl<'e> Checker<'e> {
         // Drop the previous decl's subst/ctx intern before any WHNF/shape
         // probe. Those maps otherwise hold one extra decl of residue while
         // `type_is_multiarg_prop_structure` runs.
-        expr::clear_subst_memos();
+        if XMEMO_ON.with(|b| *b) {
+            expr::clear_subst_memos_if_large(XCACHE_CAP);
+        } else {
+            expr::clear_subst_memos();
+        }
         CTX_IDS.with(|m| expr::clear_memo(&mut m.borrow_mut()));
         CTX_NEXT.with(|c| c.set(1));
         CORE_ABORTED.with(|a| a.set(false));
@@ -1013,13 +1118,18 @@ impl<'e> Checker<'e> {
         // Pointer-keyed WHNF/defeq/infer caches are only useful inside one
         // declaration. Keeping them across decls is how `#3491`–`#3495`
         // grew from ~0.9 GB to multi-GB before the next omega proof.
-        expr::clear_subst_memos();
+        if XMEMO_ON.with(|b| *b) {
+            expr::clear_subst_memos_if_large(XCACHE_CAP);
+        } else {
+            expr::clear_subst_memos();
+        }
         CTX_IDS.with(|m| expr::clear_memo(&mut m.borrow_mut()));
         CTX_NEXT.with(|c| c.set(1));
         expr::clear_memo(&mut self.whnf_cache.borrow_mut());
         expr::clear_memo(&mut self.whnf_core_cache.borrow_mut());
         expr::clear_memo(&mut self.defeq_cache.borrow_mut());
         expr::clear_memo(&mut self.infer_cache.borrow_mut());
+        expr::clear_memo(&mut self.spine_cache.borrow_mut());
         // `ctx_key`s (via `CTX_NEXT`, reset above) are reused across
         // declarations, so a stale eager-namespace entry from the last
         // declaration would be keyed identically but mean something
@@ -1167,7 +1277,7 @@ impl<'e> Checker<'e> {
                 return Ok(core);
             };
             let (_, args) = expr::unfold_apps(&core);
-            let next = expr::apps(unfolded, &args);
+            let next = apps_at(S::APPS, unfolded, &args);
             if Rc::ptr_eq(&next, &cur) {
                 return Ok(core);
             }
@@ -1191,7 +1301,7 @@ impl<'e> Checker<'e> {
             let Some(unfolded) = self.unfold_def(*n, us)? else {
                 return Ok(w);
             };
-            let next = expr::apps(unfolded, &args);
+            let next = apps_at(S::APPS, unfolded, &args);
             let core = self.whnf_core(ctx, &next)?;
             if Rc::ptr_eq(&core, &w) {
                 return Ok(w);
@@ -1308,8 +1418,33 @@ impl<'e> Checker<'e> {
                 return Ok(t.clone());
             }
         }
+        let xcache = key.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b);
+        if xcache {
+            let hit = XINFER.with(|m| m.borrow().get(&key.1).cloned());
+            if let Some((t, checked)) = hit {
+                if infer_only || checked {
+                    XCACHE_HITS.with(|c| c.set(c.get() + 1));
+                    cache_ref.borrow_mut().insert(key, (t.clone(), checked));
+                    return Ok(t);
+                }
+            }
+        }
+        crate::stats::miss(0, key.0, key.1, 0);
+        if crate::stats::enabled() {
+            let upgrade = !infer_only && cache_ref.borrow().contains_key(&key);
+            crate::stats::infer_miss(expr_kind(e), key.1, key.0, ctx.id, infer_only, upgrade);
+        }
         let t = self.infer_type_uncached(ctx, e)?;
         let checked = !self.infer_only.get();
+        if xcache && checked && !self.xcache_tainted.get() {
+            XINFER.with(|m| {
+                let mut m = m.borrow_mut();
+                if m.len() >= XCACHE_CAP {
+                    m.clear();
+                }
+                m.insert(key.1, (t.clone(), true));
+            });
+        }
         {
             let mut cache = cache_ref.borrow_mut();
             if expr::reclamation_enabled() && cache.len() >= 50_000 {
@@ -1337,6 +1472,13 @@ impl<'e> Checker<'e> {
             }
             ExprData::Sort(l) => Ok(expr::sort(level::succ(l.clone()))),
             ExprData::Const(n, us) => self.infer_const(*n, us),
+            ExprData::App(..)
+                if self.spine.get()
+                    && !nbe::nbe_enabled()
+                    && !FORCE_EAGER_DEFEQ.with(Cell::get) =>
+            {
+                self.infer_app_spine(ctx, e)
+            }
             ExprData::App(f, a) => {
                 let ft = self.infer_type(ctx, f)?;
                 let (_, dom, body) = self.ensure_pi(ctx, &ft)?;
@@ -1361,7 +1503,7 @@ impl<'e> Checker<'e> {
                         return reject("application argument type mismatch");
                     }
                 }
-                Ok(expr::instantiate1(&body, a))
+                Ok(inst1_at(S::INFER_APP, &body, a))
             }
             ExprData::Lam(bi, ty, body) => {
                 let tt = self.infer_type(ctx, ty)?;
@@ -1372,7 +1514,7 @@ impl<'e> Checker<'e> {
                 };
                 ctx2.push(ty.clone());
                 let bt = self.infer_type(&ctx2, body)?;
-                Ok(expr::pi(*bi, ty.clone(), bt))
+                Ok({ let _g = crate::stats::at(S::INFER_LAM_PI); expr::pi(*bi, ty.clone(), bt) })
             }
             ExprData::Pi(_bi, ty, body) => {
                 let tt = self.infer_type(ctx, ty)?;
@@ -1393,13 +1535,239 @@ impl<'e> Checker<'e> {
                 if !self.is_def_eq(ctx, &vt, ty)? {
                     return reject("let value type mismatch");
                 }
-                let b = expr::instantiate1(body, val);
+                let b = inst1_at(S::INFER_LET, body, val);
                 self.infer_type(ctx, &b)
             }
             ExprData::Proj(sname, idx, v) => self.infer_proj(ctx, *sname, *idx, v),
             ExprData::Lit(Lit::Nat(_)) => Ok(self.nat_type()?),
             ExprData::Lit(Lit::Str(_)) => Ok(self.string_type()?),
         }
+    }
+
+    /// The type of an application `f a₁ … aₙ`, walking the telescope of
+    /// `f`'s type once (`KIOTA_SPINE`).
+    ///
+    /// The one-argument rule infers every prefix `f a₁ … aₖ` and substitutes
+    /// `aₖ` into the whole rest of the telescope, so a telescope node that
+    /// mentions an earlier binder or a variable of the context is rebuilt
+    /// once per later argument. Here the binders stepped over stay pending:
+    /// each domain is instantiated with the pending arguments when its
+    /// argument is checked, the result type once at the end, so each
+    /// telescope node is rebuilt at most once. Where the running type is not
+    /// syntactically a Pi the pending arguments are substituted and
+    /// `ensure_pi` reduces it, exactly where the one-argument rule would.
+    ///
+    /// Same judgments in the same order as the one-argument rule: argument
+    /// `aₖ` is inferred and compared with the same domain term (simultaneous
+    /// substitution of arguments that live in the context equals the
+    /// sequential one), and the result is the same term. `spine_verify`
+    /// checks that on every spine, term against term (`spine_verify_same`):
+    /// the two are also one node unless an interner reset lies between the
+    /// allocations.
+    ///
+    /// A shared prefix (`HAdd.hAdd ℕ ℕ ℕ inst x` under many `y`) is not
+    /// walked again: the state after each prefix is kept in `spine_cache`
+    /// under that prefix's own inference key, and a later spine resumes from
+    /// its longest prefix with a usable state. A state from an infer-only
+    /// walk is not used by a checking one.
+    fn infer_app_spine(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        let infer_only = self.infer_only.get();
+        let xcache = XCACHE_ON.with(|b| *b);
+        // Descend to the longest prefix with a usable state, or to the head.
+        // `tail` collects (key, argument) of the nodes above it, outermost
+        // first.
+        let mut tail: Vec<((u64, usize), Expr)> = Vec::new();
+        let mut cur = e.clone();
+        let mut ty;
+        let pending;
+        loop {
+            let ExprData::App(f, a) = &**cur else {
+                ty = self.infer_type(ctx, &cur)?;
+                pending = 0usize;
+                break;
+            };
+            let key = (ctx.term_ctx_key(&cur), Self::ptr_key(&cur));
+            let mut found = self.spine_cache.borrow().get(&key).cloned();
+            if found.is_none() && key.0 == 0 && xcache {
+                found = XSPINE.with(|m| m.borrow().get(&key.1).cloned());
+                if found.is_some() {
+                    XCACHE_HITS.with(|c| c.set(c.get() + 1));
+                }
+            }
+            if let Some(st) = found {
+                if infer_only || st.checked {
+                    ty = st.ty;
+                    pending = st.pending as usize;
+                    break;
+                }
+            }
+            tail.push((key, a.clone()));
+            let f = f.clone();
+            cur = f;
+        }
+        // `args`: the pending arguments of the prefix reached (they are its
+        // last `pending` arguments), then the arguments still to process.
+        let mut args: Vec<Expr> = Vec::with_capacity(pending + tail.len());
+        {
+            let mut node = cur.clone();
+            for _ in 0..pending {
+                let ExprData::App(f, a) = &**node else {
+                    return Err(TcError::Other("spine state outlived its prefix".into()));
+                };
+                args.push(a.clone());
+                let f = f.clone();
+                node = f;
+            }
+            args.reverse();
+        }
+        // `args[j..i]` are pending: `ty` sits under that many binders.
+        let mut j = 0usize;
+        let mut i = pending;
+        let verify = self.spine_verify.get();
+        let mut doms_used: Vec<Expr> = Vec::new();
+        while let Some((key, a)) = tail.pop() {
+            // The one-argument rule calls `whnf` on a type that is already a
+            // Pi; that call is the identity except that it declines at the
+            // depth limit and clears a pending core-depth abort. In those
+            // two states take the reducing path so it still does.
+            let must_reduce =
+                CORE_ABORTED.with(Cell::get) || WHNF_DEPTH.with(Cell::get) >= CONV_DEPTH;
+            let dom = match &**ty {
+                ExprData::Pi(_, dom, body) if !must_reduce => {
+                    let d = Self::spine_subst(S::INFER_APP, dom, &args[j..i]);
+                    let body = body.clone();
+                    ty = body;
+                    d
+                }
+                _ => {
+                    let flushed = Self::spine_subst(S::INFER_APP, &ty, &args[j..i]);
+                    let (_, dom, body) = self.ensure_pi(ctx, &flushed)?;
+                    j = i;
+                    ty = body;
+                    dom
+                }
+            };
+            if !infer_only {
+                let at = self.infer_type(ctx, &a)?;
+                if !self.is_def_eq(ctx, &at, &dom)? {
+                    if env_set!("KIOTA_DEBUG") {
+                        return reject(format!(
+                            "application argument type mismatch\n  got:      {}\n  expected: {}\n  arg:      {}",
+                            self.pp(&at),
+                            self.pp(&dom),
+                            self.pp(&a),
+                        ));
+                    }
+                    return reject("application argument type mismatch");
+                }
+            }
+            if verify {
+                doms_used.push(dom);
+            }
+            args.push(a);
+            i += 1;
+            let st = SpineState {
+                ty: ty.clone(),
+                pending: (i - j) as u32,
+                checked: !infer_only,
+            };
+            if key.0 == 0 && xcache && st.checked && !self.xcache_tainted.get() {
+                XSPINE.with(|m| {
+                    let mut m = m.borrow_mut();
+                    if m.len() >= XCACHE_CAP {
+                        m.clear();
+                    }
+                    m.insert(key.1, st.clone());
+                });
+            }
+            let mut cache = self.spine_cache.borrow_mut();
+            if expr::reclamation_enabled() && cache.len() >= 50_000 {
+                cache.clear();
+            }
+            match cache.get(&key) {
+                // An infer-only walk never replaces a checked state.
+                Some(old) if old.checked && !st.checked => {}
+                _ => {
+                    cache.insert(key, st);
+                }
+            }
+        }
+        let result = Self::spine_subst(S::INFER_APP, &ty, &args[j..i]);
+        if verify {
+            let (reference, doms) = self.infer_app_one_at_a_time(ctx, e)?;
+            self.spine_verify_same(&result, &reference, || {
+                format!("spine inference diverged from the one-argument rule on {}", self.pp_budget(e, 40))
+            });
+            let skipped = doms.len() - doms_used.len();
+            for (k, d) in doms_used.iter().enumerate() {
+                self.spine_verify_same(d, &doms[skipped + k], || {
+                    format!(
+                        "spine inference checked argument {} of {} against another domain",
+                        skipped + k,
+                        self.pp_budget(e, 40)
+                    )
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    /// `KIOTA_SPINE_VERIFY`: `got` (the one-walk term) must be the term the
+    /// one-argument rule built. The two are one node while every node
+    /// involved comes from one generation of the intern table. Past an
+    /// interner reset (4M nodes, at a declaration boundary) they can be two
+    /// allocations of one term: the one-argument rule lifts an open argument
+    /// under the binders still ahead and lowers it again, building it anew
+    /// where the walk puts in the argument as it stands, and a memo or cache
+    /// entry kept across declarations (`KIOTA_XMEMO`, `KIOTA_XCACHE`) hands
+    /// one side a node from before the reset. That is counted, not refused.
+    /// A different term panics.
+    fn spine_verify_same(&self, got: &Expr, want: &Expr, what: impl FnOnce() -> String) {
+        let same_node = Rc::ptr_eq(got, want);
+        if !same_node && !expr::structurally_equal(got, want) {
+            panic!(
+                "{}: {} instead of {}",
+                what(),
+                self.pp_budget(got, 40),
+                self.pp_budget(want, 40)
+            );
+        }
+        SPINE_VERIFIED.with(|c| {
+            let c = &c[usize::from(!same_node)];
+            c.set(c.get() + 1);
+        });
+    }
+
+    /// `expr::instantiate_rev` for a telescope walk, charged to `site`.
+    fn spine_subst(site: u8, e: &Expr, pending: &[Expr]) -> Expr {
+        let _g = crate::stats::at(site);
+        if !crate::stats::enabled() {
+            return expr::instantiate_rev(e, pending);
+        }
+        let before = crate::stats::inst_nodes();
+        let r = expr::instantiate_rev(e, pending);
+        crate::stats::spine_subst(
+            expr::identity(e),
+            pending.iter().map(expr::identity).collect(),
+            crate::stats::inst_nodes() - before,
+        );
+        r
+    }
+
+    /// The one-argument rule's result type and domains for a spine,
+    /// recomputed from the head with no spine state: `ensure_pi` and one
+    /// substitution per argument. The arguments are not checked again.
+    /// `spine_verify` only.
+    fn infer_app_one_at_a_time(&self, ctx: &Ctx, e: &Expr) -> R<(Expr, Vec<Expr>)> {
+        let (head, args) = expr::unfold_apps(e);
+        let mut ty = self.infer_type(ctx, &head)?;
+        let mut doms = Vec::with_capacity(args.len());
+        for a in &args {
+            let (_, dom, body) = self.ensure_pi(ctx, &ty)?;
+            doms.push(dom);
+            ty = expr::instantiate1(&body, a);
+        }
+        Ok((ty, doms))
     }
 
     fn infer_const(&self, n: u32, us: &[Level]) -> R<Expr> {
@@ -1418,7 +1786,7 @@ impl<'e> Checker<'e> {
             return reject("universe param count mismatch");
         }
         let subst = level::subst_map(lp, us);
-        Ok(expr::instantiate_level_params(ci.typ(), &subst))
+        Ok(lvl_at(S::INFER_CONST, ci.typ(), &subst))
     }
 
     fn nat_type(&self) -> R<Expr> {
@@ -1478,56 +1846,70 @@ impl<'e> Checker<'e> {
             return reject("projection index out of range");
         }
         let subst = level::subst_map(&ctor_lp, &us);
-        let mut ct = expr::instantiate_level_params(&ctor_typ, &subst);
+        let ct = lvl_at(S::INFER_PROJ, &ctor_typ, &subst);
         // instantiate params
         if (args.len() as u32) < num_params {
             return reject("projection: too few params");
         }
-        for p in args.iter().take(num_params as usize) {
-            let (_, _dom, body) = self.ensure_pi(ctx, &ct)?;
-            ct = expr::instantiate1(&body, p);
-        }
-        // Every field's own type, substituting each earlier field with
-        // its own `proj sname i v` term as we walk the telescope — needed
-        // for *every* field (not only up to `idx`) to check the
-        // "dependent data field" rule below across the whole structure.
-        // Which earlier fields each field's type mentions, read off the
-        // constructor's own telescope, where field `j` is a bound variable
-        // of field `k`'s domain. This is exact at any binder depth and for
-        // any major. (It used to be found by looking for `proj sname j v`
-        // in the substituted domains by the address of `v`; under a binder
-        // the open major is shifted to another node, the occurrence was
-        // missed, and a projection past a dependent data field was let
-        // through.) A telescope that is not literally a chain of `Pi`s
-        // counts as mentioning every earlier field.
-        let mut referenced: Vec<u32> = Vec::new();
-        {
-            let mut raw = ct.clone();
-            for k in 0..num_fields {
-                match &**raw.clone() {
-                    ExprData::Pi(_, dom, body) => {
-                        for j in 0..k {
-                            if Self::occurs_bvar(dom, k - 1 - j) {
-                                referenced.push(j);
-                            }
-                        }
-                        raw = body.clone();
-                    }
-                    _ => {
-                        referenced.extend(0..k);
-                        break;
-                    }
+        let params = &args[..num_params as usize];
+        let spine =
+            self.spine.get() && !nbe::nbe_enabled() && !FORCE_EAGER_DEFEQ.with(Cell::get);
+        // `doms`: every field's own type, each earlier field replaced by its
+        // own `proj sname i v` term — needed for *every* field (not only up
+        // to `idx`) to check the "dependent data field" rule below across
+        // the whole structure.
+        //
+        // `referenced`: which earlier fields each field's type mentions,
+        // read off the constructor's own telescope, where field `j` is a
+        // bound variable of field `k`'s domain. This is exact at any binder
+        // depth and for any major. (It used to be found by looking for
+        // `proj sname j v` in the substituted domains by the address of
+        // `v`; under a binder the open major is shifted to another node, the
+        // occurrence was missed, and a projection past a dependent data
+        // field was let through.)
+        let (doms, referenced) = if spine {
+            let doms = self.proj_field_doms_one_walk(ctx, &ct, params, sname, num_fields, v)?;
+            // The walk never builds the telescope with the parameters put
+            // in, so the fields are read past the parameter binders of the
+            // constructor type as it stands. Where that is not a chain of
+            // `Pi`s all the way, build the instantiated telescope and read
+            // it as the one-argument path does.
+            let referenced = match Self::proj_referenced_fields_under_params(
+                &ct,
+                num_params,
+                num_fields,
+            ) {
+                Some(r) => r,
+                None => {
+                    let fields_ct = self.proj_strip_params(ctx, &ct, params)?;
+                    Self::proj_referenced_fields(&fields_ct, num_fields)
                 }
+            };
+            if self.spine_verify.get() {
+                let fields_ct = self.proj_strip_params(ctx, &ct, params)?;
+                let reference =
+                    self.proj_field_doms_one_at_a_time(ctx, &fields_ct, sname, num_fields, v)?;
+                assert_eq!(doms.len(), reference.len());
+                for (k, (d, r)) in doms.iter().zip(&reference).enumerate() {
+                    self.spine_verify_same(d, r, || {
+                        format!("one-walk projection gave field {k} of {} another type", self.name_str(sname))
+                    });
+                }
+                assert_eq!(
+                    referenced,
+                    Self::proj_referenced_fields(&fields_ct, num_fields),
+                    "one-walk projection read other field dependencies off {}",
+                    self.name_str(sname)
+                );
             }
-        }
-        let mut doms: Vec<Expr> = Vec::with_capacity(num_fields as usize);
-        let mut cur = ct;
-        for i in 0..num_fields {
-            let (_, dom, body) = self.ensure_pi(ctx, &cur)?;
-            doms.push(dom.clone());
-            let proj_i = expr::proj(sname, i, v.clone());
-            cur = expr::instantiate1(&body, &proj_i);
-        }
+            (doms, referenced)
+        } else {
+            let fields_ct = self.proj_strip_params(ctx, &ct, params)?;
+            let referenced = Self::proj_referenced_fields(&fields_ct, num_fields);
+            let doms =
+                self.proj_field_doms_one_at_a_time(ctx, &fields_ct, sname, num_fields, v)?;
+            (doms, referenced)
+        };
         if self.is_prop_checked(ctx, &vtw)? {
             // Lean's kernel rejects a projection out of a Prop-valued,
             // single-constructor structure unless (a) the projected
@@ -1565,6 +1947,167 @@ impl<'e> Checker<'e> {
             }
         }
         Ok(doms[idx as usize].clone())
+    }
+
+    /// The constructor type `ct` with the structure's parameters put in:
+    /// the telescope of the fields. One `ensure_pi` and one substitution per
+    /// parameter.
+    fn proj_strip_params(&self, ctx: &Ctx, ct: &Expr, params: &[Expr]) -> R<Expr> {
+        let mut ct = ct.clone();
+        for p in params {
+            let (_, _dom, body) = self.ensure_pi(ctx, &ct)?;
+            ct = inst1_at(S::INFER_PROJ, &body, p);
+        }
+        Ok(ct)
+    }
+
+    /// Which earlier fields each field's type mentions, from the telescope
+    /// of the fields `fields_ct` (the constructor type past its parameters):
+    /// field `j` is the bound variable `k - 1 - j` of field `k`'s domain.
+    /// One entry per (field, earlier field it mentions), in telescope order.
+    /// A telescope that is not literally a chain of `Pi`s counts as
+    /// mentioning every earlier field from there on.
+    fn proj_referenced_fields(fields_ct: &Expr, num_fields: u32) -> Vec<u32> {
+        let mut referenced: Vec<u32> = Vec::new();
+        let mut raw = fields_ct.clone();
+        for k in 0..num_fields {
+            match &**raw.clone() {
+                ExprData::Pi(_, dom, body) => {
+                    for j in 0..k {
+                        if Self::occurs_bvar(dom, k - 1 - j) {
+                            referenced.push(j);
+                        }
+                    }
+                    raw = body.clone();
+                }
+                _ => {
+                    referenced.extend(0..k);
+                    break;
+                }
+            }
+        }
+        referenced
+    }
+
+    /// `proj_referenced_fields` read off the constructor type `ct` with its
+    /// parameter binders still on it (`KIOTA_SPINE`, where the parameters
+    /// stay pending and the instantiated telescope is never built).
+    ///
+    /// Putting the parameters in cannot change the answer while the binders
+    /// are syntactic: a parameter is bound outside every field, so under `k`
+    /// fields it is a variable of index `>= k`, and the argument that
+    /// replaces it is lifted by the binders it goes under, so it brings no
+    /// index below `k` with it. The occurrences of the field variables
+    /// `0..k` in a field's domain are the same before and after.
+    ///
+    /// `None` when a parameter or a field is not a literal `Pi` here: the
+    /// instantiated telescope can then differ in shape (the one-argument
+    /// path reduces it with `ensure_pi`), so the caller builds and reads
+    /// that one.
+    fn proj_referenced_fields_under_params(
+        ct: &Expr,
+        num_params: u32,
+        num_fields: u32,
+    ) -> Option<Vec<u32>> {
+        let mut raw = ct.clone();
+        for _ in 0..num_params {
+            let ExprData::Pi(_, _, body) = &**raw.clone() else {
+                return None;
+            };
+            raw = body.clone();
+        }
+        let mut referenced: Vec<u32> = Vec::new();
+        for k in 0..num_fields {
+            let ExprData::Pi(_, dom, body) = &**raw.clone() else {
+                return None;
+            };
+            for j in 0..k {
+                if Self::occurs_bvar(dom, k - 1 - j) {
+                    referenced.push(j);
+                }
+            }
+            raw = body.clone();
+        }
+        Some(referenced)
+    }
+
+    /// The type of every field of `v : S params`, from the telescope of the
+    /// fields `fields_ct` (`proj_strip_params`): each earlier field is
+    /// replaced by its own `proj S i v` term as the telescope is walked. All
+    /// fields, not only up to the projected one: the "dependent data field"
+    /// rule reads the whole structure.
+    fn proj_field_doms_one_at_a_time(
+        &self,
+        ctx: &Ctx,
+        fields_ct: &Expr,
+        sname: u32,
+        num_fields: u32,
+        v: &Expr,
+    ) -> R<Vec<Expr>> {
+        let mut doms: Vec<Expr> = Vec::with_capacity(num_fields as usize);
+        let mut cur = fields_ct.clone();
+        for i in 0..num_fields {
+            let (_, dom, body) = self.ensure_pi(ctx, &cur)?;
+            doms.push(dom.clone());
+            let proj_i = expr::proj(sname, i, v.clone());
+            cur = inst1_at(S::INFER_PROJ, &body, &proj_i);
+        }
+        Ok(doms)
+    }
+
+    /// `proj_strip_params` then `proj_field_doms_one_at_a_time`, with the
+    /// parameters and the earlier fields' projections left pending, as
+    /// `infer_app_spine` leaves a spine's arguments (`KIOTA_SPINE`): each
+    /// field type is instantiated once, instead of the rest of the
+    /// constructor telescope being rebuilt per parameter and per field. The
+    /// same field types, node for node.
+    fn proj_field_doms_one_walk(
+        &self,
+        ctx: &Ctx,
+        ct: &Expr,
+        params: &[Expr],
+        sname: u32,
+        num_fields: u32,
+        v: &Expr,
+    ) -> R<Vec<Expr>> {
+        let total = params.len() + num_fields as usize;
+        let mut pend: Vec<Expr> = Vec::with_capacity(total);
+        pend.extend_from_slice(params);
+        let mut doms: Vec<Expr> = Vec::with_capacity(num_fields as usize);
+        let mut ty = ct.clone();
+        // `pend[j..k]` are pending: `ty` sits under that many binders.
+        let mut j = 0usize;
+        for k in 0..total {
+            // See `infer_app_spine`: where the skipped `whnf` of a syntactic
+            // Pi would not be the identity, reduce as the old rule does.
+            let must_reduce =
+                CORE_ABORTED.with(Cell::get) || WHNF_DEPTH.with(Cell::get) >= CONV_DEPTH;
+            let field = k >= params.len();
+            let dom = match &**ty {
+                ExprData::Pi(_, dom, body) if !must_reduce => {
+                    let d = field.then(|| Self::spine_subst(S::INFER_PROJ, dom, &pend[j..k]));
+                    let body = body.clone();
+                    ty = body;
+                    d
+                }
+                _ => {
+                    let flushed = Self::spine_subst(S::INFER_PROJ, &ty, &pend[j..k]);
+                    let (_, dom, body) = self.ensure_pi(ctx, &flushed)?;
+                    j = k;
+                    ty = body;
+                    Some(dom)
+                }
+            };
+            if field {
+                doms.push(dom.expect("a field's domain"));
+                if k + 1 < total {
+                    let i = (k - params.len()) as u32;
+                    let _g = crate::stats::at(S::INFER_PROJ);
+                    pend.push(expr::proj(sname, i, v.clone()));
+                }
+            }
+        }
+        Ok(doms)
     }
 
     fn occurs_bvar(e: &Expr, i: u32) -> bool {
@@ -2293,7 +2836,7 @@ impl<'e> Checker<'e> {
                 );
             }
             if pi || ip {
-                ty = expr::instantiate1(&body, &a1[i]);
+                ty = inst1_at(S::DEFEQ_ARGS, &body, &a1[i]);
                 i += 1;
                 continue;
             }
@@ -2303,7 +2846,7 @@ impl<'e> Checker<'e> {
                 }
                 return Ok(false);
             }
-            ty = expr::instantiate1(&body, &a1[i]);
+            ty = inst1_at(S::DEFEQ_ARGS, &body, &a1[i]);
             i += 1;
         }
         Ok(true)
@@ -2352,7 +2895,21 @@ impl<'e> Checker<'e> {
         // the normal one so a rescue still benefits from memoization.
         let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
         if let Some(r) = self.whnf_cache_get(force_eager, &k) {
+            crate::stats::whnf_hit();
             return Ok(r);
+        }
+        let xcache = k.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b);
+        if xcache {
+            if let Some(r) = XWHNF.with(|m| m.borrow().get(&k.1).cloned()) {
+                XCACHE_HITS.with(|c| c.set(c.get() + 1));
+                self.whnf_cache_insert(force_eager, k, r.clone());
+                return Ok(r);
+            }
+        }
+        crate::stats::miss(1, k.0, k.1, 0);
+        if crate::stats::enabled() {
+            let trivial = matches!(&***e, ExprData::Pi(..) | ExprData::Sort(_) | ExprData::Lam(..));
+            crate::stats::whnf_miss(k.1, k.0, ctx.id, trivial);
         }
         let mut cur = e.clone();
         let r = loop {
@@ -2362,7 +2919,7 @@ impl<'e> Checker<'e> {
                 if self.eager_whnf_unfolds(*n) {
                     if let Some(unfolded) = self.unfold_delta(*n, us, true)? {
                         let (_, args) = expr::unfold_apps(&core);
-                        let next = expr::apps(unfolded, &args);
+                        let next = apps_at(S::APPS, unfolded, &args);
                         if Rc::ptr_eq(&next, &cur) {
                             break core;
                         }
@@ -2388,6 +2945,15 @@ impl<'e> Checker<'e> {
             return Ok(r);
         }
         self.whnf_cache_insert(force_eager, k, r.clone());
+        if xcache && !self.xcache_tainted.get() {
+            XWHNF.with(|m| {
+                let mut m = m.borrow_mut();
+                if m.len() >= XCACHE_CAP {
+                    m.clear();
+                }
+                m.insert(k.1, r.clone());
+            });
+        }
         Ok(r)
     }
 
@@ -2405,13 +2971,13 @@ impl<'e> Checker<'e> {
         let (head, args) = expr::unfold_apps(e);
         match &**head {
             ExprData::Const(n, us) => {
-                Ok(self.unfold_def(*n, us)?.map(|body| expr::apps(body, &args)))
+                Ok(self.unfold_def(*n, us)?.map(|body| apps_at(S::APPS, body, &args)))
             }
             ExprData::Lam(_, _, body) if !args.is_empty() => {
-                Ok(Some(expr::apps(expr::instantiate1(body, &args[0]), &args[1..])))
+                Ok(Some(apps_at(S::APPS, inst1_at(S::LAZY_HEAD, body, &args[0]), &args[1..])))
             }
             ExprData::Let(_, value, body) => {
-                Ok(Some(expr::apps(expr::instantiate1(body, value), &args)))
+                Ok(Some(apps_at(S::APPS, inst1_at(S::LAZY_HEAD, body, value), &args)))
             }
             ExprData::Proj(sname, idx, major) => {
                 let (ctor, fields) = expr::unfold_apps(major);
@@ -2419,19 +2985,19 @@ impl<'e> Checker<'e> {
                     if let Some(ConstantInfo::Constructor {induct, num_params, ..}) = self.env.get(*cname) {
                         let field = (*num_params + *idx) as usize;
                         if *induct == *sname && field < fields.len() {
-                            return Ok(Some(expr::apps(fields[field].clone(), &args)));
+                            return Ok(Some(apps_at(S::APPS, fields[field].clone(), &args)));
                         }
                     }
                 }
                 if let ExprData::Lit(Lit::Str(s)) = &***major {
                     if *idx == 0 && self.native_string_projection_ok(*sname) {
                         if let Some(bytes) = self.string_to_byte_array(s) {
-                            return Ok(Some(expr::apps(bytes, &args)));
+                            return Ok(Some(apps_at(S::APPS, bytes, &args)));
                         }
                     }
                 }
                 Ok(self.lazy_head_step(major, fuel - 1)?
-                    .map(|next| expr::apps(expr::proj(*sname, *idx, next), &args)))
+                    .map(|next| apps_at(S::APPS, expr::proj(*sname, *idx, next), &args)))
             }
             _ => Ok(None),
         }
@@ -2578,7 +3144,7 @@ impl<'e> Checker<'e> {
         let (head, args) = expr::unfold_apps(e);
         let unfolded = match &**head {
             ExprData::Const(n, us) => match self.unfold_def(*n, us)? {
-                Some(body) => expr::apps(body, &args),
+                Some(body) => apps_at(S::APPS, body, &args),
                 None => return Ok(None),
             },
             _ => e.clone(),
@@ -2788,7 +3354,7 @@ impl<'e> Checker<'e> {
             if let ExprData::Const(n, us) = &**head {
                 let (_, args) = expr::unfold_apps(&core);
                 if let Some(unfolded) = self.unfold_def(*n, us)? {
-                    cur = expr::apps(unfolded, &args);
+                    cur = apps_at(S::APPS, unfolded, &args);
                     continue;
                 }
                 if thm_major {
@@ -2797,13 +3363,13 @@ impl<'e> Checker<'e> {
                         let mut i = 0;
                         while i < args.len() {
                             if let ExprData::Lam(_, _, b) = &**body {
-                                body = expr::instantiate1(b, &args[i]);
+                                body = inst1_at(S::WHNF_MAJOR, b, &args[i]);
                                 i += 1;
                             } else {
                                 break;
                             }
                         }
-                        let next = expr::apps(body, &args[i..]);
+                        let next = apps_at(S::APPS, body, &args[i..]);
                         if self.is_ctor_or_nat_lit_head(&next) {
                             cur = next;
                             continue;
@@ -2830,7 +3396,7 @@ impl<'e> Checker<'e> {
             let (head, args) = expr::unfold_apps(&cur);
             let ExprData::Const(n, us) = &**head else { break };
             let Some(unfolded) = self.unfold_delta(*n, us, true)? else { break };
-            cur = self.whnf_core(ctx, &expr::apps(unfolded, &args))?;
+            cur = self.whnf_core(ctx, &apps_at(S::APPS, unfolded, &args))?;
         }
         Ok(cur)
     }
@@ -2857,7 +3423,7 @@ impl<'e> Checker<'e> {
     fn cheap_zeta(e: &Expr) -> Expr {
         let mut cur = e.clone();
         while let ExprData::Let(_, val, body) = &**cur {
-            cur = expr::instantiate1(body, val);
+            cur = inst1_at(S::WHNF_ZETA, body, val);
         }
         cur
     }
@@ -2893,9 +3459,11 @@ impl<'e> Checker<'e> {
             return Ok(e);
         }
         let k = Self::whnf_cache_key(ctx, &e);
+        crate::stats::core_call();
         // See `whnf`'s `force_eager` comment just above it.
         let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
         if let Some(r) = self.whnf_core_cache_get(force_eager, &k) {
+            crate::stats::core_hit();
             CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
             return Ok(r);
         }
@@ -2920,7 +3488,7 @@ impl<'e> Checker<'e> {
                         // that stuck as App(Let, minor), so Bind.bind minors
                         // (`p.1` vs unpacked) never converted (#81930).
                         ExprData::Let(_, _, _) => {
-                            cur = expr::apps(Self::cheap_zeta(&head), &args);
+                            cur = apps_at(S::APPS, Self::cheap_zeta(&head), &args);
                             continue;
                         }
                         ExprData::Lam(_, _, _) => {
@@ -2941,8 +3509,8 @@ impl<'e> Checker<'e> {
                             // instantiate consumed args (reverse order: last-bound first)
                             let mut rev: Vec<Expr> = consumed.to_vec();
                             rev.reverse();
-                            let reduced = expr::instantiate(&body, &rev);
-                            cur = expr::apps(reduced, rest);
+                            let reduced = inst_at(S::WHNF_BETA, &body, &rev);
+                            cur = apps_at(S::APPS, reduced, rest);
                             continue;
                         }
                         // Class projections: `HAdd.hAdd` / `OfNat.ofNat` unfold to
@@ -2963,7 +3531,7 @@ impl<'e> Checker<'e> {
                                     if *induct == *sname {
                                         let fi = (*num_params + *idx) as usize;
                                         if fi < pargs.len() {
-                                            cur = expr::apps(pargs[fi].clone(), &args);
+                                            cur = apps_at(S::APPS, pargs[fi].clone(), &args);
                                             continue;
                                         }
                                     }
@@ -2972,7 +3540,7 @@ impl<'e> Checker<'e> {
                             if let ExprData::Lit(Lit::Str(s)) = &**vw {
                                 if *idx == 0 && self.native_string_projection_ok(*sname) {
                                     if let Some(ba) = self.string_to_byte_array(s) {
-                                        cur = expr::apps(ba, &args);
+                                        cur = apps_at(S::APPS, ba, &args);
                                         continue;
                                     }
                                 }
@@ -3023,7 +3591,7 @@ impl<'e> Checker<'e> {
                     }
                 }
                 ExprData::Let(_, val, body) => {
-                    cur = expr::instantiate1(body, val);
+                    cur = inst1_at(S::WHNF_ZETA, body, val);
                     continue;
                 }
                 ExprData::Proj(sname, idx, v) => {
@@ -3075,11 +3643,12 @@ impl<'e> Checker<'e> {
         let ExprData::Const(n, us) = &**h else {
             return Ok(None);
         };
-        Ok(self.unfold_def(*n, us)?.map(|u| expr::apps(u, &args)))
+        Ok(self.unfold_def(*n, us)?.map(|u| apps_at(S::APPS, u, &args)))
     }
 
     fn unfold_def(&self, n: u32, us: &[Level]) -> R<Option<Expr>> {
         if self.declaring.get() == Some(n) {
+            self.xcache_tainted.set(true);
             return Ok(None);
         }
         match self.env.get(n) {
@@ -3093,7 +3662,7 @@ impl<'e> Checker<'e> {
                     return Ok(Some(r.clone()));
                 }
                 let subst = level::subst_map(level_params, us);
-                let r = expr::instantiate_level_params(value, &subst);
+                let r = lvl_at(S::UNFOLD, value, &subst);
                 self.unfold_cache.borrow_mut().insert(key, r.clone());
                 Ok(Some(r))
             }
@@ -3125,7 +3694,7 @@ impl<'e> Checker<'e> {
                     return Ok(Some(r.clone()));
                 }
                 let subst = level::subst_map(level_params, us);
-                let r = expr::instantiate_level_params(value, &subst);
+                let r = lvl_at(S::UNFOLD, value, &subst);
                 self.unfold_cache.borrow_mut().insert(key, r.clone());
                 Ok(Some(r))
             }
@@ -3149,7 +3718,7 @@ impl<'e> Checker<'e> {
                     }
                 };
                 let subst = level::subst_map(level_params, us);
-                let r = expr::instantiate_level_params(&value, &subst);
+                let r = lvl_at(S::UNFOLD, &value, &subst);
                 self.unfold_cache.borrow_mut().insert(key, r.clone());
                 Ok(Some(r))
             }
@@ -3538,6 +4107,15 @@ impl<'e> Checker<'e> {
         }
     }
     fn defeq_cache_insert(&self, force_eager: bool, key: (u64, usize, usize), v: bool) {
+        if v && key.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b) {
+            XDEFEQ.with(|m| {
+                let mut m = m.borrow_mut();
+                if m.len() >= XCACHE_CAP {
+                    m.clear();
+                }
+                m.insert((key.1, key.2));
+            });
+        }
         if force_eager {
             expr::memo_insert(&mut self.eager_defeq_cache.borrow_mut(), key, v);
         } else {
@@ -3645,8 +4223,16 @@ impl<'e> Checker<'e> {
         // non-forced lookup.
         let force_eager = FORCE_EAGER_DEFEQ.with(Cell::get);
         if let Some(r) = self.defeq_cache_get(force_eager, &key) {
+            crate::stats::defeq_hit();
             return Ok(r);
         }
+        if key.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b)
+            && XDEFEQ.with(|m| m.borrow().contains(&(key.1, key.2)))
+        {
+            XCACHE_HITS.with(|c| c.set(c.get() + 1));
+            return Ok(true);
+        }
+        crate::stats::miss(2, key.0, key.1, key.2);
         // Proof irrelevance before app congruence. Typeclass instances are
         // proofs of a Prop (the class). Pairwise of `LawfulVecOperator.mk`
         // (7 args, nested ~15 deep) is a tree walk; PI compares the inferred
@@ -3915,10 +4501,10 @@ impl<'e> Checker<'e> {
         // Structural match without delta.
         match (&***a, &***b) {
             (ExprData::Let(_, v, body), _) => {
-                return self.is_def_eq(ctx, &expr::instantiate1(body, v), b);
+                return self.is_def_eq(ctx, &inst1_at(S::DEFEQ_LET, body, v), b);
             }
             (_, ExprData::Let(_, v, body)) => {
-                return self.is_def_eq(ctx, a, &expr::instantiate1(body, v));
+                return self.is_def_eq(ctx, a, &inst1_at(S::DEFEQ_LET, body, v));
             }
             (ExprData::Sort(l1), ExprData::Sort(l2)) => return Ok(level::is_def_eq(l1, l2)),
             (ExprData::BVar(i), ExprData::BVar(j)) if i == j => return Ok(true),
@@ -3998,7 +4584,7 @@ impl<'e> Checker<'e> {
         // Eta for lambdas: one side a lambda, other not -> eta-expand other.
         if let (ExprData::Lam(_, t1, _), _) = (&***a, &***b) {
             if !matches!(&***b, ExprData::Lam(_, _, _)) {
-                let b_app = expr::app(expr::shift(b, 1, 0), expr::bvar(0));
+                let b_app = expr::app(shift_at(S::ETA, b, 1, 0), expr::bvar(0));
                 let mut ctx2 = {
                     crate::stats::ctx_clone();
                     ctx.clone()
@@ -4014,7 +4600,7 @@ impl<'e> Checker<'e> {
         }
         if let (_, ExprData::Lam(_, t2, _)) = (&***a, &***b) {
             if !matches!(&***a, ExprData::Lam(_, _, _)) {
-                let a_app = expr::app(expr::shift(a, 1, 0), expr::bvar(0));
+                let a_app = expr::app(shift_at(S::ETA, a, 1, 0), expr::bvar(0));
                 let mut ctx2 = {
                     crate::stats::ctx_clone();
                     ctx.clone()
@@ -4145,7 +4731,7 @@ impl<'e> Checker<'e> {
                 us,
                 crate::stats::theorem_delta_in_scope() && self.delta_body_is_small(*n),
             )? {
-                return Ok(expr::apps(u, &args));
+                return Ok(apps_at(S::APPS, u, &args));
             }
         }
         Ok(e.clone())
@@ -4474,7 +5060,7 @@ impl<'e> Checker<'e> {
                 expr::memo_insert(&mut self.iota_lit_memo.borrow_mut(), key, rhs.clone());
             }
         }
-        Ok(Some(expr::apps(rhs, rest)))
+        Ok(Some(apps_at(S::IOTA, rhs, rest)))
     }
 
     /// Test/diagnostic accessor for `iota_lit_memo_misses`.
@@ -4605,10 +5191,10 @@ impl<'e> Checker<'e> {
         match &**thead {
             ExprData::Const(n, us) if *n == tname => {
                 let subst = level::subst_map(&ctor_lp, us);
-                let mut ct = expr::instantiate_level_params(&ctor_typ, &subst);
+                let mut ct = lvl_at(S::IOTA, &ctor_typ, &subst);
                 for p in params {
                     match self.ensure_pi(ctx, &ct) {
-                        Ok((_, _, body)) => ct = expr::instantiate1(&body, p),
+                        Ok((_, _, body)) => ct = inst1_at(S::IOTA, &body, p),
                         Err(_) => return Ok(None),
                     }
                 }
@@ -4706,7 +5292,7 @@ impl<'e> Checker<'e> {
                 continue;
             }
             let subst = level::subst_map(&rec_level_params, us);
-            let typ = expr::instantiate_level_params(&typ, &subst);
+            let typ = lvl_at(S::IOTA, &typ, &subst);
             // `typ` is `rec`'s own closed declared type — still `Π`-headed
             // over its params, not yet a term "under" any loose bvars —
             // so `instantiate` (which substitutes loose bvars, not `Pi`
@@ -4735,7 +5321,7 @@ impl<'e> Checker<'e> {
                 continue;
             }
             let params_rev: Vec<Expr> = params.iter().rev().cloned().collect();
-            let mut cur = expr::instantiate(&cur, &params_rev);
+            let mut cur = inst_at(S::IOTA, &cur, &params_rev);
             for _ in 0..(num_motives + num_minors + num_indices) {
                 match &**cur {
                     ExprData::Pi(_, _, body) => cur = body.clone(),
@@ -4765,7 +5351,7 @@ impl<'e> Checker<'e> {
             // premise's own type, so there is nothing here to
             // substitute, only to un-nest.
             let peeled = (num_motives + num_minors + num_indices) as i32;
-            let major_dom = expr::shift(&major_dom, -peeled, 0);
+            let major_dom = shift_at(S::IOTA, &major_dom, -peeled, 0);
             let (mh, margs) = expr::unfold_apps(&major_dom);
             if let ExprData::Const(c, _) = &**mh {
                 if *c == target && margs.len() >= target_args.len() {
@@ -4854,7 +5440,7 @@ impl<'e> Checker<'e> {
             return None;
         }
         let subst = level::subst_map(rec_level_params, us);
-        let typ = expr::instantiate_level_params(&typ, &subst);
+        let typ = lvl_at(S::IOTA, &typ, &subst);
         // `instantiate` substitutes *loose* bvars — a no-op on `typ` as a
         // whole, since it's the recursor's own closed, Pi-wrapped declared
         // type (`loose_bvar_range(typ) == 0`). The params (e.g. LCNF
@@ -4885,7 +5471,7 @@ impl<'e> Checker<'e> {
         // `instantiate` substitutes bvar 0 (innermost) with `args[0]`, so
         // reverse before substituting into the now-loose body.
         let params_rev: Vec<Expr> = params.iter().rev().cloned().collect();
-        let mut cur = expr::instantiate(&cur, &params_rev);
+        let mut cur = inst_at(S::IOTA, &cur, &params_rev);
         for _ in 0..num_motives {
             match &**cur {
                 ExprData::Pi(_, _, body) => cur = body.clone(),
@@ -5060,12 +5646,12 @@ impl<'e> Checker<'e> {
         // `ctor_us`, the constructor's own universe args at its
         // application site — not `us` (see the call site's own comment).
         let subst = level::subst_map(&ctor_lp, ctor_us);
-        let mut ct = expr::instantiate_level_params(&ctor_typ, &subst);
+        let mut ct = lvl_at(S::IOTA, &ctor_typ, &subst);
         // Nested ctors (Array.mk, List.cons) carry their own params on the
         // major; the outer recursor's params may be empty (Syntax).
         for p in ctor_params {
             let (_, _, body) = self.ensure_pi(ctx, &ct)?;
-            ct = expr::instantiate1(&body, p);
+            ct = inst1_at(S::IOTA, &body, p);
         }
         // Lean iota: apply every constructor field first, then one rec-call
         // per recursive field, in field order. Interleaving (field, rec, field)
@@ -5090,7 +5676,7 @@ impl<'e> Checker<'e> {
             // checked one binder too deep — the whole spine came out with
             // indices uniformly off by one, which is how Init's
             // Array.foldlM_toList.aux._unary failed.
-            ct = expr::instantiate1(&body, f);
+            ct = inst1_at(S::IOTA, &body, f);
         }
         for rec_call in rec_calls {
             result = expr::app(result, rec_call);
@@ -5154,7 +5740,7 @@ impl<'e> Checker<'e> {
                 return Ok(None);
             }
             for (p_field, p_rec) in iargs[..nparams].iter().zip(params.iter()) {
-                let p_rec_shifted = expr::shift(p_rec, shift_by, 0);
+                let p_rec_shifted = shift_at(S::IOTA, p_rec, shift_by, 0);
                 if !self.is_def_eq(&tctx, p_field, &p_rec_shifted)? {
                     return Ok(None);
                 }
@@ -5181,7 +5767,7 @@ impl<'e> Checker<'e> {
             // type this ran on.
             let shifted_params: Vec<Expr> = params
                 .iter()
-                .map(|p| expr::shift(p, shift_by, 0))
+                .map(|p| shift_at(S::IOTA, p, shift_by, 0))
                 .collect();
             self.nested_rec_for_type(&tctx, rname, us, &shifted_params, target, &iargs)
         } {
@@ -5204,12 +5790,12 @@ impl<'e> Checker<'e> {
             // lambda instead of a fully-reduced value, which is what
             // `Cedar.SymCC.TermType.ofType`'s own `.fst`/`.snd`
             // projections out of that stuck lambda then reject on).
-            (nrec, params.iter().map(|p| expr::shift(p, shift_by, 0)).collect(), &[][..])
+            (nrec, params.iter().map(|p| shift_at(S::IOTA, p, shift_by, 0)).collect(), &[][..])
         } else if self.occurs_any(&ty, all) {
             // Fallback for a shape `nested_rec_for_type` doesn't parse
             // cleanly: the older, name-only search, unchanged.
             if let Some(nrec) = self.nested_rec_for(target, rname) {
-                (nrec, params.iter().map(|p| expr::shift(p, shift_by, 0)).collect(), &[][..])
+                (nrec, params.iter().map(|p| shift_at(S::IOTA, p, shift_by, 0)).collect(), &[][..])
             } else {
                 return Ok(None);
             }
@@ -5222,15 +5808,15 @@ impl<'e> Checker<'e> {
             rec_app = expr::app(rec_app, p);
         }
         for m in motives {
-            rec_app = expr::app(rec_app, expr::shift(m, shift_by, 0));
+            rec_app = expr::app(rec_app, shift_at(S::IOTA, m, shift_by, 0));
         }
         for m in minors {
-            rec_app = expr::app(rec_app, expr::shift(m, shift_by, 0));
+            rec_app = expr::app(rec_app, shift_at(S::IOTA, m, shift_by, 0));
         }
         for ix in indices {
             rec_app = expr::app(rec_app, ix.clone());
         }
-        let mut fapp = expr::shift(field, binders.len() as i32, 0);
+        let mut fapp = shift_at(S::IOTA, field, binders.len() as i32, 0);
         for i in (0..binders.len()).rev() {
             fapp = expr::app(fapp, expr::bvar(i as u32));
         }
