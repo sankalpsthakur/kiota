@@ -6689,11 +6689,10 @@ impl<'e> Checker<'e> {
         }
         // The syntactic conditions the official kernel imposes before it
         // looks at any type modulo reduction (`environment::add_inductive`
-        // and `elim_nested_inductive_fn` in inductive.cpp).  They run once
-        // per block, on the first member.
-        if all.first() == Some(&first_name) {
-            self.check_inductive_block_syntax(&all, num_params, &shared_lp)?;
-        }
+        // and `elim_nested_inductive_fn` in inductive.cpp).  They concern
+        // the whole block; running them for every member keeps them
+        // independent of what a member's `all` list claims comes first.
+        self.check_inductive_block_syntax(&all, num_params, &shared_lp)?;
         // Shared parameter telescope, taken from the first type's arity.
         // `elim_nested_inductive_fn::get_params` reads it off the first type
         // without reducing, so the parameters must be manifest binders.
@@ -6870,9 +6869,7 @@ impl<'e> Checker<'e> {
                 }
             }
         }
-        if all.first() == Some(&first_name) {
-            self.check_is_rec_flag(&all)?;
-        }
+        self.check_is_rec_flag(&all)?;
         Ok(())
     }
 
