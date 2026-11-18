@@ -5035,9 +5035,9 @@ impl<'e> Checker<'e> {
         let ctor_params = &ctor_args[..cnp as usize];
         let fields = &ctor_args[cnp as usize..];
 
-        let minor_idx = self
-            .minor_index_from_type(rname, &us, &level_params, params, cname, ctor_params)
-            .unwrap_or_else(|| self.ctor_minor_index(cname, rname, &all));
+        let Some(minor_idx) = self.own_minor_index(rname, cname) else {
+            return Ok(None);
+        };
         if minor_idx >= minors.len() {
             return Ok(None);
         }
@@ -5250,28 +5250,33 @@ impl<'e> Checker<'e> {
             .unwrap_or_else(|| vec![rname])
     }
 
-    fn rec_for_ctor_in_group(&self, cname: u32, rname: u32) -> Option<u32> {
-        for rec in self.rec_group(rname) {
-            if let Some(ConstantInfo::Recursor { rules, .. }) = self.env.get(rec) {
-                if rules.iter().any(|r| r.ctor == cname) {
-                    return Some(rec);
-                }
-            }
-        }
-        None
-    }
-
-    fn nested_rec_for(&self, type_name: u32, rname: u32) -> Option<u32> {
+    /// The recursor of `rname`'s block that eliminates the nested type
+    /// `type_name`, found by its constructors alone. That identifies a
+    /// recursor only if the block nests `type_name` once: with two
+    /// specializations (`List A` and `List B`) both recursors own
+    /// `List.cons`, and taking the first would be a guess about which
+    /// induction hypothesis a field gets. The guess declines.
+    fn nested_rec_for(&self, type_name: u32, rname: u32) -> R<Option<u32>> {
         let ctors = match self.env.get(type_name) {
             Some(ConstantInfo::InductiveType { ctors, .. }) => ctors,
-            _ => return None,
+            _ => return Ok(None),
         };
-        for c in ctors {
-            if let Some(rec) = self.rec_for_ctor_in_group(*c, rname) {
-                return Some(rec);
+        let mut found: Option<u32> = None;
+        for rec in self.rec_group(rname) {
+            let owns = match self.env.get(rec) {
+                Some(ConstantInfo::Recursor { rules, .. }) => {
+                    rules.iter().any(|r| ctors.contains(&r.ctor))
+                }
+                _ => false,
+            };
+            if owns {
+                if found.is_some() {
+                    return decline("a field's nested type has several recursors in its block and none could be told apart by type");
+                }
+                found = Some(rec);
             }
         }
-        None
+        Ok(found)
     }
 
     /// Find the group member specialized for the exact nested type
@@ -5294,8 +5299,13 @@ impl<'e> Checker<'e> {
         us: &[Level],
         params: &[Expr],
         target: u32,
+        target_levels: &[Level],
         target_args: &[Expr],
-    ) -> Option<u32> {
+    ) -> R<Option<u32>> {
+        // Every recursor of the block whose major premise is convertible
+        // with the field's type, with how well it fits: `(rec, same
+        // universe levels at the head, arguments identical)`.
+        let mut candidates: Vec<(u32, bool, bool)> = Vec::new();
         for rec in self.rec_group(rname) {
             let (typ, rec_level_params, rec_num_params, num_motives, num_minors, num_indices) =
                 match self.env.get(rec) {
@@ -5382,7 +5392,7 @@ impl<'e> Checker<'e> {
             let peeled = (num_motives + num_minors + num_indices) as i32;
             let major_dom = shift_at(S::IOTA, &major_dom, -peeled, 0);
             let (mh, margs) = expr::unfold_apps(&major_dom);
-            if let ExprData::Const(c, _) = &**mh {
+            if let ExprData::Const(c, major_levels) = &**mh {
                 if *c == target && margs.len() >= target_args.len() {
                     // Structural `==` is too strict here: two occurrences
                     // of the *same* nested type can carry differently
@@ -5397,17 +5407,44 @@ impl<'e> Checker<'e> {
                     // `List Value`'s `rec_3`, sorted first, instead of
                     // `List (Prod Attr Value)`'s `rec_4`, both owning
                     // `List.cons`/`List.nil`).
-                    let matches = margs[..target_args.len()]
-                        .iter()
-                        .zip(target_args)
-                        .all(|(a, b)| a == b || self.is_def_eq(ctx, a, b).unwrap_or(false));
+                    let identical =
+                        margs[..target_args.len()].iter().zip(target_args).all(|(a, b)| a == b);
+                    let matches = identical
+                        || margs[..target_args.len()]
+                            .iter()
+                            .zip(target_args)
+                            .all(|(a, b)| a == b || self.is_def_eq(ctx, a, b).unwrap_or(false));
                     if matches {
-                        return Some(rec);
+                        let same_levels = major_levels.len() == target_levels.len()
+                            && major_levels
+                                .iter()
+                                .zip(target_levels)
+                                .all(|(a, b)| level::is_def_eq(a, b));
+                        candidates.push((rec, same_levels, identical));
                     }
                 }
             }
         }
-        None
+        // Lean fixes a field's induction hypothesis when the type is
+        // declared, by the nested occurrence as written: `List ((fun _ =>
+        // T) true)` and `List T` are two auxiliary types with a recursor
+        // each, although they are convertible. Taking the first
+        // convertible candidate gave `a`'s field the other one's
+        // recursor. The occurrence as written decides; failing that a
+        // candidate must be the only one, and otherwise there is no
+        // telling.
+        let stages: [&dyn Fn(&(u32, bool, bool)) -> bool; 3] =
+            [&|c| c.1 && c.2, &|c| c.1, &|_| true];
+        for stage in stages {
+            let mut fits = candidates.iter().filter(|c| stage(c));
+            if let Some(first) = fits.next() {
+                if fits.next().is_some() {
+                    return decline("a field's nested type is convertible with several recursors' major premises");
+                }
+                return Ok(Some(first.0));
+            }
+        }
+        Ok(None)
     }
 
     /// Find `cname`'s minor-premise slot directly from `rname`'s own type
@@ -5446,6 +5483,7 @@ impl<'e> Checker<'e> {
     /// "these are two different recursors for the same type, with
     /// pointwise-equal motives/minors" as its own defeq principle, which
     /// this checker does not implement. Out of scope for this pass.
+    #[allow(dead_code)]
     fn minor_index_from_type(
         &self,
         rname: u32,
@@ -5580,6 +5618,36 @@ impl<'e> Checker<'e> {
         None
     }
 
+    /// The position of `cname`'s minor premise among the minors of the
+    /// recursor `rname`: the minors of a block are its members'
+    /// constructors, member by member, and a recursor reduces on its own
+    /// member's constructors only. `rec_group` is the block's recursors in
+    /// member order and each one's rule list is its member's constructors
+    /// (both from reconstruction, see `Parser::handle_inductive_block`), so
+    /// the position is the rules before `rname`'s plus `cname`'s place in
+    /// its own.
+    ///
+    /// This is by position on purpose. Looking the minor up by what its
+    /// type says (the constructor's name, then its parameters) cannot tell
+    /// two auxiliary members for one container apart: with `List ((fun _ =>
+    /// T) true)` and `List T` both nested in `T`, a major `@List.nil T`
+    /// under the first one's recursor was given the second one's `nil`
+    /// minor, because its parameter is written `T`.
+    fn own_minor_index(&self, rname: u32, cname: u32) -> Option<usize> {
+        let mut before = 0usize;
+        for rec in self.rec_group(rname) {
+            let Some(ConstantInfo::Recursor { rules, .. }) = self.env.get(rec) else {
+                return None;
+            };
+            if rec == rname {
+                return rules.iter().position(|r| r.ctor == cname).map(|at| before + at);
+            }
+            before += rules.len();
+        }
+        None
+    }
+
+    #[allow(dead_code)]
     fn ctor_minor_index(&self, cname: u32, rname: u32, all: &[u32]) -> usize {
         // `rname`'s own position for `cname` first: a nested group's own
         // constructor can be *polymorphic* (`List.cons` is the same
@@ -5754,8 +5822,8 @@ impl<'e> Checker<'e> {
             }
         }
         let (head, iargs) = expr::unfold_apps(&ty);
-        let target = match &**head {
-            ExprData::Const(n, _) => *n,
+        let (target, target_levels) = match &**head {
+            ExprData::Const(n, target_levels) => (*n, target_levels.clone()),
             _ => return Ok(None),
         };
         let shift_by = binders.len() as i32;
@@ -5798,7 +5866,7 @@ impl<'e> Checker<'e> {
                 .iter()
                 .map(|p| shift_at(S::IOTA, p, shift_by, 0))
                 .collect();
-            self.nested_rec_for_type(&tctx, rname, us, &shifted_params, target, &iargs)
+            self.nested_rec_for_type(&tctx, rname, us, &shifted_params, target, &target_levels, &iargs)?
         } {
             // `nested_rec_for_type` matches on `ty`'s own head and args
             // against each candidate's *actual declared major-premise
@@ -5823,7 +5891,7 @@ impl<'e> Checker<'e> {
         } else if self.occurs_any(&ty, all) {
             // Fallback for a shape `nested_rec_for_type` doesn't parse
             // cleanly: the older, name-only search, unchanged.
-            if let Some(nrec) = self.nested_rec_for(target, rname) {
+            if let Some(nrec) = self.nested_rec_for(target, rname)? {
                 (nrec, params.iter().map(|p| shift_at(S::IOTA, p, shift_by, 0)).collect(), &[][..])
             } else {
                 return Ok(None);
@@ -7617,9 +7685,9 @@ impl<'e> Checker<'e> {
         let minors_q = self.quote_all(depth, minors)?;
         let fields_q = self.quote_all(depth, fields)?;
 
-        let minor_idx = self
-            .minor_index_from_type(rname, &us, &level_params, &params_q, cname, &ctor_params_q)
-            .unwrap_or_else(|| self.ctor_minor_index(cname, rname, &all));
+        let Some(minor_idx) = self.own_minor_index(rname, cname) else {
+            return Ok(None);
+        };
         if minor_idx >= minors.len() {
             return Ok(None);
         }
