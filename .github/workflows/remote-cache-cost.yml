@@ -1,0 +1,56 @@
+name: remote-cache-cost
+
+# What each rule of the cross-declaration cache discipline costs on std:
+# the same source with one rule switched off by a one-line patch.
+on:
+  push:
+    branches: ['remote/cache-soundness-20261118b']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+
+jobs:
+  cost:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [as-is, no-budget-guard, no-inductive-suspension]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Patch
+        env:
+          V: ${{ matrix.variant }}
+        run: |
+          set -e
+          if [ $V = no-budget-guard ]; then
+            sed -i 's/!self.xcache_tainted.get() \&\& BUDGET_EVENTS.with(Cell::get) == self.budget_mark.get()/!self.xcache_tainted.get()/' src/tc.rs
+          fi
+          if [ $V = no-inductive-suspension ]; then
+            sed -i 's/let _no_xcache = crate::tc::XcacheSuspended::new();//' src/parser.rs
+          fi
+          git diff --stat
+      - run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-std
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: std with KIOTA_XCACHE and with both
+        env:
+          V: ${{ matrix.variant }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm std.ndjson.zst -o std.ndjson
+          for side in xcache both; do
+            extra="KIOTA_XCACHE=1"; [ $side = both ] && extra="KIOTA_XCACHE=1 KIOTA_XMEMO=1"
+            env $extra KIOTA_STATS=1 /usr/bin/time -v -o time.txt ./target/release/kiota std.ndjson >/dev/null 2>err.txt; rc=$?
+            echo "COST variant=$V side=$side rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -E '^STATS3' err.txt | tail -1) $(grep -E '^STATS ' err.txt | tail -1) $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-100)"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
