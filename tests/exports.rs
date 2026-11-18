@@ -1692,3 +1692,31 @@ fn a_prop_field_after_a_data_field_mentioned_under_a_binder_is_not_projected() {
         "[projProp6] cannot project a Prop field that comes after a dependent data field",
     );
 }
+
+/// Hand-written twins for the hash-cons table: 230 definitions
+/// `d_i : T := s (s (... (s z_i)))`, 200 applications each over its own
+/// axiom `z_i : T`, so 46,000 distinct application nodes are filed and the
+/// table doubles on the way (at 40,961 nodes; under the small dense policy
+/// of `tests/intern_table.rs`, thirteen times). Every definition must
+/// accept.
+#[test]
+fn chains_that_grow_the_hash_cons_table_accept() {
+    assert_accept_deep("intern-table-chains.accept.ndjson");
+}
+
+/// The reject twin differs in one leaf: the innermost argument of the last
+/// chain is `w : U` where the accept twin has `z230 : T`. That leaf is
+/// filed after the table has grown, next to 46,000 nodes of the same shape;
+/// a table that handed back a neighbour for `s w` would accept `d230`.
+#[test]
+fn a_wrong_leaf_under_a_chain_filed_after_the_table_grew_rejects() {
+    let handle = std::thread::Builder::new()
+        .stack_size(1024 * 1024 * 1024)
+        .spawn(|| check_file(&fixture("intern-table-chains.reject.ndjson")))
+        .expect("spawn deep-stack test thread");
+    match handle.join().expect("deep-stack test thread panicked") {
+        Err(TcError::Reject(message))
+            if message == "[d230] application argument type mismatch" => {}
+        other => panic!("the wrong leaf should reject d230, got {other:?}"),
+    }
+}
