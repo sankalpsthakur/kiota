@@ -21,6 +21,21 @@ macro_rules! env_set {
     }};
 }
 
+/// Live nodes in the hash-cons table past which it is emptied at the next
+/// declaration boundary (see `check_decl_once_go`): 4,000,000, which no
+/// ordinary run reaches. `KIOTA_INTERN_RESET_AT=<n>` puts another number
+/// there, read once, so that a test can make the reset happen between the
+/// declarations of a small export.
+fn intern_reset_threshold() -> usize {
+    static AT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        std::env::var("KIOTA_INTERN_RESET_AT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(4_000_000)
+    })
+}
+
 mod recursor;
 #[cfg(test)]
 mod reclamation_tests;
@@ -100,7 +115,9 @@ thread_local! {
     static SPINE_VERIFIED: [Cell<u64>; 2] = const { [Cell::new(0), Cell::new(0)] };
     /// `XINFER`'s counterpart for spine states of closed prefixes.
     static XSPINE: RefCell<FxHashMap<usize, SpineState>> = RefCell::new(FxHashMap::default());
-    static XCACHE_ON: bool = std::env::var_os("KIOTA_XCACHE").is_some();
+    /// A `Cell` so that a test can turn the caches on for its own thread;
+    /// nothing else writes it.
+    static XCACHE_ON: Cell<bool> = Cell::new(std::env::var_os("KIOTA_XCACHE").is_some());
     static XMEMO_ON: bool = std::env::var_os("KIOTA_XMEMO").is_some();
     /// Closed pairs proved definitionally equal. Only `true` is kept: an
     /// equality once derived stays derivable as the environment grows.
@@ -1160,14 +1177,14 @@ impl<'e> Checker<'e> {
         // `iota_value_cache` owns its thunks. Clear both to release retained
         // results before the intern reset. Ordinary runs never cross 4M
         // nodes, so Init/Std keep the unfold memo.
-        const INTERN_RESET: usize = 4_000_000;
-        if expr::intern_node_count() > INTERN_RESET {
+        let intern_reset = intern_reset_threshold();
+        if expr::intern_node_count() > intern_reset {
             let intern_before = expr::intern_node_count();
             let unfold_before = self.unfold_cache.borrow().len();
             self.unfold_cache.borrow_mut().clear();
             self.iota_value_cache.borrow_mut().clear();
             self.iota_lit_memo.borrow_mut().clear();
-            expr::intern_clear_if_large(INTERN_RESET);
+            expr::intern_clear_if_large(intern_reset);
             if std::env::var_os("KIOTA_INTERN_RESET_LOG").is_some() {
                 eprintln!(
                     "INTERN_RESET decl={} intern {intern_before}→{} unfold={unfold_before}→{}",
@@ -1418,7 +1435,7 @@ impl<'e> Checker<'e> {
                 return Ok(t.clone());
             }
         }
-        let xcache = key.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b);
+        let xcache = key.0 == 0 && !force_eager && XCACHE_ON.with(Cell::get);
         if xcache {
             let hit = XINFER.with(|m| m.borrow().get(&key.1).cloned());
             if let Some((t, checked)) = hit {
@@ -1572,7 +1589,7 @@ impl<'e> Checker<'e> {
     /// walk is not used by a checking one.
     fn infer_app_spine(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         let infer_only = self.infer_only.get();
-        let xcache = XCACHE_ON.with(|b| *b);
+        let xcache = XCACHE_ON.with(Cell::get);
         // Descend to the longest prefix with a usable state, or to the head.
         // `tail` collects (key, argument) of the nodes above it, outermost
         // first.
@@ -2898,7 +2915,7 @@ impl<'e> Checker<'e> {
             crate::stats::whnf_hit();
             return Ok(r);
         }
-        let xcache = k.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b);
+        let xcache = k.0 == 0 && !force_eager && XCACHE_ON.with(Cell::get);
         if xcache {
             if let Some(r) = XWHNF.with(|m| m.borrow().get(&k.1).cloned()) {
                 XCACHE_HITS.with(|c| c.set(c.get() + 1));
@@ -4107,7 +4124,7 @@ impl<'e> Checker<'e> {
         }
     }
     fn defeq_cache_insert(&self, force_eager: bool, key: (u64, usize, usize), v: bool) {
-        if v && key.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b) {
+        if v && key.0 == 0 && !force_eager && XCACHE_ON.with(Cell::get) {
             XDEFEQ.with(|m| {
                 let mut m = m.borrow_mut();
                 if m.len() >= XCACHE_CAP {
@@ -4226,7 +4243,7 @@ impl<'e> Checker<'e> {
             crate::stats::defeq_hit();
             return Ok(r);
         }
-        if key.0 == 0 && !force_eager && XCACHE_ON.with(|b| *b)
+        if key.0 == 0 && !force_eager && XCACHE_ON.with(Cell::get)
             && XDEFEQ.with(|m| m.borrow().contains(&(key.1, key.2)))
         {
             XCACHE_HITS.with(|c| c.set(c.get() + 1));
