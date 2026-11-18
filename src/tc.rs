@@ -1470,6 +1470,35 @@ impl<'e> Checker<'e> {
         // its own `proj sname i v` term as we walk the telescope — needed
         // for *every* field (not only up to `idx`) to check the
         // "dependent data field" rule below across the whole structure.
+        // Which earlier fields each field's type mentions, read off the
+        // constructor's own telescope, where field `j` is a bound variable
+        // of field `k`'s domain. This is exact at any binder depth and for
+        // any major. (It used to be found by looking for `proj sname j v`
+        // in the substituted domains by the address of `v`; under a binder
+        // the open major is shifted to another node, the occurrence was
+        // missed, and a projection past a dependent data field was let
+        // through.) A telescope that is not literally a chain of `Pi`s
+        // counts as mentioning every earlier field.
+        let mut referenced: Vec<u32> = Vec::new();
+        {
+            let mut raw = ct.clone();
+            for k in 0..num_fields {
+                match &**raw.clone() {
+                    ExprData::Pi(_, dom, body) => {
+                        for j in 0..k {
+                            if Self::occurs_bvar(dom, k - 1 - j) {
+                                referenced.push(j);
+                            }
+                        }
+                        raw = body.clone();
+                    }
+                    _ => {
+                        referenced.extend(0..k);
+                        break;
+                    }
+                }
+            }
+        }
         let mut doms: Vec<Expr> = Vec::with_capacity(num_fields as usize);
         let mut cur = ct;
         for i in 0..num_fields {
@@ -1497,10 +1526,6 @@ impl<'e> Checker<'e> {
             if !self.is_prop_checked(ctx, &doms[idx as usize])? {
                 return reject("cannot project a Type field from a Prop structure");
             }
-            let mut referenced = Vec::new();
-            for dom_k in &doms {
-                Self::collect_proj_indices(dom_k, sname, v, &mut referenced);
-            }
             let mut dependent_data_bound: Option<u32> = None;
             for j in referenced {
                 if (j as usize) < doms.len()
@@ -1521,33 +1546,10 @@ impl<'e> Checker<'e> {
         Ok(doms[idx as usize].clone())
     }
 
-    /// Collects every `i` such that `proj sname i v` occurs as a subterm
-    /// of `e` (matching `v` by pointer identity, since every occurrence
-    /// built by `infer_proj`'s own substitution loop clones the same
-    /// `Rc`). Used to find which earlier fields a later field's type
-    /// actually mentions.
-    fn collect_proj_indices(e: &Expr, sname: u32, v: &Expr, out: &mut Vec<u32>) {
-        match &***e {
-            ExprData::Proj(s, i, inner) if *s == sname && Rc::ptr_eq(inner, v) => out.push(*i),
-            ExprData::Proj(_, _, inner) => Self::collect_proj_indices(inner, sname, v, out),
-            ExprData::App(f, a) => {
-                Self::collect_proj_indices(f, sname, v, out);
-                Self::collect_proj_indices(a, sname, v, out);
-            }
-            ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
-                Self::collect_proj_indices(t, sname, v, out);
-                Self::collect_proj_indices(b, sname, v, out);
-            }
-            ExprData::Let(t, val, b) => {
-                Self::collect_proj_indices(t, sname, v, out);
-                Self::collect_proj_indices(val, sname, v, out);
-                Self::collect_proj_indices(b, sname, v, out);
-            }
-            _ => {}
-        }
-    }
-
     fn occurs_bvar(e: &Expr, i: u32) -> bool {
+        if expr::loose_bvar_range(e) <= i {
+            return false;
+        }
         match &***e {
             ExprData::BVar(j) => *j == i,
             ExprData::App(f, a) => Self::occurs_bvar(f, i) || Self::occurs_bvar(a, i),

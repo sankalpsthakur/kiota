@@ -1638,3 +1638,15 @@ fn shifting_right_by_65536_or_more_is_still_division() {
 fn shifting_left_by_600000_bits_is_evaluated() {
     assert_accept("nat-shift-left-600k.accept.ndjson");
 }
+
+/// Tutorial 094 with the dependency moved under a binder:
+/// `aProofAboutData : ∀ t : PUnit, someMoreData = someMoreData`. The field
+/// after a dependent data field is still out of reach; the official kernel
+/// answers `invalid projection x.6`.
+#[test]
+fn a_prop_field_after_a_data_field_mentioned_under_a_binder_is_not_projected() {
+    assert_reject_exact(
+        "proj-prop-after-dependent-data-under-binder.reject.ndjson",
+        "[projProp6] cannot project a Prop field that comes after a dependent data field",
+    );
+}
