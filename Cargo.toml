@@ -21,6 +21,11 @@ rustc-hash = "2"
 num-bigint = "0.5.1"
 mimalloc = "0.1"
 
+[features]
+# Only for a `-C profile-generate` build: write the profile before the
+# process ends through `_exit` (see `finish` in src/main.rs).
+pgo-gen = []
+
 [profile.release]
 opt-level = 3
 lto = true

@@ -6,11 +6,41 @@ version: "0.1.0"
 url: https://github.com/sankalpsthakur/kiota
 ref: main
 build: |
+  # POSIX sh, run from _build/checkers/kiota/src. No `set -e`: every step of
+  # the profile-guided build is checked, and any failure ends in the plain build.
   ROOT=$(cd ../../../.. && pwd)
-  "$ROOT/lka.py" build-test init-prelude
-  mkdir -p "$PWD/pgo"
-  RUSTFLAGS="-C target-cpu=native -Cprofile-generate=$PWD/pgo" cargo build --release
-  ./target/release/kiota "$ROOT/_build/tests/init-prelude.ndjson" >/dev/null || true
-  llvm-profdata merge -o "$PWD/pgo/merged.profdata" "$PWD/pgo"
-  RUSTFLAGS="-C target-cpu=native -Cprofile-use=$PWD/pgo/merged.profdata" cargo build --release
+  TRAIN="$ROOT/_build/tests/init.ndjson"
+  CPU="-C target-cpu=native"
+  WHY=""
+  pgo() {
+    WHY="no init export to train on"
+    "$ROOT/lka.py" build-test init || return 1
+    [ -s "$TRAIN" ] || return 1
+    WHY="the instrumented build failed"
+    RUSTFLAGS="$CPU -C profile-generate=$PWD/pgo" cargo build --release --locked \
+      --features pgo-gen --target-dir "$PWD/target-pgo-gen" || return 1
+    # The build scripts cargo just ran were instrumented too and left their
+    # own profiles here. Only the training run's may be merged.
+    rm -rf "$PWD/pgo" "$PWD/pgo.profdata"
+    WHY="the training run did not accept init"
+    timeout 3600 "$PWD/target-pgo-gen/release/kiota" "$TRAIN" >/dev/null 2>&1 || return 1
+    WHY="the training run wrote no profile"
+    [ -n "$(find "$PWD/pgo" -name '*.profraw' -size +200 2>/dev/null)" ] || return 1
+    WHY="no llvm-profdata could merge the profile"
+    MERGED=""
+    for P in "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-profdata "$(command -v llvm-profdata)"; do
+      if [ -x "$P" ] && "$P" merge -o "$PWD/pgo.profdata" "$PWD/pgo"; then MERGED=1; break; fi
+    done
+    [ -n "$MERGED" ] || return 1
+    WHY="the profile-guided build failed"
+    RUSTFLAGS="$CPU -C profile-use=$PWD/pgo.profdata" cargo build --release --locked || return 1
+    WHY="the profile-guided binary did not accept init"
+    timeout 3600 target/release/kiota "$TRAIN" >/dev/null 2>&1 || return 1
+  }
+  if pgo; then
+    echo "KIOTA_BUILD=pgo" | tee kiota-build.txt
+  else
+    echo "KIOTA_BUILD=plain reason=$WHY" | tee kiota-build.txt
+    cargo build --release --locked
+  fi
 run: timeout 3600 ./target/release/kiota "$IN"
