@@ -1796,10 +1796,12 @@ impl<'e> Checker<'e> {
                 self.name_str(n)
             ));
         }
-        let ci = self
-            .env
-            .get(n)
-            .ok_or_else(|| TcError::Other(format!("unknown const {n}")))?;
+        // A constant that no earlier declaration introduced is an ill-formed
+        // term (the official kernel: "unknown constant"), not a failure of
+        // the checker: a verdict, exit 1.
+        let ci = self.env.get(n).ok_or_else(|| {
+            TcError::Reject(format!("unknown constant `{}`", self.name_str(n)))
+        })?;
         let lp = ci.level_params();
         if lp.len() != us.len() {
             return reject("universe param count mismatch");

@@ -141,3 +141,13 @@ def tryAdd (label : String) (decl : Declaration) : CoreM Unit := do
   tryAdd "ind-nested-identity-redex.accept#0" (.inductDecl [] 1 [{name := `Zq33.L, type := (.forallE `a (.sort (.succ .zero)) (.sort (.succ .zero)) .default), ctors := [{name := `Zq33.L.nil, type := (.forallE `a (.sort (.succ .zero)) (.app (.const `Zq33.L []) (.bvar 0)) .default)}, {name := `Zq33.L.cons, type := (.forallE `a (.sort (.succ .zero)) (.forallE `a (.bvar 0) (.forallE `a (.app (.const `Zq33.L []) (.bvar 1)) (.app (.const `Zq33.L []) (.bvar 2)) .default) .default) .default)}]}] false)
   tryAdd "ind-nested-identity-redex.accept#1" (.inductDecl [] 0 [{name := `Zq33.T, type := (.sort (.succ .zero)), ctors := [{name := `Zq33.T.mk, type := (.forallE `a (.app (.lam `a (.sort (.succ .zero)) (.bvar 0) .default) (.app (.const `Zq33.L []) (.const `Zq33.T []))) (.const `Zq33.T []) .default)}]}] false)
 
+#eval show CoreM Unit from do
+  tryAdd "ind-field-unknown-const.reject#0" (.inductDecl [] 0 [{name := `Zq34.T, type := (.sort (.succ .zero)), ctors := [{name := `Zq34.T.mk, type := (.forallE `a (.const `Zq34.nope []) (.const `Zq34.T []) .default)}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-sig-unknown-const.reject#0" (.inductDecl [] 0 [{name := `Zq35.T, type := (.forallE `a (.const `Zq35.nope []) (.sort (.succ .zero)) .default), ctors := []}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "def-unknown-const.reject#0" (.inductDecl [] 0 [{name := `Zq36.N, type := (.sort (.succ .zero)), ctors := [{name := `Zq36.N.z, type := (.const `Zq36.N [])}, {name := `Zq36.N.s, type := (.forallE `a (.const `Zq36.N []) (.const `Zq36.N []) .default)}]}] false)
+  tryAdd "def-unknown-const.reject#1" (.defnDecl {name := `Zq36.d, levelParams := [], type := (.const `Zq36.N []), value := (.const `Zq36.nope []), hints := .abbrev, safety := .safe})
+

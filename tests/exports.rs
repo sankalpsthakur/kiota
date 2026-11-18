@@ -1853,3 +1853,18 @@ fn a_nested_occurrence_under_a_redex_is_still_nested() {
     };
     assert_eq!((*num_motives, *num_minors), (2, 3));
 }
+
+/// A constant no earlier declaration introduced. The official kernel answers
+/// "unknown constant"; this used to end as an internal error (exit 3), which
+/// the arena scores as an error and not as a rejection.
+#[test]
+fn an_undeclared_constant_is_a_rejection() {
+    assert_reject_exact("def-unknown-const.reject.ndjson", "[d] unknown constant `nope`");
+    assert_reject_exact("ind-field-unknown-const.reject.ndjson", "unknown constant `nope`");
+    // In a signature it is met while the reconstructed recursor is inferred,
+    // and the parser reports every rejection there under one message.
+    assert_reject_exact(
+        "ind-sig-unknown-const.reject.ndjson",
+        "recursor `T.rec` type does not match reconstructed type",
+    );
+}
