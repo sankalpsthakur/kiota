@@ -1639,17 +1639,6 @@ fn shifting_left_by_600000_bits_is_evaluated() {
     assert_accept("nat-shift-left-600k.accept.ndjson");
 }
 
-/// Tutorial 094 with the dependency moved under a binder:
-/// `aProofAboutData : ∀ t : PUnit, someMoreData = someMoreData`. The field
-/// after a dependent data field is still out of reach; the official kernel
-/// answers `invalid projection x.6`.
-#[test]
-fn a_prop_field_after_a_data_field_mentioned_under_a_binder_is_not_projected() {
-    assert_reject_exact(
-        "proj-prop-after-dependent-data-under-binder.reject.ndjson",
-        "[projProp6] cannot project a Prop field that comes after a dependent data field",
-    );
-
 /// con-leche `ConLeche.Expr.wscopedBP.eq_1`, cut down to one file
 /// (`tests/fixtures/src/conleche-ite-open-hash-condition.lean`): `rfl`
 /// between `wscopedBP (.bvar i) d` and `if (E.bvar i).fvarB == 0 then true
@@ -1690,4 +1679,16 @@ fn rfl_between_decides_over_an_unevaluable_instance_accepts() {
 #[test]
 fn decides_over_distinct_open_propositions_are_not_equal() {
     assert_reject("decide-distinct-open-propositions.reject.ndjson");
+}
+
+/// Tutorial 094 with the dependency moved under a binder:
+/// `aProofAboutData : ∀ t : PUnit, someMoreData = someMoreData`. The field
+/// after a dependent data field is still out of reach; the official kernel
+/// answers `invalid projection x.6`.
+#[test]
+fn a_prop_field_after_a_data_field_mentioned_under_a_binder_is_not_projected() {
+    assert_reject_exact(
+        "proj-prop-after-dependent-data-under-binder.reject.ndjson",
+        "[projProp6] cannot project a Prop field that comes after a dependent data field",
+    );
 }
