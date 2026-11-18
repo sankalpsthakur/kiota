@@ -1,0 +1,65 @@
+name: remote-build-flags-parity
+
+# Verdict and counter parity of the proposed build (native + profile trained
+# on init) with the plain release build on the corpora no earlier build-flags
+# run touched: cslib and cedar. The two sides run on different runners, so
+# their times are not comparable; rc and the md5 of the STATS lines are.
+on:
+  push:
+    branches: ['remote/build-flags-20261118g']
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  EXPORTS_RUN: 44313744961
+
+jobs:
+  parity:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [plain, native+pgo]
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-cslib
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-cedar
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y zstd time >/dev/null
+          ls -la *.zst
+          for c in init cslib cedar; do zstd -d --rm "$c.ndjson.zst" -o "$c.ndjson"; done
+          scripts/build-flags/build_side.sh "$SIDE" init.ndjson "kiota-$SIDE" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: cedar, then cslib
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set +e
+          for c in cedar cslib; do
+            KIOTA_STATS=1 /usr/bin/time -v -o time.txt timeout 75m "./kiota-$SIDE" "$c.ndjson" >out.txt 2>err.txt; rc=$?
+            echo "PARITY corpus=$c side=$SIDE rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') stats_md5=$(grep -E '^STATS' err.txt | md5sum | cut -c1-12) out_md5=$(md5sum < out.txt | cut -c1-12) $(grep -E '^STATS ' err.txt | head -n 1 | cut -c1-160)" | tee -a "$GITHUB_STEP_SUMMARY"
+            grep -vE '^STATS' err.txt | tail -n 3
+          done
