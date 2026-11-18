@@ -108,7 +108,9 @@ thread_local! {
     /// `KIOTA_SPINE`: infer an application spine in one walk of the head's
     /// Pi telescope (`infer_app_spine`). `KIOTA_SPINE_VERIFY` also recomputes
     /// every spine's type one argument at a time and panics on a difference.
-    static SPINE_ON: bool = std::env::var_os("KIOTA_SPINE").is_some();
+    /// On unless `KIOTA_NO_SPINE` is set (the one-argument rule, kept for
+    /// comparison). `KIOTA_SPINE` is still accepted and means the default.
+    static SPINE_ON: bool = std::env::var_os("KIOTA_NO_SPINE").is_none();
     static SPINE_VERIFY_ON: bool = std::env::var_os("KIOTA_SPINE_VERIFY").is_some();
     /// `KIOTA_SPINE_VERIFY` comparisons: [the same node, an equal term in
     /// another allocation]. A third outcome, a different term, panics.

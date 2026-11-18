@@ -23,9 +23,9 @@ const FIXTURES: &[(&str, i32)] = &[
 ];
 
 const ARMS: &[(&str, &[&str])] = &[
-    ("off", &[]),
-    ("KIOTA_SPINE", &["KIOTA_SPINE"]),
-    ("KIOTA_SPINE + KIOTA_SPINE_VERIFY", &["KIOTA_SPINE", "KIOTA_SPINE_VERIFY"]),
+    ("one-argument rule (KIOTA_NO_SPINE)", &["KIOTA_NO_SPINE"]),
+    ("default (one-walk spine)", &[]),
+    ("default + KIOTA_SPINE_VERIFY", &["KIOTA_SPINE_VERIFY"]),
 ];
 
 fn run(fixture: &str, reset_at: Option<&str>, flags: &[&str]) -> Output {
