@@ -96,17 +96,72 @@ impl Hash for ExprNode {
 
 // Interned terms form spines that can be thousands of nodes deep (e.g. a
 // left-nested `App` chain). The compiler-derived recursive drop would recurse
-// once per spine node and overflow the stack. Dismantle owned children with a
-// heap worklist so teardown depth is O(1) regardless of term depth.
+// once per spine node and overflow the stack, so a node whose release can
+// cascade dismantles its children with a heap worklist: teardown depth is
+// O(1) regardless of term depth.
+//
+// Most releases cannot cascade. The hash-cons table holds a reference to
+// every node it knows, so when a table reset walks the slots nearly every
+// child of a dying node is still referenced from somewhere else. When every
+// child is, dropping the fields only decrements counters, and the worklist
+// (and its allocation) is skipped.
 impl Drop for ExprNode {
+    #[inline]
     fn drop(&mut self) {
-        let mut stack: Vec<Expr> = Vec::new();
-        take_children(&mut self.data, &mut stack);
-        while let Some(e) = stack.pop() {
-            if let Ok(mut node) = Rc::try_unwrap(e) {
-                take_children(&mut node.data, &mut stack);
-            }
+        // Whether releasing this node's reference could be the child's last.
+        #[inline(always)]
+        fn last(e: &Expr) -> bool {
+            Rc::strong_count(e) == 1
         }
+        let cascades = match &self.data {
+            ExprData::BVar(_) | ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => {
+                false
+            }
+            // The same child twice holds two of its references: both go.
+            ExprData::App(a, b) | ExprData::Lam(_, a, b) | ExprData::Pi(_, a, b) => {
+                last(a) || last(b) || Rc::ptr_eq(a, b)
+            }
+            ExprData::Let(a, b, c) => {
+                last(a)
+                    || last(b)
+                    || last(c)
+                    || Rc::ptr_eq(a, b)
+                    || Rc::ptr_eq(a, c)
+                    || Rc::ptr_eq(b, c)
+            }
+            ExprData::Proj(_, _, v) => last(v),
+        };
+        if cascades {
+            drop_cascade(&mut self.data);
+        }
+    }
+}
+
+thread_local! {
+    /// The worklist `drop_cascade` reuses, so a cascade does not allocate.
+    static DROP_STACK: RefCell<Vec<Expr>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A worklist that grew past this many entries is freed instead of kept.
+const DROP_STACK_KEEP: usize = 1 << 16;
+
+#[inline(never)]
+fn drop_cascade(data: &mut ExprData) {
+    // `try_with`: a node can die while the thread's locals are being torn
+    // down, after this one is gone. A worklist dropped mid-use (it is taken
+    // out of the cell, so nothing here observes that) is only an allocation.
+    let mut stack: Vec<Expr> = DROP_STACK
+        .try_with(|s| std::mem::take(&mut *s.borrow_mut()))
+        .unwrap_or_default();
+    take_children(data, &mut stack);
+    while let Some(e) = stack.pop() {
+        if let Ok(mut node) = Rc::try_unwrap(e) {
+            take_children(&mut node.data, &mut stack);
+            // `node` drops here childless: its own `drop` returns at once.
+        }
+    }
+    if stack.capacity() <= DROP_STACK_KEEP {
+        let _ = DROP_STACK.try_with(|s| *s.borrow_mut() = stack);
     }
 }
 
@@ -1125,6 +1180,73 @@ mod tests {
         }
         let x = app(bvar(0), bvar(1));
         assert!(Rc::ptr_eq(&x, &app(bvar(0), bvar(1))));
+    }
+
+    /// Releasing a spine hundreds of thousands of nodes deep must not
+    /// recurse once per node: test threads have a 2 MiB stack.
+    #[test]
+    fn dropping_deep_spines_does_not_overflow_the_stack() {
+        const DEPTH: u32 = 400_000;
+        // Left-nested applications.
+        let mut spine = bvar(0);
+        for i in 0..DEPTH {
+            spine = app(spine, lit_nat(BigUint::from(i)));
+        }
+        // Nested binders, body-deep.
+        let mut binders = bvar(0);
+        for _ in 0..DEPTH {
+            binders = lam(BinderInfo::Default, s0(), binders);
+        }
+        // The same child on both sides: each level holds two references to
+        // the level below, and nothing else does once the table lets go.
+        let mut doubled = bvar(0);
+        for _ in 0..DEPTH {
+            doubled = app(doubled.clone(), doubled);
+        }
+        // Three references to the level below.
+        let mut tripled = bvar(1);
+        for _ in 0..DEPTH {
+            tripled = let_(tripled.clone(), tripled.clone(), tripled);
+        }
+        let mut projs = bvar(2);
+        for i in 0..DEPTH {
+            projs = proj(i, 0, projs);
+        }
+        // With the table emptied these five are the only owners.
+        assert!(intern_clear_if_large(0));
+        let weak = [
+            Rc::downgrade(&spine),
+            Rc::downgrade(&binders),
+            Rc::downgrade(&doubled),
+            Rc::downgrade(&tripled),
+            Rc::downgrade(&projs),
+        ];
+        drop((spine, binders, doubled, tripled, projs));
+        assert!(weak.iter().all(|w| w.upgrade().is_none()));
+    }
+
+    /// The other order: the owners go first, so the table reset is what
+    /// releases every node, in slot order rather than term order.
+    #[test]
+    fn resetting_a_table_of_deep_spines_does_not_overflow_the_stack() {
+        const DEPTH: u32 = 400_000;
+        let mut spine = bvar(0);
+        let mut doubled = bvar(1);
+        for i in 0..DEPTH {
+            spine = app(spine, lit_nat(BigUint::from(i)));
+            doubled = app(doubled.clone(), doubled);
+        }
+        let weak = [Rc::downgrade(&spine), Rc::downgrade(&doubled)];
+        drop((spine, doubled));
+        if reclamation_enabled() {
+            // The weak table never owned them: the drop above released both.
+            assert!(weak.iter().all(|w| w.upgrade().is_none()));
+            return;
+        }
+        assert!(weak.iter().all(|w| w.upgrade().is_some()), "the table holds them");
+        assert!(intern_clear_if_large(0));
+        assert!(weak.iter().all(|w| w.upgrade().is_none()));
+        assert_eq!(intern_node_count(), 0);
     }
 
     #[test]
