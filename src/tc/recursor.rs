@@ -41,6 +41,28 @@ pub(crate) struct DerivedRecursor {
     pub num_motives: u32,
     pub num_minors: u32,
     pub k: bool,
+    /// The recursor's own rules as `(constructor, number of fields)`: the
+    /// constructors of the member it eliminates, in declaration order. For
+    /// an auxiliary recursor these are the source constructors
+    /// (`List.nil`, `List.cons`), as Lean restores them.
+    pub rules: Vec<(u32, u32)>,
+}
+
+/// The fields of a member's constructor: the binders of its type after the
+/// block's parameters. `RecConstructor::typ` is a manifest telescope (the
+/// structural check walks an original constructor's binders as written, and
+/// a nested member's is closed over the block's parameters here).
+fn rec_constructor_fields(typ: &Expr, num_params: u32) -> R<u32> {
+    let mut binders = 0u32;
+    let mut cur = typ.clone();
+    while let ExprData::Pi(_, _, body) = &**cur {
+        binders += 1;
+        let next = body.clone();
+        cur = next;
+    }
+    binders
+        .checked_sub(num_params)
+        .ok_or_else(|| TcError::Reject("constructor has fewer binders than the inductive has parameters".into()))
 }
 
 /// A binder whose type is expressed in the context formed by the preceding
@@ -936,8 +958,14 @@ impl<'e> Checker<'e> {
                 &params,
                 elim_level.clone(),
             )?;
+            let rules = members[target_pos]
+                .ctors
+                .iter()
+                .map(|c| Ok((c.name, rec_constructor_fields(&c.typ, num_params)?)))
+                .collect::<R<Vec<_>>>()?;
             out.push(DerivedRecursor {
                 typ,
+                rules,
                 level_params: level_params.clone(),
                 // Lean restores every recursor's metadata to the original
                 // declared group, even auxiliary `.rec_N` recursors.
