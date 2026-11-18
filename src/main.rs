@@ -40,6 +40,28 @@ fn finish(result: Result<(), tc::TcError>) -> ! {
     // interned `Rc` term DAG (`Interner` in thread-local). Full Init is
     // ~13 GB of nodes; that drop took longer than checking. The OS
     // reclaims the address space on `_exit`.
+    //
+    // `_exit` also skips `atexit` handlers, and that is where a
+    // `-C profile-generate` build writes its counters: without the call
+    // below a training run leaves no profile at all, and the only `.profraw`
+    // files in the directory are those of the build scripts cargo ran while
+    // compiling.
+    //
+    // The switch is a `--cfg` in the instrumented build's RUSTFLAGS and must
+    // not become a cargo feature: features are part of the crate hash in
+    // every mangled name, so a profile recorded with a feature on names
+    // functions the profile-use build does not have, and is silently
+    // ignored for all of this crate. RUSTFLAGS are not part of that hash.
+    // The call does not link without the profiler runtime.
+    #[cfg(kiota_pgo_gen)]
+    unsafe {
+        extern "C" {
+            fn __llvm_profile_write_file() -> i32;
+        }
+        if __llvm_profile_write_file() != 0 {
+            eprintln!("kiota: kiota_pgo_gen: the profile could not be written");
+        }
+    }
     unsafe {
         extern "C" {
             fn _exit(status: i32) -> !;

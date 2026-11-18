@@ -21,6 +21,12 @@ rustc-hash = "2"
 num-bigint = "0.5.1"
 mimalloc = "0.1"
 
+[lints.rust]
+# `--cfg kiota_pgo_gen` belongs in the RUSTFLAGS of a `-C profile-generate`
+# build only: it makes the binary write its profile before it ends through
+# `_exit` (see `finish` in src/main.rs).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kiota_pgo_gen)'] }
+
 [profile.release]
 opt-level = 3
 lto = true
