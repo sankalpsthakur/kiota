@@ -6,7 +6,7 @@ name: regenerate-arena-corpus
 # Heavy work runs here, never on a developer machine.
 on:
   push:
-    branches: ['remote/corpus-4.36*']
+    branches: ['remote/cone-*']
   workflow_dispatch:
 
 permissions:
@@ -25,36 +25,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: init
-            kind: leanfile
-            leanfile: tests/init_module.lean
-            sha256: 93b61a432ed4241b1d2184de65354e0b98333bf4403a8d63922da18e10b430ba
-            size: 347772063
-            lines: 6495296
-          - name: std
-            kind: leanfile
-            leanfile: tests/std_module.lean
-            sha256: 15b659c12c14eb5c104b169ff288dcbd35baaff51412f43c9a078f79e9cf2f7d
-            size: 584315500
-            lines: 10611507
-          - name: cedar
-            kind: module
-            url: https://github.com/cedar-policy/cedar-spec/
-            rev: 326d93c24490c90607a3e257318e9c6a049c8116
-            module: Cedar
-            prebuild: shopt -s dotglob && find . -mindepth 1 -maxdepth 1 ! -name cedar-lean -exec rm -rf {} + && mv cedar-lean/* . && rmdir cedar-lean
-            sha256: 787b0e0790186f14f79f450896650fe120cd64efcdb4ca9220667612519f0a79
-            size: 904722064
-            lines: 15913292
-          - name: cslib
-            kind: module
-            url: https://github.com/leanprover/cslib
-            rev: e60b7760d6300ca790bc6a9adf6ded47f5773953
-            module: Cslib
-            prebuild: lake exe cache get
-            sha256: 09d1225013197983fe16b7078f6475707ce13da8f7e92d7c41ab1bc354522567
-            size: 2500956112
-            lines: 44051112
           - name: mathlib
             kind: module
             url: https://github.com/leanprover-community/mathlib4
@@ -141,12 +111,11 @@ jobs:
           MOD="${MODULE:-Test}"
           start=$(date +%s)
           lake env "$GITHUB_WORKSPACE/lean4export/.lake/build/bin/lean4export" "$MOD" \
+            -- Polynomial.Bivariate.swap._proof_1 Polynomial.Bivariate.swap \
             > "$GITHUB_WORKSPACE/$NAME.ndjson"
+          ls -la "$GITHUB_WORKSPACE/$NAME.ndjson"; wc -l "$GITHUB_WORKSPACE/$NAME.ndjson"
           echo "EXPORT_SECONDS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
           df -h /
-
-      - name: Verify against the board
-        run: python3 "$GITHUB_WORKSPACE/kiota/scripts/remote/verify_export.py" "$NAME.ndjson" > "$NAME.verify.json"
 
       - name: Report
         if: always()
@@ -174,11 +143,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: export-${{ matrix.name }}
+          name: cone-${{ matrix.name }}
           path: ${{ matrix.name }}.ndjson.zst
           if-no-files-found: ignore
           compression-level: 0
           retention-days: 30
 
-      - name: Fail unless byte-identical
-        run: python3 -c "import json,sys; sys.exit(0 if json.load(open('$NAME.verify.json'))['byte_identical'] else 1)"
