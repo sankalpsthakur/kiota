@@ -69,3 +69,14 @@ fn a_forged_quotient_declaration_is_a_rejection() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("REJECT: [Quot.ind] quotient declaration before the primitive `Quot`"), "{stderr}");
 }
+
+/// `g 19 0` builds 2^19 nested additions, so evaluating it recurses that
+/// deep. The arena's `unfold-before-literal-fallback` and `-bad`: both need
+/// the value, and a depth cap of a few thousand declined them.
+#[test]
+fn a_closed_nat_half_a_million_additions_deep_is_evaluated() {
+    let ok = run(include_bytes!("fixtures/deep-nat-evaluation-sum.accept.ndjson"), None);
+    assert_eq!(ok.status.code(), Some(0), "{:?}", String::from_utf8_lossy(&ok.stderr));
+    let bad = run(include_bytes!("fixtures/deep-nat-evaluation-wrong-sum.reject.ndjson"), None);
+    assert_eq!(bad.status.code(), Some(1), "{:?}", String::from_utf8_lossy(&bad.stderr));
+}

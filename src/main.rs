@@ -86,7 +86,7 @@ fn main() {
     // the entire export text beside the parsed environment unnecessarily adds
     // the export's size to peak memory (gigabytes for the large corpora).
     let handle = std::thread::Builder::new()
-        .stack_size(1024 * 1024 * 1024)
+        .stack_size(16 << 30)
         .spawn(move || {
             let outcome = std::panic::catch_unwind(|| {
                 let mut p = parser::Parser::new();
