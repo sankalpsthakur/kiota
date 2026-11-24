@@ -6,7 +6,7 @@ name: regenerate-arena-corpus
 # Heavy work runs here, never on a developer machine.
 on:
   push:
-    branches: ['remote/corpus-*']
+    branches: ['remote/corpus-4.36*']
   workflow_dispatch:
 
 permissions:
@@ -14,7 +14,7 @@ permissions:
 
 env:
   # Arena revision that produced the board these hashes come from.
-  ARENA_REV: b1d6e91d6de351f9bcf21e6b039f4d51d6b9bb42
+  ARENA_REV: 8a7d0dceea76dfe6fd7bd7f3a6ea216f6347c6aa
 
 jobs:
   export:
@@ -28,42 +28,42 @@ jobs:
           - name: init
             kind: leanfile
             leanfile: tests/init_module.lean
-            sha256: 620502ac9e63ba4a2dea9d46386c2f6aebc49faf8848ea3aaa18a77a09491a6a
-            size: 347555345
-            lines: 6487065
+            sha256: 93b61a432ed4241b1d2184de65354e0b98333bf4403a8d63922da18e10b430ba
+            size: 347772063
+            lines: 6495296
           - name: std
             kind: leanfile
             leanfile: tests/std_module.lean
-            sha256: 289ed65a367abdc7388a855d2acf59cc1f401f5e06295acbb8a420682d9f00bd
-            size: 596655086
-            lines: 10826639
+            sha256: 15b659c12c14eb5c104b169ff288dcbd35baaff51412f43c9a078f79e9cf2f7d
+            size: 584315500
+            lines: 10611507
           - name: cedar
             kind: module
             url: https://github.com/cedar-policy/cedar-spec/
-            rev: 017c35c3d1f856a0f8b62a66660ee6628870bbcf
+            rev: 326d93c24490c90607a3e257318e9c6a049c8116
             module: Cedar
             prebuild: shopt -s dotglob && find . -mindepth 1 -maxdepth 1 ! -name cedar-lean -exec rm -rf {} + && mv cedar-lean/* . && rmdir cedar-lean
-            sha256: c675682320b1a3e84e0280ff431c89808258c636a91bc2539fe0f63c51182379
-            size: 872400673
-            lines: 15316788
+            sha256: 787b0e0790186f14f79f450896650fe120cd64efcdb4ca9220667612519f0a79
+            size: 904722064
+            lines: 15913292
           - name: cslib
             kind: module
             url: https://github.com/leanprover/cslib
-            rev: 990e65a685bed413f43b139db900a36ad5322a10
+            rev: e60b7760d6300ca790bc6a9adf6ded47f5773953
             module: Cslib
             prebuild: lake exe cache get
-            sha256: bc5c88e028d02a3c0789de6efb9cd96e8506d1e96b3d26672d28ae3bb33d0b30
-            size: 2422584798
-            lines: 42689984
+            sha256: 09d1225013197983fe16b7078f6475707ce13da8f7e92d7c41ab1bc354522567
+            size: 2500956112
+            lines: 44051112
           - name: mathlib
             kind: module
             url: https://github.com/leanprover-community/mathlib4
-            rev: d13f23b723b8a846827a245b89c10fc7d3f11612
+            rev: fc4f59e577feb1a4956671bc04ac18aaaf8cd842
             module: Mathlib
             prebuild: lake exe cache get
-            sha256: 22c5de83469408950005589a3bc5ef5157c65549b5a802f85d567c29151306a6
-            size: 6184415052
-            lines: 109790519
+            sha256: f749dfd084fc0727d107c7aaded7d492cebfc0b517cfaa7337d8a7578a6c0dec
+            size: 6326141213
+            lines: 112081718
     env:
       NAME: ${{ matrix.name }}
       KIND: ${{ matrix.kind }}
