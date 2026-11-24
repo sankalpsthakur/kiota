@@ -1,0 +1,43 @@
+name: remote-hunt
+
+# Find the declaration of the 4.36 mathlib export on which main's memory runs
+# away: check only declarations 284,000 to 286,000, trace each one, and stop
+# the process at 12 GB of address space.
+on:
+  push:
+    branches: ['remote/hunt-*']
+permissions:
+  contents: read
+  actions: read
+env:
+  EXPORTS_RUN: 45472434965
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-mathlib
+          run-id: ${{ env.EXPORTS_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Window
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm mathlib.ndjson.zst -o mathlib.ndjson
+          ( ulimit -v 12000000; KIOTA_MIN_DECL=284000 KIOTA_MAX_DECL=286000 KIOTA_TRACE_DECL=1 KIOTA_PROGRESS=1 KIOTA_STATS=1 /usr/bin/time -v -o time.txt timeout 3000 ./target/release/kiota mathlib.ndjson >/dev/null 2>err.txt ); echo "rc=$?"
+          grep -E "Elapsed|Maximum resident" time.txt
+          echo "--- last DECL lines ---"; grep -E "^DECL " err.txt | tail -5
+          echo "--- tail ---"; tail -25 err.txt | cut -c1-400
+          grep -n "^DECL " err.txt | awk -F: '{print $1}' > lines.txt
+          echo "--- slowest declarations by stderr distance ---"; grep -E "^(DECL|MEM|INTERN_CALLS)" err.txt | awk '/^DECL/{d=$0; n=0; next} {n++; c[d]=n} END{for (k in c) print c[k], k}' | sort -rn | head -8
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hunt-${{ github.run_id }}
+          path: err.txt
+          retention-days: 14
