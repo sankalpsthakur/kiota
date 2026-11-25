@@ -60,6 +60,7 @@ All need no forged prelude. "Fixture" names are under `tests/fixtures/`.
 | Rule | Official check | kiota site | Probe / fixture | Verdict |
 |---|---|---|---|---|
 | Names are fresh | `check_name`, :254 | `P` `reject_if_dup` | tutorial 133–139 | agree |
+| No constant or projected structure under the root `_nested` in a signature or a constructor type | `check_no_nested_aux` (lean4#14616, in 4.36) | `S` "uses the reserved prefix `_nested`" | `R18`; `ind-reserved-nested-prefix.reject`, `ind-sig-reserved-nested-prefix.reject`, `ind-reserved-nested-prefix-elsewhere.accept` | agree. Before (9bb4388): accepted |
 | Universe parameters distinct | `add_decl` | `S` "duplicate universe parameter" | `L3` | agree |
 | Signature is closed | `check_no_loose_bvars`, :1241 | `P` `` `type` has a loose bound variable `` | `L1`, `L2` | agree |
 | Signature is well typed, in the environment before the block | `tc().check(type)`, :260 | types are installed first, so `S` `check_inductive_block_syntax` refuses a signature that names a type or constructor of the block; the rest is inferred through the reconstructed recursor (`R` `validate_reconstructed_type`) | `H1`, `H2`, `H4`, `H6`; `ind-type-names-sibling.reject` | agree. Before: `H5`, `H6` accepted |
@@ -76,18 +77,18 @@ All need no forged prelude. "Fixture" names are under `tests/fixtures/`.
 |---|---|---|---|---|
 | A constructor belongs to the type that lists it, at its index | built by the kernel | `P` "claims inductive …", "is not …'s own constructor at index" | `K4`, `K9`, `orphan-ctor` | lies refused |
 | No constructor twice | "duplicate constructor name", :462 | `S` "duplicate constructor name in inductive declaration" | `K3`; `ind-dup-ctor-in-list.reject` | agree. Before: refused later, as a metadata mismatch |
-| Type is well typed with only the block's *types* added | `tc().check(t)`, :468 | `S` refuses a constructor of the block; a recursor of the block is not in the environment yet; the rest through the recursor's minor premises | `H1`, `H3`, `H19`, `H20b`; `ind-ctor-names-own-ctor.reject` | agree. Before: `H19` accepted |
+| Type is well typed with only the block's *types* added | `tc().check(t)`, :468 | `S` refuses a constructor of the block, and a projection out of a type of the block (inferring it needs the type's constructor: "unknown constant `T.mk`"); a recursor of the block is not in the environment yet; the rest through the recursor's minor premises | `H1`, `H3`, `H19`, `H20b`, `R16`, `R16b`; `ind-ctor-names-own-ctor.reject`, `ind-ctor-field-proj-{own-type,erased}.reject`, `ind-ctor-field-proj-other.accept` | agree. Before: `H19` accepted; before 9bb4388's follow-up: `R16`, `R16b` accepted |
 | `numParams` binders as written, convertible to the type's | `get_params`, :1138; :472 | `S` "does not start with the inductive type's parameters", "parameter telescope does not match" | `P2`, `H18`, tutorial 050; `ind-ctor-type-identity-redex.reject` | agree. Before: `P2` accepted |
 | `numFields` | `declare_constructors`, :499 | `S` "numFields does not match its type" | `K1`, `K2`, `X1`, `X6`, `H8`; `ind-ctor-numfields-zero.reject`, `ind-struct-eta.accept` | lies refused. Before: accepted |
 | Field universe ≤ type's, unless the type is a proposition | `is_geq(result, field) \|\| normalizes_to_zero(result)`, :481 | `S` `level::leq_all` | `B1`–`B12`, `F11`; `ind-field-univ-*` | agree on all probes. Before: 9 of 12 accepted. See "leq_all" below |
-| Result is `I params indices` as written, own type, own levels, no declared type in the indices | `is_valid_ind_app`, :381 | `S` conclusion checks | `F13`, `H13`, `H17`, tutorial 051–053, 056 | agree |
+| Result is `I params indices` as written, own type, own levels, no declared type in the indices | `is_valid_ind_app`, :381 | `S` conclusion checks; the levels are compared as written, and `check_uniform_ind_occs` sees the conclusion too | `F13`, `H13`, `H17`, `R1b`, tutorial 051–053, 056; `ind-result-level-max-uu.reject` | agree. Before the follow-up: `R1b` (`T.{max u u}`) accepted |
 | Index may depend on a field | allowed | allowed | `H14`, `F3` | agree |
 
 ### Occurrences and positivity
 
 | Rule | Official check | kiota site | Probe / fixture | Verdict |
 |---|---|---|---|---|
-| Every occurrence is applied to the parameters and levels, as written | `check_uniform_ind_occs`, :134 (4.34) | `S` `check_uniform_ind_occs` | `D1`–`D7`, `D10`, `E8`, `E22`, `H7`, `M3`; `ind-occ-*` | agree. Before: `D2`, `D4`, `D7`, `D10`, `E8`, `H7` accepted |
+| Every occurrence is applied to the parameters and levels, as written | `check_uniform_ind_occs`, :134 (4.34) | `S` `check_uniform_ind_occs`; `P` keeps a level that simplification would make a bare parameter (`max u u`, `imax u u`, `max 0 u`) unsimplified on a constant not declared yet, so the comparison sees the written form | `D1`–`D7`, `D10`, `E8`, `E22`, `H7`, `M3`, `R1`, `R1c`, `R5`, `R6c`; `ind-occ-*` | agree. Before: `D2`, `D4`, `D7`, `D10`, `E8`, `H7` accepted; before the follow-up: `R1`, `R1c` accepted |
 | An occurrence that `whnf` removes is no occurrence for positivity | `check_positivity` starts with `whnf`, :437 | `S` `positivity_whnf` | `D8`, `D9`; `ind-occ-erased-uniform.accept`; arena `vanishing-occurrence` | agree |
 | No occurrence in a binder domain of a field, also when it shows only after unfolding a definition, and also when unfolding the domain would remove it | :441 | `check_arg_positive_in` "non-positive" | `sanity_neg`, `N1`, `N3`, `N5`, tutorial 054, 057, 117; arena `positivity-whnf` | agree |
 | Otherwise the field ends in a valid application of a declared type | :447 | `check_positive_spine`, `check_uniform_i` | `H16`, tutorial 118 | agree |
@@ -126,17 +127,21 @@ back to the existing `level::leq`, which can be stricter on nested `imax`.
 
 ## What differs on purpose, and what is left
 
-- `corner-cases/nested-nonuniform-param` (outcome `either`) is now refused,
-  as the official kernel does since leanprover/lean4#14577; 606c3c0 accepted
-  it. It is the only exit code that changes among the fixtures, the arena
-  small suite and the corner cases.
+- `corner-cases/nested-nonuniform-param` (outcome `either`): this was said to
+  flip to a refusal. The downloadable `lean-arena-tests.tar.gz` has only
+  `good/corner-cases/proof-param-ok`, so the flip could not be reproduced
+  from it; treat it as unverified. No exit code changes on the arena small
+  suite.
 - `KL5`: `Pf : Prop | mk : Tr → Pf`, `Pf.rec (fun _ => t) h = t` for a variable
   `h`. kiota eta-expands the major premise; the official kernel does not for
   a proposition. Arena `corner-cases/eta-struct-major-and`, outcome `either`.
   Not touched.
-- Levels are simplified when they are parsed (`level::max`, `level::imax`),
-  so a constructor that returns `T.{max u u}` is read as `T.{u}`. Lean
-  compares the levels of an occurrence structurally and refuses it.
+- Levels are simplified when they are parsed (`level::max`, `level::imax`).
+  On a constant that is not declared yet (in practice an occurrence of a type
+  of the block being read) the parser keeps a level written `max`/`imax` that
+  would simplify to a bare parameter in its written form, so `T.{max u u}`
+  is refused like Lean refuses it. Everywhere else only the value of a level
+  matters, and it is unchanged.
 - `isReflexive`, `numNested` and, on this branch, `k` are not compared with
   the kernel's values. Nothing reads the first two.
 - A signature with an undeclared constant is reported as "recursor … type
@@ -144,6 +149,30 @@ back to the existing `level::leq`, which can be stricter on nested `imax`.
   the recursor comparison that message.
 - The rule-list comparison is also on snd/export-names, with the same field
   and message; one of the two goes at integration.
+
+## Follow-up (snd/inductive-audit-2)
+
+The review of 9bb4388 found three declarations Lean 4.36 refuses and kiota
+accepted (base 606c3c0 too). Each is now refused, with the same verdict as
+`leanchecker` v4.36.0 on the fixture:
+
+| Probe | Accepted before | Lean 4.36 | kiota now | Fixture |
+|---|---|---|---|---|
+| `R16`, `R16b` | `T \| mk : (n : N) → (t : T) → Eq' N t.0 n → T`, and the same field under `(fun _ => N)` | "unknown constant 'T.mk'" | "constructor type projects out of a type of the declaration being defined …" | `ind-ctor-field-proj-{own-type,erased}.reject`; twin `ind-ctor-field-proj-other.accept` |
+| `R1`, `R1b`, `R1c` | `T.{max u u}`, `T.{imax u u}` in a field or the conclusion | "invalid occurrence of datatype 'T' being declared" | the same check, on the written level | `ind-occ-level-{max,imax}-uu.reject`, `ind-result-level-max-uu.reject`; twins `ind-occ-level-max-other-const.accept`, `ind-level-max-uu-after-block.accept` |
+| `R18` | a field `_nested.Foo`, or a signature `_nested.Foo → Type` | "it uses the reserved prefix '_nested'" | "uses the reserved prefix `_nested`" | `ind-reserved-nested-prefix.reject`, `ind-sig-reserved-nested-prefix.reject`; twin `ind-reserved-nested-prefix-elsewhere.accept` |
+
+The two arms of `check_uniform_ind_occs` no committed test reached, the
+lambda-body offset (`R5`) and the let body (`R6c`), now have fixtures:
+`ind-occ-{lam-offset,let-body}-nonuniform.reject`, whose recursors come from
+probe builds with that arm removed, so the files are accepted by 606c3c0.
+
+The accept twins were replayed through Lean 4.36's `addDeclCore`
+(`tests/fixtures/src/inductive-audit.lean`; the `_nested` twin with its names
+at the root, since that script prefixes every name). `leanchecker` itself
+refuses every DSL accept fixture, old and new, with "Invalid recursor": the
+DSL writes kiota's reconstructed recursors, which are not syntactically the
+ones Lean generates.
 
 ## Remote validation
 

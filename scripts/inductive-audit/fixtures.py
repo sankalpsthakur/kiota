@@ -1,7 +1,7 @@
 """Fixture specs for the inductive admission audit: tests/fixtures/ind-*.ndjson,
 rec-rules-*.ndjson and src/inductive-audit.lean (usage in mk.py)."""
 from lib import *
-import copy, sys
+import copy, os, sys
 T = C('T'); L = C('L'); Sx = C('S')
 idT = Lam(Type, B(0))
 F = {}
@@ -165,11 +165,71 @@ def _(x):   # T : nope -> Type
 def _(x):   # def d : N := nope
     decl_N(x); x.defn('d', [], N, C('nope'))
 
+# ---- follow-up (snd/inductive-audit-2): what the review of the audit found ----
+# The two non-uniform occurrences below are refused by the structural checks
+# the probe hook runs after, so their recursors come from probe binaries with
+# that arm of `check_uniform_ind_occs` removed (the Lam offset for the first,
+# the Let arm for the second); the rest from probe.patch on 9bb4388.
+@fx('ind-occ-lam-offset-nonuniform.reject')
+def _(x):   # T (α : Type) | mk : (fun (y : Type) => T y) α -> T α : whnf gives T α, as written T y
+    x.inductive([], 1, [Ty('T', Pi(Type, Type), [('T.mk', Pi(Type, Pi(A(Lam(Type, A(T, B(0))), B(0)), A(T, B(1)))))])])
+@fx('ind-occ-let-body-nonuniform.reject')
+def _(x):   # T (α : Type) | mk : (let y : Type := α; T y) -> T α : zeta gives T α, as written T y
+    x.inductive([], 1, [Ty('T', Pi(Type, Type), [('T.mk', Pi(Type, Pi(Let(Type, B(0), A(T, B(0))), A(T, B(1)))))])])
+@fx('ind-occ-level-max-uu.reject')
+def _(x):   # T.{u} : Type u | mk : T.{max u u} -> T.{u}
+    x.inductive(['u'], 0, [Ty('T', S(('S','u')), [('T.mk', Pi(C('T', ('m','u','u')), C('T','u')))])], isRec=True)
+@fx('ind-occ-level-imax-uu.reject')
+def _(x):   # T.{u} : Type u | mk : T.{imax u u} -> T.{u}
+    x.inductive(['u'], 0, [Ty('T', S(('S','u')), [('T.mk', Pi(C('T', ('i','u','u')), C('T','u')))])], isRec=True)
+@fx('ind-result-level-max-uu.reject')
+def _(x):   # T.{u} : Type u | mk : T.{max u u}
+    x.inductive(['u'], 0, [Ty('T', S(('S','u')), [('T.mk', C('T', ('m','u','u')))])])
+@fx('ind-occ-level-max-other-const.accept')
+def _(x):   # Ax.{v} : Type v ; T.{u} : Type u | mk : Ax.{max u u} -> T.{u} : only occurrences of the block are compared as written
+    x.axiom('Ax', ['v'], S(('S','v')))
+    x.inductive(['u'], 0, [Ty('T', S(('S','u')), [('T.mk', Pi(C('Ax', ('m','u','u')), C('T','u')))])])
+@fx('ind-level-max-uu-after-block.accept')
+def _(x):   # T.{u} : Type u | mk : T.{u} -> T.{u} ; back.{u} : T.{max u u} -> T.{u} := fun t => t
+    x.inductive(['u'], 0, [Ty('T', S(('S','u')), [('T.mk', Pi(C('T','u'), C('T','u')))])])
+    x.defn('back', ['u'], Pi(C('T', ('m','u','u')), C('T','u')), Lam(C('T', ('m','u','u')), B(0)))
+@fx('ind-ctor-field-proj-own-type.reject')
+def _(x):   # T | mk : (n : N) -> (t : T) -> Eq' N t.0 n -> T : inferring t.0 needs T.mk, not declared yet
+    decl_N(x); decl_Eq(x)
+    x.inductive([], 0, [Ty('T', Type, [('T.mk', Pi(N, Pi(T, Pi(Eq(N, Proj('T', 0, B(0)), B(1)), T))))])])
+@fx('ind-ctor-field-proj-erased.reject')
+def _(x):   # T | mk : (n : N) -> (t : T) -> (fun _ : N => N) t.0 -> T
+    decl_N(x)
+    x.inductive([], 0, [Ty('T', Type, [('T.mk', Pi(N, Pi(T, Pi(A(Lam(N, N), Proj('T', 0, B(0))), T))))])])
+@fx('ind-ctor-field-proj-other.accept')
+def _(x):   # P | mk : N -> P ; T | mk : (p : P) -> (fun _ : N => N) p.0 -> T : P is declared, its constructor too
+    decl_N(x)
+    x.inductive([], 0, [Ty('P', Type, [('P.mk', Pi(N, C('P')))])])
+    x.inductive([], 0, [Ty('T', Type, [('T.mk', Pi(C('P'), Pi(A(Lam(N, N), Proj('P', 0, B(0))), T)))])])
+@fx('ind-reserved-nested-prefix.reject')
+def _(x):   # _nested.Foo : Type ; T | mk : _nested.Foo -> T
+    x.axiom('_nested.Foo', [], Type)
+    x.inductive([], 0, [Ty('T', Type, [('T.mk', Pi(C('_nested.Foo'), T))])])
+@fx('ind-sig-reserved-nested-prefix.reject')
+def _(x):   # _nested.Foo : Type ; T : _nested.Foo -> Type, no constructors
+    x.axiom('_nested.Foo', [], Type)
+    x.inductive([], 0, [Ty('T', Pi(C('_nested.Foo'), Type), [], nindices=1)])
+@fx('ind-reserved-nested-prefix-elsewhere.accept')
+def _(x):   # the prefix is a whole first component and binds only inductive blocks
+    x.axiom('_nested.Foo', [], Type)
+    x.axiom('g', [], Pi(C('_nested.Foo'), C('_nested.Foo')))
+    x.axiom('_nestedFoo', [], Type)
+    x.axiom('Foo._nested', [], Type)
+    x.inductive([], 0, [Ty('T', Type, [('T.mk', Pi(C('_nestedFoo'), Pi(C('Foo._nested'), T)))])])
+
 if __name__ == '__main__':
     outdir = sys.argv[1]
     xs = []
+    only = sys.argv[2:]   # name prefixes: render only those exports
     for name, f in F.items():
         x = X(name); f(x); xs.append(x)
-        notes = render_nd(x, '%s/%s.ndjson' % (outdir, name))
+        if not only or any(name.startswith(p) for p in only):
+            notes = render_nd(x, '%s/%s.ndjson' % (outdir, name))
+    os.makedirs(outdir + '/src', exist_ok=True)
     open(outdir + '/src/inductive-audit.lean', 'w').write(render_lean(xs) + '\n')
     print(len(xs), 'fixtures')
