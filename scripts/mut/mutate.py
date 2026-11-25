@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""mutate.py ID SRC: apply mutant ID to src/tc.rs of fix/deep-evaluation-v2 48d83ba.
+"""mutate.py ID SRC: apply mutant ID to src/tc.rs of fix/deep-evaluation-v2 8fae723 (src lines as in 48d83ba).
 Each mutant names (line, exact old text, new text); the line must hold the old text."""
 import sys
 M = {
  'M01_driver_off': [(6242, 'if expr::loose_bvar_range(e) > 0 || env_set!("KIOTA_NO_NAT_DRIVER") {', 'if true {')],
- 'M02_never_suspend': [(6262, 'let deep = w >=', 'let deep = false && w >=')],
+ 'M02_never_suspend': [(6262, 'let deep = w >=', 'let deep = false && (w >='), (6264, 'CONV_DEPTH - NAT_MARGIN;', 'CONV_DEPTH - NAT_MARGIN);')],
+ 'M02a_no_whnf_stride': [(6262, 'let deep = w >=', 'let deep = false && w >=')],
+ 'M02b_no_core_stride': [(6263, '|| c >= bc.saturating_add(NAT_STRIDE)', '|| false')],
  'M03_no_epoch_on_suspend': [(6268, 'NO_MEMO_EPOCH.with(|n| n.set(n.get() + 1));', '')],
  'M04_whnf_memo_over_suspension': [(3161, 'if no_memo_epoch() != epoch {', 'if false {')],
  'M05_core_memo_over_suspension': [(3694, 'if no_memo_epoch() == epoch {', 'if true {')],
