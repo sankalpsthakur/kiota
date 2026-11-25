@@ -1,0 +1,107 @@
+name: remote-swaprev-sweep
+
+# Independent review of fix/mathlib-swap-v2 at the reviewed sha bcb623d:
+# (1) the budget margin: mathlib under KIOTA_ABBREV_ARGS_BUDGET below the
+#     shipped 1,000,000 (the largest finished frame was 982,361);
+# (2) a wrong-accept sweep: every bad/* tarball case, every *.reject fixture
+#     and the review's bad twins at budgets 1..1000 and forced exhaustion of
+#     the Kth frame (only:K) or every Nth (every:N). Any rc=0 is a wrong accept.
+on:
+  push:
+    branches: ['remote/swaprev-sweep-*']
+permissions:
+  contents: read
+  actions: read
+env:
+  HEAD_SHA: bcb623d3ae6ddb1e57b9be4c908022776d815645
+jobs:
+  margin:
+    strategy:
+      fail-fast: false
+      matrix:
+        budget: ['900000', '250000']
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD_SHA }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked && sha256sum target/release/kiota && git rev-parse HEAD
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-mathlib
+          run-id: '45472434965'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Mathlib under a smaller budget
+        env:
+          BUDGET: ${{ matrix.budget }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm mathlib.ndjson.zst -o mathlib.ndjson
+          sha256sum mathlib.ndjson
+          export KIOTA_PROGRESS=1 KIOTA_ABBREV_STATS=1 KIOTA_ABBREV_ARGS_BUDGET=$BUDGET
+          start=$(date +%s)
+          /usr/bin/time -v -o time.txt timeout 15000 ./target/release/kiota mathlib.ndjson >/dev/null 2>err.txt &
+          pid=$!
+          while kill -0 $pid 2>/dev/null; do
+            k=$(pgrep -x kiota | head -1)
+            if [ -n "$k" ]; then
+              rss=$(ps -o rss= -p $k 2>/dev/null | tr -d ' ')
+              if [ "${rss:-0}" -gt 13000000 ]; then echo "MEMKILL rss_kb=$rss" | tee -a err.txt; kill -9 $k; fi
+            fi
+            sleep 2
+          done
+          wait $pid; rc=$?
+          wall=$(( $(date +%s) - start ))
+          grep -E '^(ABBREV_ARGS|ABBREV_DECL|ABBREV_TOP|NESTED_REC|LAZY_RETRY)' err.txt | head -80
+          echo "last progress: $(grep '^\[decl' err.txt | tail -1)"
+          echo "MARGIN budget=$BUDGET sha=$(git rev-parse --short HEAD) rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') wall=${wall}s $(grep -m1 '^ABBREV_ARGS budget' err.txt) $(grep -m1 -E '^(REJECT|DECLINE|ERROR|MEMKILL)' err.txt | cut -c1-250)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  sweep:
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: ['b1', 'b2', 'b3', 'b5', 'b10', 'b30', 'b100', 'b1000', 'only1', 'only2', 'only3', 'only5', 'every2', 'every3']
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          path: src-tree
+      - uses: dtolnay/rust-toolchain@stable
+      - working-directory: src-tree
+        run: cargo build --release --locked && sha256sum target/release/kiota && git rev-parse HEAD
+      - name: Every bad case under the mode
+        env:
+          MODE: ${{ matrix.mode }}
+        run: |
+          set +e
+          mkdir -p arena && curl -sL https://arena.lean-lang.org/lean-arena-tests.tar.gz -o arena.tgz
+          sha256sum arena.tgz; tar -xzf arena.tgz -C arena
+          case $MODE in
+            b*) export KIOTA_ABBREV_ARGS_BUDGET=${MODE#b};;
+            only*) export KIOTA_ABBREV_EXHAUST=only:${MODE#only};;
+            every*) export KIOTA_ABBREV_EXHAUST=every:${MODE#every};;
+          esac
+          export KIOTA_ABBREV_STATS=1
+          files="$(find arena -path '*bad*' -name '*.ndjson' | sort) $(ls src-tree/tests/fixtures/*.reject*.ndjson) $(ls harness/review/adv/*.bad.ndjson)"
+          n=0; wa=0
+          for f in $files; do
+            n=$((n+1))
+            timeout 600 ./src-tree/target/release/kiota "$f" >/dev/null 2>err.txt; rc=$?
+            ex=$(grep -m1 '^ABBREV_ARGS budget' err.txt | sed 's/.*exhausted_frames=//')
+            [ $rc -eq 0 ] && wa=$((wa+1))
+            echo "SWEEP mode=$MODE case=$f rc=$rc exh=$ex $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-120)" | tee -a sweep.txt
+          done
+          echo "SWEEPSUM mode=$MODE cases=$n rc0=$wa" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep ' rc=0 ' sweep.txt | tee -a "$GITHUB_STEP_SUMMARY"
