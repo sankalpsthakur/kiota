@@ -1,4 +1,4 @@
-use crate::env::{ConstantInfo, Environment, QuotKind, ReducibilityHints};
+use crate::env::{ConstantInfo, Environment, NestedIotaRule, QuotKind, ReducibilityHints};
 use crate::expr::{self, BinderInfo, Expr, ExprData, Lit};
 use crate::level::{self, Level};
 use crate::nat;
@@ -5025,9 +5025,15 @@ impl<'e> Checker<'e> {
         let ctor_params = &ctor_args[..cnp as usize];
         let fields = &ctor_args[cnp as usize..];
 
-        let minor_idx = self
-            .minor_index_from_type(rname, &us, &level_params, params, cname, ctor_params)
-            .unwrap_or_else(|| self.ctor_minor_index(cname, rname, &all));
+        let Some(nested_rule) = self.nested_iota_rule(rname, cname, fields.len()) else {
+            return Ok(None);
+        };
+        let minor_idx = match nested_rule {
+            Some(rule) => rule.minor_idx as usize,
+            None => self
+                .minor_index_from_type(rname, &us, &level_params, params, cname, ctor_params)
+                .unwrap_or_else(|| self.ctor_minor_index(cname, rname, &all)),
+        };
         if minor_idx >= minors.len() {
             return Ok(None);
         }
@@ -5053,7 +5059,7 @@ impl<'e> Checker<'e> {
         // multi-level-param constructor the way a literal `Const` major
         // does).
         let ctor_us_owned = ctor_us.unwrap_or_else(|| us.to_vec());
-        let rhs = self.iota_from_first_principles(
+        let Some(rhs) = self.iota_from_first_principles(
             ctx,
             rname,
             &us,
@@ -5067,7 +5073,11 @@ impl<'e> Checker<'e> {
             minors[minor_idx].clone(),
             cname,
             fields,
-        )?;
+            nested_rule,
+        )?
+        else {
+            return Ok(None);
+        };
         if self.projection_trace_enabled {
             let mut trace = self.projection_iota_trace.borrow_mut();
             if trace.len() >= 16 { trace.pop_front(); }
@@ -5655,12 +5665,13 @@ impl<'e> Checker<'e> {
         minor: Expr,
         cname: u32,
         fields: &[Expr],
-    ) -> R<Expr> {
+        nested_rule: Option<&NestedIotaRule>,
+    ) -> R<Option<Expr>> {
         let (ctor_lp, ctor_typ) = match self.env.get(cname) {
             Some(ConstantInfo::Constructor {
                 level_params, typ, ..
             }) => (level_params.clone(), typ.clone()),
-            _ => return Ok(minor),
+            _ => return Ok(if nested_rule.is_some() { None } else { Some(minor) }),
         };
         // `ctor_us`, the constructor's own universe args at its
         // application site — not `us` (see the call site's own comment).
@@ -5678,16 +5689,34 @@ impl<'e> Checker<'e> {
         let mut result = minor;
         let mut rec_calls: Vec<Expr> = Vec::new();
         let mut cctx = ctx.clone();
-        for f in fields {
+        for (field_idx, f) in fields.iter().enumerate() {
             // There is one constructor binder for every supplied field.
             // A resource/type error is not the end of the telescope: returning
             // a partly applied minor here constructs an ill-typed reduction.
             let (_, dom, body) = self.ensure_pi(&cctx, &ct)?;
             result = expr::app(result, f.clone());
-            if let Some(rec_call) =
-                self.mk_rec_call(&cctx, rname, us, all, params, motives, minors, f, &dom)?
-            {
-                rec_calls.push(rec_call);
+            match nested_rule {
+                // A nested block: the declaration says which fields are
+                // recursive and whose recursor each one recurs with.
+                Some(rule) => {
+                    if let Some(&(_, rec)) =
+                        rule.ihs.iter().find(|(i, _)| *i as usize == field_idx)
+                    {
+                        match self.mk_rec_call(
+                            &cctx, rname, us, all, params, motives, minors, f, &dom, Some(rec),
+                        )? {
+                            Some(rec_call) => rec_calls.push(rec_call),
+                            None => return Ok(None),
+                        }
+                    }
+                }
+                None => {
+                    if let Some(rec_call) = self.mk_rec_call(
+                        &cctx, rname, us, all, params, motives, minors, f, &dom, None,
+                    )? {
+                        rec_calls.push(rec_call);
+                    }
+                }
             }
             // `instantiate1` discharges the binder that `ensure_pi` peeled,
             // so the next `ct` lives at the same depth as this one. Pushing
@@ -5697,11 +5726,33 @@ impl<'e> Checker<'e> {
             // Array.foldlM_toList.aux._unary failed.
             ct = inst1_at(S::IOTA, &body, f);
         }
+        if nested_rule.is_some_and(|rule| rule.ihs.len() != rec_calls.len()) {
+            return Ok(None);
+        }
         for rec_call in rec_calls {
             result = expr::app(result, rec_call);
         }
         let _ = (level_params,);
-        Ok(result)
+        Ok(Some(result))
+    }
+
+    /// The declaration's iota rule for `cname` under `rname` when `rname`
+    /// belongs to a nested block. `Some(None)`: not a nested block, so the
+    /// general path applies. `None`: `rname` does not reduce `cname` with
+    /// `num_fields` fields, so there is no iota step.
+    fn nested_iota_rule(
+        &self,
+        rname: u32,
+        cname: u32,
+        num_fields: usize,
+    ) -> Option<Option<&NestedIotaRule>> {
+        match self.env.nested_iota.get(&rname) {
+            None => Some(None),
+            Some(rules) => match rules.get(&cname) {
+                Some(rule) if rule.num_fields as usize == num_fields => Some(Some(rule)),
+                _ => None,
+            },
+        }
     }
 
     fn mk_rec_call(
@@ -5715,6 +5766,7 @@ impl<'e> Checker<'e> {
         minors: &[Expr],
         field: &Expr,
         field_ty: &Expr,
+        forced: Option<u32>,
     ) -> R<Option<Expr>> {
         let is_rec = match self.env.get(rname) {
             Some(ConstantInfo::Recursor { all, .. }) => {
@@ -5725,7 +5777,7 @@ impl<'e> Checker<'e> {
             }
             _ => true,
         };
-        if !is_rec {
+        if !is_rec && forced.is_none() {
             return Ok(None);
         }
         let mut ty = self
@@ -5749,7 +5801,41 @@ impl<'e> Checker<'e> {
             _ => return Ok(None),
         };
         let shift_by = binders.len() as i32;
-        let (rec_name, rec_params, indices): (u32, Vec<Expr>, &[Expr]) = if all.contains(&target) {
+        let (rec_name, rec_params, indices): (u32, Vec<Expr>, &[Expr]) = if let Some(frec) = forced {
+            // Nested block: `frec` is the recursor the declaration gives this
+            // field. Only the parameters and indices come from the field type.
+            let (f_nparams, f_nindices) = match self.env.get(frec) {
+                Some(ConstantInfo::Recursor { num_params, num_indices, .. }) => {
+                    (*num_params as usize, *num_indices as usize)
+                }
+                _ => return Ok(None),
+            };
+            let frec_is_main = all.iter().any(|t| self.env.rec_of.get(t) == Some(&frec));
+            if f_nparams != params.len() || frec_is_main != all.contains(&target) {
+                return Ok(None);
+            }
+            if frec_is_main {
+                if self.env.rec_of.get(&target) != Some(&frec) || iargs.len() < f_nparams {
+                    return Ok(None);
+                }
+                for (p_field, p_rec) in iargs[..f_nparams].iter().zip(params.iter()) {
+                    let p_rec_shifted = shift_at(S::IOTA, p_rec, shift_by, 0);
+                    if !self.is_def_eq(&tctx, p_field, &p_rec_shifted)? {
+                        return Ok(None);
+                    }
+                }
+                (frec, iargs[..f_nparams].to_vec(), &iargs[f_nparams..])
+            } else {
+                if iargs.len() < f_nindices {
+                    return Ok(None);
+                }
+                (
+                    frec,
+                    params.iter().map(|p| shift_at(S::IOTA, p, shift_by, 0)).collect(),
+                    &iargs[iargs.len() - f_nindices..],
+                )
+            }
+        } else if all.contains(&target) {
             let rec = self.env.rec_of.get(&target).copied().unwrap_or(rname);
             let nparams = match self.env.get(rec) {
                 Some(ConstantInfo::Recursor { num_params, .. }) => *num_params as usize,
@@ -7597,9 +7683,15 @@ impl<'e> Checker<'e> {
         let minors_q = self.quote_all(depth, minors)?;
         let fields_q = self.quote_all(depth, fields)?;
 
-        let minor_idx = self
-            .minor_index_from_type(rname, &us, &level_params, &params_q, cname, &ctor_params_q)
-            .unwrap_or_else(|| self.ctor_minor_index(cname, rname, &all));
+        let Some(nested_rule) = self.nested_iota_rule(rname, cname, fields_q.len()) else {
+            return Ok(None);
+        };
+        let minor_idx = match nested_rule {
+            Some(rule) => rule.minor_idx as usize,
+            None => self
+                .minor_index_from_type(rname, &us, &level_params, &params_q, cname, &ctor_params_q)
+                .unwrap_or_else(|| self.ctor_minor_index(cname, rname, &all)),
+        };
         if minor_idx >= minors.len() {
             return Ok(None);
         }
@@ -7608,7 +7700,7 @@ impl<'e> Checker<'e> {
         // recursor's), or a nested type's own multi-level-param
         // constructor is left partly unsubstituted.
         let ctor_us_owned = ctor_us.unwrap_or_else(|| us.to_vec());
-        let rhs = self.iota_from_first_principles(
+        let Some(rhs) = self.iota_from_first_principles(
             &dctx,
             rname,
             &us,
@@ -7622,7 +7714,11 @@ impl<'e> Checker<'e> {
             minors_q[minor_idx].clone(),
             cname,
             &fields_q,
-        )?;
+            nested_rule,
+        )?
+        else {
+            return Ok(None);
+        };
         let result = self.eval(&nbe::generic_env(depth), &rhs)?;
         self.iota_value_cache_insert(rname, &us, &args, result.clone());
         Ok(Some(result))
@@ -12120,15 +12216,15 @@ fn regression_430_iota_propagates_constructor_telescope_decline() {
     tc.ensure_pi(&ctx, ctor_ty).unwrap();
     let normal = tc.iota_from_first_principles(
         &ctx, 3, &[], &[], &[], &[0], &[], &[],
-        &[motive.clone()], &[base.clone(), step.clone()], step.clone(), 2, &[field.clone()],
-    ).unwrap();
+        &[motive.clone()], &[base.clone(), step.clone()], step.clone(), 2, &[field.clone()], None,
+    ).unwrap().unwrap();
     let normal_ty = tc.infer_type(&ctx, &normal).unwrap();
     assert!(tc.is_def_eq(&ctx, &normal_ty, &nat_ty).unwrap());
     assert!(tc.is_def_eq(&ctx, &normal, &expr::app(expr::const_(2, vec![]), field.clone())).unwrap());
     let saved = WHNF_DEPTH.with(|depth| depth.replace(CONV_DEPTH));
     let result = tc.iota_from_first_principles(
         &ctx, 3, &[], &[], &[], &[0], &[], &[],
-        &[motive], &[base, step.clone()], step, 2, &[field],
+        &[motive], &[base, step.clone()], step, 2, &[field], None,
     );
     WHNF_DEPTH.with(|depth| depth.set(saved));
     assert!(matches!(result, Err(TcError::Decline(_))),
