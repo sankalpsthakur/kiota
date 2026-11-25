@@ -1,6 +1,7 @@
 /-
-Source of `k-like-eq-rec-under-nat-add.{accept,reject}` (Lean 4.36.0; exported
-with `leanexport Adv2 -- Adv2.k_nat_ok` / `Adv2.k_nat_bad`). The K-like
+Source of `k-like-eq-rec-under-nat-add.{accept,reject}` and
+`k-like-eq-rec.reject` (Lean 4.36.0; exported with `leanexport Adv2 --
+Adv2.k_nat_ok` / `Adv2.k_nat_bad` / `Adv2.k_top_bad`). The K-like
 `Eq.rec` whose proof is `Std.Time.Nanosecond.Offset.ofHours._proof_1` sits
 under `Nat.add`, so the closed-`Nat` driver evaluates it; the comparison that
 reduces it must keep its own depth cap (a deeper one counts a literal of 2^29
@@ -33,3 +34,4 @@ def mk (thm : Name) (wrap : Bool) (rhs : Nat) : CommandElabM Unit := liftTermEla
 set_option debug.skipKernelTC true
 run_cmd mk `Adv2.k_nat_ok true 7
 run_cmd mk `Adv2.k_nat_bad true 8
+run_cmd mk `Adv2.k_top_bad false 8

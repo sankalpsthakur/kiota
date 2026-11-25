@@ -2127,6 +2127,9 @@ fn a_comparison_cut_short_by_the_depth_cap_declines_rather_than_rejects() {
 fn a_k_like_eq_rec_under_nat_add_keeps_its_verdicts() {
     expect_accept_deep("k-like-eq-rec-under-nat-add.accept.ndjson");
     expect_reject_deep("k-like-eq-rec-under-nat-add.reject.ndjson");
+    // Without `Nat.add`: the countdown cut short inside the comparisons that
+    // only look for a cheap proof does not bear on the rejection.
+    expect_reject_deep("k-like-eq-rec.reject.ndjson");
 }
 
 /// The arena's four cases (2^19 nested additions; byte copies of the

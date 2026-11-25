@@ -14178,8 +14178,32 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             let tc = Checker::new(&env, &names, Some(0), None);
             let deep = nested_additions(expr::lit_nat(0u32.into()), 3 * CONV_DEPTH);
             let hits = limit_hits();
-            assert!(tc.is_def_eq(&Ctx::new(), &deep, &expr::lit_nat((3 * CONV_DEPTH).into())).unwrap());
+            let v = tc.whnf(&Ctx::new(), &deep).unwrap();
+            assert_eq!(nat::as_lit(&v), Some(&BigUint::from(3 * CONV_DEPTH)));
             assert_eq!(limit_hits(), hits, "no depth cap was reached");
+        });
+    }
+
+    /// A chain that ends in a stuck term (an axiom) has no literal value; its
+    /// arguments' weak head normal forms are memoized by the driver itself,
+    /// so the retry finds them and the evaluation completes.
+    #[test]
+    fn a_deep_closed_chain_over_an_axiom_completes() {
+        on_gib_stack(|| {
+            let (mut env, mut names) = deep_nat_checker_parts();
+            env.insert(8, ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::const_(0, vec![]),
+                is_unsafe: false,
+            });
+            names.push(std::rc::Rc::new("ax".into()));
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let deep = nested_additions(expr::const_(8, vec![]), 20_000);
+            let before = nat_suspensions();
+            let r = tc.whnf(&Ctx::new(), &deep);
+            assert!(r.is_ok(), "{r:?}");
+            assert!(nat_suspensions() > before, "the spine was evaluated by suspensions");
+            assert!(nat::as_lit(&r.unwrap()).is_none());
         });
     }
 
