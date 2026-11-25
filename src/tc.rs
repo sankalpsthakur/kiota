@@ -1111,12 +1111,17 @@ impl<'e> Checker<'e> {
 
     fn check_decl_once(&self, name: u32, kind: &str) -> R<()> {
         crate::stats::decl_start(expr::next_identity());
-        CUT_SHORT.with(|c| c.set(false));
-        let r = self.check_decl_once_go(name, kind);
+        let r = Self::conclusive(|| self.check_decl_once_go(name, kind));
         crate::stats::decl_end();
-        match r {
-            // The failed comparison rests on a computation that a resource
-            // limit cut short (see `CUT_SHORT`): it may hold all the same.
+        r
+    }
+
+    /// Run a check whose rejection must be conclusive: one that rests on a
+    /// computation a resource limit cut short (see `CUT_SHORT`) is reported
+    /// as a decline, since what failed may hold all the same.
+    fn conclusive(f: impl FnOnce() -> R<()>) -> R<()> {
+        CUT_SHORT.with(|c| c.set(false));
+        match f() {
             Err(TcError::Reject(msg)) if CUT_SHORT.with(|c| c.replace(false)) => {
                 Err(TcError::Decline(format!(
                     "{msg} (it rests on a computation cut short by a depth or budget limit)"
@@ -7106,6 +7111,10 @@ impl<'e> Checker<'e> {
     /// recursor before this point would make the subsequent construction
     /// circular.
     pub(crate) fn check_inductive_group_structure(&self, first_name: u32) -> R<()> {
+        Self::conclusive(|| self.check_inductive_group_structure_go(first_name))
+    }
+
+    fn check_inductive_group_structure_go(&self, first_name: u32) -> R<()> {
         let ci = self
             .env
             .get(first_name)
@@ -7659,7 +7668,7 @@ impl<'e> Checker<'e> {
     /// committing the block transaction.
     pub fn check_inductive_group(&self, first_name: u32) -> R<()> {
         self.check_inductive_group_structure(first_name)?;
-        self.check_inductive_group_large_elim(first_name)
+        Self::conclusive(|| self.check_inductive_group_large_elim(first_name))
     }
 
     /// Walk a constructor's argument telescope; each argument type must be
@@ -14142,6 +14151,9 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             .expect("test thread panicked");
     }
 
+    /// The comparisons below run on the eager path even under `KIOTA_NBE=1`
+    /// (`with_forced_eager_defeq`), where the driver lives; NbE evaluates a
+    /// 20,000-deep chain its own way.
     fn deep_nat_checker_parts() -> (Environment, Vec<std::rc::Rc<String>>) {
         (
             regression_432_nat_arithmetic_env(),
@@ -14160,11 +14172,11 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             let tc = Checker::new(&env, &names, Some(0), None);
             let deep = nested_additions(expr::lit_nat(0u32.into()), 20_000);
             let before = nat_suspensions();
-            assert!(tc.is_def_eq(&Ctx::new(), &deep, &expr::lit_nat(20_000u32.into())).unwrap());
+            assert!(tc.with_forced_eager_defeq(|| tc.is_def_eq(&Ctx::new(), &deep, &expr::lit_nat(20_000u32.into()))).unwrap());
             assert!(nat_suspensions() > before, "the spine was evaluated by suspensions");
             assert!(!cut_short(), "nothing was cut short");
             let tc = Checker::new(&env, &names, Some(0), None);
-            assert!(!tc.is_def_eq(&Ctx::new(), &deep, &expr::lit_nat(20_001u32.into())).unwrap());
+            assert!(!tc.with_forced_eager_defeq(|| tc.is_def_eq(&Ctx::new(), &deep, &expr::lit_nat(20_001u32.into()))).unwrap());
             assert!(!cut_short(), "the inequality is conclusive");
         });
     }
@@ -14217,7 +14229,7 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             let deep = nested_additions(expr::lit_nat(0u32.into()), 20_000);
             NAT_PENDING_CAP.with(|c| c.set(4));
             let hits = limit_hits();
-            let r = tc.is_def_eq(&Ctx::new(), &deep, &expr::lit_nat(20_000u32.into()));
+            let r = tc.with_forced_eager_defeq(|| tc.is_def_eq(&Ctx::new(), &deep, &expr::lit_nat(20_000u32.into())));
             NAT_PENDING_CAP.with(|c| c.set(NAT_MAX_PENDING));
             assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
             assert!(limit_hits() > hits, "the budget counts as a limit");
@@ -14240,7 +14252,7 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             let deep = nested_additions(expr::bvar(0), 20_000);
             let other = nested_additions(expr::bvar(0), 19_999);
             CUT_SHORT.with(|c| c.set(false));
-            let r = tc.is_def_eq(&ctx, &deep, &other);
+            let r = tc.with_forced_eager_defeq(|| tc.is_def_eq(&ctx, &deep, &other));
             assert!(
                 matches!(r, Err(TcError::Decline(_))) || (matches!(r, Ok(false)) && cut_short()),
                 "{r:?} cut_short={}",
