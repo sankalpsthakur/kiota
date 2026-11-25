@@ -1,0 +1,43 @@
+name: remote-deep-evaluation-mut
+
+# Mutation tests for fix/deep-evaluation-v2 (48d83ba, pinned): each job removes
+# one guard of the closed-Nat driver or of the cut-short decline
+# (scripts/mut/mutate.py on this branch) and runs the release test suite. A
+# mutant is killed when a committed test fails.
+on:
+  push:
+    branches: ['remote/deep-evaluation-v2-mut-*']
+permissions:
+  contents: read
+env:
+  V2: 48d83ba4e8240f0ff9c71e59cc2a0a38e94ae09a
+jobs:
+  mut:
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [M00_none, M01_driver_off, M02_never_suspend, M03_no_epoch_on_suspend, M04_whnf_memo_over_suspension, M05_core_memo_over_suspension, M06_defeq_false_memo_always, M07_no_reject_to_decline, M08_no_shape_clear, M09_no_speculative_restore, M10_no_fallback_restore, M11_no_true_restore, M12_no_cache_marks, M13_no_cache_mark_reads, M14_no_driver_discard_restore, M15_no_rescue_restore, M16_no_again_check, M17_no_pending_cap, M18_no_early_decline_while_suspended, M19_no_memo_lookup, M20_no_margin, M21_core_abort_not_counted, M22_no_nat_values]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.V2 }}
+          path: v2
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply and test
+        env:
+          M: ${{ matrix.mutant }}
+        working-directory: v2
+        run: |
+          set -o pipefail
+          [ "$M" = M00_none ] || python3 ../harness/scripts/mut/mutate.py "$M" src/tc.rs
+          git diff --stat
+          timeout 4800 cargo test --release --locked 2>&1 | tee test.log
+          rc=$?
+          grep -E '^test .*FAILED|^failures:|panicked at' test.log | head -20
+          verdict=SURVIVED; [ $rc -ne 0 ] && verdict=KILLED
+          echo "MUT mutant=$M rc=$rc $verdict failed_tests=\"$(grep -E '^test .* FAILED' test.log | awk '{print $2}' | tr '\n' ' ')\"" | tee -a "$GITHUB_STEP_SUMMARY"
