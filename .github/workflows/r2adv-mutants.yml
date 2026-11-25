@@ -1,0 +1,42 @@
+name: r2adv-mutants
+
+# Round-2 adversarial review of fix/integrate-20261125 (3fd8d86): each job
+# removes one guard added by fix/nested-iota-from-declaration (N*) or
+# snd/inductive-audit-2 (A*; A10 is the merged rule-list check) and runs the
+# committed cargo test suite, the committed fixtures and the reviewer's
+# adversarial exports (r2adv/adv, expected verdicts from leanchecker 4.36 /
+# Lean 4.36 addDeclCore). "base" is the unmutated tree. A mutant is killed
+# only when a named test FAILs; a build failure is reported as build_rc!=0.
+on:
+  push:
+    branches: ['remote/r2adv-mut-*']
+permissions:
+  contents: read
+jobs:
+  mutant:
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [base,N1_rule_miss_falls_back,N2_no_num_fields_check,N3_no_ih_count_check,N4_forced_none_skips_ih,N5_no_main_aux_kind_check,N6_no_rec_of_target_check,N7_no_forced_param_defeq,N8_aux_no_indices,N9_minor_by_name_not_table,N10_ih_not_forced,N11_no_dup_ctor_check,N12_member_outside_block_skipped,N13_rollback_keeps_nested_iota,N14_no_table_at_all,A1_no_projects_any,A2_no_nested_prefix_sig,A3_no_nested_prefix_ctor,A4_no_keep_written,A5_conclusion_levels_defeq,A6_imax_not_recorded,A7_max_not_recorded,A8_nested_prefix_exact_only,A9_no_nested_prefix_proj,A10_no_rule_list_check,A11_keep_written_even_if_declared,A12_disguised_never_cleared,N15_forced_ignored_for_nonrec,N16_no_index_count_check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply mutant
+        run: python3 r2adv/r2mutate.py ${{ matrix.mutant }} . && git diff --stat
+      - name: Build, test and check
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          cargo build --release --locked > build.log 2>&1; brc=$?
+          tail -5 build.log
+          if [ $brc != 0 ]; then grep -E '^error' -A5 build.log | head -40; echo "MUT ${{ matrix.mutant }} sha=$(git rev-parse --short HEAD) build_rc=$brc" | tee -a $GITHUB_STEP_SUMMARY; exit 0; fi
+          cargo test --release --locked --no-fail-fast > test.log 2>&1; trc=$?
+          failed=$(grep -E '^test .* FAILED$' test.log | awk '{print $2}' | tr '\n' ' ')
+          passed=$(grep -E '^test result:' test.log | awk '{s+=$4} END{print s}')
+          grep -E '^test result:|panicked' test.log | head -30
+          echo "MUT ${{ matrix.mutant }} sha=$(git rev-parse --short HEAD) build_rc=0 test_rc=$trc passed=$passed failed=[$failed]" | tee -a $GITHUB_STEP_SUMMARY
+          r2adv/check.sh target/release/kiota ${{ matrix.mutant }} | tee -a $GITHUB_STEP_SUMMARY
+          exit 0
