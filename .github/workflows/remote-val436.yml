@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        side: [main, snd/export-names, snd/validated-extensions, snd/inductive-audit, snd/interner-memory, fix/deep-evaluation]
+        side: [fix/deep-evaluation]
         corpus: [init, std, cedar, cslib]
     runs-on: ubuntu-latest
     timeout-minutes: 120
