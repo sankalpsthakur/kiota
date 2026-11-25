@@ -1,0 +1,48 @@
+name: remote-swapv2-mut
+
+# Mutation run for the abbrev argument frame of fix/mathlib-swap-v2
+# (ba4a2e5). Each job applies one mutant from scripts/mut/mutate.py to the
+# pinned source and runs the whole suite, cargo test --release. A mutant is
+# killed only when a test fails ("test result: FAILED"); a build failure is
+# reported as BUILD_FAIL, not as a kill. "control" applies nothing and must
+# pass.
+on:
+  push:
+    branches: ['remote/swapv2-mut-*']
+permissions:
+  contents: read
+env:
+  HEAD_SHA: ba4a2e5e7f970b4c9d8fdd04433d890821c5c292
+jobs:
+  mutant:
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [control,M1_no_frame_entry,M2_no_budget_check,M3_no_decline_when_exhausted,M4_keep_result_when_exhausted,M5_no_core_aborted_restore,M13_no_depth_restore_on_budget_decline,M14_exhausted_flag_not_cleared,M15_nested_frames,M16_no_frame_reset,M17_any_def,M6_infer_cache_not_frozen,M6b_xinfer_copy_not_frozen,M7_spine_not_frozen,M8_defeq_cache_not_frozen,M9_whnf_cache_not_frozen,M9b_xwhnf_not_frozen,M10_whnf_core_cache_not_frozen,M11_iota_lit_memo_not_frozen,M12_iota_value_cache_not_frozen,M18_proof_arg_cache_not_frozen,M19_native_string_not_frozen,M20_thunk_not_frozen,M21_nested_rec_for_type_swallows,M22_mk_rec_call_swallows,M23_no_decl_cap,M24_abandoned_pass_compares_on,M25_abandoned_pass_verdict_kept,M26_abandoned_pass_memoizes,M27_abandoned_entry_depth_leak]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          path: src
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply and test
+        env:
+          M: ${{ matrix.mutant }}
+        run: |
+          set +e
+          cd src
+          python3 -I ../harness/scripts/mut/mutate.py "$M" || { echo "MUT $M APPLY_FAIL" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
+          git diff --stat
+          cargo build --release --tests --locked > build.log 2>&1
+          if [ $? -ne 0 ]; then tail -30 build.log; echo "MUT $M BUILD_FAIL" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
+          cargo test --release --locked > test.log 2>&1; rc=$?
+          failed=$(grep -E '^test .* FAILED$' test.log | sed 's/^test //; s/ \.\.\. FAILED//' | tr '\n' ' ')
+          oks=$(grep -c '^test result: ok' test.log); fails=$(grep -c '^test result: FAILED' test.log)
+          grep -E '^test result' test.log
+          if [ "$fails" -gt 0 ]; then verdict=KILLED; elif [ $rc -eq 0 ]; then verdict=SURVIVED; else verdict="ERROR rc=$rc"; fi
+          echo "MUT $M $verdict suites_ok=$oks suites_failed=$fails failed_tests=$failed" | tee -a "$GITHUB_STEP_SUMMARY"
