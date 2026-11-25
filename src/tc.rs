@@ -146,11 +146,6 @@ thread_local! {
     /// unfold without end (`f ∘ f` against `f` under `DFunLike.coe` in
     /// Mathlib `Polynomial.Bivariate.swap._proof_1`).
     static ABBREV_ARGS: Cell<bool> = const { Cell::new(false) };
-    /// Bumped when an `ABBREV_ARGS` comparison ends in its decline, which the
-    /// abbrev frame reads as "not proved". `try_speculative_congruence`
-    /// re-raises it if nothing else proves the pair, so the decline stands
-    /// against a main-path `false` as any speculative decline does.
-    static ABBREV_UNPROVED: Cell<u64> = const { Cell::new(0) };
     /// Bumped by every `decline`. Nothing else bumps it while a decline
     /// propagates through `?`, so enclosing frames can tell it is the same one.
     static DECLINE_SERIAL: Cell<u64> = const { Cell::new(0) };
@@ -3102,17 +3097,6 @@ impl<'e> Checker<'e> {
     /// cheap `whnf_core`. `Ok(true)` proves equality; `Ok(false)` and a
     /// `Decline` both mean "not proved this way" (see `is_def_eq_inner_body`).
     fn try_speculative_congruence(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
-        let unproved = ABBREV_UNPROVED.with(Cell::get);
-        if self.try_speculative_congruence_go(ctx, a, b)? {
-            return Ok(true);
-        }
-        if ABBREV_UNPROVED.with(Cell::get) != unproved {
-            return decline(ABBREV_ARGS_DECLINE);
-        }
-        Ok(false)
-    }
-
-    fn try_speculative_congruence_go(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         if self.try_unreduced_const_congruence(ctx, a, b)? {
             return Ok(true);
         }
@@ -3331,8 +3315,11 @@ impl<'e> Checker<'e> {
             }
         };
         // An abbrev head: the arguments may only prove equality (see
-        // `ABBREV_ARGS`). The outermost such frame reads the decline as "not
-        // proved this way"; nested ones let it propagate to it.
+        // `ABBREV_ARGS`). The outermost such frame reads its own decline as
+        // "not proved this way", like `false`: it stands for a question
+        // official never asks, not for one kiota could not finish, so the
+        // main path's answer stands after it. Nested frames let it propagate
+        // to that frame; any other decline propagates as before.
         let r = if !ABBREV_ARGS.with(Cell::get)
             && matches!(self.env.get(*n1), Some(ConstantInfo::Def { hints: ReducibilityHints::Abbrev, .. }))
         {
@@ -3344,7 +3331,6 @@ impl<'e> Checker<'e> {
                 Ok(r) => r,
                 Err(TcError::Decline(msg)) if msg == ABBREV_ARGS_DECLINE => {
                     CORE_ABORTED.with(|c| c.set(abort_before));
-                    ABBREV_UNPROVED.with(|n| n.set(n.get() + 1));
                     false
                 }
                 Err(e) => return Err(e),
@@ -12453,10 +12439,19 @@ fn regression_432_defining_equations_and_closed_values_convert() {
 
     #[test]
     fn speculative_decline_falls_back_to_projection() {
-        on_big_stack(speculative_decline_falls_back_to_projection_body)
+        on_big_stack(|| speculative_decline_falls_back_to_projection_body(false))
     }
 
-    fn speculative_decline_falls_back_to_projection_body() {
+    /// The same with `Pair.fst` an abbrev, as Lean's projection functions
+    /// are. Its arguments are compared proof-only (`ABBREV_ARGS`): `slow n`
+    /// against `slow m` is never evaluated, and `0` against `1` after
+    /// unfolding `Pair.fst` on both sides is official's answer, `false`.
+    #[test]
+    fn speculative_decline_under_an_abbrev_projection() {
+        on_big_stack(|| speculative_decline_falls_back_to_projection_body(true))
+    }
+
+    fn speculative_decline_falls_back_to_projection_body(fst_abbrev: bool) {
         // perf/proj-lazy-struct: `(P (slow n)).1` vs `(Q (slow m)).1`.
         // Congruence on `Pair.fst` compares the structs, and so `slow n`
         // with `slow m`, which declines here (`Nat.rec` on a literal past
@@ -12495,7 +12490,7 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             level_params: vec![],
             typ: pi(pair.clone(), nat.clone()),
             value: lam(pair.clone(), expr::proj(5, 0, v(0))),
-            hints: RH::Abbrev,
+            hints: if fst_abbrev { RH::Abbrev } else { RH::Regular(1) },
             is_unsafe: false,
         });
         // P a := ⟨0, a⟩ and Q a := ⟨0, a⟩.
@@ -12561,8 +12556,13 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         let lhs = fst(expr::apps(c(10), &[slow(&big), lit(&zero)]));
         let rhs = fst(expr::apps(c(10), &[slow(&big1), lit(&one)]));
         let r = eq(&lhs, &rhs);
-        assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+        if fst_abbrev {
+            assert!(matches!(r, Ok(false)), "{r:?}");
+        } else {
+            assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+        }
         assert!(!SPECULATING.with(Cell::get));
+        assert!(!ABBREV_ARGS.with(Cell::get));
         assert!(!CORE_ABORTED.with(Cell::get));
     }
 
