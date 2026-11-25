@@ -6832,11 +6832,9 @@ impl<'e> Checker<'e> {
                     ExprData::Const(n, us) if n == tname => {
                         let expected: Vec<Level> =
                             shared_lp.iter().map(|p| level::param(*p)).collect();
-                        if us.len() != expected.len()
-                            || !us
-                                .iter()
-                                .zip(expected.iter())
-                                .all(|(a, b)| level::is_def_eq(a, b))
+                        // `is_valid_ind_app` compares the levels as
+                        // written, like `check_uniform_ind_occs`.
+                        if us.len() != expected.len() || us.iter().zip(expected.iter()).any(|(a, b)| a != b)
                         {
                             return reject(
                                 "constructor conclusion applies inductive type at wrong universes",
@@ -6901,6 +6899,64 @@ impl<'e> Checker<'e> {
                     || Self::mentions_any(b, names, seen)
             }
             ExprData::Proj(s, _, v) => names.contains(s) || Self::mentions_any(v, names, seen),
+            _ => false,
+        }
+    }
+
+    /// Whether `e` contains a projection out of one of `structs`.  Shared
+    /// subterms are visited once.
+    fn projects_any(e: &Expr, structs: &[u32], seen: &mut rustc_hash::FxHashSet<usize>) -> bool {
+        if !seen.insert(expr::identity(e)) {
+            return false;
+        }
+        match &***e {
+            ExprData::App(f, a) => {
+                Self::projects_any(f, structs, seen) || Self::projects_any(a, structs, seen)
+            }
+            ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
+                Self::projects_any(t, structs, seen) || Self::projects_any(b, structs, seen)
+            }
+            ExprData::Let(t, v, b) => {
+                Self::projects_any(t, structs, seen)
+                    || Self::projects_any(v, structs, seen)
+                    || Self::projects_any(b, structs, seen)
+            }
+            ExprData::Proj(s, _, v) => structs.contains(s) || Self::projects_any(v, structs, seen),
+            _ => false,
+        }
+    }
+
+    /// Whether a name lies under the root `_nested`, where the official
+    /// kernel puts the auxiliary types of nested inductive elimination
+    /// (`is_prefix_of(g_nested, n)`).
+    fn is_reserved_nested_name(&self, n: u32) -> bool {
+        let s = self.name_str(n);
+        s == "_nested" || s.starts_with("_nested.")
+    }
+
+    /// `check_no_nested_aux` (inductive.cpp, lean4#14616, in 4.36): whether
+    /// `e` names a constant, or projects out of a structure, under the
+    /// reserved prefix `_nested`.
+    fn mentions_reserved_nested(&self, e: &Expr, seen: &mut rustc_hash::FxHashSet<usize>) -> bool {
+        if !seen.insert(expr::identity(e)) {
+            return false;
+        }
+        match &***e {
+            ExprData::Const(n, _) => self.is_reserved_nested_name(*n),
+            ExprData::App(f, a) => {
+                self.mentions_reserved_nested(f, seen) || self.mentions_reserved_nested(a, seen)
+            }
+            ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
+                self.mentions_reserved_nested(t, seen) || self.mentions_reserved_nested(b, seen)
+            }
+            ExprData::Let(t, v, b) => {
+                self.mentions_reserved_nested(t, seen)
+                    || self.mentions_reserved_nested(v, seen)
+                    || self.mentions_reserved_nested(b, seen)
+            }
+            ExprData::Proj(s, _, v) => {
+                self.is_reserved_nested_name(*s) || self.mentions_reserved_nested(v, seen)
+            }
             _ => false,
         }
     }
@@ -6985,10 +7041,17 @@ impl<'e> Checker<'e> {
     /// What `environment::add_inductive` settles on the declaration as
     /// written, before any reduction:
     ///
+    /// - no signature or constructor type names a constant, or projects
+    ///   out of a structure, under the reserved prefix `_nested`
+    ///   (`check_no_nested_aux`, 4.36);
     /// - the types' own signatures are checked in the environment *before*
     ///   the block, and the constructor types with only the block's types
     ///   added (`check_inductive_types`, `check_constructors`), so neither
-    ///   may name a constant this block introduces beyond that;
+    ///   may name a constant this block introduces beyond that, and a
+    ///   constructor type may not project out of a type of the block: the
+    ///   official kernel infers every subterm, and inferring the projection
+    ///   looks up the type's constructor, which is not declared yet
+    ///   ("unknown constant");
     /// - the first type shows the declaration's parameters as binders
     ///   (`get_params`);
     /// - a type lists each constructor once (`check_constructors`);
@@ -7021,6 +7084,9 @@ impl<'e> Checker<'e> {
             let Some(ConstantInfo::InductiveType { typ, ctors, .. }) = self.env.get(*tname) else {
                 continue;
             };
+            if self.mentions_reserved_nested(typ, &mut Default::default()) {
+                return reject("inductive type's signature uses the reserved prefix `_nested`");
+            }
             if Self::mentions_any(typ, &block_names, &mut Default::default()) {
                 return reject("inductive type's signature refers to the declaration being defined");
             }
@@ -7028,8 +7094,14 @@ impl<'e> Checker<'e> {
                 let Some(ConstantInfo::Constructor { typ: c_typ, .. }) = self.env.get(*cname) else {
                     continue;
                 };
+                if self.mentions_reserved_nested(c_typ, &mut Default::default()) {
+                    return reject("constructor type uses the reserved prefix `_nested`");
+                }
                 if Self::mentions_any(c_typ, &block_ctors, &mut Default::default()) {
                     return reject("constructor type refers to a constructor of the declaration being defined");
+                }
+                if Self::projects_any(c_typ, all, &mut Default::default()) {
+                    return reject("constructor type projects out of a type of the declaration being defined, whose constructor is not declared yet");
                 }
                 Self::check_uniform_ind_occs(c_typ, 0, all, num_params, lps, &mut Default::default())?;
             }

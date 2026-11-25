@@ -151,3 +151,55 @@ def tryAdd (label : String) (decl : Declaration) : CoreM Unit := do
   tryAdd "def-unknown-const.reject#0" (.inductDecl [] 0 [{name := `Zq36.N, type := (.sort (.succ .zero)), ctors := [{name := `Zq36.N.z, type := (.const `Zq36.N [])}, {name := `Zq36.N.s, type := (.forallE `a (.const `Zq36.N []) (.const `Zq36.N []) .default)}]}] false)
   tryAdd "def-unknown-const.reject#1" (.defnDecl {name := `Zq36.d, levelParams := [], type := (.const `Zq36.N []), value := (.const `Zq36.nope []), hints := .abbrev, safety := .safe})
 
+#eval show CoreM Unit from do
+  tryAdd "ind-occ-lam-offset-nonuniform.reject#0" (.inductDecl [] 1 [{name := `Zq37.T, type := (.forallE `a (.sort (.succ .zero)) (.sort (.succ .zero)) .default), ctors := [{name := `Zq37.T.mk, type := (.forallE `a (.sort (.succ .zero)) (.forallE `a (.app (.lam `a (.sort (.succ .zero)) (.app (.const `Zq37.T []) (.bvar 0)) .default) (.bvar 0)) (.app (.const `Zq37.T []) (.bvar 1)) .default) .default)}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-occ-let-body-nonuniform.reject#0" (.inductDecl [] 1 [{name := `Zq38.T, type := (.forallE `a (.sort (.succ .zero)) (.sort (.succ .zero)) .default), ctors := [{name := `Zq38.T.mk, type := (.forallE `a (.sort (.succ .zero)) (.forallE `a (.letE `a (.sort (.succ .zero)) (.bvar 0) (.app (.const `Zq38.T []) (.bvar 0)) false) (.app (.const `Zq38.T []) (.bvar 1)) .default) .default)}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-occ-level-max-uu.reject#0" (.inductDecl [`u] 0 [{name := `Zq39.T, type := (.sort (.succ (.param `u))), ctors := [{name := `Zq39.T.mk, type := (.forallE `a (.const `Zq39.T [(.max (.param `u) (.param `u))]) (.const `Zq39.T [(.param `u)]) .default)}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-occ-level-imax-uu.reject#0" (.inductDecl [`u] 0 [{name := `Zq40.T, type := (.sort (.succ (.param `u))), ctors := [{name := `Zq40.T.mk, type := (.forallE `a (.const `Zq40.T [(.imax (.param `u) (.param `u))]) (.const `Zq40.T [(.param `u)]) .default)}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-result-level-max-uu.reject#0" (.inductDecl [`u] 0 [{name := `Zq41.T, type := (.sort (.succ (.param `u))), ctors := [{name := `Zq41.T.mk, type := (.const `Zq41.T [(.max (.param `u) (.param `u))])}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-occ-level-max-other-const.accept#0" (.axiomDecl {name := `Zq42.Ax, levelParams := [`v], type := (.sort (.succ (.param `v))), isUnsafe := false})
+  tryAdd "ind-occ-level-max-other-const.accept#1" (.inductDecl [`u] 0 [{name := `Zq42.T, type := (.sort (.succ (.param `u))), ctors := [{name := `Zq42.T.mk, type := (.forallE `a (.const `Zq42.Ax [(.max (.param `u) (.param `u))]) (.const `Zq42.T [(.param `u)]) .default)}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-level-max-uu-after-block.accept#0" (.inductDecl [`u] 0 [{name := `Zq43.T, type := (.sort (.succ (.param `u))), ctors := [{name := `Zq43.T.mk, type := (.forallE `a (.const `Zq43.T [(.param `u)]) (.const `Zq43.T [(.param `u)]) .default)}]}] false)
+  tryAdd "ind-level-max-uu-after-block.accept#1" (.defnDecl {name := `Zq43.back, levelParams := [`u], type := (.forallE `a (.const `Zq43.T [(.max (.param `u) (.param `u))]) (.const `Zq43.T [(.param `u)]) .default), value := (.lam `a (.const `Zq43.T [(.max (.param `u) (.param `u))]) (.bvar 0) .default), hints := .abbrev, safety := .safe})
+
+#eval show CoreM Unit from do
+  tryAdd "ind-ctor-field-proj-own-type.reject#0" (.inductDecl [] 0 [{name := `Zq44.N, type := (.sort (.succ .zero)), ctors := [{name := `Zq44.N.z, type := (.const `Zq44.N [])}, {name := `Zq44.N.s, type := (.forallE `a (.const `Zq44.N []) (.const `Zq44.N []) .default)}]}] false)
+  tryAdd "ind-ctor-field-proj-own-type.reject#1" (.inductDecl [] 2 [{name := `Zq44.Eq', type := (.forallE `a (.sort (.succ .zero)) (.forallE `a (.bvar 0) (.forallE `a (.bvar 1) (.sort .zero) .default) .default) .default), ctors := [{name := `Zq44.Eq'.refl, type := (.forallE `a (.sort (.succ .zero)) (.forallE `a (.bvar 0) (.app (.app (.app (.const `Zq44.Eq' []) (.bvar 1)) (.bvar 0)) (.bvar 0)) .default) .default)}]}] false)
+  tryAdd "ind-ctor-field-proj-own-type.reject#2" (.inductDecl [] 0 [{name := `Zq44.T, type := (.sort (.succ .zero)), ctors := [{name := `Zq44.T.mk, type := (.forallE `a (.const `Zq44.N []) (.forallE `a (.const `Zq44.T []) (.forallE `a (.app (.app (.app (.const `Zq44.Eq' []) (.const `Zq44.N [])) (.proj `Zq44.T 0 (.bvar 0))) (.bvar 1)) (.const `Zq44.T []) .default) .default) .default)}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-ctor-field-proj-erased.reject#0" (.inductDecl [] 0 [{name := `Zq45.N, type := (.sort (.succ .zero)), ctors := [{name := `Zq45.N.z, type := (.const `Zq45.N [])}, {name := `Zq45.N.s, type := (.forallE `a (.const `Zq45.N []) (.const `Zq45.N []) .default)}]}] false)
+  tryAdd "ind-ctor-field-proj-erased.reject#1" (.inductDecl [] 0 [{name := `Zq45.T, type := (.sort (.succ .zero)), ctors := [{name := `Zq45.T.mk, type := (.forallE `a (.const `Zq45.N []) (.forallE `a (.const `Zq45.T []) (.forallE `a (.app (.lam `a (.const `Zq45.N []) (.const `Zq45.N []) .default) (.proj `Zq45.T 0 (.bvar 0))) (.const `Zq45.T []) .default) .default) .default)}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-ctor-field-proj-other.accept#0" (.inductDecl [] 0 [{name := `Zq46.N, type := (.sort (.succ .zero)), ctors := [{name := `Zq46.N.z, type := (.const `Zq46.N [])}, {name := `Zq46.N.s, type := (.forallE `a (.const `Zq46.N []) (.const `Zq46.N []) .default)}]}] false)
+  tryAdd "ind-ctor-field-proj-other.accept#1" (.inductDecl [] 0 [{name := `Zq46.P, type := (.sort (.succ .zero)), ctors := [{name := `Zq46.P.mk, type := (.forallE `a (.const `Zq46.N []) (.const `Zq46.P []) .default)}]}] false)
+  tryAdd "ind-ctor-field-proj-other.accept#2" (.inductDecl [] 0 [{name := `Zq46.T, type := (.sort (.succ .zero)), ctors := [{name := `Zq46.T.mk, type := (.forallE `a (.const `Zq46.P []) (.forallE `a (.app (.lam `a (.const `Zq46.N []) (.const `Zq46.N []) .default) (.proj `Zq46.P 0 (.bvar 0))) (.const `Zq46.T []) .default) .default)}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-reserved-nested-prefix.reject#0" (.axiomDecl {name := `Zq47._nested.Foo, levelParams := [], type := (.sort (.succ .zero)), isUnsafe := false})
+  tryAdd "ind-reserved-nested-prefix.reject#1" (.inductDecl [] 0 [{name := `Zq47.T, type := (.sort (.succ .zero)), ctors := [{name := `Zq47.T.mk, type := (.forallE `a (.const `Zq47._nested.Foo []) (.const `Zq47.T []) .default)}]}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-sig-reserved-nested-prefix.reject#0" (.axiomDecl {name := `Zq48._nested.Foo, levelParams := [], type := (.sort (.succ .zero)), isUnsafe := false})
+  tryAdd "ind-sig-reserved-nested-prefix.reject#1" (.inductDecl [] 0 [{name := `Zq48.T, type := (.forallE `a (.const `Zq48._nested.Foo []) (.sort (.succ .zero)) .default), ctors := []}] false)
+
+#eval show CoreM Unit from do
+  tryAdd "ind-reserved-nested-prefix-elsewhere.accept#0" (.axiomDecl {name := `Zq49._nested.Foo, levelParams := [], type := (.sort (.succ .zero)), isUnsafe := false})
+  tryAdd "ind-reserved-nested-prefix-elsewhere.accept#1" (.axiomDecl {name := `Zq49.g, levelParams := [], type := (.forallE `a (.const `Zq49._nested.Foo []) (.const `Zq49._nested.Foo []) .default), isUnsafe := false})
+  tryAdd "ind-reserved-nested-prefix-elsewhere.accept#2" (.axiomDecl {name := `Zq49._nestedFoo, levelParams := [], type := (.sort (.succ .zero)), isUnsafe := false})
+  tryAdd "ind-reserved-nested-prefix-elsewhere.accept#3" (.axiomDecl {name := `Zq49.Foo._nested, levelParams := [], type := (.sort (.succ .zero)), isUnsafe := false})
+  tryAdd "ind-reserved-nested-prefix-elsewhere.accept#4" (.inductDecl [] 0 [{name := `Zq49.T, type := (.sort (.succ .zero)), ctors := [{name := `Zq49.T.mk, type := (.forallE `a (.const `Zq49._nestedFoo []) (.forallE `a (.const `Zq49.Foo._nested []) (.const `Zq49.T []) .default) .default)}]}] false)
+

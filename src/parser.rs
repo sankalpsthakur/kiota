@@ -18,6 +18,10 @@ pub struct Parser {
     /// through all indices of a spelling.
     pub spelling_dups: FxHashMap<String, Vec<u32>>,
     pub levels: Vec<Level>,
+    /// Levels written as `max`/`imax` that `level::max`/`level::imax`
+    /// simplify to a bare parameter (`max u u`, `imax 0 u`, …), by index,
+    /// kept unsimplified at the top. See `handle_expr`.
+    pub disguised_levels: FxHashMap<u32, Level>,
     /// The export's expression nodes by index. A slot is `None` before its
     /// `ie` line and again after `lifetimes` has released it.
     pub exprs: Vec<Option<Expr>>,
@@ -105,6 +109,7 @@ impl Parser {
             name_by_str: FxHashMap::default(),
             spelling_dups: FxHashMap::default(),
             levels: vec![level::zero()], // index 0 = zero
+            disguised_levels: FxHashMap::default(),
             exprs: Vec::new(),
             env: Environment::default(),
             decl_count: 0,
@@ -269,14 +274,29 @@ impl Parser {
     }
 
     fn handle_level(&mut self, idx: u32, v: &Value) {
+        if !self.disguised_levels.is_empty() {
+            self.disguised_levels.remove(&idx);
+        }
         let l = if let Some(a) = v.get("succ") {
             level::succ(self.level_at(a.as_u64().unwrap() as u32))
         } else if let Some(m) = v.get("max") {
             let (a, b) = Self::pair_u32(m);
-            level::max(self.level_at(a), self.level_at(b))
+            let (la, lb) = (self.level_at(a), self.level_at(b));
+            let l = level::max(la.clone(), lb.clone());
+            if matches!(&*l, level::LevelData::Param(_)) {
+                self.disguised_levels
+                    .insert(idx, Rc::new(level::LevelData::Max(la, lb)));
+            }
+            l
         } else if let Some(m) = v.get("imax") {
             let (a, b) = Self::pair_u32(m);
-            level::imax(self.level_at(a), self.level_at(b))
+            let (la, lb) = (self.level_at(a), self.level_at(b));
+            let l = level::imax(la.clone(), lb.clone());
+            if matches!(&*l, level::LevelData::Param(_)) {
+                self.disguised_levels
+                    .insert(idx, Rc::new(level::LevelData::IMax(la, lb)));
+            }
+            l
         } else if let Some(p) = v.get("param") {
             level::param(p.as_u64().unwrap() as u32)
         } else {
@@ -293,9 +313,23 @@ impl Parser {
             expr::sort(self.level_at(l.as_u64().unwrap() as u32))
         } else if let Some(c) = v.get("const") {
             let name = Self::get_u32(c, "name");
+            // `check_uniform_ind_occs` and `is_valid_ind_app` compare the
+            // levels of an occurrence of a type being declared with the
+            // declaration's parameters *as written*, so `T.{max u u}` is
+            // not `T.{u}` there.  A constant that is not declared yet can
+            // only be such an occurrence (an inductive block's records
+            // follow the expressions they use), so it keeps a level that
+            // simplification would turn into a bare parameter in its
+            // written, non-parameter form; level comparison normalizes, so
+            // nothing else sees a difference.
+            let keep_written =
+                !self.disguised_levels.is_empty() && !self.env.consts.contains_key(&name);
             let us = Self::get_vec_u32(c, "us")
                 .into_iter()
-                .map(|i| self.level_at(i))
+                .map(|i| match self.disguised_levels.get(&i) {
+                    Some(written) if keep_written => written.clone(),
+                    _ => self.level_at(i),
+                })
                 .collect();
             expr::const_(name, us)
         } else if let Some(b) = v.get("bvar") {

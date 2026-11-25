@@ -1868,3 +1868,78 @@ fn an_undeclared_constant_is_a_rejection() {
         "recursor `T.rec` type does not match reconstructed type",
     );
 }
+
+/// `check_uniform_ind_occs` walks lambda bodies and let bodies with the
+/// binder count raised: `(fun y => T y) α` and `let y := α; T y` reduce to
+/// `T α`, but as written the occurrence is applied to a local, not to the
+/// parameter.
+#[test]
+fn occurrences_under_a_lambda_or_a_let_are_uniform_as_written() {
+    for name in [
+        "ind-occ-lam-offset-nonuniform.reject.ndjson",
+        "ind-occ-let-body-nonuniform.reject.ndjson",
+    ] {
+        assert_reject_exact(
+            name,
+            "invalid occurrence of an inductive type being declared: it must be applied to the declaration's parameters and universe levels",
+        );
+    }
+}
+
+/// The levels of an occurrence are compared with the declaration's
+/// parameters as written: `T.{max u u}` and `T.{imax u u}` are refused in a
+/// field and in the conclusion although they equal `T.{u}`. The parser
+/// simplifies levels, so it keeps such a level unsimplified on a constant
+/// that is not declared yet. Elsewhere only the value matters: `Ax.{max u u}`
+/// in a field, and `T.{max u u}` once `T` exists.
+#[test]
+fn occurrence_levels_are_compared_as_written() {
+    for name in [
+        "ind-occ-level-max-uu.reject.ndjson",
+        "ind-occ-level-imax-uu.reject.ndjson",
+        "ind-result-level-max-uu.reject.ndjson",
+    ] {
+        assert_reject_exact(
+            name,
+            "invalid occurrence of an inductive type being declared: it must be applied to the declaration's parameters and universe levels",
+        );
+    }
+    assert_accept("ind-occ-level-max-other-const.accept.ndjson");
+    assert_accept("ind-level-max-uu-after-block.accept.ndjson");
+}
+
+/// The official kernel checks a constructor type with the block's types
+/// declared and their constructors not: a projection out of a type of the
+/// block, even one a redex erases, fails with "unknown constant `T.mk`".
+/// kiota installs the whole block first, so it refuses the projection as
+/// written. A projection out of an earlier structure is fine.
+#[test]
+fn a_constructor_type_does_not_project_out_of_the_block() {
+    for name in [
+        "ind-ctor-field-proj-own-type.reject.ndjson",
+        "ind-ctor-field-proj-erased.reject.ndjson",
+    ] {
+        assert_reject_exact(
+            name,
+            "constructor type projects out of a type of the declaration being defined, whose constructor is not declared yet",
+        );
+    }
+    assert_accept("ind-ctor-field-proj-other.accept.ndjson");
+}
+
+/// `check_no_nested_aux` (lean4#14616, in 4.36): an inductive block may not
+/// name a constant under the root `_nested`, where nested elimination puts
+/// its auxiliary types. Other declarations may, and a component spelled
+/// `_nested` elsewhere in a name, or `_nestedFoo`, is not the prefix.
+#[test]
+fn an_inductive_block_does_not_use_the_reserved_nested_prefix() {
+    assert_reject_exact(
+        "ind-reserved-nested-prefix.reject.ndjson",
+        "constructor type uses the reserved prefix `_nested`",
+    );
+    assert_reject_exact(
+        "ind-sig-reserved-nested-prefix.reject.ndjson",
+        "inductive type's signature uses the reserved prefix `_nested`",
+    );
+    assert_accept("ind-reserved-nested-prefix-elsewhere.accept.ndjson");
+}
