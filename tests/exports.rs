@@ -12,6 +12,9 @@ use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
 
+#[path = "support/intern_chains.rs"]
+mod intern_chains;
+
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -1691,4 +1694,40 @@ fn a_prop_field_after_a_data_field_mentioned_under_a_binder_is_not_projected() {
         "proj-prop-after-dependent-data-under-binder.reject.ndjson",
         "[projProp6] cannot project a Prop field that comes after a dependent data field",
     );
+}
+
+/// Twins for the hash-cons table, written at test time by
+/// `tests/support/intern_chains.rs`: 230 definitions
+/// `d_i : T := s (s (... (s z_i)))`, 200 applications each over its own
+/// axiom `z_i : T`, so 46,000 distinct application nodes are filed and the
+/// table doubles on the way (at 40,961 nodes; under the small dense policy
+/// of `tests/intern_table.rs`, thirteen times). Every definition must
+/// accept.
+#[test]
+fn chains_that_grow_the_hash_cons_table_accept() {
+    let handle = std::thread::Builder::new()
+        .stack_size(1024 * 1024 * 1024)
+        .spawn(|| check_file(&intern_chains::path(intern_chains::ACCEPT)))
+        .expect("spawn deep-stack test thread");
+    if let Err(e) = handle.join().expect("deep-stack test thread panicked") {
+        panic!("the chain twin should accept, got {e:?}");
+    }
+}
+
+/// The reject twin differs in one leaf: the innermost argument of the last
+/// chain is `w : U` where the accept twin has `z230 : T`. That leaf is
+/// filed after the table has grown, next to 46,000 nodes of the same shape;
+/// a table that handed back a neighbour for `s w` would accept `d230`.
+#[test]
+fn a_wrong_leaf_under_a_chain_filed_after_the_table_grew_rejects() {
+    let handle = std::thread::Builder::new()
+        .stack_size(1024 * 1024 * 1024)
+        .spawn(|| check_file(&intern_chains::path(intern_chains::REJECT)))
+        .expect("spawn deep-stack test thread");
+    // `KIOTA_NBE=1` (a mode of the arena gate) words it "... mismatch (nbe)".
+    match handle.join().expect("deep-stack test thread panicked") {
+        Err(TcError::Reject(message))
+            if message.starts_with("[d230] application argument type mismatch") => {}
+        other => panic!("the wrong leaf should reject d230, got {other:?}"),
+    }
 }
