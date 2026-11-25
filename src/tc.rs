@@ -235,15 +235,115 @@ fn memo_frozen() -> bool {
     ABBREV_EXHAUSTED.with(Cell::get)
 }
 
-/// `KIOTA_ABBREV_STATS` (or `KIOTA_STATS`): the abbrev argument frames' work.
-pub fn report_abbrev_args() {
-    if std::env::var_os("KIOTA_ABBREV_STATS").is_some() || std::env::var_os("KIOTA_STATS").is_some() {
+/// `KIOTA_ABBREV_STATS` (or `KIOTA_STATS`): the abbrev argument frames'
+/// work, timing and outcome distribution (`abbrev_stats`).
+fn abbrev_stats_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("KIOTA_ABBREV_STATS").is_some() || std::env::var_os("KIOTA_STATS").is_some()
+    })
+}
+
+/// Diagnostic only (`KIOTA_ABBREV_EXHAUST`): `every:N` exhausts every Nth
+/// outermost abbrev frame at entry, `only:K` exhausts the Kth alone, so the
+/// path taken after an exhausted frame can be measured with every other
+/// frame at its full budget. Unset in every arena run.
+fn abbrev_forced_exhaustion(frame: u64) -> bool {
+    static K: std::sync::OnceLock<Option<(bool, u64)>> = std::sync::OnceLock::new();
+    let k = *K.get_or_init(|| {
+        let v = std::env::var("KIOTA_ABBREV_EXHAUST").ok()?;
+        let (kind, n) = v.split_once(':')?;
+        let n: u64 = n.parse().ok().filter(|n| *n > 0)?;
+        match kind {
+            "every" => Some((true, n)),
+            "only" => Some((false, n)),
+            _ => None,
+        }
+    });
+    match k {
+        Some((true, n)) => frame % n == 0,
+        Some((false, n)) => frame == n,
+        None => false,
+    }
+}
+
+mod abbrev_stats {
+    use std::cell::{Cell, RefCell};
+
+    /// Frame outcomes, in report order.
+    pub const OUTCOMES: [&str; 6] = ["true", "false", "reject", "decline", "other", "exhausted"];
+
+    thread_local! {
+        /// `[bit length of the frame's work][outcome]`: frames, and the
+        /// largest wall time (µs) among them.
+        static HIST: RefCell<[[(u64, u64); 6]; 65]> = const { RefCell::new([[(0, 0); 6]; 65]) };
+        /// The 12 longest frames: (µs, work, outcome, declaration).
+        static TOP: RefCell<Vec<(u64, u64, usize, String)>> = const { RefCell::new(Vec::new()) };
+        pub static FRAMES: Cell<u64> = const { Cell::new(0) };
+        /// `nested_rec_for_type` calls, the `is_def_eq` calls it made, and
+        /// the name-only fallback (`nested_rec_for`) taken in `mk_rec_call`.
+        pub static NESTED_BY_TYPE: Cell<u64> = const { Cell::new(0) };
+        pub static NESTED_BY_TYPE_DEFEQ: Cell<u64> = const { Cell::new(0) };
+        pub static NESTED_NAME_ONLY: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub fn record(work: u64, micros: u64, outcome: usize, decl: &dyn Fn() -> String) {
+        let b = (64 - work.leading_zeros()) as usize;
+        HIST.with(|h| {
+            let mut h = h.borrow_mut();
+            let c = &mut h[b][outcome];
+            c.0 += 1;
+            c.1 = c.1.max(micros);
+        });
+        TOP.with(|t| {
+            let mut t = t.borrow_mut();
+            if t.len() < 12 || t.last().is_some_and(|l| l.0 < micros) {
+                t.push((micros, work, outcome, decl()));
+                t.sort_by(|a, b| b.0.cmp(&a.0));
+                t.truncate(12);
+            }
+        });
+    }
+
+    pub fn report() {
+        HIST.with(|h| {
+            for (b, row) in h.borrow().iter().enumerate() {
+                for (o, (n, us)) in row.iter().enumerate() {
+                    if *n > 0 {
+                        let lo = if b == 0 { 0 } else { 1u64 << (b - 1) };
+                        eprintln!(
+                            "ABBREV_HIST work>={lo} outcome={} frames={n} max_ms={}",
+                            OUTCOMES[o],
+                            us / 1000
+                        );
+                    }
+                }
+            }
+        });
+        TOP.with(|t| {
+            for (us, work, o, d) in t.borrow().iter() {
+                eprintln!("ABBREV_TOP ms={} work={work} outcome={} decl={d}", us / 1000, OUTCOMES[*o]);
+            }
+        });
         eprintln!(
-            "ABBREV_ARGS budget={} max_frame_work={} exhausted_frames={}",
+            "NESTED_REC by_type={} by_type_defeq={} name_only={}",
+            NESTED_BY_TYPE.with(Cell::get),
+            NESTED_BY_TYPE_DEFEQ.with(Cell::get),
+            NESTED_NAME_ONLY.with(Cell::get),
+        );
+    }
+}
+
+pub fn report_abbrev_args() {
+    if abbrev_stats_on() {
+        eprintln!(
+            "ABBREV_ARGS budget={} max_frame_work={} exhausted_frames={} frames={}",
             abbrev_args_budget(),
             ABBREV_MAX_WORK.with(Cell::get),
             ABBREV_EXHAUSTIONS.with(Cell::get),
+            abbrev_stats::FRAMES.with(Cell::get),
         );
+        abbrev_stats::report();
     }
 }
 
@@ -1021,7 +1121,23 @@ impl<'e> Checker<'e> {
 
     fn check_decl_once(&self, name: u32, kind: &str) -> R<()> {
         crate::stats::decl_start(expr::next_identity());
+        let stats = abbrev_stats_on().then(|| (std::time::Instant::now(), ABBREV_EXHAUSTIONS.with(Cell::get)));
         let r = self.check_decl_once_go(name, kind);
+        if let Some((t0, before)) = stats {
+            let k = ABBREV_EXHAUSTIONS.with(Cell::get) - before;
+            if k > 0 {
+                eprintln!(
+                    "ABBREV_DECL decl={} exhausted={k} ms={} lazy={} result={}",
+                    self.name_str(name),
+                    t0.elapsed().as_millis(),
+                    LAZY_MAIN_PATH.with(Cell::get),
+                    match &r {
+                        Ok(()) => "ok".to_string(),
+                        Err(e) => format!("{e:?}").chars().take(120).collect(),
+                    }
+                );
+            }
+        }
         crate::stats::decl_end();
         r
     }
@@ -3388,20 +3504,42 @@ impl<'e> Checker<'e> {
     /// of `is_def_eq`, as for any speculative `false`.
     fn abbrev_args_frame(&self, compare: impl FnOnce() -> R<bool>) -> R<bool> {
         let abort_before = CORE_ABORTED.with(Cell::get);
+        let stats = abbrev_stats_on();
+        let t0 = stats.then(std::time::Instant::now);
+        let frame = abbrev_stats::FRAMES.with(|n| {
+            n.set(n.get() + 1);
+            n.get()
+        });
         ABBREV_FRAME.with(|f| f.set(true));
         ABBREV_WORK.with(|w| w.set(0));
+        if abbrev_forced_exhaustion(frame) {
+            ABBREV_EXHAUSTED.with(|x| x.set(true));
+        }
         let r = compare();
         ABBREV_FRAME.with(|f| f.set(false));
+        let work = ABBREV_WORK.with(Cell::get);
+        let decl = || self.declaring.get().map_or_else(String::new, |n| self.name_str(n).to_string());
         if ABBREV_EXHAUSTED.with(|x| x.replace(false)) {
             ABBREV_EXHAUSTIONS.with(|n| n.set(n.get() + 1));
             CORE_ABORTED.with(|c| c.set(abort_before));
-            if env_set!("KIOTA_ABBREV_STATS") {
-                eprintln!("ABBREV_ARGS exhausted after {} calls", ABBREV_WORK.with(Cell::get));
+            if let Some(t0) = t0 {
+                let us = t0.elapsed().as_micros() as u64;
+                abbrev_stats::record(work, us, 5, &decl);
+                eprintln!("ABBREV_ARGS exhausted after {work} calls in {} ms decl={}", us / 1000, decl());
             }
             return Ok(false);
         }
-        let work = ABBREV_WORK.with(Cell::get);
         ABBREV_MAX_WORK.with(|m| m.set(m.get().max(work)));
+        if let Some(t0) = t0 {
+            let o = match &r {
+                Ok(true) => 0,
+                Ok(false) => 1,
+                Err(TcError::Reject(_)) => 2,
+                Err(TcError::Decline(_)) => 3,
+                Err(TcError::Other(_)) => 4,
+            };
+            abbrev_stats::record(work, t0.elapsed().as_micros() as u64, o, &decl);
+        }
         r
     }
 
@@ -5418,6 +5556,7 @@ impl<'e> Checker<'e> {
         target: u32,
         target_args: &[Expr],
     ) -> Option<u32> {
+        abbrev_stats::NESTED_BY_TYPE.with(|n| n.set(n.get() + 1));
         for rec in self.rec_group(rname) {
             let (typ, rec_level_params, rec_num_params, num_motives, num_minors, num_indices) =
                 match self.env.get(rec) {
@@ -5522,7 +5661,12 @@ impl<'e> Checker<'e> {
                     let matches = margs[..target_args.len()]
                         .iter()
                         .zip(target_args)
-                        .all(|(a, b)| a == b || self.is_def_eq(ctx, a, b).unwrap_or(false));
+                        .all(|(a, b)| {
+                            a == b || {
+                                abbrev_stats::NESTED_BY_TYPE_DEFEQ.with(|n| n.set(n.get() + 1));
+                                self.is_def_eq(ctx, a, b).unwrap_or(false)
+                            }
+                        });
                     if matches {
                         return Some(rec);
                     }
@@ -6021,6 +6165,7 @@ impl<'e> Checker<'e> {
         } else if self.occurs_any(&ty, all) {
             // Fallback for a shape `nested_rec_for_type` doesn't parse
             // cleanly: the older, name-only search, unchanged.
+            abbrev_stats::NESTED_NAME_ONLY.with(|n| n.set(n.get() + 1));
             if let Some(nrec) = self.nested_rec_for(target, rname) {
                 (nrec, params.iter().map(|p| shift_at(S::IOTA, p, shift_by, 0)).collect(), &[][..])
             } else {
