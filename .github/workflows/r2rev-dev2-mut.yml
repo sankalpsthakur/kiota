@@ -1,0 +1,89 @@
+name: r2rev-dev2-mut
+
+# Independent review of fix/deep-evaluation-v2 44edff2 (base fix/integrate-20261125
+# 3fd8d86). Each mut job removes one guard of the closed-Nat driver or of the
+# cut-short decline (scripts/r2rev/mutate.py) and runs the committed release
+# test suite: KILLED when a committed test fails. It then runs the reviewer's
+# adversarial exports (adv/r2rev, verdicts from leanchecker 4.36) and the
+# arena perf fixtures on the mutant binary, for information only.
+# The nbe jobs run the suite under KIOTA_NBE=1 on both shas.
+on:
+  push:
+    branches: ['remote/r2rev-dev2-mut-*']
+permissions:
+  contents: read
+env:
+  V2: 44edff268616767993c705558760e007cafc64a9
+  BASE: 3fd8d8687f100f30fd791d3f502bb92c29d2d761
+jobs:
+  mut:
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [M00_none, R01_open_terms_driven, R02_nat_values_kept_across_decls, R03_no_nat_values_lookup, R04_no_nat_memo_lookup, R05_no_early_decline_while_suspended, R06_never_suspend, R07_no_whnf_stride, R08_no_core_stride, R09_no_margin, R10_no_epoch_bump, R11_whnf_memo_over_suspension, R12_core_memo_over_suspension, R13_defeq_false_memo_always, R14_xwhnf_ignores_cut, R15_driver_keeps_ok_after_suspension, R16_no_again_check, R17_no_pending_cap, R18_no_suspension_cap, R19_remember_while_suspended, R20_driver_no_cut_restore, R21_no_conclusive_decl, R22_no_conclusive_ind_structure, R23_no_conclusive_large_elim, R24_limit_hit_sets_no_cut, R25_ensure_depth_uncounted, R26_infer_depth_uncounted, R27_whnf_depth_uncounted, R28_core_depth_uncounted, R29_defeq_depth_uncounted, R30_huge_run_uncounted, R31_peel_budget_uncounted, R32_driver_budget_uncounted, R33_no_shape_clear, R34_true_keeps_cut, R35_defeq_drops_entry_cut, R36_whnf_drops_entry_cut, R37_core_drops_entry_cut, R38_no_cache_marks, R39_no_cache_mark_reads, R40_no_speculative_restore, R41_no_lazy_head_restore, R42_no_rescue_restore, R43_xcache_hit_no_restore]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.V2 }}
+          path: v2
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply and test
+        env:
+          M: ${{ matrix.mutant }}
+        working-directory: v2
+        run: |
+          set +e -o pipefail
+          git rev-parse HEAD
+          [ "$M" = M00_none ] || python3 ../harness/scripts/r2rev/mutate.py "$M" src/tc.rs || exit 1
+          git diff | head -40
+          timeout 5400 cargo test --release --locked > test.log 2>&1
+          rc=$?
+          grep -E '^test result|^test .* FAILED|panicked at' test.log | head -30 || true
+          verdict=SURVIVED; [ $rc -ne 0 ] && verdict=KILLED
+          echo "MUT mutant=$M sha=$(git rev-parse --short HEAD) rc=$rc $verdict failed_tests=\"$(grep -E '^test .* FAILED' test.log | awk '{print $2}' | tr '\n' ' ')\"" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Adversarial exports on the mutant (information)
+        env:
+          M: ${{ matrix.mutant }}
+        working-directory: v2
+        run: |
+          set +e
+          cargo build --release --locked 2>&1 | tail -1
+          sudo apt-get install -y time >/dev/null 2>&1
+          for f in ../harness/adv/r2rev/*.ndjson tests/fixtures/arena-*.ndjson tests/fixtures/k-like-eq-rec*.ndjson tests/fixtures/deep-*.ndjson; do
+            n=$(basename $f .ndjson)
+            exp=x
+            case $n in *_ok|*.accept) exp=0;; *_bad|*.reject) exp=1;; esac
+            /usr/bin/time -f '%U %M' -o t.txt timeout 120 ./target/release/kiota $f >o.txt 2>&1; rc=$?
+            flag=ok
+            [ "$exp" = 1 ] && [ $rc = 0 ] && flag=WRONG_ACCEPT
+            [ "$exp" = 0 ] && [ $rc = 1 ] && flag=WRONG_REJECT
+            [ $rc -gt 2 ] && flag=CRASH_OR_TIMEOUT
+            echo "ADV mutant=$M case=$n exp=$exp rc=$rc $flag user_maxrss=$(tail -1 t.txt) $(grep -m1 -E '^(REJECT|DECLINE|ERROR)|panic|overflow' o.txt | cut -c1-120)"
+          done | tee adv.txt
+          grep -E 'WRONG|CRASH' adv.txt | sed 's/^/FLAG /' | tee -a "$GITHUB_STEP_SUMMARY"
+  nbe:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [base, v2]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.side == 'base' && env.BASE || env.V2 }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Suite under KIOTA_NBE=1
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set +e
+          KIOTA_NBE=1 timeout 3000 cargo test --release --locked --no-fail-fast > test.log 2>&1
+          rc=$?
+          grep -E '^test result|^test .* FAILED' test.log
+          echo "NBE side=$SIDE sha=$(git rev-parse --short HEAD) rc=$rc failed=\"$(grep -E '^test .* FAILED' test.log | awk '{print $2}' | tr '\n' ' ')\"" | tee -a "$GITHUB_STEP_SUMMARY"
