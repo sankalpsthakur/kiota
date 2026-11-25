@@ -1,0 +1,52 @@
+name: remote-swapv2-noise
+
+# Same-runner timing of fix/mathlib-swap-v2 (bcb623d; its src/ is ba4a2e5's
+# plus tests) against 3fd8d86: both binaries built on one runner, run
+# alternately three times each per corpus, user time and peak RSS.
+on:
+  push:
+    branches: ['remote/swapv2-noise-*']
+permissions:
+  contents: read
+  actions: read
+env:
+  HEAD_SHA: bcb623d3ae6ddb1e57b9be4c908022776d815645
+  BASE_SHA: 3fd8d8687f100f30fd791d3f502bb92c29d2d761
+jobs:
+  ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: [init, std, cedar]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build both
+        run: |
+          git worktree add ../head $HEAD_SHA
+          git worktree add ../base $BASE_SHA
+          (cd ../head && cargo build --release --locked) && cp ../head/target/release/kiota ./kiota-head
+          (cd ../base && cargo build --release --locked) && cp ../base/target/release/kiota ./kiota-base
+          ls -la kiota-*
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: '45472434965'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Alternate
+        env:
+          C: ${{ matrix.corpus }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          for i in 1 2 3; do
+            for s in head base; do
+              /usr/bin/time -v -o t.txt ./kiota-$s $C.ndjson >/dev/null 2>err.txt; rc=$?
+              echo "AB corpus=$C side=$s round=$i rc=$rc user=$(grep 'User time' t.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' t.txt | awk '{print $NF}')" | tee -a "$GITHUB_STEP_SUMMARY"
+            done
+          done
