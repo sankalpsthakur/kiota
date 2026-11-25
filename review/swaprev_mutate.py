@@ -39,6 +39,8 @@ M = {
  # decline propagation
  "prop_nested_swallow": [("src/tc.rs", "                        if !self.is_def_eq(ctx, a, b)? {\n                            matches = false;", "                        if !self.is_def_eq(ctx, a, b).unwrap_or(false) {\n                            matches = false;", 0)],
  "prop_mkrec_swallow": [("src/tc.rs", "            let w = self.whnf(&tctx, &cur)?;", "            let w = self.whnf(&tctx, &cur).unwrap_or_else(|_| cur.clone());", 0)],
+ "frm_frame_not_reset": [("src/tc.rs", "        let r = compare();\n        ABBREV_FRAME.with(|f| f.set(false));", "        let r = compare();", 0)],
+ "decl_depth_abandoned": [("src/tc.rs", "        if DECL_ABANDONED.with(Cell::get) {\n            DEFEQ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));", "        if DECL_ABANDONED.with(Cell::get) {", 0)],
 }
 if __name__ == "__main__":
     name = sys.argv[1]

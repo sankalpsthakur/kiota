@@ -17,7 +17,7 @@ jobs:
       fail-fast: false
       max-parallel: 20
       matrix:
-        mutant: [none, frz_all, frz_xinfer_hit, frz_infer, frz_spine, frz_proofarg, frz_xwhnf, frz_defeq, frz_whnf, frz_whnfcore, frz_iotalit, frz_nativestr, frz_iotaval, frz_thunk, frm_no_entry_decline, frm_no_budget, frm_keep_result, frm_keep_true, frm_core_aborted, frm_flag_sticky, frm_any_def, frm_nested, frm_no_frame, frm_depth_exh, frm_work_reset, decl_no_entry_decline, decl_no_convert, decl_never_abandon, decl_not_frozen, decl_cap_off_by_one, decl_no_reset_start, prop_nested_swallow, prop_mkrec_swallow]
+        mutant: [none, frm_frame_not_reset, decl_depth_abandoned]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
