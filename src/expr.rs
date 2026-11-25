@@ -637,6 +637,92 @@ const INITIAL_SLOTS_LOG2: u32 = 16;
 /// A table reset keeps its slots up to this size (256 MiB) and shrinks a
 /// larger one, so one outsized declaration does not pin its table forever.
 const RETAINED_SLOTS_LOG2: u32 = 24;
+/// From this many slots (512 MiB) a table fills to 7/8 before it doubles;
+/// a smaller one doubles at 5/8. See `TablePolicy::grow_at`.
+const DENSE_SLOTS_LOG2: u32 = 25;
+
+/// How a table sizes itself: where it starts, when it doubles, and what a
+/// reset keeps. One value per table, fixed when the table is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TablePolicy {
+    /// log2 of the slots a new table starts with.
+    initial_log2: u32,
+    /// log2 of the slot count from which the table fills to 7/8.
+    dense_log2: u32,
+    /// log2 of the largest slot array a reset keeps.
+    retained_log2: u32,
+}
+
+impl TablePolicy {
+    const DEFAULT: TablePolicy = TablePolicy {
+        initial_log2: INITIAL_SLOTS_LOG2,
+        dense_log2: DENSE_SLOTS_LOG2,
+        retained_log2: RETAINED_SLOTS_LOG2,
+    };
+
+    /// The policy of this process: the default, or the three numbers of
+    /// `KIOTA_INTERN_TABLE=<initial>,<dense>,<retained>` (log2 of slots).
+    /// The variable exists for tests: the dense regime starts at a table of
+    /// half a gigabyte, which no fixture builds, so a test starts the table
+    /// at a few slots and makes it dense from there. Anything that is not
+    /// three numbers leaves the default in place.
+    fn from_env() -> TablePolicy {
+        std::env::var("KIOTA_INTERN_TABLE")
+            .ok()
+            .and_then(|v| TablePolicy::parse(&v))
+            .unwrap_or(TablePolicy::DEFAULT)
+    }
+
+    fn parse(text: &str) -> Option<TablePolicy> {
+        let mut numbers = text.split(',').map(|part| part.trim().parse::<u32>().ok());
+        let initial = numbers.next()??;
+        let dense = numbers.next()??;
+        let retained = numbers.next()??;
+        if numbers.next().is_some() {
+            return None;
+        }
+        // Eight slots at least: at 7/8 a smaller table would have no slot
+        // left empty, and a probe ends only at an empty slot.
+        let initial_log2 = initial.clamp(3, 30);
+        Some(TablePolicy {
+            initial_log2,
+            dense_log2: dense,
+            retained_log2: retained.clamp(initial_log2, 40),
+        })
+    }
+
+    /// The node count past which a table of `1 << log2` slots doubles.
+    ///
+    /// A small table doubles at 5/8: linear probes stay short, and the slots
+    /// that costs are megabytes. On a large table the same rule costs
+    /// gigabytes. `perf/magma-list-deep-n36` ends with 42.4M nodes, 1.2%
+    /// past 5/8 of 2^26, so for its last half million nodes the table
+    /// doubled to 2^27 slots: 2 GiB, with the 1 GiB array beside it while
+    /// it was filled. The run peaked at 6.4 GB and aborted under an 8 GiB
+    /// address-space limit, where the `HashMap` this table replaced had
+    /// peaked at 4.5 GB.
+    ///
+    /// From `dense_log2` slots on, the table therefore fills to 7/8 first.
+    /// Those are the node counts the map doubled at, with 16 bytes per slot
+    /// against the map's 17, so from there on the table is never larger
+    /// than the map was, the doubling included (deep-n36: 4.4 GB).
+    ///
+    /// The rule is not applied to every size. A doubling holds both arrays,
+    /// and at 7/8 it comes later, on top of more nodes: the largest
+    /// declaration of std ends with 14.9M nodes, just past 7/8 of 2^24, and
+    /// with 7/8 at every size the peak of std rose by 250 MB (kiota run
+    /// 44398518349). A fuller table also probes further: 3.5% more cycles
+    /// on `perf/magma-list-deep-n21`. Below `dense_log2` nothing changed.
+    #[inline]
+    fn grow_at(&self, log2: u32) -> usize {
+        let n = 1usize << log2;
+        if log2 >= self.dense_log2 {
+            n / 8 * 7
+        } else {
+            n / 8 * 5
+        }
+    }
+}
 
 /// Hash-cons table: open addressing with linear probing over a power-of-two
 /// slot array, indexed by the top bits of `hash_node`.
@@ -653,8 +739,9 @@ struct Interner {
     /// `64 - log2(slots.len())`: the index is the top bits of the hash.
     shift: u32,
     len: usize,
-    /// Grow once `len` passes this (5/8 of the slots).
+    /// Grow once `len` passes this: `policy.grow_at` of the slot count.
     grow_at: usize,
+    policy: TablePolicy,
     /// The identity the next allocated node gets. Never reset: see `identity`.
     next_id: usize,
     /// `intern` calls on this thread, in either mode.
@@ -668,27 +755,33 @@ struct Interner {
     /// `KIOTA_STATS`, read once for the same reason: the per-call-site
     /// counters are asked for on every `intern` call.
     stats: bool,
+    /// `KIOTA_INTERN_TABLE_LOG`: one stderr line per doubling and per reset
+    /// (`INTERN_TABLE ...`), which is how the table's part of a run's
+    /// memory is read off. Read once; only the cold paths ask.
+    log: bool,
 }
 
 impl Default for Interner {
     fn default() -> Self {
-        Interner::with_slots_log2(INITIAL_SLOTS_LOG2)
+        Interner::with_policy(TablePolicy::from_env())
     }
 }
 
 impl Interner {
-    fn with_slots_log2(log2: u32) -> Self {
-        let n = 1usize << log2;
+    fn with_policy(policy: TablePolicy) -> Self {
+        let log2 = policy.initial_log2;
         Interner {
-            slots: vec![EMPTY_SLOT; n],
+            slots: vec![EMPTY_SLOT; 1usize << log2],
             shift: 64 - log2,
             len: 0,
-            grow_at: n / 8 * 5,
+            grow_at: policy.grow_at(log2),
+            policy,
             next_id: 1,
             calls: 0,
             next_report: INTERN_REPORT_EVERY,
             weak_mode: reclamation_enabled(),
             stats: crate::stats::enabled(),
+            log: std::env::var_os("KIOTA_INTERN_TABLE_LOG").is_some(),
         }
     }
 
@@ -734,9 +827,12 @@ impl Interner {
     fn grow(&mut self) {
         let log2 = 64 - self.shift + 1;
         let n = 1usize << log2;
+        if self.log {
+            eprintln!("INTERN_TABLE grow nodes={} slots=2^{}→2^{log2}", self.len, log2 - 1);
+        }
         let old = std::mem::replace(&mut self.slots, vec![EMPTY_SLOT; n]);
         self.shift = 64 - log2;
-        self.grow_at = n / 8 * 5;
+        self.grow_at = self.policy.grow_at(log2);
         let mask = n - 1;
         for slot in old {
             if slot.node.is_some() {
@@ -755,15 +851,27 @@ impl Interner {
     }
 
     /// Drop every node reference the table holds. The slot array is kept
-    /// (unless it outgrew `RETAINED_SLOTS_LOG2`), so the refill neither
+    /// (unless it outgrew what the policy retains), so the refill neither
     /// re-allocates nor re-files anything.
     fn clear(&mut self) {
-        if self.slots.len() > 1usize << RETAINED_SLOTS_LOG2 {
-            let fresh = Interner::with_slots_log2(RETAINED_SLOTS_LOG2);
-            let old = std::mem::replace(&mut self.slots, fresh.slots);
-            self.shift = fresh.shift;
-            self.grow_at = fresh.grow_at;
-            drop(old);
+        let retained_log2 = self.policy.retained_log2;
+        if self.log {
+            let log2 = 64 - self.shift;
+            eprintln!(
+                "INTERN_TABLE reset nodes={} slots=2^{log2}→2^{}",
+                self.len,
+                log2.min(retained_log2)
+            );
+        }
+        if self.slots.len() > 1usize << retained_log2 {
+            // The outsized array goes first, and with it every node only the
+            // table held: its replacement is allocated after that memory is
+            // back, not beside it (a quarter of a gigabyte on top of the
+            // peak, when the declaration that just ended is the largest).
+            self.slots = Vec::new();
+            self.slots = vec![EMPTY_SLOT; 1usize << retained_log2];
+            self.shift = 64 - retained_log2;
+            self.grow_at = self.policy.grow_at(retained_log2);
         } else if self.len != 0 {
             for slot in self.slots.iter_mut() {
                 slot.node = None;
@@ -1850,6 +1958,183 @@ mod tests {
         assert!(!structurally_equal(&proj(3, 1, bvar(0)), &proj(3, 2, bvar(0))));
         assert!(!structurally_equal(&lam(BinderInfo::Default, bvar(0), bvar(0)), &pi(BinderInfo::Default, bvar(0), bvar(0))));
         assert!(!structurally_equal(&new, &app(new.clone(), bvar(0))));
+    }
+
+    /// The sizes the table's memory accounting rests on. A node is 56 bytes:
+    /// 72 with `Rc`'s two counters, which the allocator serves from its
+    /// 80-byte class. A slot is 16.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn a_node_is_56_bytes_and_a_slot_is_16() {
+        assert_eq!(std::mem::size_of::<ExprData>(), 32);
+        assert_eq!(std::mem::size_of::<ExprNode>(), 56);
+        assert_eq!(std::mem::size_of::<Slot>(), 16);
+    }
+
+    /// The slot count the policy prescribes once `len` nodes have been
+    /// filed one at a time.
+    fn slots_for(policy: TablePolicy, len: usize) -> usize {
+        let mut log2 = policy.initial_log2;
+        while len > policy.grow_at(log2) {
+            log2 += 1;
+        }
+        1usize << log2
+    }
+
+    fn nat_node(t: &mut Interner, i: u32) -> Expr {
+        let k = NatShape(BigUint::from(i));
+        let h = k.hash();
+        t.intern(k, h)
+    }
+
+    /// A table below the dense size doubles when it is 5/8 full, one at or
+    /// past it when it is 7/8 full, and the default puts the boundary at
+    /// 2^25 slots. The second half files nodes through both regimes of a
+    /// small table: the slot count follows the rule after every node, there
+    /// is always an empty slot for a probe to end at, and at the fullest
+    /// moment of each size every node filed so far is still found.
+    #[test]
+    fn the_table_doubles_at_five_eighths_until_it_is_dense_and_at_seven_eighths_after() {
+        let d = TablePolicy::DEFAULT;
+        assert_eq!((d.initial_log2, d.dense_log2, d.retained_log2), (16, 25, 24));
+        assert_eq!(d.grow_at(16), 40_960);
+        assert_eq!(d.grow_at(24), 10_485_760);
+        assert_eq!(d.grow_at(25), 29_360_128);
+        assert_eq!(d.grow_at(26), 58_720_256);
+        // The 42,449,043 nodes `perf/magma-list-deep-n36` ends with fit 2^26
+        // slots (1 GiB); at 5/8 throughout they took 2^27.
+        assert_eq!(slots_for(d, 42_449_043), 1 << 26);
+        let all_sparse = TablePolicy { dense_log2: u32::MAX, ..d };
+        assert_eq!(slots_for(all_sparse, 42_449_043), 1 << 27);
+        // Up to 2^24 slots nothing changed: deep-n21, and the largest
+        // declarations of std, cedar and init (14.9M, 17.6M, 18.8M nodes).
+        for len in [0, 40_960, 40_961, 3_439_696, 10_485_760] {
+            assert_eq!(slots_for(d, len), slots_for(all_sparse, len), "{len} nodes");
+        }
+        for len in [10_485_761, 14_934_677, 17_624_806, 18_754_492, 20_971_520] {
+            assert_eq!(slots_for(d, len), 1 << 25, "{len} nodes");
+            assert_eq!(slots_for(all_sparse, len), 1 << 25, "{len} nodes");
+        }
+
+        let p = TablePolicy { initial_log2: 3, dense_log2: 8, retained_log2: 10 };
+        assert_eq!(
+            [3, 4, 7, 8, 9, 12].map(|log2| p.grow_at(log2)),
+            [5, 10, 80, 224, 448, 3584]
+        );
+        let mut t = Interner::with_policy(p);
+        let mut nodes: Vec<Expr> = Vec::new();
+        let mut fullest_checked = 0;
+        for i in 0..5000u32 {
+            nodes.push(nat_node(&mut t, i));
+            assert_eq!(t.len(), i as usize + 1, "node {i} was not new");
+            assert_eq!(t.slots.len(), slots_for(p, t.len()), "after {} nodes", t.len());
+            assert!(t.len() < t.slots.len(), "no empty slot left after {} nodes", t.len());
+            if t.len() == t.grow_at {
+                // As full as this size gets: one more node doubles it.
+                for (j, e) in nodes.iter().enumerate() {
+                    assert!(Rc::ptr_eq(e, &nat_node(&mut t, j as u32)), "node {j} lost");
+                }
+                assert_eq!(t.len(), i as usize + 1, "a lookup allocated");
+                fullest_checked += 1;
+            }
+        }
+        // 5, 10, 20, 40, 80 at 5/8; 224, 448, 896, 1792, 3584 at 7/8.
+        assert_eq!(fullest_checked, 10);
+        assert_eq!(t.slots.len(), 8192);
+        for (j, e) in nodes.iter().enumerate() {
+            assert!(Rc::ptr_eq(e, &nat_node(&mut t, j as u32)), "node {j} lost");
+            assert!(matches!(&***e, ExprData::Lit(Lit::Nat(n)) if *n == BigUint::from(j as u32)));
+        }
+        assert_eq!(t.len(), 5000);
+    }
+
+    /// The worst a dense table meets: every node of a 7/8-full table filed
+    /// under the last slot, so one run of occupied slots starts there, wraps
+    /// to slot 0 and covers all but the eight empty slots. Each node is
+    /// found behind the whole run, a node that is not there is not found
+    /// (the probe ends at an empty slot), and after the doubling, where the
+    /// stored hashes alone decide the new places, each is found again.
+    #[test]
+    fn a_run_that_wraps_past_the_last_slot_of_a_dense_table_keeps_every_node() {
+        let p = TablePolicy { initial_log2: 6, dense_log2: 6, retained_log2: 6 };
+        let mut t = Interner::with_policy(p);
+        assert_eq!((t.slots.len(), t.grow_at), (64, 56));
+        // Top six bits set: slot 63 of 64. Bit 57 decides between slots 126
+        // and 127 of the doubled table; the low bits tell the hashes apart.
+        let hash = |i: u32| (0x3f_u64 << 58) | (((i & 1) as u64) << 57) | (i as u64 + 1);
+        let mut nodes: Vec<Expr> = Vec::new();
+        for i in 0..56u32 {
+            nodes.push(t.intern(NatShape(BigUint::from(i)), hash(i)));
+        }
+        assert_eq!((t.len(), t.slots.len()), (56, 64), "7/8 full, not yet doubled");
+        assert!(t.slots[63].node.is_some() && t.slots[0].node.is_some());
+        assert_eq!(t.slots.iter().filter(|s| s.node.is_none()).count(), 8);
+        assert!((55..63).all(|i| t.slots[i].node.is_none()), "one run, ending before slot 55");
+        for (i, e) in nodes.iter().enumerate() {
+            let again = t.intern(NatShape(BigUint::from(i as u32)), hash(i as u32));
+            assert!(Rc::ptr_eq(e, &again), "node {i} not found behind the run");
+        }
+        assert_eq!(t.len(), 56, "a lookup allocated");
+        // A different node under a hash already in the run is told apart,
+        // filed at the end of the run, and its filing doubles the table.
+        let other = t.intern(BVarShape(7), hash(7));
+        assert!(matches!(&**other, ExprData::BVar(7)));
+        assert!(!Rc::ptr_eq(&other, &nodes[7]));
+        assert_eq!((t.len(), t.slots.len(), t.grow_at), (57, 128, 112));
+        for (i, e) in nodes.iter().enumerate() {
+            let again = t.intern(NatShape(BigUint::from(i as u32)), hash(i as u32));
+            assert!(Rc::ptr_eq(e, &again), "node {i} lost in the doubling");
+        }
+        assert!(Rc::ptr_eq(&other, &t.intern(BVarShape(7), hash(7))));
+        assert_eq!(t.len(), 57);
+    }
+
+    /// A reset keeps a slot array no larger than the policy retains and
+    /// replaces a larger one by one of the retained size. Either way the
+    /// table is empty, the nodes only it held are gone, and it files the
+    /// next generation by the same rule.
+    #[test]
+    fn a_reset_keeps_a_small_table_and_shrinks_an_outsized_one() {
+        let p = TablePolicy { initial_log2: 3, dense_log2: 5, retained_log2: 6 };
+        let mut t = Interner::with_policy(p);
+        for (count, slots_before, slots_after) in [(30u32, 64usize, 64usize), (500, 1024, 64)] {
+            let weak: Vec<_> = (0..count).map(|i| Rc::downgrade(&nat_node(&mut t, i))).collect();
+            let held = nat_node(&mut t, 3);
+            assert_eq!(t.len(), count as usize);
+            assert_eq!(t.slots.len(), slots_before);
+            assert!(weak.iter().all(|w| w.upgrade().is_some()), "the table holds them");
+            t.clear();
+            assert_eq!(t.len(), 0);
+            assert_eq!(t.slots.len(), slots_after);
+            assert_eq!(t.shift, 64 - slots_after.trailing_zeros());
+            assert_eq!(t.grow_at, p.grow_at(slots_after.trailing_zeros()));
+            assert!(t.slots.iter().all(|s| s.node.is_none()));
+            let alive = weak.iter().filter(|w| w.upgrade().is_some()).count();
+            assert_eq!(alive, 1, "only the node held outside the table survives");
+            // The next generation: new nodes, one per structure.
+            let fresh = nat_node(&mut t, 3);
+            assert!(!Rc::ptr_eq(&fresh, &held), "the reset table still knew the old node");
+            assert!(Rc::ptr_eq(&fresh, &nat_node(&mut t, 3)));
+            assert_eq!(t.len(), 1);
+            t.clear();
+        }
+    }
+
+    /// `KIOTA_INTERN_TABLE` is three numbers or it changes nothing.
+    #[test]
+    fn the_table_policy_variable_takes_three_numbers_or_none() {
+        let policy = |initial_log2, dense_log2, retained_log2| {
+            Some(TablePolicy { initial_log2, dense_log2, retained_log2 })
+        };
+        assert_eq!(TablePolicy::parse("3,3,8"), policy(3, 3, 8));
+        assert_eq!(TablePolicy::parse(" 16 , 25 , 24 "), Some(TablePolicy::DEFAULT));
+        // No table of fewer than eight slots, none retained below its start.
+        assert_eq!(TablePolicy::parse("0,0,0"), policy(3, 0, 3));
+        assert_eq!(TablePolicy::parse("12,99,4"), policy(12, 99, 12));
+        assert_eq!(TablePolicy::parse("64,3,3"), policy(30, 3, 30));
+        for text in ["", "3", "3,3", "3,3,8,1", "a,b,c", "3,,8", "3,-1,8", "3;3;8"] {
+            assert_eq!(TablePolicy::parse(text), None, "{text:?}");
+        }
     }
 
     /// Two different nodes filed under one hash are told apart by
