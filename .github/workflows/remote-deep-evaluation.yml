@@ -1,6 +1,6 @@
 name: remote-deep-evaluation
 
-# fix/deep-evaluation-v2 (48d83ba: the closed-Nat driver and cut-short
+# fix/deep-evaluation-v2 (44edff2: the closed-Nat driver and cut-short
 # declines) beside its base fix/integrate-20261125 (3fd8d86), both pinned by
 # sha: the six Lean 4.36 corpora strict (verdict, user time, peak memory, and
 # on v2 the driver counters), every arena tarball case, and the test suite in
@@ -12,7 +12,7 @@ permissions:
   contents: read
   actions: read
 env:
-  V2: 48d83ba4e8240f0ff9c71e59cc2a0a38e94ae09a
+  V2: 44edff268616767993c705558760e007cafc64a9
   INTEG: 3fd8d8687f100f30fd791d3f502bb92c29d2d761
 jobs:
   val:
@@ -133,12 +133,52 @@ jobs:
         run: |
           set -o pipefail
           case "$MODE" in
-            nbe) KIOTA_NBE=1 cargo test --release --locked 2>&1 | tee test.log ;;
+            nbe) KIOTA_NBE=1 cargo test --release --locked --no-fail-fast 2>&1 | tee test.log ;;
             reclaim) KIOTA_RECLAIM=1 cargo test --release --locked 2>&1 | tee test.log ;;
             debug) cargo test --locked 2>&1 | tee test.log ;;
             *) cargo test --release --locked 2>&1 | tee test.log ;;
           esac
           rc=$?
-          grep -E '^test result|FAILED|panicked' test.log | head -40
+          grep -E '^test result|FAILED|panicked' test.log | head -40 || true
           echo "TESTS mode=$MODE rc=$rc $(grep -E '^test result' test.log | awk '{p+=$4; f+=$6; i+=$8} END {print "passed=" p " failed=" f " ignored=" i}')" | tee -a "$GITHUB_STEP_SUMMARY"
           exit $rc
+
+  # The two binaries back to back on one runner (cross-runner user times
+  # differ by tens of percent): std and init, three alternating rounds.
+  overhead:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.V2 }}
+          path: v2
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.INTEG }}
+          path: integrate
+      - uses: dtolnay/rust-toolchain@stable
+      - run: (cd v2 && cargo build --release --locked) && (cd integrate && cargo build --release --locked)
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-std
+          run-id: '45472434965'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-init
+          run-id: '45472434965'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Alternating runs
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          for c in std init; do zstd -d --rm $c.ndjson.zst -o $c.ndjson; done
+          for round in 1 2 3; do
+            for c in std init; do
+              for side in integrate v2; do
+                /usr/bin/time -v -o time.txt ./$side/target/release/kiota $c.ndjson >/dev/null 2>err.txt; rc=$?
+                echo "OVH round=$round corpus=$c side=$side rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}')" | tee -a "$GITHUB_STEP_SUMMARY"
+              done
+            done
+          done
