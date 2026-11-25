@@ -1,6 +1,6 @@
-name: remote-swapv2-val
+name: remote-swaprev-val
 
-# Validation of fix/mathlib-swap-v2 (HEAD) beside its base
+# Independent review run: fix/mathlib-swap-v2 at the reviewed sha bcb623d (HEAD) beside its base
 # fix/integrate-20261125 (BASE 3fd8d86): the arena's six Lean 4.36 exports,
 # strict, one process each (verdict, user time, peak RSS), the swap cone, and
 # the whole arena tarball (every good/* and bad/* case, perf included) on both
@@ -8,12 +8,12 @@ name: remote-swapv2-val
 # only for mathlib and the cone (it prints at exit and per exhausted frame).
 on:
   push:
-    branches: ['remote/swapv2-val-*']
+    branches: ['remote/swaprev-val-*']
 permissions:
   contents: read
   actions: read
 env:
-  HEAD_SHA: ba4a2e5e7f970b4c9d8fdd04433d890821c5c292
+  HEAD_SHA: bcb623d3ae6ddb1e57b9be4c908022776d815645
   BASE_SHA: 3fd8d8687f100f30fd791d3f502bb92c29d2d761
 jobs:
   val:
@@ -29,7 +29,7 @@ jobs:
         with:
           ref: ${{ matrix.side == 'head' && env.HEAD_SHA || env.BASE_SHA }}
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release --locked
+      - run: cargo build --release --locked && sha256sum target/release/kiota && git rev-parse HEAD
       - name: Free disk
         if: matrix.corpus == 'mathlib' || matrix.corpus == 'con-leche'
         run: |
@@ -81,7 +81,7 @@ jobs:
         with:
           ref: ${{ matrix.side == 'head' && env.HEAD_SHA || env.BASE_SHA }}
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release --locked
+      - run: cargo build --release --locked && sha256sum target/release/kiota && git rev-parse HEAD
       - uses: actions/download-artifact@v4
         with:
           name: cone-mathlib
@@ -123,7 +123,7 @@ jobs:
         with:
           ref: ${{ matrix.side == 'head' && env.HEAD_SHA || env.BASE_SHA }}
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release --locked
+      - run: cargo build --release --locked && sha256sum target/release/kiota && git rev-parse HEAD
       - name: Arena tarball, every case
         env:
           SIDE: ${{ matrix.side }}
