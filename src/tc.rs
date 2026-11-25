@@ -13464,6 +13464,20 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             assert!(th.force(&tc).is_ok());
             assert!(!th.is_forced(), "a thunk forced while frozen kept its value");
         }
+        // native_string_ok: `Pair` named `String` and used as the string
+        // type; the check answers (no byte-array chain here) and is cached
+        // only when not frozen.
+        {
+            let mut names = names.clone();
+            names[5] = std::rc::Rc::new("String".into());
+            let tc = Checker::new(&env, &names, Some(0), Some(5));
+            let frozen = Frozen::set();
+            let ok = tc.native_string_projection_ok(5);
+            assert!(tc.native_string_ok.get().is_none(), "native_string_ok written while frozen");
+            drop(frozen);
+            assert_eq!(tc.native_string_projection_ok(5), ok);
+            assert!(tc.native_string_ok.get().is_some(), "the unfrozen check is cached");
+        }
         XCACHE_ON.with(|x| x.set(false));
     }
 

@@ -2057,7 +2057,9 @@ fn an_inductive_block_does_not_use_the_reserved_nested_prefix() {
 /// sides and compares `g 24 _` by its arguments. Skipping the argument
 /// comparison and normalizing both sides instead evaluates `g 24` into a
 /// 2^24-leaf tree (51 s and 680 MB when tried). It does not reproduce the
-/// Mathlib spin, which needs an argument pair that is expensive to refute.
+/// Mathlib spin, which needs an argument pair that is expensive to refute,
+/// and main accepts it as well: it guards the shortcut's speed, not the
+/// abbrev frame's budget (that is `tc::tests::*abbrev*`).
 #[test]
 fn an_abbrev_with_unequal_arguments_unfolds_on_both_sides() {
     let start = std::time::Instant::now();
