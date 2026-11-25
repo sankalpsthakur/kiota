@@ -138,14 +138,25 @@ thread_local! {
     /// Set while the arguments of two same-head applications of an `abbrev`
     /// (`DFunLike.coe`, `HAdd.hAdd`, ...) are compared before unfolding it
     /// (`try_unreduced_const_congruence_ex`). Official compares arguments
-    /// first only under a regular definition and unfolds an abbrev on both
-    /// sides instead (`lazy_delta_reduction_step`), so there an argument
-    /// pair is a shortcut that may only prove equality cheaply: a pair that
-    /// speculative congruence does not prove declines rather than taking the
-    /// main path. Refuting a pair kiota asks and official never does can
-    /// unfold without end (`f ∘ f` against `f` under `DFunLike.coe` in
-    /// Mathlib `Polynomial.Bivariate.swap._proof_1`).
-    static ABBREV_ARGS: Cell<bool> = const { Cell::new(false) };
+    /// first only under a regular definition (`lazy_delta_reduction_step`);
+    /// under an abbrev kiota asks questions official never asks, and one of
+    /// them can be unboundedly expensive to refute: `f` against `f.comp f`
+    /// under `DFunLike.coe` in Mathlib `Polynomial.Bivariate.swap._proof_1`
+    /// unfolds polynomial evaluation without end. The outermost such frame
+    /// may make at most `abbrev_args_budget()` `is_def_eq` calls.
+    static ABBREV_FRAME: Cell<bool> = const { Cell::new(false) };
+    /// `is_def_eq` calls made inside the current `ABBREV_FRAME`.
+    static ABBREV_WORK: Cell<u64> = const { Cell::new(0) };
+    /// The current `ABBREV_FRAME` ran out of budget. Until it unwinds, every
+    /// `is_def_eq` declines at entry and nothing is memoized (`memo_frozen`),
+    /// and the frame discards what its comparison returned.
+    static ABBREV_EXHAUSTED: Cell<bool> = const { Cell::new(false) };
+    /// Largest `ABBREV_WORK` an abbrev frame finished within, and how many
+    /// frames ran out (`KIOTA_ABBREV_STATS`).
+    static ABBREV_MAX_WORK: Cell<u64> = const { Cell::new(0) };
+    static ABBREV_EXHAUSTIONS: Cell<u64> = const { Cell::new(0) };
+    /// A unit test's budget in place of `abbrev_args_budget()` (0: none).
+    static ABBREV_BUDGET_OVERRIDE: Cell<u64> = const { Cell::new(0) };
     /// Bumped by every `decline`. Nothing else bumps it while a decline
     /// propagates through `?`, so enclosing frames can tell it is the same one.
     static DECLINE_SERIAL: Cell<u64> = const { Cell::new(0) };
@@ -199,8 +210,42 @@ const MAX_HUGE_NAT_PEELS: u32 = 1 << 16;
 /// path.
 const LAZY_DELTA_STEPS: usize = 16;
 
-/// The decline of an argument comparison under an abbrev head (`ABBREV_ARGS`).
-const ABBREV_ARGS_DECLINE: &str = "abbrev arguments compared proof-only";
+/// Default `is_def_eq` budget of one abbrev argument comparison
+/// (`ABBREV_FRAME`); `KIOTA_ABBREV_ARGS_BUDGET` overrides it, `0` removes it.
+const ABBREV_ARGS_BUDGET: u64 = 1_000_000;
+
+fn abbrev_args_budget() -> u64 {
+    let o = ABBREV_BUDGET_OVERRIDE.with(Cell::get);
+    if o != 0 {
+        return o;
+    }
+    static B: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("KIOTA_ABBREV_ARGS_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(|v: u64| if v == 0 { u64::MAX } else { v })
+            .unwrap_or(ABBREV_ARGS_BUDGET)
+    })
+}
+
+/// No memo table is written while an abbrev frame is exhausted: what is
+/// computed then may rest on declines swallowed as `false`.
+fn memo_frozen() -> bool {
+    ABBREV_EXHAUSTED.with(Cell::get)
+}
+
+/// `KIOTA_ABBREV_STATS` (or `KIOTA_STATS`): the abbrev argument frames' work.
+pub fn report_abbrev_args() {
+    if std::env::var_os("KIOTA_ABBREV_STATS").is_some() || std::env::var_os("KIOTA_STATS").is_some() {
+        eprintln!(
+            "ABBREV_ARGS budget={} max_frame_work={} exhausted_frames={}",
+            abbrev_args_budget(),
+            ABBREV_MAX_WORK.with(Cell::get),
+            ABBREV_EXHAUSTIONS.with(Cell::get),
+        );
+    }
+}
 
 #[derive(Debug)]
 pub enum TcError {
@@ -1468,6 +1513,9 @@ impl<'e> Checker<'e> {
             crate::stats::infer_miss(expr_kind(e), key.1, key.0, ctx.id, infer_only, upgrade);
         }
         let t = self.infer_type_uncached(ctx, e)?;
+        if memo_frozen() {
+            return Ok(t);
+        }
         let checked = !self.infer_only.get();
         if xcache && checked && !self.xcache_tainted.get() {
             XINFER.with(|m| {
@@ -1714,7 +1762,9 @@ impl<'e> Checker<'e> {
                 });
             }
             let mut cache = self.spine_cache.borrow_mut();
-            if expr::reclamation_enabled() && cache.len() >= 50_000 {
+            if memo_frozen() {
+                // Nothing is memoized while an abbrev frame is exhausted.
+            } else if expr::reclamation_enabled() && cache.len() >= 50_000 {
                 cache.clear();
             }
             match cache.get(&key) {
@@ -3036,12 +3086,6 @@ impl<'e> Checker<'e> {
         }
     }
 
-    fn abbrev_head(&self, e: &Expr) -> bool {
-        let (h, _) = expr::unfold_apps(e);
-        matches!(&**h, ExprData::Const(n, _)
-            if matches!(self.env.get(*n), Some(ConstantInfo::Def { hints: ReducibilityHints::Abbrev, .. })))
-    }
-
     fn lazy_same_head(a: &Expr, b: &Expr) -> bool {
         let (ha, aa) = expr::unfold_apps(a);
         let (hb, ab) = expr::unfold_apps(b);
@@ -3134,9 +3178,8 @@ impl<'e> Checker<'e> {
     fn try_lazy_delta(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         // Opt-in lazy-head mode's rule (top of `is_def_eq_inner_body`) holds
         // here too: no alias comparison after a core abort or at the core
-        // depth cap. The same abbrev on both sides is unfolded on both, as
-        // official does; its arguments were compared proof-only already.
-        if (Self::lazy_same_head(a, b) && !self.abbrev_head(a))
+        // depth cap.
+        if Self::lazy_same_head(a, b)
             || CORE_ABORTED.with(Cell::get)
             || CORE_DEPTH.with(Cell::get) >= CONV_DEPTH
         {
@@ -3314,27 +3357,10 @@ impl<'e> Checker<'e> {
                 self.pairwise_args(ctx, &a1, &a2)
             }
         };
-        // An abbrev head: the arguments may only prove equality (see
-        // `ABBREV_ARGS`). The outermost such frame reads its own decline as
-        // "not proved this way", like `false`: it stands for a question
-        // official never asks, not for one kiota could not finish, so the
-        // main path's answer stands after it. Nested frames let it propagate
-        // to that frame; any other decline propagates as before.
-        let r = if !ABBREV_ARGS.with(Cell::get)
+        let r = if !ABBREV_FRAME.with(Cell::get)
             && matches!(self.env.get(*n1), Some(ConstantInfo::Def { hints: ReducibilityHints::Abbrev, .. }))
         {
-            let abort_before = CORE_ABORTED.with(Cell::get);
-            ABBREV_ARGS.with(|f| f.set(true));
-            let r = compare();
-            ABBREV_ARGS.with(|f| f.set(false));
-            match r {
-                Ok(r) => r,
-                Err(TcError::Decline(msg)) if msg == ABBREV_ARGS_DECLINE => {
-                    CORE_ABORTED.with(|c| c.set(abort_before));
-                    false
-                }
-                Err(e) => return Err(e),
-            }
+            self.abbrev_args_frame(compare)?
         } else {
             compare()?
         };
@@ -3351,6 +3377,30 @@ impl<'e> Checker<'e> {
             );
         }
         Ok(r)
+    }
+
+    /// Runs the outermost abbrev argument comparison (`ABBREV_FRAME`) under
+    /// its budget. Within it the comparison is exactly the unbounded one;
+    /// past it, whatever came back (even `Ok(true)` or a rejection) is
+    /// discarded as "not proved this way", which leaves the pair to the rest
+    /// of `is_def_eq`, as for any speculative `false`.
+    fn abbrev_args_frame(&self, compare: impl FnOnce() -> R<bool>) -> R<bool> {
+        let abort_before = CORE_ABORTED.with(Cell::get);
+        ABBREV_FRAME.with(|f| f.set(true));
+        ABBREV_WORK.with(|w| w.set(0));
+        let r = compare();
+        ABBREV_FRAME.with(|f| f.set(false));
+        if ABBREV_EXHAUSTED.with(|x| x.replace(false)) {
+            ABBREV_EXHAUSTIONS.with(|n| n.set(n.get() + 1));
+            CORE_ABORTED.with(|c| c.set(abort_before));
+            if env_set!("KIOTA_ABBREV_STATS") {
+                eprintln!("ABBREV_ARGS exhausted after {} calls", ABBREV_WORK.with(Cell::get));
+            }
+            return Ok(false);
+        }
+        let work = ABBREV_WORK.with(Cell::get);
+        ABBREV_MAX_WORK.with(|m| m.set(m.get().max(work)));
+        r
     }
 
     fn is_ctor_or_nat_lit_head(&self, e: &Expr) -> bool {
@@ -4136,6 +4186,20 @@ impl<'e> Checker<'e> {
             }
             return decline("defeq depth limit");
         }
+        if ABBREV_FRAME.with(Cell::get) {
+            let n = ABBREV_WORK.with(|w| {
+                let n = w.get() + 1;
+                w.set(n);
+                n
+            });
+            if n > abbrev_args_budget() {
+                ABBREV_EXHAUSTED.with(|x| x.set(true));
+            }
+            if ABBREV_EXHAUSTED.with(Cell::get) {
+                DEFEQ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+                return decline("abbrev argument comparison over budget");
+            }
+        }
         let r = if nbe::nbe_enabled() && !FORCE_EAGER_DEFEQ.with(Cell::get) {
             self.is_def_eq_via_nbe(ctx, a, b)
         } else {
@@ -4173,6 +4237,9 @@ impl<'e> Checker<'e> {
         }
     }
     fn defeq_cache_insert(&self, force_eager: bool, key: (u64, usize, usize), v: bool) {
+        if memo_frozen() {
+            return;
+        }
         if v && key.0 == 0 && !force_eager && XCACHE_ON.with(Cell::get) {
             XDEFEQ.with(|m| {
                 let mut m = m.borrow_mut();
@@ -4196,6 +4263,9 @@ impl<'e> Checker<'e> {
         }
     }
     fn whnf_cache_insert(&self, force_eager: bool, key: (u64, usize), v: Expr) {
+        if memo_frozen() {
+            return;
+        }
         if force_eager {
             expr::memo_insert(&mut self.eager_whnf_cache.borrow_mut(), key, v);
         } else {
@@ -4210,6 +4280,9 @@ impl<'e> Checker<'e> {
         }
     }
     fn whnf_core_cache_insert(&self, force_eager: bool, key: (u64, usize), v: Expr) {
+        if memo_frozen() {
+            return;
+        }
         if force_eager {
             expr::memo_insert(&mut self.eager_whnf_core_cache.borrow_mut(), key, v);
         } else {
@@ -4343,9 +4416,6 @@ impl<'e> Checker<'e> {
                 Err(e) => return Err(e),
             }
         };
-        if ABBREV_ARGS.with(Cell::get) {
-            return decline(ABBREV_ARGS_DECLINE);
-        }
         let main = self.def_eq_main_path(ctx, a, b);
         let declined = match (main, speculative_decline) {
             (Ok((r, cacheable)), None) | (Ok((r @ true, cacheable)), Some(_)) => {
@@ -5123,7 +5193,7 @@ impl<'e> Checker<'e> {
             if trace.len() >= 16 { trace.pop_front(); }
             trace.push_back((rname, cname, minor_idx, fields.len(), major_w.clone(), rhs.clone()));
         }
-        if iota_memo_on && rest.is_empty() {
+        if iota_memo_on && rest.is_empty() && !memo_frozen() {
             if let ExprData::Lit(Lit::Nat(n)) = &**major_w {
                 let key = Self::iota_lit_memo_key(rname, &us, motives, minors, n);
                 expr::memo_insert(&mut self.iota_lit_memo.borrow_mut(), key, rhs.clone());
@@ -7751,6 +7821,9 @@ impl<'e> Checker<'e> {
         args: &[Rc<nbe::Thunk>],
         v: Rc<nbe::Value>,
     ) {
+        if memo_frozen() {
+            return;
+        }
         let key = self.iota_value_cache_key(rname, us, args);
         self.iota_value_cache.borrow_mut().insert(key, v);
     }
@@ -12437,21 +12510,74 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         assert!(tc.with_forced_eager_defeq(|| tc.is_def_eq(&Ctx::new(), &zero, &zero)).unwrap());
     }
 
+    /// An abbrev argument comparison over its budget (`ABBREV_FRAME`) is
+    /// discarded as "not proved", the main path still proves the pair, and
+    /// nothing computed past the budget is memoized: the argument pair, asked
+    /// again with the budget lifted, is still equal.
+    #[test]
+    fn an_abbrev_argument_comparison_over_budget_falls_back_to_the_main_path() {
+        use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+        let mut env = regression_429_nat_add_env();
+        let c = |i| expr::const_(i, vec![]);
+        let v = expr::bvar;
+        let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
+        let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+        let nat = c(0);
+        let pair = c(5);
+        let zero = expr::lit_nat(BigUint::from(0u32));
+        env.insert(5, CI::InductiveType {
+            level_params: vec![], typ: expr::sort(level::succ(level::zero())),
+            num_params: 0, num_indices: 0, all: vec![5], ctors: vec![6],
+            is_rec: false, is_unsafe: false,
+        });
+        env.insert(6, CI::Constructor {
+            level_params: vec![], typ: pi(nat.clone(), pi(nat.clone(), pair.clone())),
+            induct: 5, cidx: 0, num_params: 0, num_fields: 2, is_unsafe: false,
+        });
+        // Pair.fst, an abbrev as Lean's projection functions are.
+        env.insert(7, CI::Def {
+            level_params: vec![], typ: pi(pair.clone(), nat.clone()),
+            value: lam(pair.clone(), expr::proj(5, 0, v(0))),
+            hints: RH::Abbrev, is_unsafe: false,
+        });
+        // P a := ⟨0, a⟩ and Q a := ⟨0, a⟩.
+        for i in [8, 9] {
+            env.insert(i, CI::Def {
+                level_params: vec![], typ: pi(nat.clone(), pair.clone()),
+                value: lam(nat.clone(), expr::apps(c(6), &[zero.clone(), v(0)])),
+                hints: RH::Regular(1), is_unsafe: false,
+            });
+        }
+        let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add",
+            "Pair", "Pair.mk", "Pair.fst", "P", "Q"]);
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+        let five = expr::lit_nat(BigUint::from(5u32));
+        let p = expr::app(c(8), five.clone());
+        // `5 + 0`: the argument pair takes more than one comparison.
+        let q = expr::app(c(9), expr::apps(c(4), &[five, zero.clone()]));
+        let lhs = expr::app(c(7), p.clone());
+        let rhs = expr::app(c(7), q.clone());
+        let eq = |a: &Expr, b: &Expr| tc.with_forced_eager_defeq(|| tc.is_def_eq(&ctx, a, b));
+
+        let before = ABBREV_EXHAUSTIONS.with(Cell::get);
+        ABBREV_BUDGET_OVERRIDE.with(|b| b.set(1));
+        let r = eq(&lhs, &rhs);
+        ABBREV_BUDGET_OVERRIDE.with(|b| b.set(0));
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        assert!(ABBREV_EXHAUSTIONS.with(Cell::get) > before, "the budget of 1 was not reached");
+        assert!(!ABBREV_FRAME.with(Cell::get) && !ABBREV_EXHAUSTED.with(Cell::get));
+        assert!(!CORE_ABORTED.with(Cell::get));
+        let r = eq(&p, &q);
+        assert!(matches!(r, Ok(true)), "{r:?}");
+    }
+
     #[test]
     fn speculative_decline_falls_back_to_projection() {
-        on_big_stack(|| speculative_decline_falls_back_to_projection_body(false))
+        on_big_stack(speculative_decline_falls_back_to_projection_body)
     }
 
-    /// The same with `Pair.fst` an abbrev, as Lean's projection functions
-    /// are. Its arguments are compared proof-only (`ABBREV_ARGS`): `slow n`
-    /// against `slow m` is never evaluated, and `0` against `1` after
-    /// unfolding `Pair.fst` on both sides is official's answer, `false`.
-    #[test]
-    fn speculative_decline_under_an_abbrev_projection() {
-        on_big_stack(|| speculative_decline_falls_back_to_projection_body(true))
-    }
-
-    fn speculative_decline_falls_back_to_projection_body(fst_abbrev: bool) {
+    fn speculative_decline_falls_back_to_projection_body() {
         // perf/proj-lazy-struct: `(P (slow n)).1` vs `(Q (slow m)).1`.
         // Congruence on `Pair.fst` compares the structs, and so `slow n`
         // with `slow m`, which declines here (`Nat.rec` on a literal past
@@ -12490,7 +12616,7 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             level_params: vec![],
             typ: pi(pair.clone(), nat.clone()),
             value: lam(pair.clone(), expr::proj(5, 0, v(0))),
-            hints: if fst_abbrev { RH::Abbrev } else { RH::Regular(1) },
+            hints: RH::Abbrev,
             is_unsafe: false,
         });
         // P a := ⟨0, a⟩ and Q a := ⟨0, a⟩.
@@ -12556,13 +12682,8 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         let lhs = fst(expr::apps(c(10), &[slow(&big), lit(&zero)]));
         let rhs = fst(expr::apps(c(10), &[slow(&big1), lit(&one)]));
         let r = eq(&lhs, &rhs);
-        if fst_abbrev {
-            assert!(matches!(r, Ok(false)), "{r:?}");
-        } else {
-            assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
-        }
+        assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
         assert!(!SPECULATING.with(Cell::get));
-        assert!(!ABBREV_ARGS.with(Cell::get));
         assert!(!CORE_ABORTED.with(Cell::get));
     }
 
