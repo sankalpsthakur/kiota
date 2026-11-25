@@ -158,7 +158,26 @@ const MAX_FALLBACK_TRIES: u32 = 4;
 /// Lean has no 2048 cap; `WellFounded.Nat.fix` / UTF-8 decode proofs nest
 /// `Nat.rec` conversion past that (Init `utf8DecodeChar?.assemble₃._proof_3`).
 /// Kept well under typical C-stack (~8MB) so this is a decline, not a segfault.
-const CONV_DEPTH: u32 = 1_200_000;
+const CONV_DEPTH: u32 = 8_192;
+
+/// Nesting allowed while a closed `Nat` argument of a literal operation is
+/// evaluated (`reduce_nat_arg`). Its value is a literal or nothing, so a deep
+/// recursion there is the computation itself, not a search that went astray:
+/// `g 19 0` with `g n a` doubling its calls at each level nests 2^19
+/// additions. Everywhere else `CONV_DEPTH` still bounds the search.
+const NAT_EVAL_DEPTH: u32 = 1_200_000;
+
+thread_local! {
+    /// Above zero while `reduce_nat_arg` evaluates a closed argument.
+    static NAT_EVAL: Cell<u32> = const { Cell::new(0) };
+}
+
+/// The depth cap in force: `NAT_EVAL_DEPTH` inside a closed `Nat`
+/// argument's evaluation, `CONV_DEPTH` otherwise.
+#[inline]
+fn conv_cap() -> u32 {
+    if NAT_EVAL.with(Cell::get) > 0 { NAT_EVAL_DEPTH } else { CONV_DEPTH }
+}
 
 /// `KIOTA_NO_DECIDE_SHORTCUT=1` (opt-in, for measurement): `whnf_core`
 /// never normalizes the `Decidable` instance of an `ite`, `dite` or
@@ -1400,7 +1419,7 @@ impl<'e> Checker<'e> {
             d.set(n);
             n
         });
-        if depth > CONV_DEPTH {
+        if depth > conv_cap() {
             INFER_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
             return decline("infer_type depth limit");
         }
@@ -1650,7 +1669,7 @@ impl<'e> Checker<'e> {
             // depth limit and clears a pending core-depth abort. In those
             // two states take the reducing path so it still does.
             let must_reduce =
-                CORE_ABORTED.with(Cell::get) || WHNF_DEPTH.with(Cell::get) >= CONV_DEPTH;
+                CORE_ABORTED.with(Cell::get) || WHNF_DEPTH.with(Cell::get) >= conv_cap();
             let dom = match &**ty {
                 ExprData::Pi(_, dom, body) if !must_reduce => {
                     let d = Self::spine_subst(S::INFER_APP, dom, &args[j..i]);
@@ -2100,7 +2119,7 @@ impl<'e> Checker<'e> {
             // See `infer_app_spine`: where the skipped `whnf` of a syntactic
             // Pi would not be the identity, reduce as the old rule does.
             let must_reduce =
-                CORE_ABORTED.with(Cell::get) || WHNF_DEPTH.with(Cell::get) >= CONV_DEPTH;
+                CORE_ABORTED.with(Cell::get) || WHNF_DEPTH.with(Cell::get) >= conv_cap();
             let field = k >= params.len();
             let dom = match &**ty {
                 ExprData::Pi(_, dom, body) if !must_reduce => {
@@ -2879,9 +2898,9 @@ impl<'e> Checker<'e> {
             d.set(n);
             n
         });
-        if depth > CONV_DEPTH {
+        if depth > conv_cap() {
             WHNF_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-            if depth == CONV_DEPTH + 1 && env_set!("KIOTA_DEBUG") {
+            if depth == conv_cap() + 1 && env_set!("KIOTA_DEBUG") {
                 eprintln!("WHNF_DEPTH {}", self.pp_budget(e, 50));
             }
             self.dump_conversion_trace(e);
@@ -3117,7 +3136,7 @@ impl<'e> Checker<'e> {
         // depth cap.
         if Self::lazy_same_head(a, b)
             || CORE_ABORTED.with(Cell::get)
-            || CORE_DEPTH.with(Cell::get) >= CONV_DEPTH
+            || CORE_DEPTH.with(Cell::get) >= conv_cap()
         {
             return Ok(false);
         }
@@ -3457,7 +3476,7 @@ impl<'e> Checker<'e> {
             d.set(n);
             n
         });
-        if depth > CONV_DEPTH {
+        if depth > conv_cap() {
             self.dump_conversion_trace(&e);
             CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
             CORE_ABORTED.with(|a| a.set(true));
@@ -4078,9 +4097,9 @@ impl<'e> Checker<'e> {
             d.set(n);
             n
         });
-        if depth > CONV_DEPTH {
+        if depth > conv_cap() {
             DEFEQ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-            if depth == CONV_DEPTH + 1 && env_set!("KIOTA_DEBUG") {
+            if depth == conv_cap() + 1 && env_set!("KIOTA_DEBUG") {
                 eprintln!(
                     "DEFEQ_DEPTH a={} b={}",
                     self.pp_budget(a, 50),
@@ -4202,7 +4221,7 @@ impl<'e> Checker<'e> {
         // normalization or bypass the existing core depth guard. Check
         // before identity/cache hits too; whnf clears its own abort flag.
         if self.lazy_head_enabled.get()
-            && (CORE_ABORTED.with(Cell::get) || CORE_DEPTH.with(|d| d.get() >= CONV_DEPTH))
+            && (CORE_ABORTED.with(Cell::get) || CORE_DEPTH.with(|d| d.get() >= conv_cap()))
         {
             return decline("lazy head comparison after core depth abort");
         }
@@ -4330,7 +4349,7 @@ impl<'e> Checker<'e> {
             && tries < MAX_FALLBACK_TRIES
             && !abort_before
             && !CORE_ABORTED.with(Cell::get)
-            && CORE_DEPTH.with(Cell::get) < CONV_DEPTH
+            && CORE_DEPTH.with(Cell::get) < conv_cap()
         {
             CORE_ABORTED.with(|c| c.set(abort_before));
             SPECULATING.with(|s| s.set(true));
@@ -5909,7 +5928,13 @@ impl<'e> Checker<'e> {
         if nat::as_lit(e).is_some() {
             return Ok(e.clone());
         }
-        self.whnf(ctx, e)
+        if expr::loose_bvar_range(e) > 0 {
+            return self.whnf(ctx, e);
+        }
+        NAT_EVAL.with(|c| c.set(c.get() + 1));
+        let r = self.whnf(ctx, e);
+        NAT_EVAL.with(|c| c.set(c.get() - 1));
+        r
     }
 
     /// Native Nat reductions (minimal): succ/add/beq/OfNat.
