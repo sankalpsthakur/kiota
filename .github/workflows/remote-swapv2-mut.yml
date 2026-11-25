@@ -1,7 +1,7 @@
 name: remote-swapv2-mut
 
 # Mutation run for the abbrev argument frame of fix/mathlib-swap-v2
-# (ba4a2e5). Each job applies one mutant from scripts/mut/mutate.py to the
+# (bcb623d). Each job applies one mutant from scripts/mut/mutate.py to the
 # pinned source and runs the whole suite, cargo test --release. A mutant is
 # killed only when a test fails ("test result: FAILED"); a build failure is
 # reported as BUILD_FAIL, not as a kill. "control" applies nothing and must
@@ -12,7 +12,7 @@ on:
 permissions:
   contents: read
 env:
-  HEAD_SHA: ba4a2e5e7f970b4c9d8fdd04433d890821c5c292
+  HEAD_SHA: bcb623d3ae6ddb1e57b9be4c908022776d815645
 jobs:
   mutant:
     strategy:
