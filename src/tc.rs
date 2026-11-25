@@ -148,8 +148,9 @@ thread_local! {
     /// `is_def_eq` calls made inside the current `ABBREV_FRAME`.
     static ABBREV_WORK: Cell<u64> = const { Cell::new(0) };
     /// The current `ABBREV_FRAME` ran out of budget. Until it unwinds, every
-    /// `is_def_eq` declines at entry and nothing is memoized (`memo_frozen`),
-    /// and the frame discards what its comparison returned.
+    /// `is_def_eq` declines at entry, no table that outlives the frame is
+    /// written (`memo_frozen` lists them), and the frame discards what its
+    /// comparison returned.
     static ABBREV_EXHAUSTED: Cell<bool> = const { Cell::new(false) };
     /// Largest `ABBREV_WORK` an abbrev frame finished within, and how many
     /// frames ran out (`KIOTA_ABBREV_STATS`).
@@ -157,6 +158,13 @@ thread_local! {
     static ABBREV_EXHAUSTIONS: Cell<u64> = const { Cell::new(0) };
     /// A unit test's budget in place of `abbrev_args_budget()` (0: none).
     static ABBREV_BUDGET_OVERRIDE: Cell<u64> = const { Cell::new(0) };
+    /// Abbrev frames exhausted in the current pass over a declaration
+    /// (`check_decl_once`), `None` outside one (inductive blocks, tests).
+    static DECL_EXHAUSTIONS: Cell<Option<u32>> = const { Cell::new(None) };
+    /// Set once `DECL_EXHAUSTIONS` reaches `MAX_DECL_EXHAUSTIONS`: until the
+    /// pass ends every `is_def_eq` declines at entry, nothing is memoized,
+    /// and the pass declines whatever it returns (`check_decl_once`).
+    static DECL_ABANDONED: Cell<bool> = const { Cell::new(false) };
     /// Bumped by every `decline`. Nothing else bumps it while a decline
     /// propagates through `?`, so enclosing frames can tell it is the same one.
     static DECLINE_SERIAL: Cell<u64> = const { Cell::new(0) };
@@ -214,6 +222,15 @@ const LAZY_DELTA_STEPS: usize = 16;
 /// (`ABBREV_FRAME`); `KIOTA_ABBREV_ARGS_BUDGET` overrides it, `0` removes it.
 const ABBREV_ARGS_BUDGET: u64 = 1_000_000;
 
+/// Abbrev frames one pass over a declaration may exhaust before the pass
+/// gives up (`DECL_ABANDONED`). After one exhausted frame the comparison
+/// goes on by the main path, whose own abbrev frames have full budgets, so
+/// one exhaustion costs one budget. A run of them means the shortcut keeps
+/// failing under a declaration, and each costs a budget of time and memory;
+/// past this many the pass declines instead (at most this many budgets
+/// wasted per pass, twice with the lazy retry).
+const MAX_DECL_EXHAUSTIONS: u32 = 8;
+
 fn abbrev_args_budget() -> u64 {
     let o = ABBREV_BUDGET_OVERRIDE.with(Cell::get);
     if o != 0 {
@@ -229,10 +246,18 @@ fn abbrev_args_budget() -> u64 {
     })
 }
 
-/// No memo table is written while an abbrev frame is exhausted: what is
-/// computed then may rest on declines swallowed as `false`.
-fn memo_frozen() -> bool {
-    ABBREV_EXHAUSTED.with(Cell::get)
+/// While an abbrev frame is exhausted (`ABBREV_EXHAUSTED`) no table that
+/// outlives the frame is written: what is computed then may rest on
+/// declines swallowed as `false` or `None`. That covers every result table
+/// of the checker: the infer, spine, defeq, whnf and whnf_core caches (both
+/// namespaces), the cross-declaration `XINFER`, `XSPINE`, `XWHNF` and
+/// `XDEFEQ`, `iota_lit_memo`, `iota_value_cache`, `proof_arg_cache`,
+/// `native_string_ok` and NbE thunks (`nbe::Thunk::force`). Not covered,
+/// because they hold syntax only and never consult conversion:
+/// `unfold_cache` (a definition's body at given levels), `CTX_IDS` (context
+/// interning) and the substitution, shift and level memos of `expr`.
+pub(crate) fn memo_frozen() -> bool {
+    ABBREV_EXHAUSTED.with(Cell::get) || DECL_ABANDONED.with(Cell::get)
 }
 
 /// `KIOTA_ABBREV_STATS` (or `KIOTA_STATS`): the abbrev argument frames'
@@ -1122,7 +1147,20 @@ impl<'e> Checker<'e> {
     fn check_decl_once(&self, name: u32, kind: &str) -> R<()> {
         crate::stats::decl_start(expr::next_identity());
         let stats = abbrev_stats_on().then(|| (std::time::Instant::now(), ABBREV_EXHAUSTIONS.with(Cell::get)));
+        DECL_ABANDONED.with(|a| a.set(false));
+        let outer = DECL_EXHAUSTIONS.with(|n| n.replace(Some(0)));
         let r = self.check_decl_once_go(name, kind);
+        DECL_EXHAUSTIONS.with(|n| n.set(outer));
+        // An abandoned pass ran on with every comparison declining, so what
+        // it returns says nothing.
+        let r = if DECL_ABANDONED.with(|a| a.replace(false)) {
+            decline(format!(
+                "{} abbrev argument comparisons over budget in one declaration",
+                MAX_DECL_EXHAUSTIONS
+            ))
+        } else {
+            r
+        };
         if let Some((t0, before)) = stats {
             let k = ABBREV_EXHAUSTIONS.with(Cell::get) - before;
             if k > 0 {
@@ -1618,7 +1656,9 @@ impl<'e> Checker<'e> {
             if let Some((t, checked)) = hit {
                 if infer_only || checked {
                     XCACHE_HITS.with(|c| c.set(c.get() + 1));
-                    cache_ref.borrow_mut().insert(key, (t.clone(), checked));
+                    if !memo_frozen() {
+                        cache_ref.borrow_mut().insert(key, (t.clone(), checked));
+                    }
                     return Ok(t);
                 }
             }
@@ -1868,6 +1908,9 @@ impl<'e> Checker<'e> {
                 pending: (i - j) as u32,
                 checked: !infer_only,
             };
+            if memo_frozen() {
+                continue;
+            }
             if key.0 == 0 && xcache && st.checked && !self.xcache_tainted.get() {
                 XSPINE.with(|m| {
                     let mut m = m.borrow_mut();
@@ -1878,9 +1921,7 @@ impl<'e> Checker<'e> {
                 });
             }
             let mut cache = self.spine_cache.borrow_mut();
-            if memo_frozen() {
-                // Nothing is memoized while an abbrev frame is exhausted.
-            } else if expr::reclamation_enabled() && cache.len() >= 50_000 {
+            if expr::reclamation_enabled() && cache.len() >= 50_000 {
                 cache.clear();
             }
             match cache.get(&key) {
@@ -2745,7 +2786,9 @@ impl<'e> Checker<'e> {
             return b;
         }
         let b = self.const_has_proof_arg_uncached(n);
-        self.proof_arg_cache.borrow_mut().insert(n, b);
+        if !memo_frozen() {
+            self.proof_arg_cache.borrow_mut().insert(n, b);
+        }
         b
     }
 
@@ -3146,7 +3189,7 @@ impl<'e> Checker<'e> {
             return Ok(r);
         }
         self.whnf_cache_insert(force_eager, k, r.clone());
-        if xcache && !self.xcache_tainted.get() {
+        if xcache && !self.xcache_tainted.get() && !memo_frozen() {
             XWHNF.with(|m| {
                 let mut m = m.borrow_mut();
                 if m.len() >= XCACHE_CAP {
@@ -3501,7 +3544,11 @@ impl<'e> Checker<'e> {
     /// its budget. Within it the comparison is exactly the unbounded one;
     /// past it, whatever came back (even `Ok(true)` or a rejection) is
     /// discarded as "not proved this way", which leaves the pair to the rest
-    /// of `is_def_eq`, as for any speculative `false`.
+    /// of `is_def_eq`, as for any speculative `false`: the main path, whose
+    /// own abbrev frames get full budgets. The frame restores `CORE_ABORTED`;
+    /// the depth counters were restored by every declined call. The
+    /// `MAX_DECL_EXHAUSTIONS`th exhausted frame of a declaration pass
+    /// declines instead and abandons the pass (`DECL_ABANDONED`).
     fn abbrev_args_frame(&self, compare: impl FnOnce() -> R<bool>) -> R<bool> {
         let abort_before = CORE_ABORTED.with(Cell::get);
         let stats = abbrev_stats_on();
@@ -3526,6 +3573,14 @@ impl<'e> Checker<'e> {
                 let us = t0.elapsed().as_micros() as u64;
                 abbrev_stats::record(work, us, 5, &decl);
                 eprintln!("ABBREV_ARGS exhausted after {work} calls in {} ms decl={}", us / 1000, decl());
+            }
+            let n = DECL_EXHAUSTIONS.with(|n| {
+                n.set(n.get().map(|k| k + 1));
+                n.get()
+            });
+            if n.is_some_and(|n| n >= MAX_DECL_EXHAUSTIONS) {
+                DECL_ABANDONED.with(|a| a.set(true));
+                return decline("abbrev argument comparisons over budget in this declaration");
             }
             return Ok(false);
         }
@@ -4325,6 +4380,10 @@ impl<'e> Checker<'e> {
                 );
             }
             return decline("defeq depth limit");
+        }
+        if DECL_ABANDONED.with(Cell::get) {
+            DEFEQ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            return decline("abbrev argument comparisons over budget in this declaration");
         }
         if ABBREV_FRAME.with(Cell::get) {
             let n = ABBREV_WORK.with(|w| {
@@ -5546,7 +5605,9 @@ impl<'e> Checker<'e> {
     /// major premise is actually `target target_args..`). Same shape and
     /// same reasoning as `minor_index_from_type`, for recursor identity
     /// instead of minor-slot identity. Returns `None` (falls back to
-    /// `nested_rec_for`) for any shape this doesn't handle cleanly.
+    /// `nested_rec_for`) for any shape this doesn't handle cleanly. A
+    /// declined comparison declines: read as "no match" it would hand the
+    /// choice to that name-only search.
     fn nested_rec_for_type(
         &self,
         ctx: &Ctx,
@@ -5555,7 +5616,7 @@ impl<'e> Checker<'e> {
         params: &[Expr],
         target: u32,
         target_args: &[Expr],
-    ) -> Option<u32> {
+    ) -> R<Option<u32>> {
         abbrev_stats::NESTED_BY_TYPE.with(|n| n.set(n.get() + 1));
         for rec in self.rec_group(rname) {
             let (typ, rec_level_params, rec_num_params, num_motives, num_minors, num_indices) =
@@ -5658,22 +5719,24 @@ impl<'e> Checker<'e> {
                     // `List Value`'s `rec_3`, sorted first, instead of
                     // `List (Prod Attr Value)`'s `rec_4`, both owning
                     // `List.cons`/`List.nil`).
-                    let matches = margs[..target_args.len()]
-                        .iter()
-                        .zip(target_args)
-                        .all(|(a, b)| {
-                            a == b || {
-                                abbrev_stats::NESTED_BY_TYPE_DEFEQ.with(|n| n.set(n.get() + 1));
-                                self.is_def_eq(ctx, a, b).unwrap_or(false)
-                            }
-                        });
+                    let mut matches = true;
+                    for (a, b) in margs[..target_args.len()].iter().zip(target_args) {
+                        if a == b {
+                            continue;
+                        }
+                        abbrev_stats::NESTED_BY_TYPE_DEFEQ.with(|n| n.set(n.get() + 1));
+                        if !self.is_def_eq(ctx, a, b)? {
+                            matches = false;
+                            break;
+                        }
+                    }
                     if matches {
-                        return Some(rec);
+                        return Ok(Some(rec));
                     }
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     /// Find `cname`'s minor-premise slot directly from `rname`'s own type
@@ -6046,21 +6109,23 @@ impl<'e> Checker<'e> {
         if !is_rec && forced.is_none() {
             return Ok(None);
         }
-        let mut ty = self
-            .whnf(ctx, field_ty)
-            .unwrap_or_else(|_| field_ty.clone());
+        // A field type that does not reduce declines: left unreduced, its
+        // head could miss the block and drop the field's induction
+        // hypothesis from the reduct.
         let mut binders: Vec<Expr> = Vec::new();
         let mut tctx = ctx.clone();
-        loop {
-            match &**ty {
+        let mut cur = field_ty.clone();
+        let ty = loop {
+            let w = self.whnf(&tctx, &cur)?;
+            match &**w {
                 ExprData::Pi(_, dom, body) => {
                     binders.push(dom.clone());
                     tctx.push(dom.clone());
-                    ty = self.whnf(&tctx, body).unwrap_or_else(|_| body.clone());
+                    cur = body.clone();
                 }
-                _ => break,
+                _ => break w,
             }
-        }
+        };
         let (head, iargs) = expr::unfold_apps(&ty);
         let target = match &**head {
             ExprData::Const(n, _) => *n,
@@ -6140,7 +6205,7 @@ impl<'e> Checker<'e> {
                 .iter()
                 .map(|p| shift_at(S::IOTA, p, shift_by, 0))
                 .collect();
-            self.nested_rec_for_type(&tctx, rname, us, &shifted_params, target, &iargs)
+            self.nested_rec_for_type(&tctx, rname, us, &shifted_params, target, &iargs)?
         } {
             // `nested_rec_for_type` matches on `ty`'s own head and args
             // against each candidate's *actual declared major-premise
@@ -6797,7 +6862,9 @@ impl<'e> Checker<'e> {
         }
         match self.check_native_string_projection(sname) {
             Ok(ok) => {
-                self.native_string_ok.set(Some(ok));
+                if !memo_frozen() {
+                    self.native_string_ok.set(Some(ok));
+                }
                 ok
             }
             // An abort says nothing about the environment, so it is not cached.
@@ -13027,23 +13094,25 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         assert!(tc.with_forced_eager_defeq(|| tc.is_def_eq(&Ctx::new(), &zero, &zero)).unwrap());
     }
 
-    /// An abbrev argument comparison over its budget (`ABBREV_FRAME`) is
-    /// discarded as "not proved", the main path still proves the pair, and
-    /// nothing computed past the budget is memoized: the argument pair, asked
-    /// again with the budget lifted, is still equal.
-    #[test]
-    fn an_abbrev_argument_comparison_over_budget_falls_back_to_the_main_path() {
+    /// The mini Nat of `regression_429_nat_add_env` (0 `Nat` .. 4 `Nat.add`)
+    /// plus: 5 `Pair`, 6 `Pair.mk`, 7 `Pair.fst` (an abbrev, as Lean's
+    /// projection functions are), 8 `P` and 9 `Q` (regular, both
+    /// `fun a => ⟨0, a⟩`), 10 `A` (abbrev, `fun x y => x + y`), 11 `R`
+    /// (regular, `fun x => x`), and 12 `Box`, 13 `Box.mk`, 14 `Box.rec` for
+    /// `Box (α : Type) | mk : α → Box α`.
+    fn abbrev_frame_env() -> (Environment, Vec<std::rc::Rc<String>>) {
         use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
         let mut env = regression_429_nat_add_env();
         let c = |i| expr::const_(i, vec![]);
         let v = expr::bvar;
         let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
         let lam = |d, r| expr::lam(expr::BinderInfo::Default, d, r);
+        let ty = expr::sort(level::succ(level::zero()));
         let nat = c(0);
         let pair = c(5);
         let zero = expr::lit_nat(BigUint::from(0u32));
         env.insert(5, CI::InductiveType {
-            level_params: vec![], typ: expr::sort(level::succ(level::zero())),
+            level_params: vec![], typ: ty.clone(),
             num_params: 0, num_indices: 0, all: vec![5], ctors: vec![6],
             is_rec: false, is_unsafe: false,
         });
@@ -13051,13 +13120,11 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             level_params: vec![], typ: pi(nat.clone(), pi(nat.clone(), pair.clone())),
             induct: 5, cidx: 0, num_params: 0, num_fields: 2, is_unsafe: false,
         });
-        // Pair.fst, an abbrev as Lean's projection functions are.
         env.insert(7, CI::Def {
             level_params: vec![], typ: pi(pair.clone(), nat.clone()),
             value: lam(pair.clone(), expr::proj(5, 0, v(0))),
             hints: RH::Abbrev, is_unsafe: false,
         });
-        // P a := ⟨0, a⟩ and Q a := ⟨0, a⟩.
         for i in [8, 9] {
             env.insert(i, CI::Def {
                 level_params: vec![], typ: pi(nat.clone(), pair.clone()),
@@ -13065,28 +13132,466 @@ fn regression_432_defining_equations_and_closed_values_convert() {
                 hints: RH::Regular(1), is_unsafe: false,
             });
         }
+        env.insert(10, CI::Def {
+            level_params: vec![], typ: pi(nat.clone(), pi(nat.clone(), nat.clone())),
+            value: lam(nat.clone(), lam(nat.clone(), expr::apps(c(4), &[v(1), v(0)]))),
+            hints: RH::Abbrev, is_unsafe: false,
+        });
+        env.insert(11, CI::Def {
+            level_params: vec![], typ: pi(nat.clone(), nat.clone()),
+            value: lam(nat.clone(), v(0)),
+            hints: RH::Regular(1), is_unsafe: false,
+        });
+        // Box (α : Type) : Type | mk : α → Box α, and
+        // Box.rec : (α : Type) → (motive : Box α → Type) →
+        //   ((a : α) → motive (Box.mk α a)) → (t : Box α) → motive t.
+        env.insert(12, CI::InductiveType {
+            level_params: vec![], typ: pi(ty.clone(), ty.clone()),
+            num_params: 1, num_indices: 0, all: vec![12], ctors: vec![13],
+            is_rec: false, is_unsafe: false,
+        });
+        env.insert(13, CI::Constructor {
+            level_params: vec![], typ: pi(ty.clone(), pi(v(0), expr::app(c(12), v(1)))),
+            induct: 12, cidx: 0, num_params: 1, num_fields: 1, is_unsafe: false,
+        });
+        let box_rec_ty = pi(
+            ty.clone(),
+            pi(
+                pi(expr::app(c(12), v(0)), ty.clone()),
+                pi(
+                    pi(v(1), expr::app(v(1), expr::apps(c(13), &[v(2), v(0)]))),
+                    pi(expr::app(c(12), v(2)), expr::app(v(2), v(0))),
+                ),
+            ),
+        );
+        env.insert(14, CI::Recursor {
+            level_params: vec![], typ: box_rec_ty, all: vec![12],
+            num_params: 1, num_indices: 0, num_motives: 1, num_minors: 1,
+            rules: vec![crate::env::RecRule { ctor: 13, nfields: 1, rhs: v(0) }],
+            k: false, is_unsafe: false,
+        });
         let names = test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add",
-            "Pair", "Pair.mk", "Pair.fst", "P", "Q"]);
+            "Pair", "Pair.mk", "Pair.fst", "P", "Q", "A", "R", "Box", "Box.mk", "Box.rec"]);
+        (env, names)
+    }
+
+    fn lit(n: u32) -> Expr {
+        expr::lit_nat(BigUint::from(n))
+    }
+
+    /// `Pair.fst (P 5)` and `Pair.fst (Q (5 + 0))`: one abbrev frame whose
+    /// argument pair takes more than one comparison, provable by the main
+    /// path too.
+    fn abbrev_pair() -> (Expr, Expr, Expr, Expr) {
+        let c = |i| expr::const_(i, vec![]);
+        let p = expr::app(c(8), lit(5));
+        let q = expr::app(c(9), expr::apps(c(4), &[lit(5), lit(0)]));
+        (expr::app(c(7), p.clone()), expr::app(c(7), q.clone()), p, q)
+    }
+
+    /// Sets `ABBREV_BUDGET_OVERRIDE` for one test and clears it on drop.
+    struct Budget;
+    impl Budget {
+        fn set(n: u64) -> Budget {
+            ABBREV_BUDGET_OVERRIDE.with(|b| b.set(n));
+            Budget
+        }
+    }
+    impl Drop for Budget {
+        fn drop(&mut self) {
+            ABBREV_BUDGET_OVERRIDE.with(|b| b.set(0));
+        }
+    }
+
+    /// An abbrev argument comparison over its budget (`ABBREV_FRAME`) is
+    /// discarded as "not proved", the main path still proves the pair, and
+    /// the frame leaves no state behind: the argument pair, asked again with
+    /// the budget lifted, is still equal.
+    #[test]
+    fn an_abbrev_argument_comparison_over_budget_falls_back_to_the_main_path() {
+        let (env, names) = abbrev_frame_env();
         let tc = Checker::new(&env, &names, Some(0), None);
         let ctx = Ctx::new();
-        let five = expr::lit_nat(BigUint::from(5u32));
-        let p = expr::app(c(8), five.clone());
-        // `5 + 0`: the argument pair takes more than one comparison.
-        let q = expr::app(c(9), expr::apps(c(4), &[five, zero.clone()]));
-        let lhs = expr::app(c(7), p.clone());
-        let rhs = expr::app(c(7), q.clone());
+        let (lhs, rhs, p, q) = abbrev_pair();
         let eq = |a: &Expr, b: &Expr| tc.with_forced_eager_defeq(|| tc.is_def_eq(&ctx, a, b));
 
         let before = ABBREV_EXHAUSTIONS.with(Cell::get);
-        ABBREV_BUDGET_OVERRIDE.with(|b| b.set(1));
+        let budget = Budget::set(1);
         let r = eq(&lhs, &rhs);
-        ABBREV_BUDGET_OVERRIDE.with(|b| b.set(0));
+        drop(budget);
         assert!(matches!(r, Ok(true)), "{r:?}");
         assert!(ABBREV_EXHAUSTIONS.with(Cell::get) > before, "the budget of 1 was not reached");
         assert!(!ABBREV_FRAME.with(Cell::get) && !ABBREV_EXHAUSTED.with(Cell::get));
         assert!(!CORE_ABORTED.with(Cell::get));
+        assert_eq!(DEFEQ_DEPTH.with(Cell::get), 0);
         let r = eq(&p, &q);
         assert!(matches!(r, Ok(true)), "{r:?}");
+    }
+
+    /// Once a frame is exhausted every `is_def_eq` declines at entry, even
+    /// on a pair it would prove at once, and gives its depth back; work stops
+    /// at the budget. Whatever the comparison returns after that (a proof,
+    /// a rejection, a decline) is discarded as `false`; the frame's flags
+    /// and `CORE_ABORTED` are restored.
+    #[test]
+    fn an_exhausted_abbrev_frame_stops_work_and_discards_what_comes_back() {
+        let (env, names) = abbrev_frame_env();
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+        let five = lit(5);
+        let _budget = Budget::set(3);
+        let outcomes: [fn() -> R<bool>; 3] =
+            [|| Ok(true), || reject("past the budget"), || decline("past the budget")];
+        for ret in outcomes {
+            let r = tc.abbrev_args_frame(|| {
+                for _ in 0..3 {
+                    assert!(matches!(tc.is_def_eq(&ctx, &five, &five), Ok(true)));
+                }
+                assert!(!ABBREV_EXHAUSTED.with(Cell::get));
+                CORE_ABORTED.with(|c| c.set(true));
+                for _ in 0..1000 {
+                    let depth = DEFEQ_DEPTH.with(Cell::get);
+                    let r = tc.is_def_eq(&ctx, &five, &five);
+                    assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+                    assert_eq!(DEFEQ_DEPTH.with(Cell::get), depth);
+                }
+                assert!(ABBREV_EXHAUSTED.with(Cell::get));
+                ret()
+            });
+            assert!(matches!(r, Ok(false)), "{r:?}");
+            assert!(!ABBREV_FRAME.with(Cell::get) && !ABBREV_EXHAUSTED.with(Cell::get));
+            assert!(!CORE_ABORTED.with(Cell::get), "CORE_ABORTED leaked out of the frame");
+            assert_eq!(DEFEQ_DEPTH.with(Cell::get), 0);
+        }
+        // Work past the budget: one more counted entry, then declines only.
+        let r = tc.abbrev_args_frame(|| {
+            for _ in 0..1000 {
+                let _ = tc.is_def_eq(&ctx, &five, &five);
+            }
+            Ok(true)
+        });
+        assert!(matches!(r, Ok(false)), "{r:?}");
+        // Within the budget the frame returns what the comparison returned.
+        for ret in [true, false] {
+            let r = tc.abbrev_args_frame(|| {
+                assert!(matches!(tc.is_def_eq(&ctx, &five, &five), Ok(true)));
+                Ok(ret)
+            });
+            assert!(matches!(r, Ok(b) if b == ret), "{r:?}");
+        }
+    }
+
+    /// The budget is the outermost frame's: an abbrev comparison inside it
+    /// neither opens a frame of its own (resetting the count) nor closes the
+    /// outer one when it returns.
+    #[test]
+    fn an_abbrev_comparison_inside_a_frame_shares_its_budget() {
+        let (env, names) = abbrev_frame_env();
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+        let (lhs, rhs, _, _) = abbrev_pair();
+        let five = lit(5);
+        let _budget = Budget::set(1_000_000);
+        let r = tc.abbrev_args_frame(|| {
+            for _ in 0..10 {
+                tc.is_def_eq(&ctx, &five, &five)?;
+            }
+            let w = ABBREV_WORK.with(Cell::get);
+            assert_eq!(w, 10);
+            let r = tc.with_forced_eager_defeq(|| tc.is_def_eq(&ctx, &lhs, &rhs));
+            assert!(matches!(r, Ok(true)), "{r:?}");
+            assert!(ABBREV_FRAME.with(Cell::get), "the inner abbrev comparison closed the frame");
+            assert!(ABBREV_WORK.with(Cell::get) > w + 1, "the inner abbrev comparison reset the count");
+            Ok(true)
+        });
+        assert!(matches!(r, Ok(true)), "{r:?}");
+    }
+
+    /// Only an abbrev head opens a frame: the arguments of a regular head
+    /// are compared without a budget (official compares them first there).
+    #[test]
+    fn a_regular_head_opens_no_abbrev_frame() {
+        let (env, names) = abbrev_frame_env();
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+        let c = |i| expr::const_(i, vec![]);
+        let a = expr::app(c(11), lit(5));
+        let b = expr::app(c(11), expr::apps(c(4), &[lit(5), lit(0)]));
+        let frames = abbrev_stats::FRAMES.with(Cell::get);
+        let before = ABBREV_EXHAUSTIONS.with(Cell::get);
+        let _budget = Budget::set(1);
+        let r = tc.with_forced_eager_defeq(|| tc.is_def_eq(&ctx, &a, &b));
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        assert_eq!(abbrev_stats::FRAMES.with(Cell::get), frames, "a regular head opened a frame");
+        assert_eq!(ABBREV_EXHAUSTIONS.with(Cell::get), before);
+    }
+
+    /// Sets `ABBREV_EXHAUSTED` (without a frame, so every operation runs to
+    /// completion) for one test and clears it on drop.
+    struct Frozen;
+    impl Frozen {
+        fn set() -> Frozen {
+            ABBREV_EXHAUSTED.with(|x| x.set(true));
+            Frozen
+        }
+    }
+    impl Drop for Frozen {
+        fn drop(&mut self) {
+            ABBREV_EXHAUSTED.with(|x| x.set(false));
+        }
+    }
+
+    /// While a frame is exhausted (`memo_frozen`) no table that outlives
+    /// the frame is written, whichever path computes the result: each case
+    /// computes something that would be memoized and checks the table.
+    #[test]
+    fn nothing_computed_while_a_frame_is_exhausted_is_memoized() {
+        let (env, names) = abbrev_frame_env();
+        let c = |i| expr::const_(i, vec![]);
+        let ctx = Ctx::new();
+        let add50 = || expr::apps(c(4), &[lit(5), lit(0)]);
+        XCACHE_ON.with(|x| x.set(true));
+        let xlen = || {
+            (
+                XINFER.with(|m| m.borrow().len()),
+                XWHNF.with(|m| m.borrow().len()),
+                XSPINE.with(|m| m.borrow().len()),
+                XDEFEQ.with(|m| m.borrow().len()),
+            )
+        };
+        // Checked inference of a closed application: the infer cache, the
+        // spine cache, and XINFER and XSPINE.
+        {
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let x0 = xlen();
+            let frozen = Frozen::set();
+            let t = tc.infer_type(&ctx, &expr::app(c(11), add50()));
+            assert!(t.is_ok(), "{t:?}");
+            assert_eq!(tc.infer_cache.borrow().len(), 0, "infer cache written");
+            assert_eq!(tc.spine_cache.borrow().len(), 0, "spine cache written");
+            assert_eq!(xlen(), x0, "a cross-declaration cache written");
+            drop(frozen);
+            // Unfrozen, the same inference writes them (the case is live).
+            tc.infer_type(&ctx, &expr::app(c(11), add50())).unwrap();
+            assert!(!tc.infer_cache.borrow().is_empty() && !tc.spine_cache.borrow().is_empty());
+            assert!(xlen().0 > x0.0 && xlen().2 > x0.2);
+        }
+        // An XINFER hit is not copied into a frozen checker's own cache.
+        {
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let _frozen = Frozen::set();
+            let t = tc.infer_type(&ctx, &expr::app(c(11), add50()));
+            assert!(t.is_ok(), "{t:?}");
+            assert_eq!(tc.infer_cache.borrow().len(), 0, "XINFER hit copied while frozen");
+        }
+        // Infer-only spine walk.
+        {
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let _frozen = Frozen::set();
+            let e = expr::apps(c(10), &[lit(1), lit(2)]);
+            let t = tc.with_infer_only(|| tc.infer_type(&ctx, &e));
+            assert!(t.is_ok(), "{t:?}");
+            assert_eq!(tc.spine_cache.borrow().len(), 0, "infer-only spine state written");
+        }
+        // whnf, whnf_core, defeq (both namespaces), XWHNF, XDEFEQ.
+        for eager in [false, true] {
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let x0 = xlen();
+            let frozen = Frozen::set();
+            let run = |f: &dyn Fn()| if eager { tc.with_forced_eager_defeq(f) } else { f() };
+            run(&|| {
+                let w = tc.whnf(&ctx, &expr::app(c(11), add50()));
+                assert!(w.is_ok(), "{w:?}");
+                let beta = expr::app(expr::lam(expr::BinderInfo::Default, c(0), expr::bvar(0)), lit(3));
+                let w = tc.whnf_core(&ctx, &beta);
+                assert!(w.is_ok(), "{w:?}");
+                let r = tc.is_def_eq(&ctx, &expr::app(c(11), lit(5)), &expr::app(c(11), add50()));
+                assert!(matches!(r, Ok(true)), "{r:?}");
+            });
+            for (what, n) in [
+                ("whnf", tc.whnf_cache.borrow().len()),
+                ("whnf_core", tc.whnf_core_cache.borrow().len()),
+                ("defeq", tc.defeq_cache.borrow().len()),
+                ("eager whnf", tc.eager_whnf_cache.borrow().len()),
+                ("eager whnf_core", tc.eager_whnf_core_cache.borrow().len()),
+                ("eager defeq", tc.eager_defeq_cache.borrow().len()),
+            ] {
+                assert_eq!(n, 0, "{what} cache written while frozen (eager={eager})");
+            }
+            assert_eq!(xlen(), x0, "a cross-declaration cache written (eager={eager})");
+            drop(frozen);
+            run(&|| {
+                tc.whnf(&ctx, &expr::app(c(11), add50())).unwrap();
+                assert!(tc.is_def_eq(&ctx, &expr::app(c(11), lit(5)), &expr::app(c(11), add50())).unwrap());
+            });
+            let (w, d) = if eager {
+                (tc.eager_whnf_cache.borrow().len(), tc.eager_defeq_cache.borrow().len())
+            } else {
+                (tc.whnf_cache.borrow().len(), tc.defeq_cache.borrow().len())
+            };
+            assert!(w > 0 && d > 0, "the unfrozen run memoizes (eager={eager})");
+        }
+        // Iota on a literal major: iota_lit_memo.
+        {
+            let tc = Checker::new(&env, &names, Some(0), None);
+            tc.set_iota_memo_enabled_for_test(true);
+            let motive = expr::lam(expr::BinderInfo::Default, c(0), c(0));
+            let step = expr::lam(
+                expr::BinderInfo::Default,
+                c(0),
+                expr::lam(expr::BinderInfo::Default, c(0), expr::app(c(2), expr::bvar(0))),
+            );
+            let e = expr::apps(c(3), &[motive, lit(0), step, lit(3)]);
+            let frozen = Frozen::set();
+            let w = tc.whnf(&ctx, &e);
+            assert!(w.is_ok(), "{w:?}");
+            assert_eq!(tc.iota_lit_memo.borrow().len(), 0, "iota_lit_memo written while frozen");
+            drop(frozen);
+            tc.whnf(&ctx, &e).unwrap();
+            assert!(!tc.iota_lit_memo.borrow().is_empty(), "the unfrozen peel memoizes");
+        }
+        // iota_value_cache, proof_arg_cache and an NbE thunk.
+        {
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let _frozen = Frozen::set();
+            let v = tc.eval(&nbe::empty_env(), &lit(1)).unwrap();
+            let arg = nbe::Thunk::forced(v.clone());
+            tc.iota_value_cache_insert(3, &Rc::new(vec![]), &[arg], v);
+            assert_eq!(tc.iota_value_cache.borrow().len(), 0, "iota_value_cache written while frozen");
+            tc.const_has_proof_arg(7);
+            assert_eq!(tc.proof_arg_cache.borrow().len(), 0, "proof_arg_cache written while frozen");
+            let th = nbe::Thunk::deferred(nbe::empty_env(), lit(2));
+            assert!(th.force(&tc).is_ok());
+            assert!(!th.is_forced(), "a thunk forced while frozen kept its value");
+        }
+        XCACHE_ON.with(|x| x.set(false));
+    }
+
+    /// `abbrev_frame_env` plus 15 `T : Pair → Type` (an abbrev, `T _ := Nat`),
+    /// and for `i` in `1..=n` the axioms `c_i : T (P i)` (id `14 + 2i`) and
+    /// `h_i : T (Q (i + 0)) → Nat` (id `15 + 2i`), and 40 `D : Nat :=
+    /// h_1 c_1 + (h_2 c_2 + (... + h_n c_n))`: each application compares
+    /// `T (P i)` with `T (Q (i + 0))`, an abbrev frame whose argument pair
+    /// takes more than one comparison.
+    fn abbrev_cap_env(n: u32) -> (Environment, Vec<std::rc::Rc<String>>) {
+        use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+        assert!(n >= 1 && 15 + 2 * n < 40);
+        let (mut env, base) = abbrev_frame_env();
+        let c = |i| expr::const_(i, vec![]);
+        let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
+        let nat = c(0);
+        let ty = expr::sort(level::succ(level::zero()));
+        env.insert(15, CI::Def {
+            level_params: vec![], typ: pi(c(5), ty),
+            value: expr::lam(expr::BinderInfo::Default, c(5), nat.clone()),
+            hints: RH::Abbrev, is_unsafe: false,
+        });
+        let mut names: Vec<String> = base.iter().map(|s| s.to_string()).collect();
+        names.push("T".into());
+        let mut value: Option<Expr> = None;
+        for i in (1..=n).rev() {
+            let (ci, hi) = (14 + 2 * i, 15 + 2 * i);
+            env.insert(ci, CI::Axiom {
+                level_params: vec![], typ: expr::app(c(15), expr::app(c(8), lit(i))), is_unsafe: false,
+            });
+            env.insert(hi, CI::Axiom {
+                level_params: vec![],
+                typ: pi(expr::app(c(15), expr::app(c(9), expr::apps(c(4), &[lit(i), lit(0)]))), nat.clone()),
+                is_unsafe: false,
+            });
+            let term = expr::app(c(hi), c(ci));
+            value = Some(match value {
+                None => term,
+                Some(rest) => expr::apps(c(4), &[term, rest]),
+            });
+        }
+        env.insert(40, CI::Def {
+            level_params: vec![], typ: nat, value: value.unwrap(),
+            hints: RH::Regular(1), is_unsafe: false,
+        });
+        for i in names.len() as u32..=40 {
+            names.push(format!("x{i}"));
+        }
+        names[40] = "D".into();
+        (env, names.into_iter().map(std::rc::Rc::new).collect())
+    }
+
+    /// A pass over a declaration that exhausts `MAX_DECL_EXHAUSTIONS` abbrev
+    /// frames declines: the shortcut keeps failing there, and each failure
+    /// costs a whole budget. One exhaustion costs one budget and the main
+    /// path proves the pair; the same declaration accepts at the full budget.
+    #[test]
+    fn a_declaration_that_keeps_exhausting_abbrev_frames_declines() {
+        let check = |n: u32, budget: u64| {
+            let (env, names) = abbrev_cap_env(n);
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let _budget = Budget::set(budget);
+            let before = ABBREV_EXHAUSTIONS.with(Cell::get);
+            let r = tc.check_decl(40, "def");
+            assert!(!DECL_ABANDONED.with(Cell::get) && DECL_EXHAUSTIONS.with(Cell::get).is_none());
+            (r, ABBREV_EXHAUSTIONS.with(Cell::get) - before)
+        };
+        let (r, k) = check(1, 1);
+        assert!(matches!(r, Ok(())), "{r:?}");
+        assert!(k >= 1 && k < MAX_DECL_EXHAUSTIONS as u64, "{k} exhaustions for one pair");
+        let (r, k) = check(12, 1);
+        assert!(
+            matches!(&r, Err(TcError::Decline(m)) if m.contains("over budget in one declaration")),
+            "{r:?} after {k} exhaustions"
+        );
+        let (r, k) = check(12, 1_000_000);
+        assert!(matches!(r, Ok(())), "{r:?}");
+        assert_eq!(k, 0);
+
+        // Once abandoned, a pass declines every comparison at entry and
+        // memoizes nothing until it ends.
+        let (env, names) = abbrev_frame_env();
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+        let (lhs, rhs, _, _) = abbrev_pair();
+        let _budget = Budget::set(1);
+        DECL_EXHAUSTIONS.with(|n| n.set(Some(MAX_DECL_EXHAUSTIONS - 1)));
+        // The frame declines; what the main path does with that after it
+        // (here it still proves the pair without asking again) is discarded
+        // by `check_decl_once`.
+        let r = tc.with_forced_eager_defeq(|| tc.is_def_eq(&ctx, &lhs, &rhs));
+        assert!(matches!(r, Ok(true) | Err(TcError::Decline(_))), "{r:?}");
+        assert!(DECL_ABANDONED.with(Cell::get) && memo_frozen());
+        assert_eq!(tc.defeq_cache.borrow().len() + tc.eager_defeq_cache.borrow().len(), 0);
+        let r = tc.is_def_eq(&ctx, &lit(5), &lit(5));
+        DECL_ABANDONED.with(|a| a.set(false));
+        DECL_EXHAUSTIONS.with(|n| n.set(None));
+        assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+        assert_eq!(DEFEQ_DEPTH.with(Cell::get), 0);
+    }
+
+    /// `nested_rec_for_type` and `mk_rec_call` pass a decline on: read as
+    /// "no match" or "no further reduction", it picks another recursor or
+    /// drops an induction hypothesis from the reduct.
+    #[test]
+    fn nested_recursor_selection_propagates_a_decline() {
+        let (env, names) = abbrev_frame_env();
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let c = |i| expr::const_(i, vec![]);
+        let ctx = Ctx::new();
+        // `Box.rec`'s major premise is `Box α`; asked for `Box β` with α ≠ β
+        // syntactically, the parameters are compared, and that declines.
+        let alpha = c(0);
+        let beta = expr::app(expr::lam(expr::BinderInfo::Default, c(5), c(0)), c(5));
+        let held = DEFEQ_DEPTH.with(|d| d.replace(CONV_DEPTH));
+        let r = tc.nested_rec_for_type(&ctx, 14, &[], &[alpha.clone()], 12, &[beta.clone()]);
+        DEFEQ_DEPTH.with(|d| d.set(held));
+        assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+        let r = tc.nested_rec_for_type(&ctx, 14, &[], &[alpha], 12, &[beta]);
+        assert!(matches!(r, Ok(Some(14))), "{r:?}");
+        // A field type that does not reduce: `Nat.rec`'s recursive field.
+        let motive = expr::lam(expr::BinderInfo::Default, c(0), c(0));
+        let held = WHNF_DEPTH.with(|d| d.replace(CONV_DEPTH));
+        let r = tc.mk_rec_call(&ctx, 3, &[], &[0], &[], &[motive.clone()], &[lit(0), lit(0)], &lit(4), &c(0), None);
+        WHNF_DEPTH.with(|d| d.set(held));
+        assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+        let r = tc.mk_rec_call(&ctx, 3, &[], &[0], &[], &[motive], &[lit(0), lit(0)], &lit(4), &c(0), None);
+        assert!(matches!(r, Ok(Some(_))), "{r:?}");
     }
 
     #[test]

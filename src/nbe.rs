@@ -173,8 +173,17 @@ impl Thunk {
             }
         };
         let computed = tc.eval(&env, &e)?;
-        *self.0.borrow_mut() = ThunkState::Forced(computed.clone());
+        // A thunk can outlive an exhausted abbrev frame (one reached through
+        // `iota_value_cache`), so what is computed there is not kept.
+        if !crate::tc::memo_frozen() {
+            *self.0.borrow_mut() = ThunkState::Forced(computed.clone());
+        }
         Ok(computed)
+    }
+
+    #[cfg(test)]
+    pub fn is_forced(&self) -> bool {
+        matches!(&*self.0.borrow(), ThunkState::Forced(_))
     }
 }
 
