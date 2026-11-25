@@ -50,6 +50,7 @@ jobs:
           ls -la $C.ndjson; df -h .
           # Per-declaration progress on mathlib only, so a kill names the declaration.
           [ "$C" = mathlib ] && export KIOTA_PROGRESS=1
+          export KIOTA_ABBREV_STATS=1
           start=$(date +%s)
           # Kill past 13 GB RSS so a spinning declaration ends with its name
           # (the last `[decl #N]` line) instead of a dead runner.
@@ -68,5 +69,7 @@ jobs:
           grep -v '^\[decl' err.txt | tail -c 3000
           echo "last progress: $(grep '^\[decl' err.txt | tail -1)"
           echo "lazy retries: $(grep -c '^LAZY_RETRY' err.txt)"; grep '^LAZY_RETRY' err.txt | tail -20
+          echo "abbrev: $(grep '^ABBREV_ARGS budget' err.txt) exhausted_lines=$(grep -c '^ABBREV_ARGS exhausted' err.txt)"
+          grep -B1 '^ABBREV_ARGS exhausted' err.txt | head -40
           echo "FULL side=$SIDE sha=$(git rev-parse --short HEAD) corpus=$C rc=$rc wall=${wall}s" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "VAL side=$SIDE sha=$(git rev-parse --short HEAD) corpus=$C rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-250)" | tee -a "$GITHUB_STEP_SUMMARY"
