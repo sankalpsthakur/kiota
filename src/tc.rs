@@ -1796,10 +1796,12 @@ impl<'e> Checker<'e> {
                 self.name_str(n)
             ));
         }
-        let ci = self
-            .env
-            .get(n)
-            .ok_or_else(|| TcError::Other(format!("unknown const {n}")))?;
+        // A constant that no earlier declaration introduced is an ill-formed
+        // term (the official kernel: "unknown constant"), not a failure of
+        // the checker: a verdict, exit 1.
+        let ci = self.env.get(n).ok_or_else(|| {
+            TcError::Reject(format!("unknown constant `{}`", self.name_str(n)))
+        })?;
         let lp = ci.level_params();
         if lp.len() != us.len() {
             return reject("universe param count mismatch");
@@ -6603,24 +6605,6 @@ impl<'e> Checker<'e> {
 
     // ---------------- Inductive/recursor validation ----------------
 
-    fn is_closed_numeral(l: &Level) -> bool {
-        match &**l {
-            crate::level::LevelData::Zero => true,
-            crate::level::LevelData::Succ(a) => Self::is_closed_numeral(a),
-            _ => false,
-        }
-    }
-
-    fn is_strict_succ_of(hi: &Level, lo: &Level) -> bool {
-        let mut n = 0u32;
-        let mut cur = hi.clone();
-        while let crate::level::LevelData::Succ(a) = &*cur {
-            n += 1;
-            cur = a.clone();
-        }
-        n > 0 && level::is_def_eq(&cur, lo)
-    }
-
     /// Lean kernel `elim_only_at_universe_zero` (`src/kernel/inductive.cpp`):
     /// whether the recursor(s) for the (mutual) inductive group `all` may
     /// only eliminate into `Prop` (motive codomain fixed at `Sort 0`),
@@ -6791,6 +6775,12 @@ impl<'e> Checker<'e> {
                 seen.push(*p);
             }
         }
+        // The syntactic conditions the official kernel imposes before it
+        // looks at any type modulo reduction (`environment::add_inductive`
+        // and `elim_nested_inductive_fn` in inductive.cpp).  They concern
+        // the whole block; running them for every member keeps them
+        // independent of what a member's `all` list claims comes first.
+        self.check_inductive_block_syntax(&all, num_params, &shared_lp)?;
         // Shared parameter telescope, taken from the first type's arity.
         let mut param_ctx: Ctx = Ctx::new();
         let mut cur = typ.clone();
@@ -6859,13 +6849,14 @@ impl<'e> Checker<'e> {
                 .map(|i| i.sort.clone())
                 .unwrap_or_else(level::zero);
             for cname in &ctors {
-                let (c_lp, c_typ, c_np) = match self.env.get(*cname) {
+                let (c_lp, c_typ, c_np, c_nf) = match self.env.get(*cname) {
                     Some(ConstantInfo::Constructor {
                         level_params,
                         typ,
                         num_params,
+                        num_fields,
                         ..
-                    }) => (level_params.clone(), typ.clone(), *num_params),
+                    }) => (level_params.clone(), typ.clone(), *num_params, *num_fields),
                     _ => continue,
                 };
                 if c_lp != shared_lp {
@@ -6877,7 +6868,11 @@ impl<'e> Checker<'e> {
                 let mut c2: Ctx = Ctx::new();
                 let mut cur2 = c_typ.clone();
                 for i in 0..num_params {
-                    let (_, dom, body) = self.ensure_pi(&c2, &cur2)?;
+                    // `get_params` again: no reduction to find a parameter.
+                    let ExprData::Pi(_, dom, body) = &**cur2 else {
+                        return reject("constructor type does not start with the inductive type's parameters");
+                    };
+                    let (dom, body) = (dom.clone(), body.clone());
                     if !self.is_def_eq(&c2, &dom, &param_ctx[i as usize])? {
                         return reject(
                             "constructor parameter telescope does not match inductive type",
@@ -6886,25 +6881,31 @@ impl<'e> Checker<'e> {
                     c2.push(dom);
                     cur2 = body;
                 }
+                // `declare_constructors`: the field count is the number of
+                // manifest binders after the parameters.  Structure eta and
+                // projections read it, so it cannot be taken on trust.
+                if Self::manifest_arity(&cur2) != c_nf as u64 {
+                    return reject("constructor numFields does not match its type");
+                }
                 loop {
                     // Only walk *manifest* Pis — do not whnf the constructor type
                     // itself (see tutorial/054_reduceCtorType).
                     match &**cur2 {
                         ExprData::Pi(_, dom, body) => {
                             self.check_arg_positive(&c2, dom, &all, num_params)?;
+                            // `check_constructors`: the field's sort must be
+                            // at most the inductive type's, unless the type
+                            // is a proposition.  The comparison has to hold
+                            // for every universe assignment, not only for
+                            // closed numerals.
                             let ds = self.infer_type(&c2, dom)?;
-                            if let Ok(field_lvl) = self.ensure_sort(&c2, &ds) {
-                                let too_big_closed = Self::is_closed_numeral(&field_lvl)
-                                    && Self::is_closed_numeral(&t_sort)
-                                    && !level::leq(&field_lvl, &t_sort, 0);
-                                let too_big_succ = Self::is_strict_succ_of(&field_lvl, &t_sort);
-                                if (too_big_closed || too_big_succ)
-                                    && !level::is_def_eq(&t_sort, &level::zero())
-                                {
-                                    return reject(
-                                        "constructor field universe is too big for the inductive type",
-                                    );
-                                }
+                            let field_lvl = self.ensure_sort(&c2, &ds)?;
+                            if !level::leq_all(&field_lvl, &t_sort)
+                                && !level::leq_all(&t_sort, &level::zero())
+                            {
+                                return reject(
+                                    "constructor field universe is too big for the inductive type",
+                                );
                             }
                             c2.push(dom.clone());
                             cur2 = body.clone();
@@ -6917,11 +6918,9 @@ impl<'e> Checker<'e> {
                     ExprData::Const(n, us) if n == tname => {
                         let expected: Vec<Level> =
                             shared_lp.iter().map(|p| level::param(*p)).collect();
-                        if us.len() != expected.len()
-                            || !us
-                                .iter()
-                                .zip(expected.iter())
-                                .all(|(a, b)| level::is_def_eq(a, b))
+                        // `is_valid_ind_app` compares the levels as
+                        // written, like `check_uniform_ind_occs`.
+                        if us.len() != expected.len() || us.iter().zip(expected.iter()).any(|(a, b)| a != b)
                         {
                             return reject(
                                 "constructor conclusion applies inductive type at wrong universes",
@@ -6948,6 +6947,283 @@ impl<'e> Checker<'e> {
                     if self.occurs_any(idx_arg, &all) {
                         return reject("constructor index expression refers to the inductive type being defined");
                     }
+                }
+            }
+        }
+        self.check_is_rec_flag(&all)?;
+        Ok(())
+    }
+
+    /// Number of manifest leading binders of a type.
+    pub(crate) fn manifest_arity(e: &Expr) -> u64 {
+        let mut n = 0u64;
+        let mut cur = e;
+        while let ExprData::Pi(_, _, body) = &***cur {
+            n += 1;
+            cur = body;
+        }
+        n
+    }
+
+    /// Whether `e` mentions one of `names` as a constant or as the structure
+    /// of a projection.  Shared subterms are visited once.
+    fn mentions_any(e: &Expr, names: &[u32], seen: &mut rustc_hash::FxHashSet<usize>) -> bool {
+        if !seen.insert(expr::identity(e)) {
+            return false;
+        }
+        match &***e {
+            ExprData::Const(n, _) => names.contains(n),
+            ExprData::App(f, a) => {
+                Self::mentions_any(f, names, seen) || Self::mentions_any(a, names, seen)
+            }
+            ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
+                Self::mentions_any(t, names, seen) || Self::mentions_any(b, names, seen)
+            }
+            ExprData::Let(t, v, b) => {
+                Self::mentions_any(t, names, seen)
+                    || Self::mentions_any(v, names, seen)
+                    || Self::mentions_any(b, names, seen)
+            }
+            ExprData::Proj(s, _, v) => names.contains(s) || Self::mentions_any(v, names, seen),
+            _ => false,
+        }
+    }
+
+    /// Whether `e` contains a projection out of one of `structs`.  Shared
+    /// subterms are visited once.
+    fn projects_any(e: &Expr, structs: &[u32], seen: &mut rustc_hash::FxHashSet<usize>) -> bool {
+        if !seen.insert(expr::identity(e)) {
+            return false;
+        }
+        match &***e {
+            ExprData::App(f, a) => {
+                Self::projects_any(f, structs, seen) || Self::projects_any(a, structs, seen)
+            }
+            ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
+                Self::projects_any(t, structs, seen) || Self::projects_any(b, structs, seen)
+            }
+            ExprData::Let(t, v, b) => {
+                Self::projects_any(t, structs, seen)
+                    || Self::projects_any(v, structs, seen)
+                    || Self::projects_any(b, structs, seen)
+            }
+            ExprData::Proj(s, _, v) => structs.contains(s) || Self::projects_any(v, structs, seen),
+            _ => false,
+        }
+    }
+
+    /// Whether a name lies under the root `_nested`, where the official
+    /// kernel puts the auxiliary types of nested inductive elimination
+    /// (`is_prefix_of(g_nested, n)`).
+    fn is_reserved_nested_name(&self, n: u32) -> bool {
+        let s = self.name_str(n);
+        s == "_nested" || s.starts_with("_nested.")
+    }
+
+    /// `check_no_nested_aux` (inductive.cpp, lean4#14616, in 4.36): whether
+    /// `e` names a constant, or projects out of a structure, under the
+    /// reserved prefix `_nested`.
+    fn mentions_reserved_nested(&self, e: &Expr, seen: &mut rustc_hash::FxHashSet<usize>) -> bool {
+        if !seen.insert(expr::identity(e)) {
+            return false;
+        }
+        match &***e {
+            ExprData::Const(n, _) => self.is_reserved_nested_name(*n),
+            ExprData::App(f, a) => {
+                self.mentions_reserved_nested(f, seen) || self.mentions_reserved_nested(a, seen)
+            }
+            ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
+                self.mentions_reserved_nested(t, seen) || self.mentions_reserved_nested(b, seen)
+            }
+            ExprData::Let(t, v, b) => {
+                self.mentions_reserved_nested(t, seen)
+                    || self.mentions_reserved_nested(v, seen)
+                    || self.mentions_reserved_nested(b, seen)
+            }
+            ExprData::Proj(s, _, v) => {
+                self.is_reserved_nested_name(*s) || self.mentions_reserved_nested(v, seen)
+            }
+            _ => false,
+        }
+    }
+
+    /// `check_uniform_ind_occs` (inductive.cpp, Lean 4.34): every occurrence
+    /// of a type being declared, anywhere in a constructor type, is applied
+    /// to exactly the declaration's universe parameters and to its
+    /// parameters, which under `offset` binders are the bound variables
+    /// `#(offset-1) … #(offset-nparams)`.  Later phases look at constructor
+    /// types modulo `whnf`, which can erase or disguise an occurrence, so
+    /// this has to be decided on the term as written.
+    fn check_uniform_ind_occs(
+        e: &Expr,
+        offset: u32,
+        all: &[u32],
+        num_params: u32,
+        lps: &[u32],
+        seen: &mut rustc_hash::FxHashSet<(usize, u32)>,
+    ) -> R<()> {
+        if !seen.insert((expr::identity(e), offset)) {
+            return Ok(());
+        }
+        let bad = || {
+            reject(
+                "invalid occurrence of an inductive type being declared: it must be applied to the declaration's parameters and universe levels",
+            )
+        };
+        match &***e {
+            ExprData::Const(n, us) if all.contains(n) => {
+                let levels_ok = us.len() == lps.len()
+                    && us
+                        .iter()
+                        .zip(lps.iter())
+                        .all(|(u, p)| matches!(&**u, crate::level::LevelData::Param(q) if q == p));
+                if num_params != 0 || !levels_ok {
+                    return bad();
+                }
+                Ok(())
+            }
+            ExprData::App(f, a) => {
+                let (head, args) = expr::unfold_apps(e);
+                if let ExprData::Const(n, us) = &**head {
+                    if all.contains(n) && args.len() as u64 <= num_params as u64 {
+                        let levels_ok = us.len() == lps.len()
+                            && us.iter().zip(lps.iter()).all(
+                                |(u, p)| matches!(&**u, crate::level::LevelData::Param(q) if q == p),
+                            );
+                        let mut ok = args.len() as u64 == num_params as u64
+                            && offset >= num_params
+                            && levels_ok;
+                        for (i, arg) in args.iter().enumerate() {
+                            ok = ok
+                                && matches!(&***arg, ExprData::BVar(j) if *j == offset - 1 - i as u32);
+                        }
+                        if !ok {
+                            return bad();
+                        }
+                        return Ok(());
+                    }
+                }
+                // Not an occurrence, or over-applied: the parameter
+                // application is a subterm of `f` and is checked there.
+                Self::check_uniform_ind_occs(f, offset, all, num_params, lps, seen)?;
+                Self::check_uniform_ind_occs(a, offset, all, num_params, lps, seen)
+            }
+            ExprData::Lam(_, t, b) | ExprData::Pi(_, t, b) => {
+                Self::check_uniform_ind_occs(t, offset, all, num_params, lps, seen)?;
+                Self::check_uniform_ind_occs(b, offset + 1, all, num_params, lps, seen)
+            }
+            ExprData::Let(t, v, b) => {
+                Self::check_uniform_ind_occs(t, offset, all, num_params, lps, seen)?;
+                Self::check_uniform_ind_occs(v, offset, all, num_params, lps, seen)?;
+                Self::check_uniform_ind_occs(b, offset + 1, all, num_params, lps, seen)
+            }
+            ExprData::Proj(_, _, v) => {
+                Self::check_uniform_ind_occs(v, offset, all, num_params, lps, seen)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// What `environment::add_inductive` settles on the declaration as
+    /// written, before any reduction:
+    ///
+    /// - no signature or constructor type names a constant, or projects
+    ///   out of a structure, under the reserved prefix `_nested`
+    ///   (`check_no_nested_aux`, 4.36);
+    /// - the types' own signatures are checked in the environment *before*
+    ///   the block, and the constructor types with only the block's types
+    ///   added (`check_inductive_types`, `check_constructors`), so neither
+    ///   may name a constant this block introduces beyond that, and a
+    ///   constructor type may not project out of a type of the block: the
+    ///   official kernel infers every subterm, and inferring the projection
+    ///   looks up the type's constructor, which is not declared yet
+    ///   ("unknown constant");
+    /// - the first type shows the declaration's parameters as binders
+    ///   (`get_params`);
+    /// - a type lists each constructor once (`check_constructors`);
+    /// - occurrences of the types being declared are uniform
+    ///   (`check_uniform_ind_occs`).
+    fn check_inductive_block_syntax(&self, all: &[u32], num_params: u32, lps: &[u32]) -> R<()> {
+        // `elim_nested_inductive_fn::get_params` reads the parameters off
+        // the *first* type without reducing.  The other members' parameters
+        // are reached modulo `whnf` (`check_inductive_types`), so only the
+        // first signature has to show them as binders.
+        if let Some(ConstantInfo::InductiveType { typ, .. }) = all.first().and_then(|t| self.env.get(*t)) {
+            if Self::manifest_arity(typ) < num_params as u64 {
+                return reject("inductive type does not start with its declared parameters");
+            }
+        }
+        let mut block_ctors: Vec<u32> = Vec::new();
+        for tname in all {
+            if let Some(ConstantInfo::InductiveType { ctors, .. }) = self.env.get(*tname) {
+                for c in ctors {
+                    if block_ctors.contains(c) {
+                        return reject("duplicate constructor name in inductive declaration");
+                    }
+                    block_ctors.push(*c);
+                }
+            }
+        }
+        let mut block_names: Vec<u32> = all.to_vec();
+        block_names.extend(block_ctors.iter().copied());
+        for tname in all {
+            let Some(ConstantInfo::InductiveType { typ, ctors, .. }) = self.env.get(*tname) else {
+                continue;
+            };
+            if self.mentions_reserved_nested(typ, &mut Default::default()) {
+                return reject("inductive type's signature uses the reserved prefix `_nested`");
+            }
+            if Self::mentions_any(typ, &block_names, &mut Default::default()) {
+                return reject("inductive type's signature refers to the declaration being defined");
+            }
+            for cname in ctors {
+                let Some(ConstantInfo::Constructor { typ: c_typ, .. }) = self.env.get(*cname) else {
+                    continue;
+                };
+                if self.mentions_reserved_nested(c_typ, &mut Default::default()) {
+                    return reject("constructor type uses the reserved prefix `_nested`");
+                }
+                if Self::mentions_any(c_typ, &block_ctors, &mut Default::default()) {
+                    return reject("constructor type refers to a constructor of the declaration being defined");
+                }
+                if Self::projects_any(c_typ, all, &mut Default::default()) {
+                    return reject("constructor type projects out of a type of the declaration being defined, whose constructor is not declared yet");
+                }
+                Self::check_uniform_ind_occs(c_typ, 0, all, num_params, lps, &mut Default::default())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `is_rec` (inductive.cpp): a block is recursive when some constructor
+    /// binder mentions, as written, a type of the block.  The kernel computes
+    /// the flag; structure eta and projection-to-constructor conversion read
+    /// it (`is_non_rec_structure`), so an exported value that disagrees is a
+    /// forgery, not a hint.
+    fn check_is_rec_flag(&self, all: &[u32]) -> R<()> {
+        let mut computed_rec = false;
+        'block: for tname in all {
+            let Some(ConstantInfo::InductiveType { ctors, .. }) = self.env.get(*tname) else {
+                continue;
+            };
+            for cname in ctors {
+                let Some(ConstantInfo::Constructor { typ: c_typ, .. }) = self.env.get(*cname) else {
+                    continue;
+                };
+                let mut cur = c_typ;
+                while let ExprData::Pi(_, dom, body) = &***cur {
+                    if Self::mentions_any(dom, all, &mut Default::default()) {
+                        computed_rec = true;
+                        break 'block;
+                    }
+                    cur = body;
+                }
+            }
+        }
+        for tname in all {
+            if let Some(ConstantInfo::InductiveType { is_rec, .. }) = self.env.get(*tname) {
+                if *is_rec != computed_rec {
+                    return reject("inductive type's isRec flag does not match its constructors");
                 }
             }
         }

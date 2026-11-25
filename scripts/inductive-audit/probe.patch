@@ -1,0 +1,87 @@
+diff --git a/src/parser.rs b/src/parser.rs
+index ffafbcb..8ec97fc 100644
+--- a/src/parser.rs
++++ b/src/parser.rs
+@@ -846,6 +846,32 @@ impl Parser {
+             Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
+                 .check_inductive_group_structure(name)?;
+         }
++        if std::env::var("KIOTA_PROBE").ok().as_deref() == Some(self.name_str(type_names[0])) {
++            println!("PROBE structure ok");
++            let shared = match self.env.get(type_names[0]) {
++                Some(ConstantInfo::InductiveType { level_params, .. }) => level_params.clone(),
++                _ => Vec::new(),
++            };
++            let fresh = u32::MAX - 7;
++            let mut lp = vec![fresh];
++            lp.extend(shared.iter().copied());
++            let ck = Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref());
++            let (prop_only, d) = match ck.reconstruct_recursors(&type_names, &lp) {
++                Ok(d) => (false, d),
++                Err(e1) => match ck.reconstruct_recursors(&type_names, &shared) {
++                    Ok(d) => (true, d),
++                    Err(e2) => {
++                        println!("PROBE reconstruct failed: {e1:?} / {e2:?}");
++                        return Err(TcError::Reject("probe".into()));
++                    }
++                },
++            };
++            let recs: Vec<String> = d.iter().map(|r| format!(
++                "{{\"type\":{},\"numParams\":{},\"numIndices\":{},\"numMotives\":{},\"numMinors\":{},\"k\":{}}}",
++                crate::tc::probe_expr(&r.typ), r.num_params, r.num_indices, r.num_motives, r.num_minors, r.k)).collect();
++            println!("PROBE recs {{\"propOnly\":{},\"recs\":[{}]}}", prop_only, recs.join(","));
++            return Err(TcError::Reject("probe".into()));
++        }
+         let supplied_level_params = pending_recs[0].level_params.clone();
+         let derived = Checker::new(&self.env, &self.names, nat_ref, string_ref).with_proof_store(self.proofs.as_ref())
+             .reconstruct_recursors(&type_names, &supplied_level_params)?;
+diff --git a/src/tc.rs b/src/tc.rs
+index 08e1ea9..a969c8c 100644
+--- a/src/tc.rs
++++ b/src/tc.rs
+@@ -13558,3 +13558,26 @@ fn regression_432_defining_equations_and_closed_values_convert() {
+     }
+ 
+ }
++
++pub(crate) fn probe_level(l: &Level) -> String {
++    match &**l {
++        level::LevelData::Zero => "[\"z\"]".into(),
++        level::LevelData::Succ(a) => format!("[\"S\",{}]", probe_level(a)),
++        level::LevelData::Max(a, b) => format!("[\"m\",{},{}]", probe_level(a), probe_level(b)),
++        level::LevelData::IMax(a, b) => format!("[\"i\",{},{}]", probe_level(a), probe_level(b)),
++        level::LevelData::Param(n) => format!("[\"P\",{}]", n),
++    }
++}
++pub(crate) fn probe_expr(e: &Expr) -> String {
++    match &***e {
++        ExprData::BVar(i) => format!("[\"b\",{}]", i),
++        ExprData::Sort(l) => format!("[\"s\",{}]", probe_level(l)),
++        ExprData::Const(n, us) => format!("[\"c\",{},[{}]]", n, us.iter().map(probe_level).collect::<Vec<_>>().join(",")),
++        ExprData::App(f, a) => format!("[\"a\",{},{}]", probe_expr(f), probe_expr(a)),
++        ExprData::Lam(_, t, b) => format!("[\"l\",{},{}]", probe_expr(t), probe_expr(b)),
++        ExprData::Pi(_, t, b) => format!("[\"p\",{},{}]", probe_expr(t), probe_expr(b)),
++        ExprData::Let(t, v, b) => format!("[\"let\",{},{},{}]", probe_expr(t), probe_expr(v), probe_expr(b)),
++        ExprData::Proj(s, i, v) => format!("[\"proj\",{},{},{}]", s, i, probe_expr(v)),
++        ExprData::Lit(_) => "[\"lit\"]".into(),
++    }
++}
+diff --git a/src/tc/recursor.rs b/src/tc/recursor.rs
+index d1d7836..bc6f5f6 100644
+--- a/src/tc/recursor.rs
++++ b/src/tc/recursor.rs
+@@ -927,6 +927,14 @@ impl<'e> Checker<'e> {
+             ));
+         }
+ 
++        if std::env::var_os("KIOTA_PROBE").is_some() {
++            let ms: Vec<String> = members.iter().map(|m| format!("[{}]", m.ctors.iter().map(|c| {
++                let mut n = 0u32; let mut t = c.typ.clone();
++                while let ExprData::Pi(_, _, b) = &**t { n += 1; let b2 = b.clone(); t = b2; }
++                format!("[{},{}]", c.name, n.saturating_sub(num_params))
++            }).collect::<Vec<_>>().join(","))).collect();
++            println!("PROBE members [{}]", ms.join(","));
++        }
+         let num_minors: u32 = members.iter().map(|m| m.ctors.len() as u32).sum();
+         let k = members.len() == 1 && self.is_k_like(&all)?;
+         let mut out = Vec::with_capacity(members.len());

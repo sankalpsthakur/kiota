@@ -196,6 +196,121 @@ pub fn leq(l1: &Level, l2: &Level, diff: i64) -> bool {
     }
 }
 
+/// A level under one choice of which parameters are zero: the maximum of a
+/// constant and of `p + k` over parameters `p` that are at least one.
+struct MaxPlus {
+    konst: u64,
+    terms: Vec<(u32, u64)>,
+}
+
+impl MaxPlus {
+    fn is_zero(&self) -> bool {
+        self.konst == 0 && self.terms.is_empty()
+    }
+
+    fn join(mut self, other: MaxPlus) -> MaxPlus {
+        self.konst = self.konst.max(other.konst);
+        for (p, k) in other.terms {
+            match self.terms.iter_mut().find(|(q, _)| *q == p) {
+                Some((_, k0)) => *k0 = (*k0).max(k),
+                None => self.terms.push((p, k)),
+            }
+        }
+        self
+    }
+}
+
+fn max_plus(l: &Level, zero_params: &[u32]) -> MaxPlus {
+    match &**l {
+        LevelData::Zero => MaxPlus { konst: 0, terms: Vec::new() },
+        LevelData::Param(p) => {
+            if zero_params.contains(p) {
+                MaxPlus { konst: 0, terms: Vec::new() }
+            } else {
+                MaxPlus { konst: 0, terms: vec![(*p, 0)] }
+            }
+        }
+        LevelData::Succ(a) => {
+            let mut f = max_plus(a, zero_params);
+            f.konst += 1;
+            for (_, k) in f.terms.iter_mut() {
+                *k += 1;
+            }
+            f
+        }
+        LevelData::Max(a, b) => max_plus(a, zero_params).join(max_plus(b, zero_params)),
+        LevelData::IMax(a, b) => {
+            let fb = max_plus(b, zero_params);
+            if fb.is_zero() {
+                fb
+            } else {
+                max_plus(a, zero_params).join(fb)
+            }
+        }
+    }
+}
+
+fn collect_params(l: &Level, out: &mut Vec<u32>) {
+    match &**l {
+        LevelData::Zero => {}
+        LevelData::Param(p) => {
+            if !out.contains(p) {
+                out.push(*p);
+            }
+        }
+        LevelData::Succ(a) => collect_params(a, out),
+        LevelData::Max(a, b) | LevelData::IMax(a, b) => {
+            collect_params(a, out);
+            collect_params(b, out);
+        }
+    }
+}
+
+/// Decide `l1 <= l2` under every assignment of natural numbers to the
+/// universe parameters, exactly.
+///
+/// For each choice of which parameters are zero, `imax` becomes `max` or `0`
+/// and both sides are maxima of constants and `p + k` terms with `p >= 1`.
+/// Then `l1 <= l2` holds for all remaining values iff every `p + a` of `l1`
+/// has a `p + b` in `l2` with `b >= a` (otherwise a large `p` separates them)
+/// and the constant of `l1` is at most the least value of `l2`, which is
+/// attained with every parameter at one.
+///
+/// The official kernel's `is_geq` is sound but not complete, so anything it
+/// admits is admitted here; `leq` above may be strict on nested `imax` and
+/// is not a substitute.  With more than twelve parameters this falls back to
+/// `leq` on normal forms rather than enumerate.
+pub fn leq_all(l1: &Level, l2: &Level) -> bool {
+    let mut params = Vec::new();
+    collect_params(l1, &mut params);
+    collect_params(l2, &mut params);
+    if params.len() > 12 {
+        return leq(&normalize(l1), &normalize(l2), 0);
+    }
+    let mut zero_params: Vec<u32> = Vec::with_capacity(params.len());
+    for mask in 0u32..(1u32 << params.len()) {
+        zero_params.clear();
+        for (i, p) in params.iter().enumerate() {
+            if mask & (1 << i) != 0 {
+                zero_params.push(*p);
+            }
+        }
+        let f1 = max_plus(l1, &zero_params);
+        let f2 = max_plus(l2, &zero_params);
+        let least2 = f2.terms.iter().map(|(_, k)| k + 1).fold(f2.konst, u64::max);
+        if f1.konst > least2 {
+            return false;
+        }
+        for (p, a) in &f1.terms {
+            match f2.terms.iter().find(|(q, _)| q == p) {
+                Some((_, b)) if b >= a => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
 pub fn pp(l: &Level) -> String {
     match &**l {
         LevelData::Zero => "0".into(),
@@ -235,6 +350,87 @@ pub fn is_zero(l: &Level) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn eval(l: &Level, env: &[u64; 3]) -> u64 {
+        match &**l {
+            LevelData::Zero => 0,
+            LevelData::Param(p) => env[*p as usize],
+            LevelData::Succ(a) => eval(a, env) + 1,
+            LevelData::Max(a, b) => eval(a, env).max(eval(b, env)),
+            LevelData::IMax(a, b) => {
+                let vb = eval(b, env);
+                if vb == 0 { 0 } else { eval(a, env).max(vb) }
+            }
+        }
+    }
+
+    // Raw constructors: `max`/`imax` above simplify, and the comparison must
+    // be right on unsimplified terms too.
+    fn random_level(seed: &mut u64, depth: u32) -> Level {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let r = (*seed >> 33) % if depth == 0 { 2 } else { 6 };
+        match r {
+            0 => zero(),
+            1 => param(((*seed >> 40) % 3) as u32),
+            2 | 3 => succ(random_level(seed, depth - 1)),
+            4 => Rc::new(LevelData::Max(random_level(seed, depth - 1), random_level(seed, depth - 1))),
+            _ => Rc::new(LevelData::IMax(random_level(seed, depth - 1), random_level(seed, depth - 1))),
+        }
+    }
+
+    #[test]
+    fn leq_all_agrees_with_evaluation_on_small_assignments() {
+        // Levels of depth four add at most four to a parameter, so a
+        // violated inequality already fails for some value below ten.
+        let mut seed = 0x5eed_u64;
+        let (mut holds, mut fails) = (0, 0);
+        for _ in 0..20_000 {
+            let a = random_level(&mut seed, 4);
+            let b = random_level(&mut seed, 4);
+            let mut brute = true;
+            'outer: for x in 0..10u64 {
+                for y in 0..10u64 {
+                    for z in 0..10u64 {
+                        if eval(&a, &[x, y, z]) > eval(&b, &[x, y, z]) {
+                            brute = false;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            assert_eq!(leq_all(&a, &b), brute, "{} <= {}", pp(&a), pp(&b));
+            if brute { holds += 1 } else { fails += 1 }
+        }
+        assert!(holds > 1000 && fails > 1000, "{holds} hold, {fails} fail");
+    }
+
+    #[test]
+    fn leq_all_is_never_stricter_than_leq() {
+        let mut seed = 0xfeed_u64;
+        for _ in 0..20_000 {
+            let a = random_level(&mut seed, 4);
+            let b = random_level(&mut seed, 4);
+            if leq(&normalize(&a), &normalize(&b), 0) {
+                assert!(leq_all(&a, &b), "{} <= {}", pp(&a), pp(&b));
+            }
+        }
+    }
+
+    #[test]
+    fn leq_all_field_universe_cases() {
+        let (u, v) = (param(0), param(1));
+        // Type v field in Type u.
+        assert!(!leq_all(&succ(succ(v.clone())), &succ(u.clone())));
+        // Type u field in Type u.
+        assert!(!leq_all(&succ(succ(u.clone())), &succ(u.clone())));
+        // Sort u field in Sort (max u v + 1).
+        assert!(leq_all(&succ(u.clone()), &succ(max(u.clone(), v.clone()))));
+        // Sort u field in Sort (max 1 u): fails at u = 1.
+        assert!(!leq_all(&succ(u.clone()), &max(succ(zero()), u.clone())));
+        // imax u 0 is always zero.
+        assert!(leq_all(&Rc::new(LevelData::IMax(u.clone(), zero())), &zero()));
+        assert!(!leq_all(&u, &zero()));
+    }
 
     #[test]
     fn imax_one_param_is_param() {

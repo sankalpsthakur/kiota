@@ -272,19 +272,20 @@ fn recursor_type_reconstruction_late_failure_rolls_back_ownership() {
     let auxiliary = parser.name_by_str["LALNest.rec_1"];
     let owner = parser.name_by_str["LALNest"];
     let mut missing_owner = original.clone();
-    // A nonempty rule list naming an earlier block's constructor claims no
-    // current owner. This reaches the missing-owner check after rec_group has
-    // been filled, rather than failing during type reconstruction.
+    // A rule list naming an earlier block's constructor would claim no
+    // current owner, and one naming the current constructor from the
+    // auxiliary recursor would claim it twice. Both used to reach the
+    // ownership checks after rec_group had been filled; the rule lists are
+    // now compared with the reconstructed members first, so they are refused
+    // there. Either way nothing of the block may remain.
     recursor_record(&mut missing_owner, main)["rules"][0]["ctor"] =
         serde_json::json!(parser.name_by_str["LALWrap.mk"]);
     let mut duplicate_owner = original.clone();
-    // Both recursors now claim the current constructor. Whichever comes first
-    // writes rec_of; the second fails, exercising rollback of that write too.
     recursor_record(&mut duplicate_owner, auxiliary)["rules"][0]["ctor"] =
         serde_json::json!(parser.name_by_str["LALNest.node"]);
     for (record, expected) in [
-        (missing_owner, "inductive `LALNest` is missing a recursor".to_string()),
-        (duplicate_owner, format!("duplicate recursor for type {owner}")),
+        (missing_owner, "recursor `LALNest.rec` rules do not match its constructors"),
+        (duplicate_owner, "recursor `LALNest.rec_1` rules do not match its constructors"),
     ] {
         assert!(matches!(import_record(&mut parser, &record), Err(TcError::Reject(m))
             if m == expected));
@@ -1798,4 +1799,254 @@ fn nested_iota_coinciding_auxiliaries_follow_the_field_position() {
     for case in ["fa", "fb"] {
         assert_reject(&format!("nested-iota-coincide-{case}-false.reject.ndjson"));
     }
+}
+
+// ---- Inductive admission audit (docs/inductive-audit.md) ----
+//
+// Every `ind-*` and `rec-rules-*` fixture carries the recursors kiota itself
+// reconstructs, so a reject below is the named check firing and not a
+// mismatched recursor. The declarations are replayed through the official
+// kernel in `tests/fixtures/src/inductive-audit.lean`.
+
+/// `check_constructors`: a field's sort must be at most the type's for every
+/// universe assignment. Only closed numerals and exact successors used to be
+/// compared, so `T.{u,v} : Type u | mk : Type v → T`, `Type u` inside
+/// `Type u` and a `Type` field in `Sort u` were admitted.
+#[test]
+fn a_constructor_field_universe_is_compared_for_every_assignment() {
+    for name in [
+        "ind-field-univ-other-param.reject.ndjson",
+        "ind-field-univ-same-param.reject.ndjson",
+        "ind-field-univ-sort-param.reject.ndjson",
+    ] {
+        assert_reject_exact(name, "constructor field universe is too big for the inductive type");
+    }
+    // `Sort u` in `Sort (max u v + 1)`, and `Ax.{u} : Sort u` in
+    // `Sort (max 1 u)`.
+    assert_accept("ind-field-univ-max.accept.ndjson");
+    assert_accept("ind-field-univ-max-one-param.accept.ndjson");
+}
+
+/// `check_uniform_ind_occs` (Lean 4.34): occurrences of a type being declared
+/// are judged as written. `(fun _ => N) (T N)` reduces away, `T ((fun x => x)
+/// α)` and, for a unit `U`, `T b` are convertible to `T α`/`T a`, a nested
+/// `Lu T.{v,u}` swaps the universe parameters, and a constructor type that is
+/// a redex hides its parameters; reduction made all five look uniform.
+#[test]
+fn occurrences_of_the_declared_type_are_uniform_as_written() {
+    for name in [
+        "ind-occ-erased-nonuniform.reject.ndjson",
+        "ind-occ-beta-param.reject.ndjson",
+        "ind-occ-unit-eta-param.reject.ndjson",
+        "ind-occ-nested-wrong-levels.reject.ndjson",
+        "ind-ctor-type-redex.reject.ndjson",
+    ] {
+        assert_reject_exact(
+            name,
+            "invalid occurrence of an inductive type being declared: it must be applied to the declaration's parameters and universe levels",
+        );
+    }
+    // The same vanishing field with the parameter itself: `(fun _ => N) (T α)`.
+    assert_accept("ind-occ-erased-uniform.accept.ndjson");
+}
+
+/// The official kernel checks the types' signatures before the block exists
+/// and the constructor types with only the types added. With the whole block
+/// installed first, `Bx : A → Type` next to `A` in one block (an
+/// inductive-inductive form) and a field mentioning the block's own
+/// constructor `T.a` were well typed.
+#[test]
+fn a_block_does_not_refer_to_what_it_is_still_declaring() {
+    assert_reject_exact(
+        "ind-type-names-sibling.reject.ndjson",
+        "inductive type's signature refers to the declaration being defined",
+    );
+    assert_reject_exact(
+        "ind-ctor-names-own-ctor.reject.ndjson",
+        "constructor type refers to a constructor of the declaration being defined",
+    );
+    // An ordinary mutual pair: constructors mention the sibling type.
+    assert_accept("ind-mutual-params.accept.ndjson");
+}
+
+/// `numFields` is the constructor type's binder count after the parameters.
+/// Exported as 0 for `S | mk : B2 → S`, it made `S` unit-like, and
+/// `∀ x y : S, x = y` held by `rfl`.
+#[test]
+fn constructor_num_fields_is_derived_from_the_constructor_type() {
+    assert_reject_exact(
+        "ind-ctor-numfields-zero.reject.ndjson",
+        "constructor numFields does not match its type",
+    );
+    // The honest `S`, with structure eta: `∀ x : S, x = S.mk x.1`.
+    assert_accept("ind-struct-eta.accept.ndjson");
+}
+
+/// `isRec` is whether a constructor binder mentions, as written, a type of
+/// the block. Exported as false for `T | mk : T → T`, it turned on structure
+/// eta for a recursive type; exported as true it turns eta off.
+#[test]
+fn is_rec_is_derived_from_the_constructors() {
+    for name in [
+        "ind-isrec-false-struct-eta.reject.ndjson",
+        "ind-isrec-true-lie.reject.ndjson",
+    ] {
+        assert_reject_exact(name, "inductive type's isRec flag does not match its constructors");
+    }
+    // The kernel's flag is syntactic: the occurrence in
+    // `(fun _ => N) (T → N)` vanishes under reduction and still counts.
+    assert_accept("ind-isrec-erased-occurrence.accept.ndjson");
+}
+
+#[test]
+fn a_constructor_is_listed_once() {
+    assert_reject_exact(
+        "ind-dup-ctor-in-list.reject.ndjson",
+        "duplicate constructor name in inductive declaration",
+    );
+}
+
+/// A recursor's rules are its member's constructors in order, each with its
+/// field count. The list was stored as exported; `rec_of` and the minor index
+/// read it.
+#[test]
+fn recursor_rules_are_the_member_constructors_in_order() {
+    for (name, rec) in [
+        ("rec-rules-swapped.reject.ndjson", "B2.rec"),
+        ("rec-rules-dropped.reject.ndjson", "B2.rec"),
+        ("rec-rules-nfields.reject.ndjson", "T.rec"),
+        ("rec-rules-mutual-crossed.reject.ndjson", "A.rec"),
+        ("rec-rules-nested-order.reject.ndjson", "Tree.rec_1"),
+    ] {
+        assert_reject_exact(name, &format!("recursor `{rec}` rules do not match its constructors"));
+    }
+    assert_accept("rec-rules.accept.ndjson");
+    assert_accept("rec-rules-mutual.accept.ndjson");
+    assert_accept("rec-rules-nested.accept.ndjson");
+}
+
+/// `elim_nested_inductive_fn::get_params` reads the parameters off the first
+/// type and off every constructor type without reducing. An identity redex
+/// around either, or a first signature that is a constant unfolding to the
+/// parameter binder, used to be reduced and admitted; in each the occurrence
+/// of `T` is uniform as written, so nothing else stops it.
+#[test]
+fn parameters_are_manifest_binders_of_the_first_type_and_of_constructor_types() {
+    assert_reject_exact(
+        "ind-ctor-type-identity-redex.reject.ndjson",
+        "constructor type does not start with the inductive type's parameters",
+    );
+    for name in [
+        "ind-first-sig-identity-redex.reject.ndjson",
+        "ind-first-sig-via-def.reject.ndjson",
+    ] {
+        assert_reject_exact(name, "inductive type does not start with its declared parameters");
+    }
+    // The other members' parameters, and any member's indices, are reached
+    // modulo `whnf` (`check_inductive_types`): the same mutual pair with the
+    // constant-typed member second, and an index behind a constant.
+    assert_accept("ind-later-sig-via-def.accept.ndjson");
+    assert_accept("ind-index-sig-via-def.accept.ndjson");
+}
+
+/// Nested occurrences are found in the constructor type as written, so
+/// `(fun x => x) (L T)` is one: `T.rec` has a second motive for `L T`.
+#[test]
+fn a_nested_occurrence_under_a_redex_is_still_nested() {
+    let parser = parse_accept("ind-nested-identity-redex.accept.ndjson");
+    let rec = parser.name_by_str["T.rec"];
+    let ConstantInfo::Recursor { num_motives, num_minors, .. } = parser.env.get(rec).unwrap() else {
+        panic!("expected a recursor");
+    };
+    assert_eq!((*num_motives, *num_minors), (2, 3));
+}
+
+/// A constant no earlier declaration introduced. The official kernel answers
+/// "unknown constant"; this used to end as an internal error (exit 3), which
+/// the arena scores as an error and not as a rejection.
+#[test]
+fn an_undeclared_constant_is_a_rejection() {
+    assert_reject_exact("def-unknown-const.reject.ndjson", "[d] unknown constant `nope`");
+    assert_reject_exact("ind-field-unknown-const.reject.ndjson", "unknown constant `nope`");
+    // In a signature it is met while the reconstructed recursor is inferred,
+    // and the parser reports every rejection there under one message.
+    assert_reject_exact(
+        "ind-sig-unknown-const.reject.ndjson",
+        "recursor `T.rec` type does not match reconstructed type",
+    );
+}
+
+/// `check_uniform_ind_occs` walks lambda bodies and let bodies with the
+/// binder count raised: `(fun y => T y) α` and `let y := α; T y` reduce to
+/// `T α`, but as written the occurrence is applied to a local, not to the
+/// parameter.
+#[test]
+fn occurrences_under_a_lambda_or_a_let_are_uniform_as_written() {
+    for name in [
+        "ind-occ-lam-offset-nonuniform.reject.ndjson",
+        "ind-occ-let-body-nonuniform.reject.ndjson",
+    ] {
+        assert_reject_exact(
+            name,
+            "invalid occurrence of an inductive type being declared: it must be applied to the declaration's parameters and universe levels",
+        );
+    }
+}
+
+/// The levels of an occurrence are compared with the declaration's
+/// parameters as written: `T.{max u u}` and `T.{imax u u}` are refused in a
+/// field and in the conclusion although they equal `T.{u}`. The parser
+/// simplifies levels, so it keeps such a level unsimplified on a constant
+/// that is not declared yet. Elsewhere only the value matters: `Ax.{max u u}`
+/// in a field, and `T.{max u u}` once `T` exists.
+#[test]
+fn occurrence_levels_are_compared_as_written() {
+    for name in [
+        "ind-occ-level-max-uu.reject.ndjson",
+        "ind-occ-level-imax-uu.reject.ndjson",
+        "ind-result-level-max-uu.reject.ndjson",
+    ] {
+        assert_reject_exact(
+            name,
+            "invalid occurrence of an inductive type being declared: it must be applied to the declaration's parameters and universe levels",
+        );
+    }
+    assert_accept("ind-occ-level-max-other-const.accept.ndjson");
+    assert_accept("ind-level-max-uu-after-block.accept.ndjson");
+}
+
+/// The official kernel checks a constructor type with the block's types
+/// declared and their constructors not: a projection out of a type of the
+/// block, even one a redex erases, fails with "unknown constant `T.mk`".
+/// kiota installs the whole block first, so it refuses the projection as
+/// written. A projection out of an earlier structure is fine.
+#[test]
+fn a_constructor_type_does_not_project_out_of_the_block() {
+    for name in [
+        "ind-ctor-field-proj-own-type.reject.ndjson",
+        "ind-ctor-field-proj-erased.reject.ndjson",
+    ] {
+        assert_reject_exact(
+            name,
+            "constructor type projects out of a type of the declaration being defined, whose constructor is not declared yet",
+        );
+    }
+    assert_accept("ind-ctor-field-proj-other.accept.ndjson");
+}
+
+/// `check_no_nested_aux` (lean4#14616, in 4.36): an inductive block may not
+/// name a constant under the root `_nested`, where nested elimination puts
+/// its auxiliary types. Other declarations may, and a component spelled
+/// `_nested` elsewhere in a name, or `_nestedFoo`, is not the prefix.
+#[test]
+fn an_inductive_block_does_not_use_the_reserved_nested_prefix() {
+    assert_reject_exact(
+        "ind-reserved-nested-prefix.reject.ndjson",
+        "constructor type uses the reserved prefix `_nested`",
+    );
+    assert_reject_exact(
+        "ind-sig-reserved-nested-prefix.reject.ndjson",
+        "inductive type's signature uses the reserved prefix `_nested`",
+    );
+    assert_accept("ind-reserved-nested-prefix-elsewhere.accept.ndjson");
 }
