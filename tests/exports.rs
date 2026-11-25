@@ -264,6 +264,7 @@ fn recursor_type_reconstruction_late_failure_rolls_back_ownership() {
     let before = environment_constants(&parser);
     let rec_of = parser.env.rec_of.clone();
     let rec_group = parser.env.rec_group.clone();
+    let nested_iota = parser.env.nested_iota.clone();
     let main = parser.name_by_str["LALNest.rec"];
     let auxiliary = parser.name_by_str["LALNest.rec_1"];
     let owner = parser.name_by_str["LALNest"];
@@ -287,9 +288,13 @@ fn recursor_type_reconstruction_late_failure_rolls_back_ownership() {
         assert_eq!(environment_constants(&parser), before);
         assert_eq!(parser.env.rec_of, rec_of);
         assert_eq!(parser.env.rec_group, rec_group);
+        // The nested iota table is written before these checks fail.
+        assert_eq!(parser.env.nested_iota, nested_iota);
+        assert!(!parser.env.nested_iota.contains_key(&main));
     }
     import_record(&mut parser, &original).expect("valid retry after late failures");
     assert_eq!(parser.env.rec_of[&owner], main);
+    assert!(parser.env.nested_iota.contains_key(&main));
 }
 
 #[test]
@@ -335,6 +340,17 @@ fn recursor_type_reconstruction_control_accepts() {
             _ => unreachable!(),
         }
     }
+    // Iota for the nested block is fixed by position from the declaration:
+    // `LALNest.node : LALWrap LALNest → LALNest` takes minor 0 and recurs
+    // with `rec_1`; `LALWrap.mk`'s field recurs with `LALNest.rec`.
+    let main = parser.name_by_str["LALNest.rec"];
+    let aux = parser.name_by_str["LALNest.rec_1"];
+    let node = &parser.env.nested_iota[&main][&parser.name_by_str["LALNest.node"]];
+    assert_eq!((node.minor_idx, node.num_fields, node.ihs.clone()), (0, 1, vec![(0, aux)]));
+    let mk = &parser.env.nested_iota[&aux][&parser.name_by_str["LALWrap.mk"]];
+    assert_eq!((mk.minor_idx, mk.num_fields, mk.ihs.clone()), (1, 1, vec![(0, main)]));
+    assert_eq!(parser.env.nested_iota[&main].len(), 1);
+    assert_eq!(parser.env.nested_iota[&aux].len(), 1);
 }
 
 #[test]
@@ -1691,4 +1707,56 @@ fn a_prop_field_after_a_data_field_mentioned_under_a_binder_is_not_projected() {
         "proj-prop-after-dependent-data-under-binder.reject.ndjson",
         "[projProp6] cannot project a Prop field that comes after a dependent data field",
     );
+}
+
+/// `tests/fixtures/src/nested-iota-wrap.lean`: `abbrev Wrap α := α` and
+/// `inductive W | leaf | a : List (Wrap W) → W | b : List W → W`, so `W.rec`
+/// has two `List` auxiliaries whose major premises are convertible. Iota
+/// takes each field's recursor and minors from the declaration, never by
+/// matching the major's spelling (`[W.leaf] : List W` under `W.a`) against
+/// the auxiliaries' major premises. Lean's kernel computes 1 and 110; the
+/// false twins state 101 and 10 with the same `rfl` proof.
+#[test]
+fn nested_iota_convertible_auxiliaries_follow_the_declaration() {
+    for case in ["x7", "x8", "fa1", "fa2", "fb1", "fb2"] {
+        assert_accept(&format!("nested-iota-wrap-{case}.accept.ndjson"));
+    }
+    for case in ["x7", "x8"] {
+        assert_reject_exact(
+            &format!("nested-iota-wrap-{case}-false.reject.ndjson"),
+            &format!(
+                "[bad_WR.{case}_false{}] theorem 161: value type does not match declared type",
+                if case == "x7" { "101" } else { "10" },
+            ),
+        );
+    }
+}
+
+/// `tests/fixtures/src/nested-iota-redex.lean`: `NR.a`'s field is declared
+/// at `List ((fun _ => NR) true)`, `NR.b`'s at `List NR`. Majors written in
+/// the other auxiliary's form, both under `NR.rec` and directly under
+/// `NR.rec_1`/`NR.rec_2`, still reduce with the declared recursor's minors.
+#[test]
+fn nested_iota_major_spelling_cannot_pick_the_auxiliary() {
+    for i in 1..=6 {
+        assert_accept(&format!("nested-iota-redex-x{i}.accept.ndjson"));
+    }
+    for i in 1..=4 {
+        assert_reject(&format!("nested-iota-redex-x{i}-false.reject.ndjson"));
+    }
+}
+
+/// `tests/fixtures/src/nested-iota-coincide.lean`: `T2 α β` nests
+/// `List (T2 α β × α)` and `List (T2 α β × β)`, which coincide at
+/// `α = β = Nat`. The recursor is chosen by the field's position in the
+/// declaration, so `.a` and `.b` keep their own minors (16 and 1119).
+/// `brecon` is a structural-recursion export over the same shape.
+#[test]
+fn nested_iota_coinciding_auxiliaries_follow_the_field_position() {
+    for case in ["fa", "fb", "fab", "brecon"] {
+        assert_accept(&format!("nested-iota-coincide-{case}.accept.ndjson"));
+    }
+    for case in ["fa", "fb"] {
+        assert_reject(&format!("nested-iota-coincide-{case}-false.reject.ndjson"));
+    }
 }

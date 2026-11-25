@@ -41,6 +41,22 @@ pub(crate) struct DerivedRecursor {
     pub num_motives: u32,
     pub num_minors: u32,
     pub k: bool,
+    /// One entry per constructor of this recursor's own member, read off the
+    /// minor premises as they are built: the declaration, never a major
+    /// premise met during reduction, decides iota for nested blocks.
+    pub iota_rules: Vec<DerivedIotaRule>,
+}
+
+/// How iota reduces one constructor of a recursor's member: the minor
+/// premise slot, the constructor's field count, and for each recursive field
+/// (in field order) the member position whose recursor gives its induction
+/// hypothesis.
+#[derive(Clone, Debug)]
+pub(crate) struct DerivedIotaRule {
+    pub ctor: u32,
+    pub minor_idx: u32,
+    pub num_fields: u32,
+    pub ihs: Vec<(u32, u32)>,
 }
 
 /// A binder whose type is expressed in the context formed by the preceding
@@ -928,7 +944,7 @@ impl<'e> Checker<'e> {
         let k = members.len() == 1 && self.is_k_like(&all)?;
         let mut out = Vec::with_capacity(members.len());
         for target_pos in 0..members.len() {
-            let typ = self.build_base_recursor_type(
+            let (typ, mut iota_rules) = self.build_base_recursor_type(
                 &all,
                 &members,
                 target_pos,
@@ -947,6 +963,7 @@ impl<'e> Checker<'e> {
                 num_motives: members.len() as u32,
                 num_minors,
                 k,
+                iota_rules: std::mem::take(&mut iota_rules[target_pos]),
             });
         }
         Ok(out)
@@ -1062,8 +1079,9 @@ impl<'e> Checker<'e> {
         num_params: u32,
         params: &[RecBinder],
         elim_level: Level,
-    ) -> R<Expr> {
+    ) -> R<(Expr, Vec<Vec<DerivedIotaRule>>)> {
         let mut binders = params.to_vec();
+        let mut iota_rules: Vec<Vec<DerivedIotaRule>> = Vec::with_capacity(members.len());
 
         for member in members {
             let motive_base = binders.len();
@@ -1106,9 +1124,11 @@ impl<'e> Checker<'e> {
             });
         }
 
+        let minors_base = binders.len();
         for (owner_pos, owner) in members.iter().enumerate() {
+            let mut owner_rules = Vec::with_capacity(owner.ctors.len());
             for ctor in &owner.ctors {
-                let minor = self.build_minor_type(
+                let (minor, num_fields, ihs) = self.build_minor_type(
                     original_names,
                     members,
                     owner_pos,
@@ -1116,11 +1136,18 @@ impl<'e> Checker<'e> {
                     num_params,
                     binders.len(),
                 )?;
+                owner_rules.push(DerivedIotaRule {
+                    ctor: ctor.name,
+                    minor_idx: (binders.len() - minors_base) as u32,
+                    num_fields,
+                    ihs,
+                });
                 binders.push(RecBinder {
                     info: BinderInfo::Default,
                     typ: minor,
                 });
             }
+            iota_rules.push(owner_rules);
         }
 
         let target = &members[target_pos];
@@ -1162,12 +1189,14 @@ impl<'e> Checker<'e> {
             .map(|i| expr::bvar(target.num_indices - i as u32))
             .collect();
         result_args.push(expr::bvar(0));
-        Ok(close_rec_telescope(
-            &binders,
-            expr::apps(motive, &result_args),
+        Ok((
+            close_rec_telescope(&binders, expr::apps(motive, &result_args)),
+            iota_rules,
         ))
     }
 
+    /// The minor premise type, the constructor's field count, and for each
+    /// recursive field `(field position, member position)` in field order.
     fn build_minor_type(
         &self,
         original_names: &[u32],
@@ -1176,7 +1205,7 @@ impl<'e> Checker<'e> {
         ctor: &RecConstructor,
         num_params: u32,
         outer_depth: usize,
-    ) -> R<Expr> {
+    ) -> R<(Expr, u32, Vec<(u32, u32)>)> {
         let mut src_ctx = Ctx::new();
         let mut cur = ctor.typ.clone();
         for _ in 0..num_params {
@@ -1232,6 +1261,7 @@ impl<'e> Checker<'e> {
         }
 
         let mut ih_count = 0usize;
+        let mut ih_targets: Vec<(u32, u32)> = Vec::new();
         for (field_pos, field) in fields.iter().enumerate() {
             let mut fctx = field.ctx.clone();
             let mut fcur = self.whnf(&fctx, &field.dom)?;
@@ -1330,6 +1360,7 @@ impl<'e> Checker<'e> {
                 info: BinderInfo::Default,
                 typ: close_rec_telescope(&arg_binders, expr::apps(motive, &ih_args)),
             });
+            ih_targets.push((field_pos as u32, member_pos as u32));
             ih_count += 1;
         }
 
@@ -1372,9 +1403,10 @@ impl<'e> Checker<'e> {
             expr::const_(ctor.name, ctor.levels.clone()),
             &ctor_args,
         ));
-        Ok(close_rec_telescope(
-            &local,
-            expr::apps(motive, &result_args),
+        Ok((
+            close_rec_telescope(&local, expr::apps(motive, &result_args)),
+            field_count as u32,
+            ih_targets,
         ))
     }
 

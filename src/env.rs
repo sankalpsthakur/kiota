@@ -143,6 +143,22 @@ pub struct Environment {
     /// Recursor → every recursor in its inductive block (`.rec`, `.rec_1`, …),
     /// sorted so main comes first. Used for nested ι, not for trusting RHS.
     pub rec_group: FxHashMap<u32, Vec<u32>>,
+    /// Recursor of a nested block → constructor → how iota reduces it,
+    /// fixed from the reconstructed recursor when the block is admitted.
+    /// Only blocks with auxiliary members have an entry.
+    pub nested_iota: FxHashMap<u32, FxHashMap<u32, NestedIotaRule>>,
+}
+
+/// Iota for one constructor under one recursor of a nested block: the minor
+/// premise slot, the constructor's field count, and for each recursive field
+/// `(field index, recursor giving its induction hypothesis)`, in field order.
+/// Both choices come from the declaration, so how a major premise happens to
+/// spell its constructor's parameters cannot change them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NestedIotaRule {
+    pub minor_idx: u32,
+    pub num_fields: u32,
+    pub ihs: Vec<(u32, u32)>,
 }
 
 impl Environment {

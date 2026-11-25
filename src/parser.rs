@@ -1,4 +1,4 @@
-use crate::env::{ConstantInfo, Environment, QuotKind, RecRule, ReducibilityHints};
+use crate::env::{ConstantInfo, Environment, NestedIotaRule, QuotKind, RecRule, ReducibilityHints};
 use crate::expr::{self, BinderInfo, Expr, ExprData};
 use crate::level::{self, Level};
 use crate::tc::{Checker, TcError};
@@ -44,6 +44,7 @@ enum InductiveWrite {
     Constant(u32, Option<ConstantInfo>),
     Owner(u32, Option<u32>),
     Group(u32, Option<Vec<u32>>),
+    NestedIota(u32, Option<FxHashMap<u32, NestedIotaRule>>),
 }
 
 impl InductiveUndo {
@@ -62,6 +63,18 @@ impl InductiveUndo {
             .push(InductiveWrite::Group(name, env.rec_group.insert(name, group)));
     }
 
+    fn insert_nested_iota(
+        &mut self,
+        env: &mut Environment,
+        name: u32,
+        rules: FxHashMap<u32, NestedIotaRule>,
+    ) {
+        self.0.push(InductiveWrite::NestedIota(
+            name,
+            env.nested_iota.insert(name, rules),
+        ));
+    }
+
     fn rollback(self, env: &mut Environment) {
         fn restore<T>(map: &mut FxHashMap<u32, T>, name: u32, prior: Option<T>) {
             match prior {
@@ -78,6 +91,9 @@ impl InductiveUndo {
                 InductiveWrite::Constant(name, prior) => restore(&mut env.consts, name, prior),
                 InductiveWrite::Owner(name, prior) => restore(&mut env.rec_of, name, prior),
                 InductiveWrite::Group(name, prior) => restore(&mut env.rec_group, name, prior),
+                InductiveWrite::NestedIota(name, prior) => {
+                    restore(&mut env.nested_iota, name, prior)
+                }
             }
         }
     }
@@ -914,6 +930,39 @@ impl Parser {
             stored.typ = expr::instantiate_level_params(&d.typ, &subst);
             stored.level_params = r.level_params.clone();
             ordered.push((r, stored));
+        }
+        // A nested block's iota is fixed here, by position: member `i` of the
+        // reconstruction is the recursor just matched to derived index `i`.
+        // Its minor slots and each recursive field's recursor come from the
+        // minor premises, so the spelling of a major premise met later cannot
+        // pick another auxiliary's recursor or minors.
+        if ordered.len() > type_names.len() {
+            let member_recs: Vec<u32> = ordered.iter().map(|(r, _)| r.name).collect();
+            for (r, d) in &ordered {
+                let mut rules: FxHashMap<u32, NestedIotaRule> = FxHashMap::default();
+                for rule in &d.iota_rules {
+                    let mut ihs = Vec::with_capacity(rule.ihs.len());
+                    for &(field, member) in &rule.ihs {
+                        let Some(&rec) = member_recs.get(member as usize) else {
+                            return Err(TcError::Other(
+                                "nested iota rule names a member outside the block".into(),
+                            ));
+                        };
+                        ihs.push((field, rec));
+                    }
+                    let entry = NestedIotaRule {
+                        minor_idx: rule.minor_idx,
+                        num_fields: rule.num_fields,
+                        ihs,
+                    };
+                    if rules.insert(rule.ctor, entry).is_some() {
+                        return Err(TcError::Other(
+                            "a nested member lists one constructor twice".into(),
+                        ));
+                    }
+                }
+                undo.insert_nested_iota(&mut self.env, r.name, rules);
+            }
         }
         for (r, d) in ordered {
             undo.insert_constant(
