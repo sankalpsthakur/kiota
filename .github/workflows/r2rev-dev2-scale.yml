@@ -1,0 +1,75 @@
+name: r2rev-dev2-scale
+
+# Independent review of fix/deep-evaluation-v2 44edff2 beside its base
+# fix/integrate-20261125 3fd8d86: every adversarial export (round-1 adv/r1 at
+# 2^19..2^21 and 1M-3M scale, the reviewer's adv/r2rev) in its own process,
+# strict, 600 s timeout, user time and peak RSS. Verdicts expected from the
+# names (_ok accepted by leanchecker 4.36, _bad rejected or a false claim).
+on:
+  push:
+    branches: ['remote/r2rev-dev2-scale-*']
+permissions:
+  contents: read
+env:
+  V2: 44edff268616767993c705558760e007cafc64a9
+  BASE: 3fd8d8687f100f30fd791d3f502bb92c29d2d761
+jobs:
+  build:
+    strategy:
+      matrix:
+        side: [base, v2]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.side == 'base' && env.BASE || env.V2 }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked && git rev-parse HEAD > target/release/SHA
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiota-${{ matrix.side }}
+          path: |
+            target/release/kiota
+            target/release/SHA
+  list:
+    runs-on: ubuntu-latest
+    outputs:
+      cases: ${{ steps.l.outputs.cases }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: l
+        run: echo "cases=$(ls adv/r1/*.ndjson adv/r2rev/*.ndjson | python3 -c 'import sys,json; print(json.dumps([l.strip() for l in sys.stdin]))')" >> $GITHUB_OUTPUT
+  run:
+    needs: [build, list]
+    strategy:
+      fail-fast: false
+      max-parallel: 40
+      matrix:
+        side: [base, v2]
+        case: ${{ fromJson(needs.list.outputs.cases) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kiota-${{ matrix.side }}
+          path: bin
+      - name: Run
+        env:
+          SIDE: ${{ matrix.side }}
+          F: ${{ matrix.case }}
+        run: |
+          set +e
+          chmod +x bin/kiota
+          sudo apt-get install -y time >/dev/null 2>&1
+          n=$(basename $F .ndjson)
+          exp=x; case $n in *_ok) exp=0;; *_bad) exp=1;; esac
+          KIOTA_NAT_REPORT=1 /usr/bin/time -v -o time.txt timeout 600 bin/kiota $F >o.txt 2>err.txt; rc=$?
+          flag=ok
+          [ "$exp" = 1 ] && [ $rc = 0 ] && flag=WRONG_ACCEPT
+          [ "$exp" = 0 ] && [ $rc = 1 ] && flag=WRONG_REJECT
+          [ $rc = 124 ] && flag=TIMEOUT
+          [ $rc -gt 2 ] && [ $rc != 124 ] && flag=CRASH
+          tail -c 1500 err.txt
+          echo "SCALE side=$SIDE sha=$(cut -c1-7 bin/SHA) case=$F exp=$exp rc=$rc $flag user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -m1 '^NAT_DRIVE' err.txt) $(grep -m1 -E '^(REJECT|DECLINE|ERROR)|panic|overflow' err.txt | cut -c1-160)" | tee -a "$GITHUB_STEP_SUMMARY"
