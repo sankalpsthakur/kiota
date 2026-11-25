@@ -1,49 +1,32 @@
-name: remote-integrate
+name: remote-deep-evaluation
 
-# fix/integrate-20261125 (3fd8d86: snd/interner-memory through bcc57e8 plus
-# its tests, fix/nested-iota-from-declaration 4dad564, snd/inductive-audit-2
-# 25f7be5) beside main (606c3c0) on the arena's six Lean 4.36 exports, strict,
-# one process each: verdict, user time, peak memory. Both refs are pinned by
-# sha. mathlib OOMs on main near decl #284,600 (a defeq runaway that only
-# fix/mathlib-swap addresses, and that branch is not part of the integration),
-# so a diagnostic side "integrate+swap" merges af180e9 into 3fd8d86 inside the
-# job for mathlib only. The arena tarball's perf cases run on both sides.
+# fix/deep-evaluation-v2 (48d83ba: the closed-Nat driver and cut-short
+# declines) beside its base fix/integrate-20261125 (3fd8d86), both pinned by
+# sha: the six Lean 4.36 corpora strict (verdict, user time, peak memory, and
+# on v2 the driver counters), every arena tarball case, and the test suite in
+# the three modes the arena gate uses.
 on:
   push:
-    branches: ['remote/integrate-*']
+    branches: ['remote/deep-evaluation-v2-*']
 permissions:
   contents: read
   actions: read
 env:
+  V2: 48d83ba4e8240f0ff9c71e59cc2a0a38e94ae09a
   INTEG: 3fd8d8687f100f30fd791d3f502bb92c29d2d761
-  MAIN: 606c3c08f892243d83faadf33ae2acd8bf218f78
-  SWAP: af180e9
 jobs:
   val:
     strategy:
       fail-fast: false
       matrix:
-        side: [integrate, main]
+        side: [v2, integrate]
         corpus: [init, std, cedar, cslib, mathlib, con-leche]
-        include:
-          - {side: integrate+swap, corpus: mathlib}
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ matrix.side == 'main' && env.MAIN || env.INTEG }}
-          fetch-depth: 0
-      - name: Diagnostic merge with fix/mathlib-swap (not part of the integration)
-        if: matrix.side == 'integrate+swap'
-        run: |
-          git -c user.name=ci -c user.email=ci@localhost merge --no-edit $SWAP || {
-            # Only tests/exports.rs conflicts (both append tests); the binary does not use it.
-            git checkout --ours tests/exports.rs && git add tests/exports.rs
-            test -z "$(git diff --name-only --diff-filter=U)" || { git status; exit 1; }
-            git -c user.name=ci -c user.email=ci@localhost commit --no-edit
-          }
-          git log --oneline -3
+          ref: ${{ matrix.side == 'v2' && env.V2 || env.INTEG }}
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked
       - name: Free disk
@@ -60,6 +43,7 @@ jobs:
         env:
           C: ${{ matrix.corpus }}
           SIDE: ${{ matrix.side }}
+          KIOTA_NAT_REPORT: '1'
         run: |
           set +e
           sudo apt-get install -y zstd time >/dev/null
@@ -83,31 +67,34 @@ jobs:
           grep -v '^\[decl' err.txt | tail -c 3000
           echo "last progress: $(grep '^\[decl' err.txt | tail -1)"
           echo "FULL side=$SIDE sha=$(git rev-parse --short HEAD) corpus=$C rc=$rc wall=${wall}s" | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "VAL side=$SIDE sha=$(git rev-parse --short HEAD) corpus=$C rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -m1 -E '^(REJECT|DECLINE|ERROR|MEMKILL)' err.txt | cut -c1-250)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "VAL side=$SIDE sha=$(git rev-parse --short HEAD) corpus=$C rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -m1 '^NAT_DRIVE' err.txt) $(grep -m1 -E '^(REJECT|DECLINE|ERROR|MEMKILL)' err.txt | cut -c1-250)" | tee -a "$GITHUB_STEP_SUMMARY"
 
-  perf:
+  tarball:
     strategy:
       fail-fast: false
       matrix:
-        side: [integrate, main]
+        side: [v2, integrate]
+        part: [perf, rest]
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ matrix.side == 'main' && env.MAIN || env.INTEG }}
+          ref: ${{ matrix.side == 'v2' && env.V2 || env.INTEG }}
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked
-      - name: Arena tarball perf cases
+      - name: Arena tarball cases
         env:
           SIDE: ${{ matrix.side }}
+          PART: ${{ matrix.part }}
+          KIOTA_NAT_REPORT: '1'
         run: |
           set +e
           sudo apt-get install -y time >/dev/null
           mkdir -p arena && curl -sL https://arena.lean-lang.org/lean-arena-tests.tar.gz -o arena.tgz
           sha256sum arena.tgz; tar -xzf arena.tgz -C arena
           sha=$(git rev-parse --short HEAD)
-          one() {  # <file> <timeout>; extra env comes from the caller
+          one() {  # <file> <timeout>
             /usr/bin/time -v -o time.txt timeout $2 ./target/release/kiota "$1" >/dev/null 2>err.txt &
             pid=$!
             while kill -0 $pid 2>/dev/null; do
@@ -120,16 +107,38 @@ jobs:
             done
             wait $pid; rc=$?
           }
-          for f in $(ls arena/good/perf/*.ndjson arena/bad/perf/*.ndjson); do
+          if [ "$PART" = perf ]; then files=$(ls arena/good/perf/*.ndjson arena/bad/perf/*.ndjson)
+          else files=$(ls arena/good/*/*.ndjson arena/bad/*/*.ndjson | grep -v '/perf/'); fi
+          for f in $files; do
             case_=${f#arena/}
             one "$f" 1800
-            echo "PERF side=$SIDE sha=$sha case=$case_ rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') wall=$(grep 'Elapsed (wall' time.txt | awk '{print $NF}') $(grep -m1 -E '^(REJECT|DECLINE|ERROR|MEMKILL)' err.txt | cut -c1-200)" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "PERF side=$SIDE sha=$sha case=$case_ rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') wall=$(grep 'Elapsed (wall' time.txt | awk '{print $NF}') $(grep -m1 '^NAT_DRIVE' err.txt) $(grep -m1 -E '^(REJECT|DECLINE|ERROR|MEMKILL)' err.txt | cut -c1-200)" | tee -a "$GITHUB_STEP_SUMMARY"
           done
-          # The interner review's check: table history and counters on the two big magma cases.
-          for c in magma-list-deep-n36 magma-list-pair-n21; do
-            export KIOTA_INTERN_TABLE_LOG=1 KIOTA_STATS=1
-            one arena/good/perf/$c.ndjson 1800
-            unset KIOTA_INTERN_TABLE_LOG KIOTA_STATS
-            grep '^INTERN_TABLE' err.txt | tail -12
-            echo "TABLE side=$SIDE sha=$sha case=$c rc=$rc maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') grows=$(grep -c '^INTERN_TABLE grow' err.txt) last_grow=\"$(grep '^INTERN_TABLE grow' err.txt | tail -1)\" stats_sha=$(grep '^STATS' err.txt | sha256sum | cut -c1-12) stats_lines=$(grep -c '^STATS' err.txt)" | tee -a "$GITHUB_STEP_SUMMARY"
-          done
+
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [default, nbe, reclaim, debug]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.V2 }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test
+        env:
+          MODE: ${{ matrix.mode }}
+        run: |
+          set -o pipefail
+          case "$MODE" in
+            nbe) KIOTA_NBE=1 cargo test --release --locked 2>&1 | tee test.log ;;
+            reclaim) KIOTA_RECLAIM=1 cargo test --release --locked 2>&1 | tee test.log ;;
+            debug) cargo test --locked 2>&1 | tee test.log ;;
+            *) cargo test --release --locked 2>&1 | tee test.log ;;
+          esac
+          rc=$?
+          grep -E '^test result|FAILED|panicked' test.log | head -40
+          echo "TESTS mode=$MODE rc=$rc $(grep -E '^test result' test.log | awk '{p+=$4; f+=$6; i+=$8} END {print "passed=" p " failed=" f " ignored=" i}')" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit $rc
