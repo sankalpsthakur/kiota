@@ -135,6 +135,22 @@ thread_local! {
     /// propagate it. Retrying at every level would redo the declining
     /// subterm once per enclosing frame and per path, exponentially.
     static SPECULATING: Cell<bool> = const { Cell::new(false) };
+    /// Set while the arguments of two same-head applications of an `abbrev`
+    /// (`DFunLike.coe`, `HAdd.hAdd`, ...) are compared before unfolding it
+    /// (`try_unreduced_const_congruence_ex`). Official compares arguments
+    /// first only under a regular definition and unfolds an abbrev on both
+    /// sides instead (`lazy_delta_reduction_step`), so there an argument
+    /// pair is a shortcut that may only prove equality cheaply: a pair that
+    /// speculative congruence does not prove declines rather than taking the
+    /// main path. Refuting a pair kiota asks and official never does can
+    /// unfold without end (`f ∘ f` against `f` under `DFunLike.coe` in
+    /// Mathlib `Polynomial.Bivariate.swap._proof_1`).
+    static ABBREV_ARGS: Cell<bool> = const { Cell::new(false) };
+    /// Bumped when an `ABBREV_ARGS` comparison ends in its decline, which the
+    /// abbrev frame reads as "not proved". `try_speculative_congruence`
+    /// re-raises it if nothing else proves the pair, so the decline stands
+    /// against a main-path `false` as any speculative decline does.
+    static ABBREV_UNPROVED: Cell<u64> = const { Cell::new(0) };
     /// Bumped by every `decline`. Nothing else bumps it while a decline
     /// propagates through `?`, so enclosing frames can tell it is the same one.
     static DECLINE_SERIAL: Cell<u64> = const { Cell::new(0) };
@@ -187,6 +203,9 @@ const MAX_HUGE_NAT_PEELS: u32 = 1 << 16;
 /// Head steps `try_lazy_delta` takes before leaving a comparison to the main
 /// path.
 const LAZY_DELTA_STEPS: usize = 16;
+
+/// The decline of an argument comparison under an abbrev head (`ABBREV_ARGS`).
+const ABBREV_ARGS_DECLINE: &str = "abbrev arguments compared proof-only";
 
 #[derive(Debug)]
 pub enum TcError {
@@ -3022,6 +3041,12 @@ impl<'e> Checker<'e> {
         }
     }
 
+    fn abbrev_head(&self, e: &Expr) -> bool {
+        let (h, _) = expr::unfold_apps(e);
+        matches!(&**h, ExprData::Const(n, _)
+            if matches!(self.env.get(*n), Some(ConstantInfo::Def { hints: ReducibilityHints::Abbrev, .. })))
+    }
+
     fn lazy_same_head(a: &Expr, b: &Expr) -> bool {
         let (ha, aa) = expr::unfold_apps(a);
         let (hb, ab) = expr::unfold_apps(b);
@@ -3077,6 +3102,17 @@ impl<'e> Checker<'e> {
     /// cheap `whnf_core`. `Ok(true)` proves equality; `Ok(false)` and a
     /// `Decline` both mean "not proved this way" (see `is_def_eq_inner_body`).
     fn try_speculative_congruence(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
+        let unproved = ABBREV_UNPROVED.with(Cell::get);
+        if self.try_speculative_congruence_go(ctx, a, b)? {
+            return Ok(true);
+        }
+        if ABBREV_UNPROVED.with(Cell::get) != unproved {
+            return decline(ABBREV_ARGS_DECLINE);
+        }
+        Ok(false)
+    }
+
+    fn try_speculative_congruence_go(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         if self.try_unreduced_const_congruence(ctx, a, b)? {
             return Ok(true);
         }
@@ -3114,8 +3150,9 @@ impl<'e> Checker<'e> {
     fn try_lazy_delta(&self, ctx: &Ctx, a: &Expr, b: &Expr) -> R<bool> {
         // Opt-in lazy-head mode's rule (top of `is_def_eq_inner_body`) holds
         // here too: no alias comparison after a core abort or at the core
-        // depth cap.
-        if Self::lazy_same_head(a, b)
+        // depth cap. The same abbrev on both sides is unfolded on both, as
+        // official does; its arguments were compared proof-only already.
+        if (Self::lazy_same_head(a, b) && !self.abbrev_head(a))
             || CORE_ABORTED.with(Cell::get)
             || CORE_DEPTH.with(Cell::get) >= CONV_DEPTH
         {
@@ -3283,13 +3320,37 @@ impl<'e> Checker<'e> {
         if env_set!("KIOTA_TRACE_PAIR") && a1.len() >= 3 {
             Self::trace_pair("unreduced", self.name_str(*n1), a1.len(), has_pr);
         }
-        let r = if has_pr {
-            match self.infer_const(*n1, u1) {
-                Ok(fn_ty) => self.defeq_args(ctx, &fn_ty, &a1, &a2)?,
-                Err(_) => self.pairwise_args(ctx, &a1, &a2)?,
+        let compare = || -> R<bool> {
+            if has_pr {
+                match self.infer_const(*n1, u1) {
+                    Ok(fn_ty) => self.defeq_args(ctx, &fn_ty, &a1, &a2),
+                    Err(_) => self.pairwise_args(ctx, &a1, &a2),
+                }
+            } else {
+                self.pairwise_args(ctx, &a1, &a2)
+            }
+        };
+        // An abbrev head: the arguments may only prove equality (see
+        // `ABBREV_ARGS`). The outermost such frame reads the decline as "not
+        // proved this way"; nested ones let it propagate to it.
+        let r = if !ABBREV_ARGS.with(Cell::get)
+            && matches!(self.env.get(*n1), Some(ConstantInfo::Def { hints: ReducibilityHints::Abbrev, .. }))
+        {
+            let abort_before = CORE_ABORTED.with(Cell::get);
+            ABBREV_ARGS.with(|f| f.set(true));
+            let r = compare();
+            ABBREV_ARGS.with(|f| f.set(false));
+            match r {
+                Ok(r) => r,
+                Err(TcError::Decline(msg)) if msg == ABBREV_ARGS_DECLINE => {
+                    CORE_ABORTED.with(|c| c.set(abort_before));
+                    ABBREV_UNPROVED.with(|n| n.set(n.get() + 1));
+                    false
+                }
+                Err(e) => return Err(e),
             }
         } else {
-            self.pairwise_args(ctx, &a1, &a2)?
+            compare()?
         };
         if eq_trace {
             eprintln!("EQARGS r={r} n={} na={}", self.name_str(*n1), a1.len());
@@ -4296,6 +4357,9 @@ impl<'e> Checker<'e> {
                 Err(e) => return Err(e),
             }
         };
+        if ABBREV_ARGS.with(Cell::get) {
+            return decline(ABBREV_ARGS_DECLINE);
+        }
         let main = self.def_eq_main_path(ctx, a, b);
         let declined = match (main, speculative_decline) {
             (Ok((r, cacheable)), None) | (Ok((r @ true, cacheable)), Some(_)) => {
