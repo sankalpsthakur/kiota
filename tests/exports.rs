@@ -1760,3 +1760,17 @@ fn nested_iota_coinciding_auxiliaries_follow_the_field_position() {
         assert_reject(&format!("nested-iota-coincide-{case}-false.reject.ndjson"));
     }
 }
+
+/// `CoeF.coe f (CoeF.coe f q) = CoeF.coe (f.comp f) q` by `rfl`
+/// (`tests/fixtures/src/abbrev-coe-of-comp.lean`). `CoeF.coe` is an abbrev
+/// whose arguments `f` and `f.comp f` differ; official unfolds it on both
+/// sides and compares `g 24 _` by its arguments. Skipping the argument
+/// comparison and normalizing both sides instead evaluates `g 24` into a
+/// 2^24-leaf tree (51 s and 680 MB when tried). It does not reproduce the
+/// Mathlib spin, which needs an argument pair that is expensive to refute.
+#[test]
+fn an_abbrev_with_unequal_arguments_unfolds_on_both_sides() {
+    let start = std::time::Instant::now();
+    assert_accept("abbrev-coe-of-comp.accept.ndjson");
+    assert!(start.elapsed().as_secs() < 20, "took {:?}", start.elapsed());
+}
