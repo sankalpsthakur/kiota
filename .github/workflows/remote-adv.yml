@@ -1,0 +1,61 @@
+name: remote-deep-evaluation-adv
+
+# The round-1 review's adversarial exports (adv/*.ndjson, Lean sources beside
+# them) on fix/deep-evaluation-v2 (48d83ba), its base fix/integrate-20261125
+# (3fd8d86) and the official checker (leanchecker 4.36.0), 600 s each.
+on:
+  push:
+    branches: ['remote/deep-evaluation-v2-adv-*']
+permissions:
+  contents: read
+env:
+  V2: 48d83ba4e8240f0ff9c71e59cc2a0a38e94ae09a
+  INTEG: 3fd8d8687f100f30fd791d3f502bb92c29d2d761
+jobs:
+  adv:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.V2 }}
+          path: v2
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.INTEG }}
+          path: integrate
+      - uses: dtolnay/rust-toolchain@stable
+      - run: (cd v2 && cargo build --release --locked) && (cd integrate && cargo build --release --locked)
+      - name: Lean 4.36.0
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
+          sh elan-init.sh -y --default-toolchain leanprover/lean4:v4.36.0 >/dev/null
+          ~/.elan/bin/leanchecker --help 2>&1 | head -2 || ls ~/.elan/toolchains/*/bin
+      - name: Run
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set +e
+          sudo apt-get install -y time >/dev/null
+          LC=$(ls ~/.elan/toolchains/*/bin/leanchecker | head -1)
+          i=0
+          for f in $(ls harness/adv/*.ndjson); do
+            i=$((i+1)); [ $((i % 5)) -eq "$SHARD" ] || continue
+            t=$(basename $f .ndjson)
+            for side in leanchecker v2 integrate; do
+              case $side in
+                leanchecker) cmd="$LC --from-export $f" ;;
+                *) cmd="./$side/target/release/kiota $f" ;;
+              esac
+              KIOTA_NAT_REPORT=1 /usr/bin/time -v -o time.txt timeout 600 $cmd >out.txt 2>err.txt
+              rc=$?
+              echo "ADV case=$t side=$side rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -m1 '^NAT_DRIVE' err.txt) $(cat out.txt err.txt | grep -m1 -E '^(REJECT|DECLINE|ERROR)|accepts|error' | cut -c1-200)" | tee -a "$GITHUB_STEP_SUMMARY"
+            done
+          done
