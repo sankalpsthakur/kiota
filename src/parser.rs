@@ -1804,3 +1804,67 @@ fn rec_sort_key(name: &str) -> (u8, u32) {
     }
     (3, 0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::io::Cursor;
+
+    fn constants(env: &Environment) -> BTreeMap<u32, String> {
+        // `ConstantInfo` has no `PartialEq`; its `Debug` form is complete.
+        env.consts.iter().map(|(n, c)| (*n, format!("{c:?}"))).collect()
+    }
+
+    /// Every check after the nested iota table is written re-reads data the
+    /// reconstruction has already matched, so no export reaches a failure
+    /// there today; the transaction must still undo the table if one ever
+    /// does. The `LALNest` block of `recursor-type-reconstruction` is
+    /// imported through `handle_inductive_block` with its own journal, which
+    /// writes both members' iota entries, and the journal is then rolled
+    /// back as a later failure would: the environment must be the one
+    /// before the block, and the block must import again.
+    #[test]
+    fn a_nested_block_rolled_back_after_its_iota_table_is_written_leaves_nothing() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/recursor-type-reconstruction.accept.ndjson"
+        );
+        let text = std::fs::read_to_string(path).expect("read fixture");
+        let mut parser = Parser::new();
+        for line in text.lines() {
+            let record: Value = serde_json::from_str(line).expect("fixture JSON");
+            let block = record.get("inductive").filter(|d| {
+                d["types"]
+                    .as_array()
+                    .is_some_and(|ts| ts.iter().any(|t| parser.name_str(Parser::get_u32(t, "name")) == "LALNest"))
+            });
+            let Some(block) = block else {
+                parser.run(Cursor::new(line)).expect("valid fixture prefix");
+                continue;
+            };
+            let consts = constants(&parser.env);
+            let rec_of = parser.env.rec_of.clone();
+            let rec_group = parser.env.rec_group.clone();
+            let nested_iota = parser.env.nested_iota.clone();
+            let main = parser.name_by_str["LALNest.rec"];
+            let auxiliary = parser.name_by_str["LALNest.rec_1"];
+            let mut undo = InductiveUndo::default();
+            parser
+                .handle_inductive_block(block, &mut undo)
+                .expect("the block is admitted");
+            assert!(parser.env.nested_iota.contains_key(&main));
+            assert!(parser.env.nested_iota.contains_key(&auxiliary));
+            assert!(!nested_iota.contains_key(&main));
+            undo.rollback(&mut parser.env);
+            assert_eq!(constants(&parser.env), consts);
+            assert_eq!(parser.env.rec_of, rec_of);
+            assert_eq!(parser.env.rec_group, rec_group);
+            assert_eq!(parser.env.nested_iota, nested_iota);
+            parser.run(Cursor::new(line)).expect("the block imports after the rollback");
+            assert!(parser.env.nested_iota.contains_key(&main));
+            return;
+        }
+        panic!("the fixture has no LALNest block");
+    }
+}

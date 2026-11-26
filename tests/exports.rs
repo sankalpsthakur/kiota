@@ -292,7 +292,9 @@ fn recursor_type_reconstruction_late_failure_rolls_back_ownership() {
         assert_eq!(environment_constants(&parser), before);
         assert_eq!(parser.env.rec_of, rec_of);
         assert_eq!(parser.env.rec_group, rec_group);
-        // The nested iota table is written before these checks fail.
+        // These are refused before the nested iota table is written; the
+        // rollback of a written table is `parser::tests::
+        // a_nested_block_rolled_back_after_its_iota_table_is_written_leaves_nothing`.
         assert_eq!(parser.env.nested_iota, nested_iota);
         assert!(!parser.env.nested_iota.contains_key(&main));
     }
