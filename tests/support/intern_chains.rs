@@ -74,30 +74,50 @@ pub fn text(wrong_leaf: bool) -> String {
     out
 }
 
-/// The path of a twin written for this test process: `name` is `ACCEPT` or
-/// `REJECT`. Each file is written once, to a fresh name, then renamed into
-/// place, so tests running side by side never read a partial file.
+/// The path of a twin: `name` is `ACCEPT` or `REJECT`. The text is fixed,
+/// so every test process writes the same two files under
+/// `CARGO_TARGET_TMPDIR`: each is written to a name of its own process and
+/// then renamed into place, so a test running side by side never reads a
+/// partial file, and runs no longer leave one pair of 1.9 MB files behind
+/// each. The per-process files earlier versions left there are removed.
 pub fn path(name: &str) -> PathBuf {
     static PATHS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
     let (accept, reject) = PATHS.get_or_init(|| {
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
         std::fs::create_dir_all(&dir).expect("create the test tmp dir");
+        sweep_per_process_twins(&dir);
         let pid = std::process::id();
-        let write = |stem: &str, wrong_leaf: bool| {
-            let dest = dir.join(format!("{stem}-{pid}.ndjson"));
-            let tmp = dir.join(format!("{stem}-{pid}.ndjson.partial"));
+        let write = |file: &str, wrong_leaf: bool| {
+            let dest = dir.join(file);
+            let tmp = dir.join(format!("{file}.{pid}.partial"));
             std::fs::write(&tmp, text(wrong_leaf)).expect("write a chain twin");
             std::fs::rename(&tmp, &dest).expect("move a chain twin into place");
             dest
         };
-        (
-            write("intern-table-chains.accept", false),
-            write("intern-table-chains.reject", true),
-        )
+        (write(ACCEPT, false), write(REJECT, true))
     });
     match name {
         ACCEPT => accept.clone(),
         REJECT => reject.clone(),
         other => panic!("not a chain twin: {other}"),
+    }
+}
+
+/// `intern-table-chains.{accept,reject}-<pid>.ndjson`, the names each test
+/// process used to write. Nothing writes them any more, so removing them
+/// cannot pull a file from under a running test.
+fn sweep_per_process_twins(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let legacy = ["intern-table-chains.accept-", "intern-table-chains.reject-"]
+            .iter()
+            .filter_map(|stem| name.strip_prefix(stem))
+            .filter_map(|rest| rest.strip_suffix(".ndjson"))
+            .any(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()));
+        if legacy {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
