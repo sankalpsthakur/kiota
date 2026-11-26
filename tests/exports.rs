@@ -2108,3 +2108,77 @@ fn an_abbrev_with_unequal_arguments_unfolds_on_both_sides() {
     assert_accept("abbrev-coe-of-comp.accept.ndjson");
     assert!(start.elapsed().as_secs() < 20, "took {:?}", start.elapsed());
 }
+
+fn assert_reject_in(name: &str, decl: &str) {
+    let path = fixture(name);
+    let tag = format!("[{decl}] ");
+    match check_file(&path) {
+        Err(TcError::Reject(message)) if message.starts_with(&tag) => {}
+        other => panic!("{name} should reject in {decl}, got {other:?}"),
+    }
+}
+
+/// Lean compares names by components (`tests/fixtures/src/name-components.lean`,
+/// Lean 4.36 exports, leanchecker accepts each): the single component
+/// `«a.b»` and the two components `a.b` are two constants, and so are the
+/// numeric `a.1` and the string `a.«1»`, and `«».Nat` (components `""`,
+/// `"Nat"`) and `Nat`. Printed alike, they used to be one duplicate.
+#[test]
+fn names_with_different_components_are_different_constants() {
+    assert_accept("name-quoted-beside-dotted.accept.ndjson");
+    assert_accept("name-num-beside-digit-string.accept.ndjson");
+    assert_accept("name-empty-component-nat.accept.ndjson");
+}
+
+/// The Nat extensions belong to `Nat.add`, `Nat.beq`, … by components. A
+/// user's `def «Nat.add» (x _y : Nat) := x` is an ordinary definition:
+/// `«Nat.add» 2 3 = 2` by `rfl`, and the twin claiming `= 5` is refused by
+/// leanchecker 4.36 but was accepted when the printed name chose the
+/// extension. The same for `«Nat.beq»` (through `Bool.true`), `«Nat.succ»`
+/// and `«Decidable.decide»`, and for `«».ite`, which always takes the else
+/// branch.
+#[test]
+fn a_single_component_spelled_like_a_builtin_is_not_the_builtin() {
+    assert_accept("name-quoted-nat-add.accept.ndjson");
+    assert_reject_in("name-quoted-nat-add-false.reject.ndjson", "bad_c2_false");
+    assert_accept("name-quoted-nat-beq.accept.ndjson");
+    assert_reject_in("name-quoted-nat-beq-false.reject.ndjson", "bad_c4_false");
+    assert_accept("name-quoted-nat-succ.accept.ndjson");
+    assert_accept("name-quoted-decide.accept.ndjson");
+    assert_reject_in("name-quoted-decide-false.reject.ndjson", "bad_c10_false");
+    assert_accept("name-empty-component-ite.accept.ndjson");
+    assert_reject_in("name-empty-component-ite-false.reject.ndjson", "bad_c12_false");
+}
+
+/// The type of a Nat literal is `Nat` by components. `«».Nat := Unit`
+/// printed as `Nat`, so a literal took it as its type and
+/// `@Eq «».Nat 5 ()` held by unit eta; leanchecker 4.36 refuses both files
+/// (`unknown constant 'Nat'` without Nat, a type mismatch beside it).
+/// Without Nat in the export a literal has no type, which declines.
+#[test]
+fn a_nat_literal_is_not_typed_by_a_name_printed_like_nat() {
+    let path = fixture("name-empty-component-nat-literal.reject.ndjson");
+    match check_file(&path) {
+        Err(TcError::Decline(m)) if m.contains("Nat type unavailable") => {}
+        other => panic!("should decline for want of Nat, got {other:?}"),
+    }
+    assert_reject_in("name-empty-component-nat-literal-beside-nat.reject.ndjson", "c5_lit");
+}
+
+/// Two indices may carry the same components (leanchecker 4.36 accepts
+/// this export, where index 17 is `Bool.true` and never declared, and 106
+/// is `Bool.true` again and is the constructor). They are one name, and the
+/// `Bool.true` that `Nat.beq 3 3` reduces to is the declared constant, not
+/// the first index that prints like it.
+#[test]
+fn a_builtin_reduct_names_the_declared_constant() {
+    assert_accept("name-duplicate-index-bool-true.accept.ndjson");
+}
+
+/// leanchecker 4.36 refuses an export that binds a name index twice
+/// ("Name index 23 bound twice"). Rebinding renamed every constant already
+/// declared under the index: here it turned `«Nat.add»` into `other`.
+#[test]
+fn a_name_index_is_bound_once() {
+    assert_reject_exact("name-index-bound-twice.reject.ndjson", "name index 23 bound twice");
+}

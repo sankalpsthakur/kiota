@@ -253,49 +253,59 @@ impl Parser {
         }
     }
 
-    fn handle_name(&mut self, idx: u32, v: &Value) {
+    /// Binds name index `idx`. `names[idx]` is the name printed with each
+    /// component escaped (see `push_component`), so two names print alike
+    /// exactly when they have the same components: `«a.b»` and `a.b`,
+    /// `a.«1»` and `a.1`, or `«».Nat` and `Nat` print differently. Every
+    /// lookup by printed name (`declared`, `reject_if_dup`, the built-in
+    /// names the checker matches) therefore compares components, as the
+    /// official kernel's `Name` equality does.
+    ///
+    /// An index may be bound once, and only to a name built on indices
+    /// already bound, as Lean's export reader demands ("Name index N bound
+    /// twice"): rebinding one would rename the constants that already use it.
+    fn handle_name(&mut self, idx: u32, v: &Value) -> Result<(), TcError> {
+        if idx == 0 || self.names.get(idx as usize).is_some_and(|s| !s.is_empty()) {
+            return Err(TcError::Reject(format!("name index {idx} bound twice")));
+        }
+        let (pre, comp) = if let Some(s) = v.get("str") {
+            (Self::get_u32(s, "pre"), Ok(Self::get_str(s, "str")))
+        } else if let Some(n) = v.get("num") {
+            (Self::get_u32(n, "pre"), Err(n.get("i").and_then(|x| x.as_u64()).unwrap_or(0)))
+        } else {
+            return Err(TcError::Reject(format!("name index {idx} is neither `str` nor `num`")));
+        };
+        if pre != 0 && self.names.get(pre as usize).is_none_or(|s| s.is_empty()) {
+            return Err(TcError::Reject(format!(
+                "name index {idx} extends name index {pre}, which is not bound"
+            )));
+        }
         // Whether the root component is exactly `_nested`: index 0 is the
         // anonymous name, and a longer name inherits its prefix's root.
-        let root = |env: &Environment, pre: u32| env.nested_root_names.contains(&pre);
-        let nested_root = if let Some(s) = v.get("str") {
-            let pre = Self::get_u32(s, "pre");
-            if pre == 0 {
-                Self::get_str(s, "str") == "_nested"
-            } else {
-                root(&self.env, pre)
-            }
-        } else if let Some(n) = v.get("num") {
-            let pre = Self::get_u32(n, "pre");
-            pre != 0 && root(&self.env, pre)
+        let nested_root = if pre == 0 {
+            comp == Ok("_nested")
         } else {
-            false
+            self.env.nested_root_names.contains(&pre)
         };
         if nested_root {
             self.env.nested_root_names.insert(idx);
-        } else {
-            self.env.nested_root_names.remove(&idx);
         }
-        let full = if let Some(s) = v.get("str") {
-            let pre = Self::get_u32(s, "pre");
-            let seg = Self::get_str(s, "str");
-            let parent = &*self.names[pre as usize];
-            if parent.is_empty() {
-                seg.to_string()
-            } else {
-                format!("{}.{}", parent, seg)
-            }
-        } else if let Some(n) = v.get("num") {
-            let pre = Self::get_u32(n, "pre");
-            let i = n.get("i").and_then(|x| x.as_u64()).unwrap_or(0);
-            let parent = &*self.names[pre as usize];
-            if parent.is_empty() {
-                format!("{}", i)
-            } else {
-                format!("{}.{}", parent, i)
-            }
-        } else {
+        let mut full = if pre == 0 {
             String::new()
+        } else {
+            let parent = &*self.names[pre as usize];
+            let mut f = String::with_capacity(parent.len() + 16);
+            f.push_str(parent);
+            f.push('.');
+            f
         };
+        match comp {
+            Ok(seg) => push_component(&mut full, seg),
+            Err(i) => {
+                use std::fmt::Write;
+                let _ = write!(full, "{i}");
+            }
+        }
         while self.names.len() <= idx as usize {
             self.names.push(Rc::new(String::new()));
         }
@@ -308,6 +318,7 @@ impl Parser {
             }
         }
         self.names[idx as usize] = Rc::new(full);
+        Ok(())
     }
 
     fn handle_level(&mut self, idx: u32, v: &Value) {
@@ -1431,7 +1442,9 @@ impl Parser {
             return Ok(false);
         }
         if let Some(idx) = v.get("in").and_then(|x| x.as_u64()) {
-            self.handle_name(idx as u32, v);
+            let idx = u32::try_from(idx)
+                .map_err(|_| TcError::Reject(format!("name index {idx} is out of range")))?;
+            self.handle_name(idx, v)?;
             return Ok(false);
         }
         if let Some(idx) = v.get("il").and_then(|x| x.as_u64()) {
@@ -1790,17 +1803,54 @@ fn expr_occurs_names(e: &Expr, names: &[u32]) -> bool {
 }
 
 
+/// Appends one string component of a name as `Parser::names` prints it:
+/// bare when that cannot be mistaken for anything else, otherwise inside
+/// `«»` (with `\\` and `»` escaped by a backslash). Bare components are
+/// nonempty, contain none of `.`, `«`, `»`, and are not all digits (a
+/// numeric component prints its digits bare), so a printed name splits
+/// back into its components and prints equal only to itself. Every
+/// built-in name the checker matches (`Nat.add`, `Bool.true`, `ite`, …)
+/// consists of bare components.
+pub(crate) fn push_component(out: &mut String, seg: &str) {
+    let bare = !seg.is_empty()
+        && !seg.bytes().all(|b| b.is_ascii_digit())
+        && !seg.contains(['.', '«', '»']);
+    if bare {
+        out.push_str(seg);
+        return;
+    }
+    out.push('«');
+    for ch in seg.chars() {
+        if ch == '»' || ch == '\\' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('»');
+}
+
 /// Lean nested recursor numbering: `.rec` first, then `.rec_1`, `.rec_2`, …
 /// Used for rec_group minor order only, not extra-rec reject.
 fn rec_sort_key(name: &str) -> (u8, u32) {
-    if let Some((_, suf)) = name.rsplit_once(".rec_") {
-        if let Ok(n) = suf.parse::<u32>() {
-            return (1, n);
+    // The last component, when it is bare (`push_component`): a printed
+    // name that ends in `»` ends in an escaped component, which is never
+    // `rec` or `rec_N`, and a `.rec_` inside it is not a component.
+    let last = if name.ends_with('»') {
+        ""
+    } else {
+        name.rsplit('.').next().unwrap_or("")
+    };
+    let has_parent = name.len() > last.len();
+    if has_parent {
+        if let Some(suf) = last.strip_prefix("rec_") {
+            if let Ok(n) = suf.parse::<u32>() {
+                return (1, n);
+            }
+            return (2, 0);
         }
-        return (2, 0);
-    }
-    if name.ends_with(".rec") {
-        return (0, 0);
+        if last == "rec" {
+            return (0, 0);
+        }
     }
     (3, 0)
 }
@@ -1814,6 +1864,82 @@ mod tests {
     fn constants(env: &Environment) -> BTreeMap<u32, String> {
         // `ConstantInfo` has no `PartialEq`; its `Debug` form is complete.
         env.consts.iter().map(|(n, c)| (*n, format!("{c:?}"))).collect()
+    }
+
+    /// Binds the names of `records` (`(index, prefix, Ok(string) |
+    /// Err(number))`) and returns each printed name.
+    fn printed(records: &[(u32, u32, Result<&str, u64>)]) -> Vec<String> {
+        let mut parser = Parser::new();
+        for (idx, pre, comp) in records {
+            let v = match comp {
+                Ok(s) => serde_json::json!({"in": idx, "str": {"pre": pre, "str": s}}),
+                Err(i) => serde_json::json!({"in": idx, "num": {"pre": pre, "i": i}}),
+            };
+            parser.handle_name(*idx, &v).expect("fresh index");
+        }
+        records.iter().map(|(i, _, _)| parser.names[*i as usize].to_string()).collect()
+    }
+
+    /// Two names print alike exactly when their components are equal, the
+    /// identity every lookup by printed name relies on. Plain components
+    /// print as before, so `Nat.add` and `_private.M.0.f` keep their spelling.
+    #[test]
+    fn printed_names_tell_apart_names_with_different_components() {
+        let p = printed(&[
+            (1, 0, Ok("Nat")),
+            (2, 1, Ok("add")),
+            (3, 0, Ok("Nat.add")),
+            (4, 0, Ok("")),
+            (5, 4, Ok("Nat")),
+            (6, 5, Ok("add")),
+            (7, 1, Err(1)),
+            (8, 1, Ok("1")),
+            (9, 0, Ok("a»b")),
+            (10, 0, Ok("a\\.b")),
+            (11, 0, Ok("a«b")),
+            (12, 0, Ok("_private")),
+            (13, 12, Ok("M")),
+            (14, 13, Err(0)),
+            (15, 14, Ok("f")),
+        ]);
+        assert_eq!(p[1], "Nat.add");
+        assert_eq!(p[2], "«Nat.add»");
+        assert_eq!(p[3], "«»");
+        assert_eq!(p[4], "«».Nat");
+        assert_eq!(p[5], "«».Nat.add");
+        assert_eq!(p[6], "Nat.1");
+        assert_eq!(p[7], "Nat.«1»");
+        assert_eq!(p[8], "«a\\»b»");
+        assert_eq!(p[9], "«a\\\\.b»");
+        assert_eq!(p[10], "«a«b»");
+        assert_eq!(p[14], "_private.M.0.f");
+        let distinct: rustc_hash::FxHashSet<&String> = p.iter().collect();
+        assert_eq!(distinct.len(), p.len());
+    }
+
+    /// The official export reader refuses a name index bound twice, and a
+    /// name built on an index that is not bound.
+    #[test]
+    fn a_name_index_is_bound_once_on_bound_prefixes() {
+        let mut parser = Parser::new();
+        let name = |idx: u32, pre: u32, s: &str| serde_json::json!({"in": idx, "str": {"pre": pre, "str": s}});
+        parser.handle_name(1, &name(1, 0, "a")).expect("fresh");
+        assert!(matches!(parser.handle_name(1, &name(1, 0, "b")), Err(TcError::Reject(_))));
+        assert!(matches!(parser.handle_name(0, &name(0, 0, "b")), Err(TcError::Reject(_))));
+        assert!(matches!(parser.handle_name(3, &name(3, 2, "b")), Err(TcError::Reject(_))));
+        assert_eq!(&*parser.names[1], "a");
+    }
+
+    /// Recursor order reads the last component, so a `.rec_` inside one
+    /// escaped component does not count.
+    #[test]
+    fn recursor_order_reads_the_last_component() {
+        assert_eq!(rec_sort_key("T.rec"), (0, 0));
+        assert_eq!(rec_sort_key("T.rec_2"), (1, 2));
+        assert_eq!(rec_sort_key("«x.rec_2».rec"), (0, 0));
+        assert_eq!(rec_sort_key("T.«rec_2»"), (3, 0));
+        assert_eq!(rec_sort_key("rec"), (3, 0));
+        assert_eq!(rec_sort_key("T.rec_x"), (2, 0));
     }
 
     /// Every check after the nested iota table is written re-reads data the
