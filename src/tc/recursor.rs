@@ -801,6 +801,138 @@ impl<'e> Checker<'e> {
         Ok(())
     }
 
+    /// `check_inductive_types` and `check_constructors` as Lean runs them on
+    /// the auxiliary declaration `elim_nested_inductive_fn` produces:
+    ///
+    /// - every nested occurrence `I Ds is` in a constructor type (the
+    ///   block's own and the copied ones) is rewritten, outermost first and
+    ///   without descending into the rewritten application, to `auxI As is`;
+    /// - the auxiliary types are new inductive types, unrelated to `I` and
+    ///   without declared constructors, so a value of `auxI As` is not one
+    ///   of `I Ds`: projecting it as an `I` ("invalid projection"), passing
+    ///   it where an `I Ds` is expected, or a `let` of type `I Ds` whose
+    ///   value has the real `I Ds` all fail ("type mismatch");
+    /// - each rewritten constructor type is then checked in full;
+    /// - an auxiliary signature is checked in the environment before the
+    ///   block, so it may not name a type of the block ("unknown constant").
+    ///
+    /// Here the auxiliary types are opaque local hypotheses typed by the
+    /// member's (unrewritten) signature, the only typing Lean gives them
+    /// while their constructors are undeclared.  Occurrences are found with
+    /// the same `nested_occurrence` as the discovery that built `members`.
+    fn check_nested_aux_constructors(
+        &self,
+        original_names: &[u32],
+        num_params: u32,
+        members: &[RecMember],
+    ) -> R<()> {
+        let n_orig = original_names.len();
+        let aux = &members[n_orig..];
+        if aux.is_empty() {
+            return Ok(());
+        }
+        for member in aux {
+            if Checker::mentions_any(&member.typ, original_names, &mut Default::default()) {
+                return reject(format!(
+                    "nested auxiliary copy of `{}` has a signature that names a type of the declaration being defined",
+                    self.name_str(member.source_name)
+                ));
+            }
+        }
+        // aux_j is bvar `depth + j` below the context, so the last pushed
+        // hypothesis is aux_0.  Member signatures are closed.
+        let mut ctx = Ctx::new();
+        for member in aux.iter().rev() {
+            ctx.push(member.typ.clone());
+        }
+        for member in members {
+            for ctor in &member.ctors {
+                let mut params: Vec<(BinderInfo, Expr)> = Vec::with_capacity(num_params as usize);
+                let mut cur = ctor.typ.clone();
+                for _ in 0..num_params {
+                    let ExprData::Pi(bi, dom, body) = &**cur else {
+                        return reject("constructor type does not start with the inductive type's parameters");
+                    };
+                    params.push((*bi, dom.clone()));
+                    let body = body.clone();
+                    cur = body;
+                }
+                let mut rewritten =
+                    self.rewrite_nested_to_aux(&cur, 0, num_params, original_names, members)?;
+                for (bi, dom) in params.into_iter().rev() {
+                    rewritten = expr::pi(bi, dom, rewritten);
+                }
+                let ty = self.infer_type(&ctx, &rewritten).map_err(|e| match e {
+                    TcError::Reject(m) => TcError::Reject(format!(
+                        "constructor `{}` is ill-typed once nested occurrences are auxiliary types: {m}",
+                        self.name_str(ctor.name)
+                    )),
+                    e => e,
+                })?;
+                self.ensure_sort(&ctx, &ty)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `replace_all_nested` in the de Bruijn form `check_nested_aux_constructors`
+    /// uses: below `local_depth` constructor binders and the `num_params`
+    /// parameters, auxiliary member `j` is bvar `local_depth + num_params + j`.
+    fn rewrite_nested_to_aux(
+        &self,
+        e: &Expr,
+        local_depth: u32,
+        num_params: u32,
+        original_names: &[u32],
+        members: &[RecMember],
+    ) -> R<Expr> {
+        let n_orig = original_names.len();
+        if let Some(occ) =
+            self.nested_occurrence(e, local_depth, num_params, original_names, members)?
+        {
+            let Some(j) = members[n_orig..].iter().position(|m| {
+                m.source_name == occ.source_name
+                    && m.source_levels == occ.source_levels
+                    && rec_exprs_eq(&m.fixed_params, &occ.fixed_params)
+            }) else {
+                return super::decline(format!(
+                    "nested occurrence of `{}` has no auxiliary member",
+                    self.name_str(occ.source_name)
+                ));
+            };
+            let (_, args) = expr::unfold_apps(e);
+            let mut r = expr::bvar(local_depth + num_params + j as u32);
+            for i in 0..num_params {
+                r = expr::app(r, expr::bvar(local_depth + num_params - 1 - i));
+            }
+            for a in &args[occ.source_num_params as usize..] {
+                r = expr::app(r, a.clone());
+            }
+            return Ok(r);
+        }
+        let go = |x: &Expr, d: u32| {
+            self.rewrite_nested_to_aux(x, d, num_params, original_names, members)
+        };
+        Ok(match &***e {
+            ExprData::BVar(_) | ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => {
+                e.clone()
+            }
+            ExprData::App(f, a) => expr::app(go(f, local_depth)?, go(a, local_depth)?),
+            ExprData::Lam(bi, ty, body) => {
+                expr::lam(*bi, go(ty, local_depth)?, go(body, local_depth + 1)?)
+            }
+            ExprData::Pi(bi, ty, body) => {
+                expr::pi(*bi, go(ty, local_depth)?, go(body, local_depth + 1)?)
+            }
+            ExprData::Let(ty, val, body) => expr::let_(
+                go(ty, local_depth)?,
+                go(val, local_depth)?,
+                go(body, local_depth + 1)?,
+            ),
+            ExprData::Proj(s, i, v) => expr::proj(*s, *i, go(v, local_depth)?),
+        })
+    }
+
     fn expanded_prop_only(
         &self,
         original_names: &[u32],
@@ -900,6 +1032,7 @@ impl<'e> Checker<'e> {
         )?;
         let prop_only =
             self.expanded_prop_only(&all, &discovery_members, num_params)?;
+        self.check_nested_aux_constructors(&all, num_params, &discovery_members)?;
 
         if !ids_are_pairwise_distinct(supplied_level_params) {
             return reject("recursor has duplicate universe parameters");

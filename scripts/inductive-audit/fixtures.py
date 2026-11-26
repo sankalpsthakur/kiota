@@ -222,6 +222,69 @@ def _(x):   # the prefix is a whole first component and binds only inductive blo
     x.axiom('Foo._nested', [], Type)
     x.inductive([], 0, [Ty('T', Type, [('T.mk', Pi(C('_nestedFoo'), Pi(C('Foo._nested'), T)))])])
 
+# ---- nested auxiliary typing ----
+# `elim_nested_inductive_fn` rewrites each nested occurrence `P T` to a fresh
+# auxiliary type before `check_constructors` checks the constructor types, so
+# a value of the rewritten field is not a `P T`. Reject twins: Lean 4.36
+# leanchecker. Accept twins: exported from the `addDeclCore` script
+# tests/fixtures/src/nested-aux-typing.lean with leanexport (see there).
+Pc = C('P'); Qc = C('Q'); zN = C('N.z'); PT = A(Pc, T)
+def decl_P(x):  # P (a : Type) | mk : a -> P a
+    x.inductive([], 1, [Ty('P', Pi(Type, Type), [('P.mk', Pi(Type, Pi(B(0), A(Pc, B(1)))))])])
+def decl_Q(x):  # Q (a : Type) | mk : (y : P a) -> (fun _ : a => N) y.0 -> Q a
+    x.inductive([], 1, [Ty('Q', Pi(Type, Type), [('Q.mk', Pi(Type, Pi(A(Pc, B(0)), Pi(A(Lam(B(1), N), Proj('P', 0, B(0))), A(Qc, B(2))))))])])
+def decl_V(x):  # V (a : Type) : P a -> Type | mk : (x : P a) -> V a x
+    x.inductive([], 1, [Ty('V', Pi(Type, Pi(A(Pc, B(0)), Type)), [('V.mk', Pi(Type, Pi(A(Pc, B(0)), A(C('V'), B(1), B(0)))))], nindices=1)])
+def ind_T(x, ctor, sort=Type, **flags):
+    x.inductive([], 0, [Ty('T', sort, [('T.mk', ctor)])], **flags)
+@fx('ind-nested-aux-proj-field.reject')
+def _(x):   # T | mk : (x : P T) -> (fun _ : T => N) x.0 -> T : x has the auxiliary type, not P T
+    decl_N(x); decl_P(x); ind_T(x, Pi(PT, Pi(A(Lam(T, N), Proj('P', 0, B(0))), T)), numNested=1)
+@fx('ind-nested-aux-app-field.reject')
+def _(x):   # ax : (a : Type) -> P a -> N ; T | mk : (x : P T) -> (fun _ : N => N) (ax T x) -> T
+    decl_N(x); decl_P(x); x.axiom('ax', [], Pi(Type, Pi(A(Pc, B(0)), N)))
+    ind_T(x, Pi(PT, Pi(A(Lam(N, N), A(C('ax'), T, B(0))), T)))
+@fx('ind-nested-aux-container-ctor-proj.reject')
+def _(x):   # T | mk : Q T -> T : the copy of Q.mk projects its own `P T` field
+    decl_N(x); decl_P(x); decl_Q(x); ind_T(x, Pi(A(Qc, T), T))
+@fx('ind-nested-aux-let-proj.reject')
+def _(x):   # T | mk : (x : P T) -> (let y : P T := x; (fun _ : T => N) y.0) -> T
+    decl_N(x); decl_P(x); ind_T(x, Pi(PT, Pi(Let(PT, B(0), A(Lam(T, N), Proj('P', 0, B(0)))), T)))
+@fx('ind-nested-aux-let-value-type.reject')
+def _(x):   # T | mk : (x : P T) -> (f : N -> T) -> (let y : P T := P.mk T (f N.z); N) -> T
+    decl_N(x); decl_P(x); ind_T(x, Pi(PT, Pi(Pi(N, T), Pi(Let(PT, A(C('P.mk'), T, A(B(0), zN)), N), T))))
+@fx('ind-nested-aux-index-sig.reject')
+def _(x):   # T | mk : (x : P T) -> V T x -> T : the copy of V's signature names T
+    decl_P(x); decl_V(x); ind_T(x, Pi(PT, Pi(A(C('V'), T, B(0)), T)))
+@fx('ind-nested-aux-proj-reserved-name.reject')
+def _(x):   # T | mk : (x : P T) -> (fun _ : T => N) (x.0 as `_nested.P_1`) -> T
+    decl_N(x); decl_P(x); ind_T(x, Pi(PT, Pi(A(Lam(T, N), Proj('_nested.P_1', 0, B(0))), T)))
+@fx('ind-nested-aux-proj-unnested.accept')
+def _(x):   # T | mk : (x : P N) -> (fun _ : N => N) x.0 -> T
+    decl_N(x); decl_P(x); ind_T(x, Pi(A(Pc, N), Pi(A(Lam(N, N), Proj('P', 0, B(0))), T)))
+@fx('ind-nested-aux-proj-ctor-value.accept')
+def _(x):   # T | mk : (x : P T) -> (f : N -> T) -> (fun _ : T => N) (P.mk T (f N.z)).0 -> T
+    decl_N(x); decl_P(x); ind_T(x, Pi(PT, Pi(Pi(N, T), Pi(A(Lam(T, N), Proj('P', 0, A(C('P.mk'), T, A(B(0), zN)))), T))))
+@fx('ind-nested-aux-app-ctor-value.accept')
+def _(x):   # T | mk : (x : P T) -> (f : N -> T) -> (fun _ : N => N) (ax T (P.mk T (f N.z))) -> T
+    decl_N(x); decl_P(x); x.axiom('ax', [], Pi(Type, Pi(A(Pc, B(0)), N)))
+    ind_T(x, Pi(PT, Pi(Pi(N, T), Pi(A(Lam(N, N), A(C('ax'), T, A(C('P.mk'), T, A(B(0), zN)))), T))))
+@fx('ind-nested-aux-container-unnested.accept')
+def _(x):   # T | mk : Q N -> T
+    decl_N(x); decl_P(x); decl_Q(x); ind_T(x, Pi(A(Qc, N), T))
+@fx('ind-nested-aux-let-var.accept')
+def _(x):   # T | mk : (x : P T) -> (let y : P T := x; N) -> T
+    decl_N(x); decl_P(x); ind_T(x, Pi(PT, Pi(Let(PT, B(0), N), T)))
+@fx('ind-nested-aux-index-closed.accept')
+def _(x):   # W (a : Type) : N -> Type | mk : a -> W a N.z ; T | mk : W T N.z -> T
+    decl_N(x)
+    x.inductive([], 1, [Ty('W', Pi(Type, Pi(N, Type)), [('W.mk', Pi(Type, Pi(B(0), A(C('W'), B(1), zN))))], nindices=1)])
+    ind_T(x, Pi(A(C('W'), T, zN), T))
+@fx('ind-nested-aux-prop-in-prop.accept')
+def _(x):   # PR (a : Prop) : Prop | mk : a -> PR a ; T : Prop | mk : PR T -> T
+    x.inductive([], 1, [Ty('PR', Pi(Prop, Prop), [('PR.mk', Pi(Prop, Pi(B(0), A(C('PR'), B(1)))))])])
+    ind_T(x, Pi(A(C('PR'), T), T), sort=Prop)
+
 if __name__ == '__main__':
     outdir = sys.argv[1]
     xs = []

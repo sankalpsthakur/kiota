@@ -2071,6 +2071,75 @@ fn an_inductive_block_does_not_use_the_reserved_nested_prefix() {
     assert_accept("ind-reserved-nested-prefix-elsewhere.accept.ndjson");
 }
 
+fn assert_reject_starting(name: &str, prefix: &str) {
+    let path = fixture(name);
+    match check_file(&path) {
+        Err(TcError::Reject(message)) if message.starts_with(prefix) => {}
+        other => panic!("{name} should reject with {prefix:?}..., got {other:?}"),
+    }
+}
+
+/// `elim_nested_inductive_fn` rewrites every nested occurrence `P T` in the
+/// constructor types (the block's own and the copies of the containers') to
+/// a fresh auxiliary type before `check_constructors` checks them, so a
+/// field of type `P T` holds an auxiliary value, not a `P T`. Lean 4.36
+/// (leanchecker) rejects each reject twin: projecting it as a `P` ("invalid
+/// projection", the round-1 reproducer `ind-nested-aux-proj-field`, also
+/// through a `let` and inside the copy of a container's constructor),
+/// passing it to a function of `P T` ("application type mismatch"), a `let`
+/// of type `P T` whose value is a real `P T` ("let-declaration type
+/// mismatch"), and a copied signature that names the block ("unknown
+/// constant"). The accept twins are exported from Lean 4.36 and accepted by
+/// leanchecker (`tests/fixtures/src/nested-aux-typing.lean`,
+/// `nested-aux-shapes.lean`): a projection or an application of a real
+/// constructor value of `P T`, a `let` of an auxiliary value, an unnested
+/// container, and genuine nested blocks with parameters, several and
+/// reflexive containers, mutual containers, deep nesting and indices.
+#[test]
+fn nested_occurrences_are_auxiliary_types_while_constructors_are_checked() {
+    let ill_typed = "constructor `T.mk` is ill-typed once nested occurrences are auxiliary types: ";
+    assert_reject_starting(
+        "ind-nested-aux-proj-field.reject.ndjson",
+        &format!("{ill_typed}projection of non-inductive value"),
+    );
+    assert_reject_starting(
+        "ind-nested-aux-let-proj.reject.ndjson",
+        &format!("{ill_typed}projection of non-inductive value"),
+    );
+    assert_reject_starting(
+        "ind-nested-aux-app-field.reject.ndjson",
+        &format!("{ill_typed}application argument type mismatch"),
+    );
+    assert_reject_starting(
+        "ind-nested-aux-let-value-type.reject.ndjson",
+        &format!("{ill_typed}let value type mismatch"),
+    );
+    assert_reject_starting(
+        "ind-nested-aux-container-ctor-proj.reject.ndjson",
+        "constructor `Q.mk` is ill-typed once nested occurrences are auxiliary types: projection of non-inductive value",
+    );
+    assert_reject_exact(
+        "ind-nested-aux-index-sig.reject.ndjson",
+        "nested auxiliary copy of `V` has a signature that names a type of the declaration being defined",
+    );
+    assert_reject_exact(
+        "ind-nested-aux-proj-reserved-name.reject.ndjson",
+        "constructor type uses the reserved prefix `_nested`",
+    );
+    for name in [
+        "ind-nested-aux-proj-unnested.accept.ndjson",
+        "ind-nested-aux-proj-ctor-value.accept.ndjson",
+        "ind-nested-aux-app-ctor-value.accept.ndjson",
+        "ind-nested-aux-container-unnested.accept.ndjson",
+        "ind-nested-aux-let-var.accept.ndjson",
+        "ind-nested-aux-index-closed.accept.ndjson",
+        "ind-nested-aux-prop-in-prop.accept.ndjson",
+        "ind-nested-aux-shapes.accept.ndjson",
+    ] {
+        assert_accept(name);
+    }
+}
+
 /// The prefix is a name *component*: Lean's `is_prefix_of(g_nested, n)`
 /// compares components, and `«_nested.Tr2»` is the one component
 /// `"_nested.Tr2"`, though it prints like `_nested.Tr2`. Lean 4.36
