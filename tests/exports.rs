@@ -1801,6 +1801,24 @@ fn nested_iota_coinciding_auxiliaries_follow_the_field_position() {
     }
 }
 
+/// `tests/fixtures/src/nested-iota-indexed.lean` (Lean 4.36.0 exports): the
+/// auxiliary member is an indexed family, `Vec T n`, so the induction
+/// hypothesis a nested iota step builds for a recursive field must pass
+/// that field's indices to the auxiliary recursor. `n1` reduces through
+/// `VT.rec`, `n1b` applies `VT.rec_1` at an index written as a redex, `d1`
+/// builds the hypothesis under a binder the index depends on, `b5a` has two
+/// indexed auxiliaries that coincide up to an abbrev, and `b7` reaches `Vec`
+/// through another container. Each `-false` twin proves a wrong value with
+/// the true theorem's proof; leanchecker 4.36 accepts the five and refuses
+/// the five twins.
+#[test]
+fn nested_iota_through_an_indexed_family_passes_the_indices() {
+    for case in ["n1", "n1b", "d1", "b5a", "b7"] {
+        assert_accept(&format!("nested-iota-indexed-{case}.accept.ndjson"));
+        assert_reject(&format!("nested-iota-indexed-{case}-false.reject.ndjson"));
+    }
+}
+
 // ---- Inductive admission audit (docs/inductive-audit.md) ----
 //
 // Every `ind-*` and `rec-rules-*` fixture carries the recursors kiota itself
