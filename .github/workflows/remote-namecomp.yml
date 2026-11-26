@@ -1,7 +1,8 @@
 name: remote-namecomp
 
-# snd/name-components (HEAD: names compared by components; built-in names,
-# declared/reject_if_dup and find_name by components; a name index bound once)
+# snd/name-components (HEAD: names compared by components; built-in names and
+# declared/reject_if_dup by components; indices with one name's components
+# read as one index; a name index bound once)
 # beside main f7c0960 on the arena's six Lean 4.36 exports, strict, one
 # process each: verdict, user time, peak memory. Both refs are pinned by sha.
 # The arena tarball's perf cases and every other tarball case run on both
@@ -13,7 +14,7 @@ permissions:
   contents: read
   actions: read
 env:
-  HEAD_SHA: c5e184d13e1ac8bac7f205270aa9e2326494a232
+  HEAD_SHA: 2444b727e7734fe58998d0973f6d85f159ffe5a7
   MAIN: f7c09605e8fe7dc7ddcb3b1650aeb259793ee3aa
 jobs:
   val:
@@ -149,7 +150,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mutant: [base, E1_components_print_bare, E2_find_name_any_index, E3_name_index_rebound, E4_rec_order_inside_component]
+        mutant: [base, E1_components_print_bare, E2_no_name_alias, E3_name_index_rebound, E4_rec_order_inside_component]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -166,9 +167,9 @@ jobs:
           M = {
             "base": [],
             "E1_components_print_bare": [("src/parser.rs", "    if bare {\n", "    if bare || true {\n")],
-            "E2_find_name_any_index": [("src/tc.rs",
-              ".find(|(i, n)| n.as_str() == s && self.env.get(*i as u32).is_some())",
-              ".find(|(_, n)| n.as_str() == s)")],
+            "E2_no_name_alias": [("src/parser.rs",
+              "                self.name_alias.insert(idx, first);",
+              "                let _ = first;")],
             "E3_name_index_rebound": [("src/parser.rs",
               "if idx == 0 || self.names.get(idx as usize).is_some_and(|s| !s.is_empty()) {",
               "if idx == 0 {")],
