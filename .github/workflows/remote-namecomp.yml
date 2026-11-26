@@ -1,0 +1,194 @@
+name: remote-namecomp
+
+# snd/name-components (HEAD: names compared by components; built-in names,
+# declared/reject_if_dup and find_name by components; a name index bound once)
+# beside main f7c0960 on the arena's six Lean 4.36 exports, strict, one
+# process each: verdict, user time, peak memory. Both refs are pinned by sha.
+# The arena tarball's perf cases and every other tarball case run on both
+# sides. The mutant job shows the new tests kill the guards they cover.
+on:
+  push:
+    branches: ['remote/name-components-20261127']
+permissions:
+  contents: read
+  actions: read
+env:
+  HEAD_SHA: 788102e804295994ee3b61f9b9e98f80a30b0fb9
+  MAIN: f7c09605e8fe7dc7ddcb3b1650aeb259793ee3aa
+jobs:
+  val:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [head, main]
+        corpus: [init, std, cedar, cslib, mathlib, con-leche]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.side == 'main' && env.MAIN || env.HEAD_SHA }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: Free disk
+        if: matrix.corpus == 'mathlib' || matrix.corpus == 'con-leche'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-${{ matrix.corpus }}
+          run-id: ${{ matrix.corpus == 'con-leche' && '45661537211' || '45472434965' }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Strict run
+        env:
+          C: ${{ matrix.corpus }}
+          SIDE: ${{ matrix.side }}
+        run: |
+          set +e
+          sudo apt-get install -y zstd time >/dev/null
+          zstd -d --rm $C.ndjson.zst -o $C.ndjson
+          ls -la $C.ndjson; sha256sum $C.ndjson; df -h .
+          [ "$C" = mathlib ] && export KIOTA_PROGRESS=1
+          start=$(date +%s)
+          # Kill past 13 GB RSS so a runaway ends with its declaration named.
+          /usr/bin/time -v -o time.txt timeout 15000 ./target/release/kiota $C.ndjson >/dev/null 2>err.txt &
+          pid=$!
+          while kill -0 $pid 2>/dev/null; do
+            k=$(pgrep -x kiota | head -1)
+            if [ -n "$k" ]; then
+              rss=$(ps -o rss= -p $k 2>/dev/null | tr -d ' ')
+              if [ "${rss:-0}" -gt 13000000 ]; then echo "MEMKILL rss_kb=$rss" | tee -a err.txt; kill -9 $k; fi
+            fi
+            sleep 2
+          done
+          wait $pid; rc=$?
+          wall=$(( $(date +%s) - start ))
+          grep -v '^\[decl' err.txt | tail -c 3000
+          echo "last progress: $(grep '^\[decl' err.txt | tail -1)"
+          echo "FULL side=$SIDE sha=$(git rev-parse --short HEAD) corpus=$C rc=$rc wall=${wall}s" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "VAL side=$SIDE sha=$(git rev-parse --short HEAD) corpus=$C rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -m1 -E '^(REJECT|DECLINE|ERROR|MEMKILL)' err.txt | cut -c1-250)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  perf:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [head, main]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.side == 'main' && env.MAIN || env.HEAD_SHA }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: Arena tarball perf cases
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set +e
+          sudo apt-get install -y time >/dev/null
+          mkdir -p arena && curl -sL https://arena.lean-lang.org/lean-arena-tests.tar.gz -o arena.tgz
+          sha256sum arena.tgz; tar -xzf arena.tgz -C arena
+          sha=$(git rev-parse --short HEAD)
+          one() {  # <file> <timeout>; extra env comes from the caller
+            /usr/bin/time -v -o time.txt timeout $2 ./target/release/kiota "$1" >/dev/null 2>err.txt &
+            pid=$!
+            while kill -0 $pid 2>/dev/null; do
+              k=$(pgrep -x kiota | head -1)
+              if [ -n "$k" ]; then
+                rss=$(ps -o rss= -p $k 2>/dev/null | tr -d ' ')
+                if [ "${rss:-0}" -gt 13000000 ]; then echo "MEMKILL rss_kb=$rss" >> err.txt; kill -9 $k; fi
+              fi
+              sleep 1
+            done
+            wait $pid; rc=$?
+          }
+          for f in $(ls arena/good/perf/*.ndjson arena/bad/perf/*.ndjson); do
+            case_=${f#arena/}
+            one "$f" 1800
+            echo "PERF side=$SIDE sha=$sha case=$case_ rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') wall=$(grep 'Elapsed (wall' time.txt | awk '{print $NF}') $(grep -m1 -E '^(REJECT|DECLINE|ERROR|MEMKILL)' err.txt | cut -c1-200)" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          # The interner review's check: table history and counters on the two big magma cases.
+          for c in magma-list-deep-n36 magma-list-pair-n21; do
+            export KIOTA_INTERN_TABLE_LOG=1 KIOTA_STATS=1
+            one arena/good/perf/$c.ndjson 1800
+            unset KIOTA_INTERN_TABLE_LOG KIOTA_STATS
+            grep '^INTERN_TABLE' err.txt | tail -12
+            echo "TABLE side=$SIDE sha=$sha case=$c rc=$rc maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') grows=$(grep -c '^INTERN_TABLE grow' err.txt) last_grow=\"$(grep '^INTERN_TABLE grow' err.txt | tail -1)\" stats_sha=$(grep '^STATS' err.txt | sha256sum | cut -c1-12) stats_lines=$(grep -c '^STATS' err.txt)" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+
+  tarball:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [head, main]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.side == 'main' && env.MAIN || env.HEAD_SHA }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: Arena tarball, every case outside perf/
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set +e
+          mkdir -p arena && curl -sL https://arena.lean-lang.org/lean-arena-tests.tar.gz -o arena.tgz
+          sha256sum arena.tgz; tar -xzf arena.tgz -C arena
+          sha=$(git rev-parse --short HEAD)
+          for f in $(find arena -name '*.ndjson' | grep -v '/perf/' | sort); do
+            timeout 900 ./target/release/kiota "$f" >/dev/null 2>err.txt; rc=$?
+            echo "TAR side=$SIDE sha=$sha case=${f#arena/} rc=$rc $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-160)" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+
+  mutant:
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [base, E1_components_print_bare, E2_find_name_any_index, E3_name_index_rebound, E4_rec_order_inside_component]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD_SHA }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply mutant
+        env:
+          MUT: ${{ matrix.mutant }}
+        run: |
+          python3 - <<'PY'
+          import os
+          M = {
+            "base": [],
+            "E1_components_print_bare": [("src/parser.rs", "    if bare {\n", "    if bare || true {\n")],
+            "E2_find_name_any_index": [("src/tc.rs",
+              ".find(|(i, n)| n.as_str() == s && self.env.get(*i as u32).is_some())",
+              ".find(|(_, n)| n.as_str() == s)")],
+            "E3_name_index_rebound": [("src/parser.rs",
+              "if idx == 0 || self.names.get(idx as usize).is_some_and(|s| !s.is_empty()) {",
+              "if idx == 0 {")],
+            "E4_rec_order_inside_component": [("src/parser.rs",
+              "    let last = if name.ends_with('»') {",
+              "    let last = if false {")],
+          }
+          for path, old, new in M[os.environ["MUT"]]:
+              s = open(path).read()
+              assert s.count(old) == 1, (path, old)
+              open(path, "w").write(s.replace(old, new))
+          PY
+          git diff --stat
+      - name: Build and test
+        shell: bash
+        run: |
+          set +e
+          cargo test --release --locked --no-fail-fast > test.log 2>&1; trc=$?
+          failed=$(grep -E '^test .* FAILED$' test.log | awk '{print $2}' | tr '\n' ' ')
+          passed=$(grep -E '^test result:' test.log | awk '{s+=$4} END{print s}')
+          grep -E '^test result:|panicked|^error' test.log | head -40
+          echo "MUT ${{ matrix.mutant }} sha=$(git rev-parse --short HEAD) test_rc=$trc passed=$passed failed=[$failed]" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 0
