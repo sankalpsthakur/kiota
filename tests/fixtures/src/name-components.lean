@@ -21,6 +21,9 @@
 -- * name-duplicate-index-bool-true.accept: `c13_beq`, given a second index
 --   (106) with Bool.true's components, bound right after the original (17);
 --   every reference to 17 is moved to 106, so 17 is bound and never declared.
+-- * name-two-universes.accept: `c15`; the -same-components.reject twin
+--   rebinds index 3 (`v`) as `u`, the components of index 2; leanchecker:
+--   "duplicate universe level parameter: 'u'".
 -- * name-index-bound-twice.reject: name-quoted-nat-add.accept with the line
 --   `{"in":23,"str":{"pre":0,"str":"other"}}` inserted right after index 23's
 --   own line; leanchecker: "Name index 23 bound twice".
@@ -53,6 +56,9 @@ def c4_false : Prop := «Nat.beq» 3 3 = true
 
 -- c13: the native Nat.beq returns the declared Bool.true.
 theorem c13_beq : Nat.beq 3 3 = true := rfl
+
+-- c15: two universe parameters.
+def c15.{u, v} (α : Sort u) (_β : Sort v) : Sort u := α
 
 -- ===== NC2 =====
 import Lean

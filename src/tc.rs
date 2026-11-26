@@ -6801,16 +6801,15 @@ impl<'e> Checker<'e> {
 
 
 
-    /// The declared constant printed `s`. Printed names compare components
+    /// The name printed `s`. Printed names compare components
     /// (`parser::push_component`), so a single component `«Bool.true»` or
-    /// the name `«».Bool.true` is not `Bool.true`; and of several indices
-    /// with the same components, only the declared one names the constant.
+    /// the name `«».Bool.true` is not `Bool.true`; of several indices with
+    /// the same components the first is the one the parser refers to.
     fn find_name(&self, s: &str) -> Option<u32> {
         self.names
             .iter()
-            .enumerate()
-            .find(|(i, n)| n.as_str() == s && self.env.get(*i as u32).is_some())
-            .map(|(i, _)| i as u32)
+            .position(|n| n.as_str() == s)
+            .map(|i| i as u32)
     }
 
 

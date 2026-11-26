@@ -17,6 +17,14 @@ pub struct Parser {
     /// a constant is its name, so `declared` and `reject_if_dup` look
     /// through all indices of a spelling.
     pub spelling_dups: FxHashMap<String, Vec<u32>>,
+    /// Name index → the first index bound with the same components, for
+    /// every later one (empty for a lean4export file). Lean identifies a
+    /// name by its components, so `run` rewrites each record's name fields
+    /// to the first index before reading it: a constant, a universe
+    /// parameter or a structure is then one index however it is referred
+    /// to, and `levelParams` `[u, u]` written with two indices is the
+    /// duplicate it is.
+    pub name_alias: FxHashMap<u32, u32>,
     pub levels: Vec<Level>,
     /// Levels written as `max`/`imax` that `level::max`/`level::imax`
     /// simplify to a bare parameter (`max u u`, `imax 0 u`, …), by index,
@@ -124,6 +132,7 @@ impl Parser {
             names: vec![Rc::new(String::new())], // index 0 = anonymous
             name_by_str: FxHashMap::default(),
             spelling_dups: FxHashMap::default(),
+            name_alias: FxHashMap::default(),
             levels: vec![level::zero()], // index 0 = zero
             disguised_levels: FxHashMap::default(),
             exprs: Vec::new(),
@@ -309,16 +318,52 @@ impl Parser {
         while self.names.len() <= idx as usize {
             self.names.push(Rc::new(String::new()));
         }
-        if let Some(prev) = self.name_by_str.insert(full.clone(), idx) {
-            if prev != idx {
+        match self.name_by_str.get(&full) {
+            Some(&first) => {
+                self.name_alias.insert(idx, first);
                 self.spelling_dups
                     .entry(full.clone())
-                    .or_insert_with(|| vec![prev])
+                    .or_insert_with(|| vec![first])
                     .push(idx);
+            }
+            None => {
+                self.name_by_str.insert(full.clone(), idx);
             }
         }
         self.names[idx as usize] = Rc::new(full);
         Ok(())
+    }
+
+    /// Rewrites the name indices of a record to their first index
+    /// (`name_alias`). The fields that hold names in the export format:
+    /// a declaration's `name`, `levelParams`, `all`, `ctors`, `induct` and
+    /// rule `ctor`, a constant's `name`, a projection's `typeName`, a
+    /// binder's `name` and a level's `param`.
+    fn canonicalize_names(&self, v: &mut Value, name_field: bool) {
+        const NAME_FIELDS: [&str; 8] =
+            ["name", "levelParams", "all", "ctors", "induct", "ctor", "typeName", "param"];
+        match v {
+            Value::Number(n) if name_field => {
+                let canonical = n
+                    .as_u64()
+                    .and_then(|i| u32::try_from(i).ok())
+                    .and_then(|i| self.name_alias.get(&i).copied());
+                if let Some(c) = canonical {
+                    *v = Value::from(c);
+                }
+            }
+            Value::Array(items) => {
+                for x in items {
+                    self.canonicalize_names(x, name_field);
+                }
+            }
+            Value::Object(fields) => {
+                for (k, x) in fields.iter_mut() {
+                    self.canonicalize_names(x, NAME_FIELDS.contains(&k.as_str()));
+                }
+            }
+            _ => {}
+        }
     }
 
     fn handle_level(&mut self, idx: u32, v: &Value) {
@@ -1369,8 +1414,11 @@ impl Parser {
             if line.trim().is_empty() {
                 continue;
             }
-            let v: Value = serde_json::from_str(&line)
+            let mut v: Value = serde_json::from_str(&line)
                 .map_err(|e| TcError::Other(format!("json parse: {e} on line: {line}")))?;
+            if !self.name_alias.is_empty() && v.get("in").is_none() {
+                self.canonicalize_names(&mut v, false);
+            }
             let result = self.handle_line(&v);
             // Release after every declaration line, failed or not: in
             // diagnostic modes the run continues past a failure.

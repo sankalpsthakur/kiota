@@ -2166,14 +2166,18 @@ fn a_nat_literal_is_not_typed_by_a_name_printed_like_nat() {
     assert_reject_in("name-empty-component-nat-literal-beside-nat.reject.ndjson", "c5_lit");
 }
 
-/// Two indices may carry the same components (leanchecker 4.36 accepts
-/// this export, where index 17 is `Bool.true` and never declared, and 106
-/// is `Bool.true` again and is the constructor). They are one name, and the
-/// `Bool.true` that `Nat.beq 3 3` reduces to is the declared constant, not
-/// the first index that prints like it.
+/// Two indices may carry the same components, and Lean reads them as one
+/// name. In the first export (leanchecker 4.36 accepts it) index 17 is
+/// `Bool.true` and nothing refers to it, and 106 is `Bool.true` again and
+/// is the constructor: the `Bool.true` that `Nat.beq 3 3` reduces to is the
+/// constructor. In the second, `c15.{u, v}` has its `v` rebound to a second
+/// index spelling `u`, and leanchecker refuses the duplicate universe
+/// parameter that two distinct indices used to hide.
 #[test]
-fn a_builtin_reduct_names_the_declared_constant() {
+fn indices_with_the_same_components_are_one_name() {
     assert_accept("name-duplicate-index-bool-true.accept.ndjson");
+    assert_accept("name-two-universes.accept.ndjson");
+    assert_reject_in("name-two-universes-same-components.reject.ndjson", "c15");
 }
 
 /// leanchecker 4.36 refuses an export that binds a name index twice
