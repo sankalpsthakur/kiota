@@ -15243,6 +15243,42 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         });
     }
 
+    /// A caught suspension under a chain whose value is stuck: `Nat.sub` of
+    /// 20,000 ones from an axiom is a `Nat.rec` application, not a literal or
+    /// a constructor, so nothing normal by its shape clears `CUT_SHORT` on the
+    /// way out, and a cut-short mark the dropped attempt left would survive.
+    #[test]
+    fn a_caught_suspension_under_a_stuck_chain_leaves_no_cut_short_mark() {
+        on_gib_stack(|| {
+            let _p = Presets;
+            let (mut env, mut names) = deep_nat_checker_parts();
+            env.insert(8, ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::const_(0, vec![]),
+                is_unsafe: false,
+            });
+            names.push(std::rc::Rc::new("ax".into()));
+            let mut deep = expr::const_(8, vec![]);
+            for _ in 0..20_000 {
+                deep = expr::apps(expr::const_(7, vec![]), &[deep, expr::lit_nat(1u32.into())]);
+            }
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let before = nat_suspensions();
+            let expected = tc.whnf(&Ctx::new(), &deep).unwrap();
+            assert!(nat_suspensions() > before, "the chain is driven");
+            assert!(!tc.whnf_by_shape(&expected), "{}", tc.pp_budget(&expected, 8));
+            assert!(!cut_short());
+            let tc = Checker::new(&env, &names, Some(0), None);
+            // The catching frame carries on with the axiom itself in place of
+            // the suspended argument, so what it builds is stuck too.
+            SWALLOW_NEXT_SUSPENSION.with(|s| *s.borrow_mut() = Some((expr::const_(8, vec![]), true)));
+            let w = tc.whnf(&Ctx::new(), &deep).unwrap();
+            assert!(SWALLOW_NEXT_SUSPENSION.with(|s| s.borrow().is_none()), "the hook fired");
+            assert!(Rc::ptr_eq(&w, &expected) || w == expected, "the dropped attempt's value came back");
+            assert!(!cut_short(), "the dropped attempt's cut-short mark survived");
+        });
+    }
+
     /// While a suspension unwinds, any further closed `Nat` argument a frame
     /// on the way asks for declines at once instead of being evaluated
     /// without the suspended value (or suspending again over it).
