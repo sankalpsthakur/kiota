@@ -24,6 +24,11 @@
 -- * name-two-universes.accept: `c15`; the -same-components.reject twin
 --   rebinds index 3 (`v`) as `u`, the components of index 2; leanchecker:
 --   "duplicate universe level parameter: 'u'".
+-- * name-recursor-and-constructor-spellings.accept: `c16`.
+-- * name-recursor-one-component.reject: `c17` with T17.rec's name record
+--   rebound as the single component «T17.rec»; name-quot-mk-one-component.reject:
+--   `c18` with Quot.mk's rebound as «Quot.mk». leanchecker: "unknown constant
+--   '«T17.rec»'" (replaying T17.casesOn) and "unknown constant '«Quot.mk»'".
 -- * name-index-bound-twice.reject: name-quoted-nat-add.accept with the line
 --   `{"in":23,"str":{"pre":0,"str":"other"}}` inserted right after index 23's
 --   own line; leanchecker: "Name index 23 bound twice".
@@ -59,6 +64,28 @@ theorem c13_beq : Nat.beq 3 3 = true := rfl
 
 -- c15: two universe parameters.
 def c15.{u, v} (α : Sort u) (_β : Sort v) : Sort u := α
+
+-- c16: an inductive and a structure beside definitions whose single
+-- components spell their recursor and constructors.
+inductive T16 where
+  | a
+  | b
+def «T16.rec» : Nat := 1
+def «T16.a» : Nat := 2
+structure S16 where
+  x : Nat
+def «S16.mk» : Nat := 3
+theorem c16 : «T16.rec» + «T16.a» + «S16.mk» = 6 ∧ (S16.mk 1).x = 1 ∧ T16.a ≠ T16.b :=
+  ⟨rfl, rfl, fun h => T16.noConfusion h⟩
+
+-- c17: an inductive (its twin renames the recursor).
+inductive T17 where
+  | a
+  | b
+theorem c17 : T17.a ≠ T17.b := fun h => T17.noConfusion h
+
+-- c18: the quotient primitives, through funext (its twin renames Quot.mk).
+theorem c18 : (fun x : Nat => x + 0) = (fun x => x) := funext fun x => Nat.add_zero x
 
 -- ===== NC2 =====
 import Lean

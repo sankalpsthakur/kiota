@@ -277,13 +277,36 @@ impl Parser {
         if idx == 0 || self.names.get(idx as usize).is_some_and(|s| !s.is_empty()) {
             return Err(TcError::Reject(format!("name index {idx} bound twice")));
         }
-        let (pre, comp) = if let Some(s) = v.get("str") {
-            (Self::get_u32(s, "pre"), Ok(Self::get_str(s, "str")))
+        // Read exactly: a component read as some default (`""`, `0`) would
+        // print like, and so be, another name.
+        let malformed = |what: &str| TcError::Reject(format!("name index {idx}: {what}"));
+        let (record, comp) = if let Some(s) = v.get("str") {
+            let seg = s
+                .get("str")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| malformed("the `str` component is not a string"))?;
+            (s, Ok(seg))
         } else if let Some(n) = v.get("num") {
-            (Self::get_u32(n, "pre"), Err(n.get("i").and_then(|x| x.as_u64()).unwrap_or(0)))
+            let i = match n.get("i") {
+                Some(x) if x.as_u64().is_some() => x.as_u64().unwrap_or_default(),
+                // Lean's components are unbounded naturals; one past u64
+                // reaches here as a float and cannot be told apart.
+                Some(x) if x.is_f64() => {
+                    return Err(TcError::Decline(format!(
+                        "name index {idx}: numeric component {x} is beyond u64"
+                    )))
+                }
+                _ => return Err(malformed("the `num` component is not a natural number")),
+            };
+            (n, Err(i))
         } else {
-            return Err(TcError::Reject(format!("name index {idx} is neither `str` nor `num`")));
+            return Err(malformed("neither `str` nor `num`"));
         };
+        let pre = record
+            .get("pre")
+            .and_then(|x| x.as_u64())
+            .and_then(|p| u32::try_from(p).ok())
+            .ok_or_else(|| malformed("`pre` is not a name index"))?;
         if pre != 0 && self.names.get(pre as usize).is_none_or(|s| s.is_empty()) {
             return Err(TcError::Reject(format!(
                 "name index {idx} extends name index {pre}, which is not bound"
@@ -1976,6 +1999,22 @@ mod tests {
         assert!(matches!(parser.handle_name(0, &name(0, 0, "b")), Err(TcError::Reject(_))));
         assert!(matches!(parser.handle_name(3, &name(3, 2, "b")), Err(TcError::Reject(_))));
         assert_eq!(&*parser.names[1], "a");
+        // leanchecker 4.36: "Unknown export object", "Name.str invalid".
+        let malformed = [
+            serde_json::json!({"in": 4, "foo": {"pre": 0, "str": "b"}}),
+            serde_json::json!({"in": 4, "str": {"pre": 0}}),
+            serde_json::json!({"in": 4, "str": {"pre": 0, "str": 7}}),
+            serde_json::json!({"in": 4, "num": {"pre": 1, "i": -1}}),
+            serde_json::json!({"in": 4, "str": {"str": "b"}}),
+        ];
+        for v in &malformed {
+            assert!(matches!(parser.handle_name(4, v), Err(TcError::Reject(_))), "{v}");
+        }
+        // Lean accepts a numeric component past u64; it cannot be told apart.
+        let big: Value = serde_json::from_str(r#"{"in":4,"num":{"pre":1,"i":18446744073709551616}}"#).unwrap();
+        assert!(matches!(parser.handle_name(4, &big), Err(TcError::Decline(_))));
+        parser.handle_name(4, &serde_json::json!({"in": 4, "num": {"pre": 1, "i": 0}})).expect("fresh");
+        assert_eq!(&*parser.names[4], "a.0");
     }
 
     /// Recursor order reads the last component, so a `.rec_` inside one

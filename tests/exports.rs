@@ -2180,6 +2180,22 @@ fn indices_with_the_same_components_are_one_name() {
     assert_reject_in("name-two-universes-same-components.reject.ndjson", "c15");
 }
 
+/// An inductive's recursor and constructors, and a structure's `mk`, are
+/// names of two components or more. `def «T16.rec»`, `«T16.a»` and
+/// `«S16.mk»` beside them are other constants (leanchecker 4.36 accepts).
+/// A recursor or `Quot.mk` exported as the single component `«T17.rec»` or
+/// `«Quot.mk»` is not the constant the kernel builds, and leanchecker
+/// refuses both (unknown constant when the next declaration uses it).
+#[test]
+fn recursor_constructor_and_quotient_names_compare_components() {
+    assert_accept("name-recursor-and-constructor-spellings.accept.ndjson");
+    assert_reject_exact(
+        "name-recursor-one-component.reject.ndjson",
+        "inductive group is missing reconstructed recursor `T17.rec`",
+    );
+    assert_reject_in("name-quot-mk-one-component.reject.ndjson", "«Quot.mk»");
+}
+
 /// leanchecker 4.36 refuses an export that binds a name index twice
 /// ("Name index 23 bound twice"). Rebinding renamed every constant already
 /// declared under the index: here it turned `«Nat.add»` into `other`.
