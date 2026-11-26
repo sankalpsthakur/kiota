@@ -1938,6 +1938,7 @@ mod tests {
         assert_eq!(rec_sort_key("T.rec_2"), (1, 2));
         assert_eq!(rec_sort_key("«x.rec_2».rec"), (0, 0));
         assert_eq!(rec_sort_key("T.«rec_2»"), (3, 0));
+        assert_eq!(rec_sort_key("T.«a.rec_2»"), (3, 0));
         assert_eq!(rec_sort_key("rec"), (3, 0));
         assert_eq!(rec_sort_key("T.rec_x"), (2, 0));
     }
