@@ -2,7 +2,7 @@ name: remote-namecomp
 
 # snd/name-components (HEAD: names compared by components; built-in names and
 # declared/reject_if_dup by components; indices with one name's components
-# read as one index; a name index bound once)
+# read as one index; name records read exactly and bound once)
 # beside main f7c0960 on the arena's six Lean 4.36 exports, strict, one
 # process each: verdict, user time, peak memory. Both refs are pinned by sha.
 # The arena tarball's perf cases and every other tarball case run on both
@@ -14,7 +14,7 @@ permissions:
   contents: read
   actions: read
 env:
-  HEAD_SHA: 2444b727e7734fe58998d0973f6d85f159ffe5a7
+  HEAD_SHA: 8d3411e4fee141b25755de03ac0dd84fb7626d13
   MAIN: f7c09605e8fe7dc7ddcb3b1650aeb259793ee3aa
 jobs:
   val:
