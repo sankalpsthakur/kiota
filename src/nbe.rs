@@ -73,7 +73,23 @@ pub fn nbe_enabled() -> bool {
             .map(|v| parse_nbe_flag(&v))
             .unwrap_or(false);
     }
+    #[cfg(test)]
+    if let Some(on) = NBE_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
     ON.with(|b| *b)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Unit tests only: `nbe_enabled` for this thread, whatever `KIOTA_NBE` says.
+    static NBE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Unit tests only: set or clear (`None`) this thread's `nbe_enabled`.
+#[cfg(test)]
+pub(crate) fn set_nbe_for_test(on: Option<bool>) {
+    NBE_FOR_TEST.with(|c| c.set(on));
 }
 
 #[cfg(test)]

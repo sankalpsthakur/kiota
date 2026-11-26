@@ -201,11 +201,14 @@ thread_local! {
     /// `whnf_core` (2, eager 3) results that were cut short. Emptied with
     /// those caches at each declaration.
     static CUT_SHORT_KEYS: RefCell<rustc_hash::FxHashSet<(u8, u64, usize)>> = RefCell::new(Default::default());
-    /// Bumped on every closed-`Nat` suspension. A `whnf`, `whnf_core` or
-    /// `false` comparison computed while it moved is not memoized: it was
-    /// built over a subcomputation that stopped at the suspension, and the
-    /// driver retries it.
-    static NO_MEMO_EPOCH: Cell<u64> = const { Cell::new(0) };
+    /// Set from a closed-`Nat` suspension (`reduce_nat_arg`) until the
+    /// driver takes it (`drive_closed_nat`). Every frame that can see the
+    /// suspension's decline, or a result some frame built after catching it,
+    /// returns while this is set, since the driver is below all of them; so
+    /// while it is set `memo_frozen` holds and no result table is written.
+    /// A plain flag beside `NAT_SUSPENDED` because `memo_frozen` runs on
+    /// every cache insert.
+    static NAT_UNWINDING: Cell<bool> = const { Cell::new(false) };
     /// Closed-`Nat` evaluation driver (`drive_closed_nat`). While it runs,
     /// `reduce_nat_arg` on a closed argument nested `NAT_STRIDE` levels below
     /// the driver suspends instead of recursing: it records the argument in
@@ -232,6 +235,18 @@ thread_local! {
     static NAT_DRIVES: Cell<u64> = const { Cell::new(0) };
     /// `NAT_MAX_PENDING`, lowered by tests to reach the budget quickly.
     static NAT_PENDING_CAP: Cell<usize> = const { Cell::new(NAT_MAX_PENDING) };
+    /// `NAT_MAX_SUSPENSIONS`, lowered by tests to reach the budget quickly.
+    static NAT_SUSPENSION_CAP: Cell<u64> = const { Cell::new(NAT_MAX_SUSPENSIONS) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: the next suspension is caught at its own site, as a frame
+    /// on the way to the driver might catch its decline, and that frame
+    /// carries on with this value in place of the argument's (and, if the
+    /// flag is set, with something cut short on the way). Whatever is built
+    /// from it must neither be memoized nor survive the driver.
+    static SWALLOW_NEXT_SUSPENSION: RefCell<Option<(Expr, bool)>> = const { RefCell::new(None) };
 }
 
 /// Depth (in `whnf` or `whnf_core` frames below the driver) at which a nested
@@ -293,9 +308,11 @@ fn mark_cut_short_key(cache: u8, key: (u64, usize), cut: bool) {
     })
 }
 
+/// Whether a closed-`Nat` suspension is unwinding to the driver
+/// (`NAT_UNWINDING`).
 #[inline]
-fn no_memo_epoch() -> u64 {
-    NO_MEMO_EPOCH.with(Cell::get)
+fn nat_unwinding() -> bool {
+    NAT_UNWINDING.with(Cell::get)
 }
 
 /// Resource limits reached so far in this thread (tests).
@@ -404,8 +421,14 @@ fn abbrev_args_budget() -> u64 {
 /// because they hold syntax only and never consult conversion:
 /// `unfold_cache` (a definition's body at given levels), `CTX_IDS` (context
 /// interning) and the substitution, shift and level memos of `expr`.
+///
+/// A closed-`Nat` suspension unwinding to its driver (`NAT_UNWINDING`)
+/// freezes the same tables, and `NAT_VALUES` besides: a frame that caught
+/// the suspension's decline built what it returns without the suspended
+/// argument's value. The driver's own `NAT_MEMO` is written only after it has
+/// taken the suspension.
 pub(crate) fn memo_frozen() -> bool {
-    ABBREV_EXHAUSTED.with(Cell::get) || DECL_ABANDONED.with(Cell::get)
+    ABBREV_EXHAUSTED.with(Cell::get) || DECL_ABANDONED.with(Cell::get) || nat_unwinding()
 }
 
 /// `KIOTA_ABBREV_STATS` (or `KIOTA_STATS`): the abbrev argument frames'
@@ -3350,7 +3373,6 @@ impl<'e> Checker<'e> {
         force_eager: bool,
         xcache: bool,
     ) -> R<Expr> {
-        let epoch = no_memo_epoch();
         let mut cur = e.clone();
         let r = loop {
             let core = self.whnf_core(ctx, &cur)?;
@@ -3386,9 +3408,6 @@ impl<'e> Checker<'e> {
             return Ok(r);
         }
         self.clear_cut_if_normal(&r);
-        if no_memo_epoch() != epoch {
-            return Ok(r);
-        }
         self.whnf_cache_insert(force_eager, k, r.clone());
         if xcache && !self.xcache_tainted.get() && !memo_frozen() && !CUT_SHORT.with(Cell::get) {
             XWHNF.with(|m| {
@@ -3541,10 +3560,15 @@ impl<'e> Checker<'e> {
         // Opt-in lazy-head mode's rule (top of `is_def_eq_inner_body`) holds
         // here too: no alias comparison after a core abort or at the core
         // depth cap.
-        if Self::lazy_same_head(a, b)
-            || CORE_ABORTED.with(Cell::get)
-            || CORE_DEPTH.with(Cell::get) >= CONV_DEPTH
-        {
+        if Self::lazy_same_head(a, b) || CORE_ABORTED.with(Cell::get) {
+            return Ok(false);
+        }
+        // At the core depth cap the attempt is cut short, not failed. Its
+        // only caller is speculative (`try_speculative_congruence`), which
+        // restores `CUT_SHORT` because a speculative `false` is never the
+        // answer; the mark matters to any caller that would take it as one.
+        if CORE_DEPTH.with(Cell::get) >= CONV_DEPTH {
+            note_limit_hit("lazy delta at core depth");
             return Ok(false);
         }
         let (mut x, mut y) = (a.clone(), b.clone());
@@ -3752,6 +3776,9 @@ impl<'e> Checker<'e> {
     /// declines instead and abandons the pass (`DECL_ABANDONED`).
     fn abbrev_args_frame(&self, compare: impl FnOnce() -> R<bool>) -> R<bool> {
         let abort_before = CORE_ABORTED.with(Cell::get);
+        // An exhausted frame's work is discarded, so what it cut short does
+        // not bear on the answer the rest of `is_def_eq` gives (`CUT_SHORT`).
+        let cut_before = CUT_SHORT.with(Cell::get);
         let stats = abbrev_stats_on();
         let t0 = stats.then(std::time::Instant::now);
         let frame = abbrev_stats::FRAMES.with(|n| {
@@ -3770,6 +3797,7 @@ impl<'e> Checker<'e> {
         if ABBREV_EXHAUSTED.with(|x| x.replace(false)) {
             ABBREV_EXHAUSTIONS.with(|n| n.set(n.get() + 1));
             CORE_ABORTED.with(|c| c.set(abort_before));
+            CUT_SHORT.with(|c| c.set(cut_before));
             if let Some(t0) = t0 {
                 let us = t0.elapsed().as_micros() as u64;
                 abbrev_stats::record(work, us, 5, &decl);
@@ -3980,15 +4008,12 @@ impl<'e> Checker<'e> {
             CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
             return Ok(r);
         }
-        let epoch = no_memo_epoch();
         let cut = CUT_SHORT.with(|c| c.replace(false));
         let r = self.whnf_core_go(ctx, &e);
         CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         if let Ok(r) = &r {
             self.clear_cut_if_normal(r);
-            if no_memo_epoch() == epoch {
-                self.whnf_core_cache_insert(force_eager, k, r.clone());
-            }
+            self.whnf_core_cache_insert(force_eager, k, r.clone());
         }
         CUT_SHORT.with(|c| c.set(cut || c.get()));
         r
@@ -4818,7 +4843,6 @@ impl<'e> Checker<'e> {
         // still runs, but only a proof of equality overrides the decline.
         let outermost = !SPECULATING.with(Cell::get);
         let abort_before = CORE_ABORTED.with(Cell::get);
-        let epoch = no_memo_epoch();
         // The speculative attempts below only ever prove equality; whatever
         // they cut short does not bear on the main path's answer.
         let cut = CUT_SHORT.with(Cell::get);
@@ -4856,7 +4880,7 @@ impl<'e> Checker<'e> {
             (Ok((r, cacheable)), None) | (Ok((r @ true, cacheable)), Some(_)) => {
                 // `true` is proved whatever was cut short on the way; `false`
                 // is complete only if nothing was.
-                if cacheable && (r || (no_memo_epoch() == epoch && !CUT_SHORT.with(Cell::get))) {
+                if cacheable && (r || !CUT_SHORT.with(Cell::get)) {
                     self.defeq_cache_insert(force_eager, key, r);
                 }
                 return Ok(r);
@@ -6589,7 +6613,7 @@ impl<'e> Checker<'e> {
         }
         // A suspension is already unwinding (a frame on the way caught it
         // and carried on): stop here too, the driver retries from scratch.
-        if NAT_SUSPENDED.with(|s| s.borrow().is_some()) {
+        if nat_unwinding() {
             return decline("closed Nat argument suspended to the evaluation driver");
         }
         let (bw, bc) = NAT_BASE.with(Cell::get);
@@ -6599,8 +6623,15 @@ impl<'e> Checker<'e> {
             || w.max(c) >= CONV_DEPTH - NAT_MARGIN;
         if deep {
             NAT_SUSPENDED.with(|s| *s.borrow_mut() = Some(e.clone()));
+            NAT_UNWINDING.with(|u| u.set(true));
             NAT_SUSPENSIONS.with(|n| n.set(n.get() + 1));
-            NO_MEMO_EPOCH.with(|n| n.set(n.get() + 1));
+            #[cfg(test)]
+            if let Some((v, cut)) = SWALLOW_NEXT_SUSPENSION.with(|s| s.borrow_mut().take()) {
+                if cut {
+                    CUT_SHORT.with(|c| c.set(true));
+                }
+                return Ok(v);
+            }
             return decline("closed Nat argument suspended to the evaluation driver");
         }
         let v = self.whnf(ctx, e)?;
@@ -6609,9 +6640,10 @@ impl<'e> Checker<'e> {
     }
 
     /// Keep a closed `Nat` term's literal value for the rest of the
-    /// declaration (`NAT_VALUES`).
+    /// declaration (`NAT_VALUES`), unless the tables are frozen
+    /// (`memo_frozen`: a suspension is unwinding, or an abbrev frame ran out).
     fn remember_nat_value(e: &Expr, v: &Expr) {
-        if nat::as_lit(v).is_some() && NAT_SUSPENDED.with(|s| s.borrow().is_none()) {
+        if nat::as_lit(v).is_some() && !memo_frozen() {
             NAT_VALUES.with(|m| m.borrow_mut().insert(Self::ptr_key(e), (e.clone(), v.clone())));
         }
     }
@@ -6644,6 +6676,7 @@ impl<'e> Checker<'e> {
             let cut = CUT_SHORT.with(Cell::get);
             let r = self.whnf(ctx, &top);
             if let Some(x) = NAT_SUSPENDED.with(|s| s.borrow_mut().take()) {
+                NAT_UNWINDING.with(|u| u.set(false));
                 CUT_SHORT.with(|c| c.set(cut));
                 // Whatever came back (a decline, or a result some frame built
                 // after catching it) was computed without `x`'s value: drop it.
@@ -6652,7 +6685,7 @@ impl<'e> Checker<'e> {
                     || NAT_MEMO.with(|m| m.borrow().contains_key(&Self::ptr_key(&x)));
                 if again
                     || pending.len() >= NAT_PENDING_CAP.with(Cell::get)
-                    || suspensions > NAT_MAX_SUSPENSIONS
+                    || suspensions > NAT_SUSPENSION_CAP.with(Cell::get)
                 {
                     note_limit_hit("nat driver budget");
                     break decline("closed Nat evaluation exceeds its depth or work budget");
@@ -6685,6 +6718,7 @@ impl<'e> Checker<'e> {
         };
         NAT_MEMO.with(|m| *m.borrow_mut() = FxHashMap::default());
         NAT_SUSPENDED.with(|s| *s.borrow_mut() = None);
+        NAT_UNWINDING.with(|u| u.set(false));
         NAT_DRIVER.with(|d| d.set(false));
         result
     }
@@ -13729,16 +13763,27 @@ fn regression_432_defining_equations_and_closed_values_convert() {
 
     /// Sets `ABBREV_EXHAUSTED` (without a frame, so every operation runs to
     /// completion) for one test and clears it on drop.
-    struct Frozen;
+    /// `Frozen::on` sets another freezing flag instead: `NAT_UNWINDING`, as
+    /// while a closed-`Nat` suspension unwinds to its driver.
+    struct Frozen(&'static std::thread::LocalKey<Cell<bool>>);
     impl Frozen {
         fn set() -> Frozen {
-            ABBREV_EXHAUSTED.with(|x| x.set(true));
-            Frozen
+            Frozen::on(&ABBREV_EXHAUSTED)
+        }
+        /// A suspension unwinds only inside a driver run, so `NAT_UNWINDING`
+        /// comes with `NAT_DRIVER`.
+        fn on(flag: &'static std::thread::LocalKey<Cell<bool>>) -> Frozen {
+            flag.with(|x| x.set(true));
+            if std::ptr::eq(flag, &NAT_UNWINDING) {
+                NAT_DRIVER.with(|d| d.set(true));
+            }
+            Frozen(flag)
         }
     }
     impl Drop for Frozen {
         fn drop(&mut self) {
-            ABBREV_EXHAUSTED.with(|x| x.set(false));
+            self.0.with(|x| x.set(false));
+            NAT_DRIVER.with(|d| d.set(false));
         }
     }
 
@@ -13747,6 +13792,28 @@ fn regression_432_defining_equations_and_closed_values_convert() {
     /// computes something that would be memoized and checks the table.
     #[test]
     fn nothing_computed_while_a_frame_is_exhausted_is_memoized() {
+        nothing_is_memoized_while(&ABBREV_EXHAUSTED);
+    }
+
+    /// The same tables, and `NAT_VALUES`, stay unwritten while a closed-`Nat`
+    /// suspension unwinds to its driver (`NAT_UNWINDING`): a frame that
+    /// caught its decline built what it returns without the suspended value.
+    #[test]
+    fn nothing_computed_while_a_suspension_unwinds_is_memoized() {
+        nothing_is_memoized_while(&NAT_UNWINDING);
+        let e = expr::apps(expr::const_(4, vec![]), &[lit(5), lit(0)]);
+        let five = lit(5);
+        NAT_VALUES.with(|m| *m.borrow_mut() = FxHashMap::default());
+        let frozen = Frozen::on(&NAT_UNWINDING);
+        Checker::remember_nat_value(&e, &five);
+        assert!(NAT_VALUES.with(|m| m.borrow().is_empty()), "NAT_VALUES written while a suspension unwinds");
+        drop(frozen);
+        Checker::remember_nat_value(&e, &five);
+        assert_eq!(NAT_VALUES.with(|m| m.borrow().len()), 1, "the unfrozen value is kept");
+        NAT_VALUES.with(|m| *m.borrow_mut() = FxHashMap::default());
+    }
+
+    fn nothing_is_memoized_while(flag: &'static std::thread::LocalKey<Cell<bool>>) {
         let (env, names) = abbrev_frame_env();
         let c = |i| expr::const_(i, vec![]);
         let ctx = Ctx::new();
@@ -13765,7 +13832,7 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         {
             let tc = Checker::new(&env, &names, Some(0), None);
             let x0 = xlen();
-            let frozen = Frozen::set();
+            let frozen = Frozen::on(flag);
             let t = tc.infer_type(&ctx, &expr::app(c(11), add50()));
             assert!(t.is_ok(), "{t:?}");
             assert_eq!(tc.infer_cache.borrow().len(), 0, "infer cache written");
@@ -13780,7 +13847,7 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         // An XINFER hit is not copied into a frozen checker's own cache.
         {
             let tc = Checker::new(&env, &names, Some(0), None);
-            let _frozen = Frozen::set();
+            let _frozen = Frozen::on(flag);
             let t = tc.infer_type(&ctx, &expr::app(c(11), add50()));
             assert!(t.is_ok(), "{t:?}");
             assert_eq!(tc.infer_cache.borrow().len(), 0, "XINFER hit copied while frozen");
@@ -13788,7 +13855,7 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         // Infer-only spine walk.
         {
             let tc = Checker::new(&env, &names, Some(0), None);
-            let _frozen = Frozen::set();
+            let _frozen = Frozen::on(flag);
             let e = expr::apps(c(10), &[lit(1), lit(2)]);
             let t = tc.with_infer_only(|| tc.infer_type(&ctx, &e));
             assert!(t.is_ok(), "{t:?}");
@@ -13798,7 +13865,7 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         for eager in [false, true] {
             let tc = Checker::new(&env, &names, Some(0), None);
             let x0 = xlen();
-            let frozen = Frozen::set();
+            let frozen = Frozen::on(flag);
             let run = |f: &dyn Fn()| if eager { tc.with_forced_eager_defeq(f) } else { f() };
             run(&|| {
                 let w = tc.whnf(&ctx, &expr::app(c(11), add50()));
@@ -13837,13 +13904,20 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             let tc = Checker::new(&env, &names, Some(0), None);
             tc.set_iota_memo_enabled_for_test(true);
             let motive = expr::lam(expr::BinderInfo::Default, c(0), c(0));
+            // While a suspension unwinds a closed `Nat` argument declines
+            // (`reduce_nat_arg`), so that run counts down instead of adding.
+            let body = if std::ptr::eq(flag, &NAT_UNWINDING) {
+                expr::bvar(0)
+            } else {
+                expr::app(c(2), expr::bvar(0))
+            };
             let step = expr::lam(
                 expr::BinderInfo::Default,
                 c(0),
-                expr::lam(expr::BinderInfo::Default, c(0), expr::app(c(2), expr::bvar(0))),
+                expr::lam(expr::BinderInfo::Default, c(0), body),
             );
             let e = expr::apps(c(3), &[motive, lit(0), step, lit(3)]);
-            let frozen = Frozen::set();
+            let frozen = Frozen::on(flag);
             let w = tc.whnf(&ctx, &e);
             assert!(w.is_ok(), "{w:?}");
             assert_eq!(tc.iota_lit_memo.borrow().len(), 0, "iota_lit_memo written while frozen");
@@ -13854,7 +13928,7 @@ fn regression_432_defining_equations_and_closed_values_convert() {
         // iota_value_cache, proof_arg_cache and an NbE thunk.
         {
             let tc = Checker::new(&env, &names, Some(0), None);
-            let _frozen = Frozen::set();
+            let _frozen = Frozen::on(flag);
             let v = tc.eval(&nbe::empty_env(), &lit(1)).unwrap();
             let arg = nbe::Thunk::forced(v.clone());
             tc.iota_value_cache_insert(3, &Rc::new(vec![]), &[arg], v);
@@ -13872,7 +13946,7 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             let mut names = names.clone();
             names[5] = std::rc::Rc::new("String".into());
             let tc = Checker::new(&env, &names, Some(0), Some(5));
-            let frozen = Frozen::set();
+            let frozen = Frozen::on(flag);
             let ok = tc.native_string_projection_ok(5);
             assert!(tc.native_string_ok.get().is_none(), "native_string_ok written while frozen");
             drop(frozen);
@@ -15111,5 +15185,402 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             );
             CUT_SHORT.with(|c| c.set(false));
         });
+    }
+
+    /// Resets the thread-locals a test presets on drop, so a failed
+    /// assertion does not leak them into the next test on this thread.
+    struct Presets;
+    impl Drop for Presets {
+        fn drop(&mut self) {
+            WHNF_DEPTH.with(|d| d.set(0));
+            CORE_DEPTH.with(|d| d.set(0));
+            DEFEQ_DEPTH.with(|d| d.set(0));
+            INFER_DEPTH.with(|d| d.set(0));
+            CORE_ABORTED.with(|a| a.set(false));
+            CUT_SHORT.with(|c| c.set(false));
+            NAT_DRIVER.with(|d| d.set(false));
+            NAT_UNWINDING.with(|u| u.set(false));
+            NAT_SUSPENDED.with(|s| *s.borrow_mut() = None);
+            NAT_PENDING_CAP.with(|c| c.set(NAT_MAX_PENDING));
+            NAT_SUSPENSION_CAP.with(|c| c.set(NAT_MAX_SUSPENSIONS));
+            SWALLOW_NEXT_SUSPENSION.with(|s| *s.borrow_mut() = None);
+            XCACHE_ON.with(|x| x.set(false));
+            nbe::set_nbe_for_test(None);
+        }
+    }
+
+    /// A frame on the way to the driver catches a suspension's decline and
+    /// carries on with a wrong value (0 for the suspended argument) and with
+    /// something cut short. The driver drops that attempt whole: nothing built
+    /// from it is memoized (`whnf`/`whnf_core` caches, `NAT_VALUES`), the
+    /// result it returned is not taken as the value, and the cut-short mark
+    /// does not outlive it. The value comes out right and conclusive.
+    #[test]
+    fn a_caught_suspension_leaves_nothing_behind() {
+        on_gib_stack(|| {
+            let _p = Presets;
+            let (env, names) = deep_nat_checker_parts();
+            let deep = nested_additions(expr::lit_nat(0u32.into()), 20_000);
+            for cut in [false, true] {
+                let tc = Checker::new(&env, &names, Some(0), None);
+                NAT_VALUES.with(|m| *m.borrow_mut() = FxHashMap::default());
+                CUT_SHORT.with(|c| c.set(false));
+                SWALLOW_NEXT_SUSPENSION.with(|s| *s.borrow_mut() = Some((expr::lit_nat(0u32.into()), cut)));
+                let before = nat_suspensions();
+                let v = tc.whnf(&Ctx::new(), &deep);
+                assert!(SWALLOW_NEXT_SUSPENSION.with(|s| s.borrow().is_none()), "the hook fired");
+                assert!(nat_suspensions() > before + 1, "the driver went on after the caught suspension");
+                assert_eq!(nat::as_lit(v.as_ref().unwrap()), Some(&BigUint::from(20_000u32)), "{v:?} (cut={cut})");
+                assert!(!cut_short(), "the dropped attempt's cut-short mark survived (cut={cut})");
+                assert!(!nat_unwinding() && NAT_SUSPENDED.with(|s| s.borrow().is_none()));
+                let tc = Checker::new(&env, &names, Some(0), None);
+                SWALLOW_NEXT_SUSPENSION.with(|s| *s.borrow_mut() = Some((expr::lit_nat(0u32.into()), cut)));
+                let r = tc.with_forced_eager_defeq(|| tc.is_def_eq(&Ctx::new(), &deep, &expr::lit_nat(20_000u32.into())));
+                assert!(matches!(r, Ok(true)), "{r:?} (cut={cut})");
+                assert!(!cut_short());
+            }
+            NAT_VALUES.with(|m| *m.borrow_mut() = FxHashMap::default());
+        });
+    }
+
+    /// While a suspension unwinds, any further closed `Nat` argument a frame
+    /// on the way asks for declines at once instead of being evaluated
+    /// without the suspended value (or suspending again over it).
+    #[test]
+    fn a_closed_nat_argument_declines_while_a_suspension_unwinds() {
+        let _p = Presets;
+        let (env, names) = deep_nat_checker_parts();
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let e = nested_additions(expr::lit_nat(5u32.into()), 3);
+        NAT_DRIVER.with(|d| d.set(true));
+        NAT_UNWINDING.with(|u| u.set(true));
+        let before = nat_suspensions();
+        let r = tc.reduce_nat_arg(&Ctx::new(), &e);
+        assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+        assert_eq!(nat_suspensions(), before, "it suspended again");
+        NAT_UNWINDING.with(|u| u.set(false));
+        let r = tc.reduce_nat_arg(&Ctx::new(), &e);
+        assert_eq!(nat::as_lit(r.as_ref().unwrap()), Some(&BigUint::from(8u32)), "{r:?}");
+    }
+
+    /// `loop : Nat := loop + 1`: evaluating it needs its own value. The
+    /// driver sees the same argument suspended a second time and declines at
+    /// once, as a limit, instead of stacking it up to the pending cap.
+    #[test]
+    fn a_closed_nat_that_needs_its_own_value_declines_at_once() {
+        on_gib_stack(|| {
+            let _p = Presets;
+            let (mut env, mut names) = deep_nat_checker_parts();
+            let nat = expr::const_(0, vec![]);
+            let me = expr::const_(8, vec![]);
+            env.insert(8, ConstantInfo::Def {
+                level_params: vec![],
+                typ: nat,
+                value: expr::apps(expr::const_(4, vec![]), &[me.clone(), expr::lit_nat(1u32.into())]),
+                hints: crate::env::ReducibilityHints::Regular(1),
+                is_unsafe: false,
+            });
+            names.push(std::rc::Rc::new("loop".into()));
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let e = expr::apps(expr::const_(4, vec![]), &[me, expr::lit_nat(1u32.into())]);
+            let before = nat_suspensions();
+            CUT_SHORT.with(|c| c.set(false));
+            let r = tc.whnf(&Ctx::new(), &e);
+            assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+            assert!(nat_suspensions() - before <= 2, "{} suspensions before declining", nat_suspensions() - before);
+            assert!(cut_short(), "the decline is a limit");
+        });
+    }
+
+    /// Past the suspension budget the driver declines, as a limit, though
+    /// the pending stack never fills.
+    #[test]
+    fn a_closed_nat_past_the_suspension_budget_declines() {
+        on_gib_stack(|| {
+            let _p = Presets;
+            let (env, names) = deep_nat_checker_parts();
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let deep = nested_additions(expr::lit_nat(0u32.into()), 20_000);
+            NAT_SUSPENSION_CAP.with(|c| c.set(2));
+            CUT_SHORT.with(|c| c.set(false));
+            let r = tc.whnf(&Ctx::new(), &deep);
+            assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+            assert!(cut_short(), "the budget is a limit");
+            NAT_SUSPENSION_CAP.with(|c| c.set(NAT_MAX_SUSPENSIONS));
+            CUT_SHORT.with(|c| c.set(false));
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let v = tc.whnf(&Ctx::new(), &deep).unwrap();
+            assert_eq!(nat::as_lit(&v), Some(&BigUint::from(20_000u32)));
+        });
+    }
+
+    /// Each depth cap marks the computation in progress as cut short when it
+    /// declines, so a comparison that catches the decline and answers `false`
+    /// is not a conclusive rejection (`Checker::conclusive`). The counters are
+    /// preset to the cap.
+    #[test]
+    fn every_depth_cap_marks_the_computation_cut_short() {
+        let _p = Presets;
+        let (env, names) = deep_nat_checker_parts();
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+        let e = nested_additions(expr::lit_nat(5u32.into()), 2);
+        let seven = expr::lit_nat(7u32.into());
+        let check = |what: &str, r: Result<(), TcError>| {
+            assert!(matches!(r, Err(TcError::Decline(_))), "{what}: {r:?}");
+            assert!(cut_short(), "{what}: the decline is not marked cut short");
+            CUT_SHORT.with(|c| c.set(false));
+        };
+        WHNF_DEPTH.with(|d| d.set(CONV_DEPTH));
+        check("whnf", tc.whnf(&ctx, &e).map(|_| ()));
+        WHNF_DEPTH.with(|d| d.set(0));
+        DEFEQ_DEPTH.with(|d| d.set(CONV_DEPTH));
+        check("defeq", tc.is_def_eq(&ctx, &e, &seven).map(|_| ()));
+        DEFEQ_DEPTH.with(|d| d.set(0));
+        // infer_type counts its depth on the NbE path only.
+        nbe::set_nbe_for_test(Some(true));
+        INFER_DEPTH.with(|d| d.set(CONV_DEPTH));
+        check("infer", tc.infer_type(&ctx, &e).map(|_| ()));
+        INFER_DEPTH.with(|d| d.set(0));
+        nbe::set_nbe_for_test(None);
+        // Below the caps the same calls are conclusive.
+        assert!(tc.is_def_eq(&ctx, &e, &seven).unwrap());
+        assert!(!tc.is_def_eq(&ctx, &e, &expr::lit_nat(8u32.into())).unwrap());
+        assert!(!cut_short());
+    }
+
+    /// `Nat.rec` counting a literal down by `succ`: the two countdown budgets
+    /// (a run of peels of literals over 256 bits, and peels of literals of
+    /// 2^29 or more) decline as limits. The counters are preset to the budget.
+    #[test]
+    fn the_literal_countdown_budgets_mark_the_computation_cut_short() {
+        let _p = Presets;
+        let (env, names) = deep_nat_checker_parts();
+        let c = |i| expr::const_(i, vec![]);
+        let lam = |d, b| expr::lam(expr::BinderInfo::Default, d, b);
+        let nat = c(0);
+        let countdown = |n: BigUint| {
+            expr::apps(c(3), &[
+                lam(nat.clone(), nat.clone()),
+                c(1),
+                lam(nat.clone(), lam(nat.clone(), expr::bvar(0))),
+                expr::lit_nat(n),
+            ])
+        };
+        let ctx = Ctx::new();
+        let huge: BigUint = BigUint::from(1u32) << 300usize;
+        let tc = Checker::new(&env, &names, Some(0), None);
+        tc.fuel_nat_run.set(HUGE_LIT_RUN);
+        *tc.fuel_nat_last.borrow_mut() = Some(&huge + 1u32);
+        CUT_SHORT.with(|c| c.set(false));
+        let r = tc.whnf(&ctx, &countdown(huge.clone()));
+        assert!(matches!(r, Err(TcError::Decline(ref m)) if m.contains("over 256 bits")), "{r:?}");
+        assert!(cut_short(), "the huge-literal run is a limit");
+        CUT_SHORT.with(|c| c.set(false));
+        let tc = Checker::new(&env, &names, Some(0), None);
+        tc.fuel_nat_peels.set(MAX_HUGE_NAT_PEELS);
+        let r = tc.whnf(&ctx, &countdown(BigUint::from(1u32) << 30usize));
+        assert!(matches!(r, Err(TcError::Decline(ref m)) if m.contains("peel budget")), "{r:?}");
+        assert!(cut_short(), "the peel budget is a limit");
+        CUT_SHORT.with(|c| c.set(false));
+        // Within the budgets a short countdown completes.
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let w = tc.whnf(&ctx, &countdown(BigUint::from(3u32))).unwrap();
+        assert!(matches!(&**w, ExprData::Const(1, _)), "{}", tc.pp_budget(&w, 8));
+        assert!(!cut_short());
+    }
+
+    /// `try_lazy_delta` at the core depth cap is cut short, not a failure.
+    #[test]
+    fn lazy_delta_at_the_core_depth_cap_is_cut_short() {
+        let _p = Presets;
+        let (env, names) = deep_nat_checker_parts();
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+        let a = expr::apps(expr::const_(5, vec![]), &[expr::lit_nat(2u32.into()), expr::lit_nat(3u32.into())]);
+        let b = expr::apps(expr::const_(7, vec![]), &[expr::lit_nat(9u32.into()), expr::lit_nat(3u32.into())]);
+        CORE_DEPTH.with(|d| d.set(CONV_DEPTH));
+        let r = tc.try_lazy_delta(&ctx, &a, &b);
+        CORE_DEPTH.with(|d| d.set(0));
+        assert!(matches!(r, Ok(false)), "{r:?}");
+        assert!(cut_short(), "the attempt at the cap is not marked cut short");
+        CUT_SHORT.with(|c| c.set(false));
+        let r = tc.try_lazy_delta(&ctx, &a, &b);
+        assert!(r.is_ok(), "{r:?}");
+        assert!(!cut_short(), "below the cap nothing is cut short");
+    }
+
+    /// A `whnf` result cut short by the core depth cap is not shared through
+    /// the cross-declaration `XWHNF`: the next declaration reduces it
+    /// properly. `Pair.snd (Nat.rec (fun _ => Pair) (Pair.mk 0 5) (fun _ ih =>
+    /// ih) 0)` is `5`; with the projected term's `whnf_core` at the cap it
+    /// stays a stuck projection.
+    #[test]
+    fn a_cut_short_whnf_is_not_shared_across_declarations() {
+        let _p = Presets;
+        let (env, names) = abbrev_frame_env();
+        let c = |i| expr::const_(i, vec![]);
+        let lam = |d, b| expr::lam(expr::BinderInfo::Default, d, b);
+        let nat = c(0);
+        let pair = c(5);
+        let v = expr::apps(c(3), &[
+            lam(nat.clone(), pair.clone()),
+            expr::apps(c(6), &[lit(0), lit(5)]),
+            lam(nat.clone(), lam(pair.clone(), expr::bvar(0))),
+            lit(0),
+        ]);
+        let e = expr::proj(5, 1, v);
+        let ctx = Ctx::new();
+        XCACHE_ON.with(|x| x.set(true));
+        XWHNF.with(|m| m.borrow_mut().clear());
+        let tc = Checker::new(&env, &names, Some(0), None);
+        CORE_DEPTH.with(|d| d.set(CONV_DEPTH - 1));
+        let w = tc.whnf(&ctx, &e);
+        CORE_DEPTH.with(|d| d.set(0));
+        let w = w.unwrap();
+        assert!(nat::as_lit(&w).is_none(), "the projection was not cut: {}", tc.pp_budget(&w, 8));
+        assert!(cut_short());
+        CUT_SHORT.with(|c| c.set(false));
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let w = tc.whnf(&ctx, &e).unwrap();
+        assert_eq!(nat::as_lit(&w), Some(&BigUint::from(5u32)), "{}", tc.pp_budget(&w, 8));
+        assert!(!cut_short());
+        XWHNF.with(|m| m.borrow_mut().clear());
+    }
+
+    /// An exhausted abbrev frame's work is discarded, and so is what it cut
+    /// short: `CUT_SHORT` leaves the frame as it entered.
+    #[test]
+    fn an_exhausted_abbrev_frame_does_not_leave_a_cut_short_mark() {
+        let _p = Presets;
+        let (env, names) = abbrev_frame_env();
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let ctx = Ctx::new();
+        let five = lit(5);
+        let _budget = Budget::set(2);
+        for entry in [false, true] {
+            CUT_SHORT.with(|c| c.set(entry));
+            let r = tc.abbrev_args_frame(|| {
+                note_limit_hit("test");
+                for _ in 0..10 {
+                    let _ = tc.is_def_eq(&ctx, &five, &five);
+                }
+                assert!(ABBREV_EXHAUSTED.with(Cell::get));
+                Ok(false)
+            });
+            assert!(matches!(r, Ok(false)), "{r:?}");
+            assert_eq!(cut_short(), entry, "the exhausted frame's mark leaked (entry={entry})");
+        }
+        // A frame within its budget keeps what its comparison cut short.
+        CUT_SHORT.with(|c| c.set(false));
+        let r = tc.abbrev_args_frame(|| {
+            note_limit_hit("test");
+            Ok(false)
+        });
+        assert!(matches!(r, Ok(false)), "{r:?}");
+        assert!(cut_short());
+    }
+
+    /// `I : Prop` with `mk : Nat.rec (fun _ => Prop) I (fun _ ih => ih) 0 → I`.
+    /// The field type is `I` by one iota step; with every `whnf_core` at the
+    /// depth cap it stays a recursor application with `I` among its
+    /// arguments, which the positivity check rejects, and the rejection
+    /// rests on that: it is a decline. Below the cap it accepts.
+    #[test]
+    fn an_inductive_structure_rejection_cut_short_by_a_cap_is_a_decline() {
+        let _p = Presets;
+        let (env, names) = cut_inductive_env();
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let r = tc.check_inductive_group_structure(8);
+        assert!(r.is_ok(), "below the cap: {r:?}");
+        let tc = Checker::new(&env, &names, Some(0), None);
+        CORE_DEPTH.with(|d| d.set(CONV_DEPTH));
+        let r = tc.check_inductive_group_structure(8);
+        CORE_DEPTH.with(|d| d.set(0));
+        assert!(matches!(r, Err(TcError::Decline(ref m)) if m.contains("cut short")), "{r:?}");
+    }
+
+    /// `P : Prop` with `mk : Nat → P` eliminates only into `Prop`, and its
+    /// recursor's motive is `P → S` with `S := (fun X => X) Prop`. With every
+    /// `whnf_core` at the depth cap `S` is not seen to be a sort, and the
+    /// large elimination check's rejection rests on that: it is a decline.
+    #[test]
+    fn a_large_elimination_rejection_cut_short_by_a_cap_is_a_decline() {
+        let _p = Presets;
+        let (env, names) = cut_inductive_env();
+        let tc = Checker::new(&env, &names, Some(0), None);
+        let r = tc.check_inductive_group(11);
+        assert!(r.is_ok(), "below the cap: {r:?}");
+        let tc = Checker::new(&env, &names, Some(0), None);
+        CORE_DEPTH.with(|d| d.set(CONV_DEPTH));
+        let r = tc.check_inductive_group(11);
+        CORE_DEPTH.with(|d| d.set(0));
+        assert!(matches!(r, Err(TcError::Decline(ref m)) if m.contains("cut short")), "{r:?}");
+    }
+
+    /// `deep_nat_checker_parts` plus 8 `I : Prop`, 9 `I.mk : Nat.rec (fun _ =>
+    /// Prop) I (fun _ ih => ih) 0 → I`, 10 an unused axiom; 11 `P : Prop`, 12 `P.mk : Nat → P`,
+    /// 13 `S : Type := (fun X : Type => X) Prop`, 14 `P.rec : (motive : P → S) → ((n : Nat) → motive (P.mk n)) →
+    /// (t : P) → motive t`.
+    fn cut_inductive_env() -> (Environment, Vec<std::rc::Rc<String>>) {
+        use crate::env::{ConstantInfo as CI, ReducibilityHints as RH};
+        let (mut env, mut names) = deep_nat_checker_parts();
+        let c = |i| expr::const_(i, vec![]);
+        let v = expr::bvar;
+        let pi = |d, r| expr::pi(expr::BinderInfo::Default, d, r);
+        let ty = expr::sort(level::succ(level::zero()));
+        let prop = expr::sort(level::zero());
+        let nat = c(0);
+        env.insert(8, CI::InductiveType {
+            level_params: vec![], typ: prop.clone(),
+            num_params: 0, num_indices: 0, all: vec![8], ctors: vec![9],
+            is_rec: true, is_unsafe: false,
+        });
+        let lam = |d, b| expr::lam(expr::BinderInfo::Default, d, b);
+        let field = expr::apps(c(3), &[
+            lam(nat.clone(), prop.clone()),
+            c(8),
+            lam(nat.clone(), lam(prop.clone(), v(0))),
+            expr::lit_nat(0u32.into()),
+        ]);
+        env.insert(9, CI::Constructor {
+            level_params: vec![], typ: pi(field, c(8)),
+            induct: 8, cidx: 0, num_params: 0, num_fields: 1, is_unsafe: false,
+        });
+        env.insert(10, CI::Axiom {
+            level_params: vec![], typ: nat.clone(), is_unsafe: false,
+        });
+        env.insert(11, CI::InductiveType {
+            level_params: vec![], typ: prop.clone(),
+            num_params: 0, num_indices: 0, all: vec![11], ctors: vec![12],
+            is_rec: false, is_unsafe: false,
+        });
+        env.insert(12, CI::Constructor {
+            level_params: vec![], typ: pi(nat.clone(), c(11)),
+            induct: 11, cidx: 0, num_params: 0, num_fields: 1, is_unsafe: false,
+        });
+        env.insert(13, CI::Def {
+            level_params: vec![], typ: ty.clone(),
+            value: expr::app(expr::lam(expr::BinderInfo::Default, ty.clone(), v(0)), prop.clone()),
+            hints: RH::Regular(1), is_unsafe: false,
+        });
+        let rec_ty = pi(
+            pi(c(11), c(13)),
+            pi(
+                pi(nat.clone(), expr::app(v(1), expr::app(c(12), v(0)))),
+                pi(c(11), expr::app(v(2), v(0))),
+            ),
+        );
+        env.insert(14, CI::Recursor {
+            level_params: vec![], typ: rec_ty, all: vec![11],
+            num_params: 0, num_indices: 0, num_motives: 1, num_minors: 1,
+            rules: vec![crate::env::RecRule { ctor: 12, nfields: 1, rhs: v(0) }],
+            k: false, is_unsafe: false,
+        });
+        env.rec_of.insert(11, 14);
+        for n in ["I", "I.mk", "unused", "P", "P.mk", "S", "P.rec"] {
+            names.push(std::rc::Rc::new(n.into()));
+        }
+        (env, names)
     }
 }
