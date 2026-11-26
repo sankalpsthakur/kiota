@@ -15,7 +15,7 @@ permissions:
   contents: read
   actions: read
 env:
-  HEAD_SHA: 366550e753fe6a574a5261a0bdce8eca1337ae41
+  HEAD_SHA: 0f9d6e54c957eb6003981d536568bb8e1bf69caa
   MAIN: f7c09605e8fe7dc7ddcb3b1650aeb259793ee3aa
 jobs:
   tests:
