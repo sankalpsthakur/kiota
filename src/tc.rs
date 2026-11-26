@@ -177,6 +177,154 @@ thread_local! {
     static LAZY_MAIN_PATH: Cell<bool> = const { Cell::new(false) };
     /// Declarations re-checked that way in this thread (tests, statistics).
     static LAZY_RETRIES: Cell<u64> = const { Cell::new(0) };
+    /// Resource limits reached so far: a depth cap (`whnf`, `whnf_core`,
+    /// `is_def_eq`, `infer_type`, `ensure_*`), the huge-literal peel budget,
+    /// or the closed-`Nat` evaluation budget (tests, statistics).
+    static LIMIT_HITS: Cell<u64> = const { Cell::new(0) };
+    /// Set while the computation in progress depends on one that a resource
+    /// limit cut short. A limit can only lose equalities: `whnf_core` at its
+    /// cap returns the term it was given as if it were weak head normal, and a
+    /// declined comparison caught on the way reads as "not proved". So a
+    /// `false` or a weak head normal form derived from such a computation is
+    /// not conclusive, and a rejection reached with this set is reported as a
+    /// decline (`check_decl_once`).
+    ///
+    /// `whnf`, `whnf_core` and `is_def_eq` each clear it on entry and, on
+    /// return, set it again if it was set on entry or became set inside, except
+    /// that a comparison proving equality restores the value it had on entry:
+    /// an equality holds however the work towards it was cut short.
+    /// Speculative attempts that can only prove equality restore it too, and
+    /// a memoized `whnf` / `whnf_core` result keeps its mark (`CUT_SHORT_KEYS`)
+    /// so that reading it back sets this again.
+    static CUT_SHORT: Cell<bool> = const { Cell::new(false) };
+    /// `(cache, ctx key, term)` of memoized `whnf` (0, eager 1) and
+    /// `whnf_core` (2, eager 3) results that were cut short. Emptied with
+    /// those caches at each declaration.
+    static CUT_SHORT_KEYS: RefCell<rustc_hash::FxHashSet<(u8, u64, usize)>> = RefCell::new(Default::default());
+    /// Bumped on every closed-`Nat` suspension. A `whnf`, `whnf_core` or
+    /// `false` comparison computed while it moved is not memoized: it was
+    /// built over a subcomputation that stopped at the suspension, and the
+    /// driver retries it.
+    static NO_MEMO_EPOCH: Cell<u64> = const { Cell::new(0) };
+    /// Closed-`Nat` evaluation driver (`drive_closed_nat`). While it runs,
+    /// `reduce_nat_arg` on a closed argument nested `NAT_STRIDE` levels below
+    /// the driver suspends instead of recursing: it records the argument in
+    /// `NAT_SUSPENDED` and declines, the decline unwinds to the driver, and the
+    /// driver evaluates that argument first from its own depth, memoizes the
+    /// value in `NAT_MEMO` and retries. The recursion depth of every function
+    /// stays under `CONV_DEPTH`; only the literal spine is made iterative.
+    static NAT_DRIVER: Cell<bool> = const { Cell::new(false) };
+    /// `(WHNF_DEPTH, CORE_DEPTH)` when the driver started.
+    static NAT_BASE: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
+    static NAT_SUSPENDED: RefCell<Option<Expr>> = const { RefCell::new(None) };
+    /// Values of closed `Nat` arguments the driver has evaluated, by
+    /// allocation identity; the key is held so it is never reused. Emptied
+    /// when the driver ends.
+    static NAT_MEMO: RefCell<FxHashMap<usize, (Expr, Expr)>> = RefCell::new(FxHashMap::default());
+    /// Literal values of closed `Nat` terms the driver evaluated, kept for the
+    /// whole declaration: its caches are emptied before the lazy re-check
+    /// (`check_decl`), and a closed term's literal value is the same in both
+    /// passes. Emptied when the next declaration starts.
+    static NAT_VALUES: RefCell<FxHashMap<usize, (Expr, Expr)>> = RefCell::new(FxHashMap::default());
+    /// Suspensions so far in this thread (tests, statistics).
+    static NAT_SUSPENSIONS: Cell<u64> = const { Cell::new(0) };
+    /// Driver runs so far in this thread (statistics).
+    static NAT_DRIVES: Cell<u64> = const { Cell::new(0) };
+    /// `NAT_MAX_PENDING`, lowered by tests to reach the budget quickly.
+    static NAT_PENDING_CAP: Cell<usize> = const { Cell::new(NAT_MAX_PENDING) };
+}
+
+/// Depth (in `whnf` or `whnf_core` frames below the driver) at which a nested
+/// closed `Nat` argument is suspended to the driver rather than evaluated in
+/// place.
+const NAT_STRIDE: u32 = 1024;
+
+/// Room left under `CONV_DEPTH` below which a nested closed `Nat` argument is
+/// suspended whatever its distance from the driver.
+const NAT_MARGIN: u32 = 2048;
+
+/// Arguments waiting for their values at once in one driver run. Each one is
+/// up to `NAT_STRIDE` frames deeper than the one below it, so this bounds the
+/// nesting of a closed `Nat` evaluation at about 1.2 million frames.
+const NAT_MAX_PENDING: usize = 1200;
+
+/// Suspensions one driver run may make before it declines (a work bound: a
+/// closed `Nat` that evaluates in finitely many steps but too many for any of
+/// the arena's limits).
+const NAT_MAX_SUSPENSIONS: u64 = 1 << 20;
+
+/// A resource limit was reached (see `LIMIT_HITS`).
+#[inline]
+fn note_limit_hit(what: &'static str) {
+    if env_set!("KIOTA_LIMIT_TRACE") {
+        eprintln!(
+            "LIMIT_HIT {what} spec={} lazy={} w={} c={} d={} driver={}",
+            SPECULATING.with(Cell::get),
+            LAZY_MAIN_PATH.with(Cell::get),
+            WHNF_DEPTH.with(Cell::get),
+            CORE_DEPTH.with(Cell::get),
+            DEFEQ_DEPTH.with(Cell::get),
+            NAT_DRIVER.with(Cell::get)
+        );
+    }
+    LIMIT_HITS.with(|c| c.set(c.get() + 1));
+    CUT_SHORT.with(|c| c.set(true));
+}
+
+/// Whether the memoized result under `(cache, key)` was cut short.
+#[inline]
+fn cut_short_key(cache: u8, key: &(u64, usize)) -> bool {
+    CUT_SHORT_KEYS.with(|s| {
+        let s = s.borrow();
+        !s.is_empty() && s.contains(&(cache, key.0, key.1))
+    })
+}
+
+/// Record whether the result being memoized under `(cache, key)` was cut short.
+#[inline]
+fn mark_cut_short_key(cache: u8, key: (u64, usize), cut: bool) {
+    CUT_SHORT_KEYS.with(|s| {
+        let mut s = s.borrow_mut();
+        if cut {
+            s.insert((cache, key.0, key.1));
+        } else if !s.is_empty() {
+            s.remove(&(cache, key.0, key.1));
+        }
+    })
+}
+
+#[inline]
+fn no_memo_epoch() -> u64 {
+    NO_MEMO_EPOCH.with(Cell::get)
+}
+
+/// Resource limits reached so far in this thread (tests).
+pub fn limit_hits() -> u64 {
+    LIMIT_HITS.with(Cell::get)
+}
+
+/// Whether the computation in progress rests on one a limit cut short
+/// (`CUT_SHORT`; tests).
+pub fn cut_short() -> bool {
+    CUT_SHORT.with(Cell::get)
+}
+
+/// Closed-`Nat` suspensions so far in this thread (tests, statistics).
+pub fn nat_suspensions() -> u64 {
+    NAT_SUSPENSIONS.with(Cell::get)
+}
+
+/// `KIOTA_NAT_REPORT`: one line of closed-`Nat` driver and limit counters for
+/// this thread, on stderr.
+pub fn report_nat_drive() {
+    if std::env::var_os("KIOTA_NAT_REPORT").is_some() {
+        eprintln!(
+            "NAT_DRIVE drives={} suspensions={} limit_hits={}",
+            NAT_DRIVES.with(Cell::get),
+            nat_suspensions(),
+            limit_hits()
+        );
+    }
 }
 
 /// Lazy-head fallbacks per unwinding decline. Every main-path frame is
@@ -1126,6 +1274,7 @@ impl<'e> Checker<'e> {
     /// decline for a decided verdict, and it costs nothing on declarations
     /// the eager pass accepts (every corpus but a handful of declarations).
     pub fn check_decl(&self, name: u32, kind: &str) -> R<()> {
+        NAT_VALUES.with(|m| *m.borrow_mut() = FxHashMap::default());
         match self.check_decl_once(name, kind) {
             Err(first @ (TcError::Decline(_) | TcError::Reject(_))) if !LAZY_MAIN_PATH.with(Cell::get) => {
                 if std::env::var_os("KIOTA_PROGRESS").is_some() {
@@ -1149,7 +1298,7 @@ impl<'e> Checker<'e> {
         let stats = abbrev_stats_on().then(|| (std::time::Instant::now(), ABBREV_EXHAUSTIONS.with(Cell::get)));
         DECL_ABANDONED.with(|a| a.set(false));
         let outer = DECL_EXHAUSTIONS.with(|n| n.replace(Some(0)));
-        let r = self.check_decl_once_go(name, kind);
+        let r = Self::conclusive(|| self.check_decl_once_go(name, kind));
         DECL_EXHAUSTIONS.with(|n| n.set(outer));
         // An abandoned pass ran on with every comparison declining, so what
         // it returns says nothing.
@@ -1178,6 +1327,21 @@ impl<'e> Checker<'e> {
         }
         crate::stats::decl_end();
         r
+    }
+
+    /// Run a check whose rejection must be conclusive: one that rests on a
+    /// computation a resource limit cut short (see `CUT_SHORT`) is reported
+    /// as a decline, since what failed may hold all the same.
+    fn conclusive(f: impl FnOnce() -> R<()>) -> R<()> {
+        CUT_SHORT.with(|c| c.set(false));
+        match f() {
+            Err(TcError::Reject(msg)) if CUT_SHORT.with(|c| c.replace(false)) => {
+                Err(TcError::Decline(format!(
+                    "{msg} (it rests on a computation cut short by a depth or budget limit)"
+                )))
+            }
+            r => r,
+        }
     }
 
     fn check_decl_once_go(&self, name: u32, kind: &str) -> R<()> {
@@ -1359,6 +1523,7 @@ impl<'e> Checker<'e> {
         CTX_NEXT.with(|c| c.set(1));
         expr::clear_memo(&mut self.whnf_cache.borrow_mut());
         expr::clear_memo(&mut self.whnf_core_cache.borrow_mut());
+        CUT_SHORT_KEYS.with(|s| *s.borrow_mut() = Default::default());
         expr::clear_memo(&mut self.defeq_cache.borrow_mut());
         expr::clear_memo(&mut self.infer_cache.borrow_mut());
         expr::clear_memo(&mut self.spine_cache.borrow_mut());
@@ -1453,7 +1618,7 @@ impl<'e> Checker<'e> {
         }
         if let Some(value) = ci.value() {
             let vt = self.infer_type(&ctx, value)?;
-            if !self.is_def_eq(&ctx, &vt, typ)? && !self.value_type_ok_eager(&ctx, value, typ)? {
+            if !self.is_def_eq(&ctx, &vt, typ)? && !self.rescue_only(|| self.value_type_ok_eager(&ctx, value, typ))? {
                 if std::env::var_os("KIOTA_DEBUG").is_some() {
                     let eager_vt = self
                         .infer_type_cached(&ctx, value)
@@ -1540,6 +1705,7 @@ impl<'e> Checker<'e> {
             }
             w = core;
         }
+        note_limit_hit("ensure depth");
         decline("ensure reduction depth limit")
     }
 
@@ -1615,6 +1781,7 @@ impl<'e> Checker<'e> {
         });
         if depth > CONV_DEPTH {
             INFER_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            note_limit_hit("infer depth");
             return decline("infer_type depth limit");
         }
         let r = self.infer_type_via_nbe(ctx, e);
@@ -3110,6 +3277,7 @@ impl<'e> Checker<'e> {
                 eprintln!("WHNF_DEPTH {}", self.pp_budget(e, 50));
             }
             self.dump_conversion_trace(e);
+            note_limit_hit("whnf depth");
             return decline("WHNF depth limit");
         }
         let r = self.whnf_inner(ctx, e);
@@ -3146,7 +3314,9 @@ impl<'e> Checker<'e> {
         if xcache {
             if let Some(r) = XWHNF.with(|m| m.borrow().get(&k.1).cloned()) {
                 XCACHE_HITS.with(|c| c.set(c.get() + 1));
+                let cut = CUT_SHORT.with(|c| c.replace(false));
                 self.whnf_cache_insert(force_eager, k, r.clone());
+                CUT_SHORT.with(|c| c.set(cut));
                 return Ok(r);
             }
         }
@@ -3155,6 +3325,32 @@ impl<'e> Checker<'e> {
             let trivial = matches!(&***e, ExprData::Pi(..) | ExprData::Sort(_) | ExprData::Lam(..));
             crate::stats::whnf_miss(k.1, k.0, ctx.id, trivial);
         }
+        let cut = CUT_SHORT.with(|c| c.replace(false));
+        let r = self.whnf_miss(ctx, e, k, force_eager, xcache);
+        CUT_SHORT.with(|c| c.set(cut || c.get()));
+        r
+    }
+
+    /// `CUT_SHORT` after a reduction to `r`: a result normal by its shape is
+    /// complete however it was reached.
+    #[inline]
+    fn clear_cut_if_normal(&self, r: &Expr) {
+        if CUT_SHORT.with(Cell::get) && self.whnf_by_shape(r) {
+            CUT_SHORT.with(|c| c.set(false));
+        }
+    }
+
+    /// `whnf_inner` past its caches: reduce `e`, and memoize the result under
+    /// `k` unless a closed-`Nat` suspension happened meanwhile.
+    fn whnf_miss(
+        &self,
+        ctx: &Ctx,
+        e: &Expr,
+        k: (u64, usize),
+        force_eager: bool,
+        xcache: bool,
+    ) -> R<Expr> {
+        let epoch = no_memo_epoch();
         let mut cur = e.clone();
         let r = loop {
             let core = self.whnf_core(ctx, &cur)?;
@@ -3186,10 +3382,15 @@ impl<'e> Checker<'e> {
                     self.pp_budget(&r, 12)
                 ));
             }
+            self.clear_cut_if_normal(&r);
+            return Ok(r);
+        }
+        self.clear_cut_if_normal(&r);
+        if no_memo_epoch() != epoch {
             return Ok(r);
         }
         self.whnf_cache_insert(force_eager, k, r.clone());
-        if xcache && !self.xcache_tainted.get() && !memo_frozen() {
+        if xcache && !self.xcache_tainted.get() && !memo_frozen() && !CUT_SHORT.with(Cell::get) {
             XWHNF.with(|m| {
                 let mut m = m.borrow_mut();
                 if m.len() >= XCACHE_CAP {
@@ -3753,6 +3954,7 @@ impl<'e> Checker<'e> {
             self.dump_conversion_trace(&e);
             CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
             CORE_ABORTED.with(|a| a.set(true));
+            note_limit_hit("core depth");
             // Do not cache. A β/ζ/proj redex at the cap is not WHNF — Decline.
             // A stuck recursor/axiom app is already WHNF; returning it as Ok
             // is honest (Init `Int8.toInt_toInt32`).
@@ -3778,11 +3980,18 @@ impl<'e> Checker<'e> {
             CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
             return Ok(r);
         }
+        let epoch = no_memo_epoch();
+        let cut = CUT_SHORT.with(|c| c.replace(false));
         let r = self.whnf_core_go(ctx, &e);
         CORE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-        let r = r?;
-        self.whnf_core_cache_insert(force_eager, k, r.clone());
-        Ok(r)
+        if let Ok(r) = &r {
+            self.clear_cut_if_normal(r);
+            if no_memo_epoch() == epoch {
+                self.whnf_core_cache_insert(force_eager, k, r.clone());
+            }
+        }
+        CUT_SHORT.with(|c| c.set(cut || c.get()));
+        r
     }
 
     fn whnf_core_go(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
@@ -4379,6 +4588,7 @@ impl<'e> Checker<'e> {
                     self.pp_budget(b, 50)
                 );
             }
+            note_limit_hit("defeq depth");
             return decline("defeq depth limit");
         }
         if DECL_ABANDONED.with(Cell::get) {
@@ -4399,12 +4609,15 @@ impl<'e> Checker<'e> {
                 return decline("abbrev argument comparison over budget");
             }
         }
+        let cut = CUT_SHORT.with(|c| c.replace(false));
         let r = if nbe::nbe_enabled() && !FORCE_EAGER_DEFEQ.with(Cell::get) {
             self.is_def_eq_via_nbe(ctx, a, b)
         } else {
             self.is_def_eq_inner(ctx, a, b)
         };
         DEFEQ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        // An equality is proved however the work towards it was cut short.
+        CUT_SHORT.with(|c| c.set(cut || (c.get() && !matches!(r, Ok(true)))));
         r
     }
 
@@ -4455,16 +4668,24 @@ impl<'e> Checker<'e> {
         }
     }
     fn whnf_cache_get(&self, force_eager: bool, key: &(u64, usize)) -> Option<Expr> {
-        if force_eager {
+        let r = if force_eager {
             self.eager_whnf_cache.borrow().get(key).cloned()
         } else {
             self.whnf_cache.borrow().get(key).cloned()
+        };
+        if r.is_some() && cut_short_key(force_eager as u8, key) {
+            if env_set!("KIOTA_LIMIT_TRACE") {
+                eprintln!("CUT_READ whnf spec={} d={} w={} {}", SPECULATING.with(Cell::get), DEFEQ_DEPTH.with(Cell::get), WHNF_DEPTH.with(Cell::get), self.pp_budget(r.as_ref().unwrap(), 8));
+            }
+            CUT_SHORT.with(|c| c.set(true));
         }
+        r
     }
     fn whnf_cache_insert(&self, force_eager: bool, key: (u64, usize), v: Expr) {
         if memo_frozen() {
             return;
         }
+        mark_cut_short_key(force_eager as u8, key, CUT_SHORT.with(Cell::get));
         if force_eager {
             expr::memo_insert(&mut self.eager_whnf_cache.borrow_mut(), key, v);
         } else {
@@ -4472,16 +4693,24 @@ impl<'e> Checker<'e> {
         }
     }
     fn whnf_core_cache_get(&self, force_eager: bool, key: &(u64, usize)) -> Option<Expr> {
-        if force_eager {
+        let r = if force_eager {
             self.eager_whnf_core_cache.borrow().get(key).cloned()
         } else {
             self.whnf_core_cache.borrow().get(key).cloned()
+        };
+        if r.is_some() && cut_short_key(2 + force_eager as u8, key) {
+            if env_set!("KIOTA_LIMIT_TRACE") {
+                eprintln!("CUT_READ core spec={} d={} w={} {}", SPECULATING.with(Cell::get), DEFEQ_DEPTH.with(Cell::get), WHNF_DEPTH.with(Cell::get), self.pp_budget(r.as_ref().unwrap(), 8));
+            }
+            CUT_SHORT.with(|c| c.set(true));
         }
+        r
     }
     fn whnf_core_cache_insert(&self, force_eager: bool, key: (u64, usize), v: Expr) {
         if memo_frozen() {
             return;
         }
+        mark_cut_short_key(2 + force_eager as u8, key, CUT_SHORT.with(Cell::get));
         if force_eager {
             expr::memo_insert(&mut self.eager_whnf_core_cache.borrow_mut(), key, v);
         } else {
@@ -4589,8 +4818,14 @@ impl<'e> Checker<'e> {
         // still runs, but only a proof of equality overrides the decline.
         let outermost = !SPECULATING.with(Cell::get);
         let abort_before = CORE_ABORTED.with(Cell::get);
+        let epoch = no_memo_epoch();
+        // The speculative attempts below only ever prove equality; whatever
+        // they cut short does not bear on the main path's answer.
+        let cut = CUT_SHORT.with(Cell::get);
         let speculative_decline = if !outermost {
-            if self.try_speculative_congruence(ctx, a, b)? {
+            let r = self.try_speculative_congruence(ctx, a, b);
+            CUT_SHORT.with(|c| c.set(cut));
+            if r? {
                 self.defeq_cache_insert(force_eager, key, true);
                 return Ok(true);
             }
@@ -4599,6 +4834,7 @@ impl<'e> Checker<'e> {
             SPECULATING.with(|s| s.set(true));
             let r = self.try_speculative_congruence(ctx, a, b);
             SPECULATING.with(|s| s.set(false));
+            CUT_SHORT.with(|c| c.set(cut));
             match r {
                 Ok(true) => {
                     self.defeq_cache_insert(force_eager, key, true);
@@ -4618,7 +4854,9 @@ impl<'e> Checker<'e> {
         let main = self.def_eq_main_path(ctx, a, b);
         let declined = match (main, speculative_decline) {
             (Ok((r, cacheable)), None) | (Ok((r @ true, cacheable)), Some(_)) => {
-                if cacheable {
+                // `true` is proved whatever was cut short on the way; `false`
+                // is complete only if nothing was.
+                if cacheable && (r || (no_memo_epoch() == epoch && !CUT_SHORT.with(Cell::get))) {
                     self.defeq_cache_insert(force_eager, key, r);
                 }
                 return Ok(r);
@@ -4653,7 +4891,9 @@ impl<'e> Checker<'e> {
         {
             CORE_ABORTED.with(|c| c.set(abort_before));
             SPECULATING.with(|s| s.set(true));
+            let cut = CUT_SHORT.with(Cell::get);
             let r = self.try_lazy_head_congruence(ctx, a, b);
+            CUT_SHORT.with(|c| c.set(cut));
             SPECULATING.with(|s| s.set(false));
             CORE_ABORTED.with(|c| c.set(abort_before));
             match r {
@@ -5290,6 +5530,7 @@ impl<'e> Checker<'e> {
                                 let run = if consecutive { self.fuel_nat_run.get() + 1 } else { 1 };
                                 self.fuel_nat_run.set(run);
                                 if run > HUGE_LIT_RUN {
+                                    note_limit_hit("huge literal run");
                                     return decline("Nat literal countdown from a literal over 256 bits");
                                 }
                             }
@@ -5299,6 +5540,7 @@ impl<'e> Checker<'e> {
                                 let peels = self.fuel_nat_peels.get() + 1;
                                 self.fuel_nat_peels.set(peels);
                                 if peels > MAX_HUGE_NAT_PEELS {
+                                    note_limit_hit("peel budget");
                                     return decline("Nat literal countdown from 2^29 or more exceeds the peel budget");
                                 }
                             }
@@ -6323,11 +6565,128 @@ impl<'e> Checker<'e> {
     }
 
     /// Whnf a Nat argument without expanding an existing nat lit to `succ`.
+    ///
+    /// A closed argument is evaluated under the closed-`Nat` driver
+    /// (`drive_closed_nat`): the outermost one starts it, and a nested one
+    /// far enough below it is suspended to it (see `NAT_DRIVER`). An open
+    /// argument is reduced in place, as before.
     fn reduce_nat_arg(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
         if nat::as_lit(e).is_some() {
             return Ok(e.clone());
         }
-        self.whnf(ctx, e)
+        if expr::loose_bvar_range(e) > 0 || env_set!("KIOTA_NO_NAT_DRIVER") {
+            return self.whnf(ctx, e);
+        }
+        let key = Self::ptr_key(e);
+        if let Some(v) = NAT_VALUES.with(|m| m.borrow().get(&key).map(|(_, v)| v.clone())) {
+            return Ok(v);
+        }
+        if !NAT_DRIVER.with(Cell::get) {
+            return self.drive_closed_nat(ctx, e);
+        }
+        if let Some(v) = NAT_MEMO.with(|m| m.borrow().get(&key).map(|(_, v)| v.clone())) {
+            return Ok(v);
+        }
+        // A suspension is already unwinding (a frame on the way caught it
+        // and carried on): stop here too, the driver retries from scratch.
+        if NAT_SUSPENDED.with(|s| s.borrow().is_some()) {
+            return decline("closed Nat argument suspended to the evaluation driver");
+        }
+        let (bw, bc) = NAT_BASE.with(Cell::get);
+        let (w, c) = (WHNF_DEPTH.with(Cell::get), CORE_DEPTH.with(Cell::get));
+        let deep = w >= bw.saturating_add(NAT_STRIDE)
+            || c >= bc.saturating_add(NAT_STRIDE)
+            || w.max(c) >= CONV_DEPTH - NAT_MARGIN;
+        if deep {
+            NAT_SUSPENDED.with(|s| *s.borrow_mut() = Some(e.clone()));
+            NAT_SUSPENSIONS.with(|n| n.set(n.get() + 1));
+            NO_MEMO_EPOCH.with(|n| n.set(n.get() + 1));
+            return decline("closed Nat argument suspended to the evaluation driver");
+        }
+        let v = self.whnf(ctx, e)?;
+        Self::remember_nat_value(e, &v);
+        Ok(v)
+    }
+
+    /// Keep a closed `Nat` term's literal value for the rest of the
+    /// declaration (`NAT_VALUES`).
+    fn remember_nat_value(e: &Expr, v: &Expr) {
+        if nat::as_lit(v).is_some() && NAT_SUSPENDED.with(|s| s.borrow().is_none()) {
+            NAT_VALUES.with(|m| m.borrow_mut().insert(Self::ptr_key(e), (e.clone(), v.clone())));
+        }
+    }
+
+    /// Weak head normal form of the closed `Nat` term `e`, evaluated with an
+    /// explicit stack instead of native recursion along its literal spine.
+    ///
+    /// `whnf` of `e` runs as usual; a closed `Nat` argument that a literal
+    /// operation needs `NAT_STRIDE` frames further down is not evaluated
+    /// there but suspended (`reduce_nat_arg`). The driver pushes it, takes its
+    /// `whnf` first, memoizes the result and retries the term below it, which
+    /// now finds that value where it suspended. `g 19 0` with
+    /// `g (n+1) a = g n (g n a)` and `g 0 a = a + 1` nests 2^19 additions,
+    /// each waiting for the value of the next; that is 2^19 / `NAT_STRIDE`
+    /// suspensions, each a short native recursion.
+    ///
+    /// Every function keeps its depth cap: a comparison, inference or
+    /// reduction between two suspension points declines at `CONV_DEPTH` as
+    /// before. What is iterative is only the chain of closed `Nat` arguments,
+    /// up to `NAT_MAX_PENDING` of them waiting at once and
+    /// `NAT_MAX_SUSPENSIONS` in all, past which the evaluation declines.
+    fn drive_closed_nat(&self, ctx: &Ctx, e: &Expr) -> R<Expr> {
+        NAT_DRIVES.with(|n| n.set(n.get() + 1));
+        NAT_DRIVER.with(|d| d.set(true));
+        NAT_BASE.with(|b| b.set((WHNF_DEPTH.with(Cell::get), CORE_DEPTH.with(Cell::get))));
+        let mut pending: Vec<Expr> = vec![e.clone()];
+        let mut suspensions = 0u64;
+        let result = loop {
+            let top = pending.last().expect("the driver's stack is never empty").clone();
+            let cut = CUT_SHORT.with(Cell::get);
+            let r = self.whnf(ctx, &top);
+            if let Some(x) = NAT_SUSPENDED.with(|s| s.borrow_mut().take()) {
+                CUT_SHORT.with(|c| c.set(cut));
+                // Whatever came back (a decline, or a result some frame built
+                // after catching it) was computed without `x`'s value: drop it.
+                suspensions += 1;
+                let again = pending.iter().any(|p| Rc::ptr_eq(p, &x))
+                    || NAT_MEMO.with(|m| m.borrow().contains_key(&Self::ptr_key(&x)));
+                if again
+                    || pending.len() >= NAT_PENDING_CAP.with(Cell::get)
+                    || suspensions > NAT_MAX_SUSPENSIONS
+                {
+                    note_limit_hit("nat driver budget");
+                    break decline("closed Nat evaluation exceeds its depth or work budget");
+                }
+                if env_set!("KIOTA_NAT_TRACE") {
+                    eprintln!(
+                        "NAT_SUSPEND pending={} n={} w={} c={} d={} arg={}",
+                        pending.len(),
+                        suspensions,
+                        WHNF_DEPTH.with(Cell::get),
+                        CORE_DEPTH.with(Cell::get),
+                        DEFEQ_DEPTH.with(Cell::get),
+                        self.pp_budget(&x, 12)
+                    );
+                }
+                pending.push(x);
+                continue;
+            }
+            if let Ok(v) = &r {
+                Self::remember_nat_value(&top, v);
+            }
+            match r {
+                Ok(v) if pending.len() == 1 => break Ok(v),
+                Ok(v) => {
+                    let k = pending.pop().expect("more than one pending");
+                    NAT_MEMO.with(|m| m.borrow_mut().insert(Self::ptr_key(&k), (k, v)));
+                }
+                Err(err) => break Err(err),
+            }
+        };
+        NAT_MEMO.with(|m| *m.borrow_mut() = FxHashMap::default());
+        NAT_SUSPENDED.with(|s| *s.borrow_mut() = None);
+        NAT_DRIVER.with(|d| d.set(false));
+        result
     }
 
     /// Native Nat reductions (minimal): succ/add/beq/OfNat.
@@ -7084,6 +7443,10 @@ impl<'e> Checker<'e> {
     /// recursor before this point would make the subsequent construction
     /// circular.
     pub(crate) fn check_inductive_group_structure(&self, first_name: u32) -> R<()> {
+        Self::conclusive(|| self.check_inductive_group_structure_go(first_name))
+    }
+
+    fn check_inductive_group_structure_go(&self, first_name: u32) -> R<()> {
         let ci = self
             .env
             .get(first_name)
@@ -7639,7 +8002,7 @@ impl<'e> Checker<'e> {
     /// committing the block transaction.
     pub fn check_inductive_group(&self, first_name: u32) -> R<()> {
         self.check_inductive_group_structure(first_name)?;
-        self.check_inductive_group_large_elim(first_name)
+        Self::conclusive(|| self.check_inductive_group_large_elim(first_name))
     }
 
     /// Walk a constructor's argument telescope; each argument type must be
@@ -8831,6 +9194,42 @@ impl<'e> Checker<'e> {
     /// against `typ` with `is_def_eq_inner` directly (never `is_def_eq`,
     /// to avoid re-dispatching into the same NbE path). Only ever rescues
     /// a decline into an accept that matches eager's own judgment.
+    /// Whether `e` is weak head normal by its shape alone: a literal, sort,
+    /// binder, or an application of a variable, constructor, inductive type
+    /// or axiom. No further work could reduce its head, so a reduction to it
+    /// is complete even if some attempt on the way was cut short (`CUT_SHORT`).
+    fn whnf_by_shape(&self, e: &Expr) -> bool {
+        match &***e {
+            ExprData::Lit(_) | ExprData::Sort(_) | ExprData::Pi(..) | ExprData::Lam(..) => true,
+            ExprData::App(..) | ExprData::Const(..) | ExprData::BVar(_) => {
+                let (head, _) = expr::unfold_apps(e);
+                match &**head {
+                    ExprData::BVar(_) => true,
+                    ExprData::Const(n, _) => matches!(
+                        self.env.get(*n),
+                        Some(
+                            ConstantInfo::Constructor { .. }
+                                | ConstantInfo::InductiveType { .. }
+                                | ConstantInfo::Axiom { .. }
+                        )
+                    ),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Run a rescue that can only turn a failed comparison into an accept:
+    /// what it cuts short does not bear on the failure it was asked about
+    /// (see `CUT_SHORT`).
+    fn rescue_only(&self, f: impl FnOnce() -> R<bool>) -> R<bool> {
+        let cut = CUT_SHORT.with(Cell::get);
+        let r = f();
+        CUT_SHORT.with(|c| c.set(cut));
+        r
+    }
+
     fn value_type_ok_eager(&self, ctx: &Ctx, value: &Expr, typ: &Expr) -> R<bool> {
         if env_set!("KIOTA_TRACE_RESCUE") {
             eprintln!("RESCUE value value_size={}", expr_size_capped(value, 100_000));
@@ -8964,7 +9363,7 @@ impl<'e> Checker<'e> {
                 // skips it, matching the eager App case exactly.
                 if !self.infer_only.get() {
                     let at = self.infer_type_value(ctx, tys, env, a)?;
-                    if !self.types_compatible(ctx, depth, &at, &dom_v)? && !self.app_arg_type_ok_eager(ctx, f, a)? {
+                    if !self.types_compatible(ctx, depth, &at, &dom_v)? && !self.rescue_only(|| self.app_arg_type_ok_eager(ctx, f, a))? {
                         if env_set!("KIOTA_DEBUG") {
                             let at_q = self.quote(depth, &at).unwrap_or_else(|_| a.clone());
                             let dom_q = self.quote(depth, &dom_v).unwrap_or_else(|_| a.clone());
@@ -14578,4 +14977,139 @@ fn regression_432_defining_equations_and_closed_values_convert() {
             "one closed declaration must not reuse Prop-only checked inference for data");
     }
 
+
+    /// `Nat.add (… (Nat.add 0 1) …) 1`, `n` additions deep, each waiting for
+    /// the value of the one inside it; `base` at the bottom.
+    fn nested_additions(base: Expr, n: u32) -> Expr {
+        let add = expr::const_(4, vec![]);
+        let one = expr::lit_nat(1u32.into());
+        let mut e = base;
+        for _ in 0..n {
+            e = expr::apps(add.clone(), &[e, one.clone()]);
+        }
+        e
+    }
+
+    /// Run `f` on a thread with the release binary's 1 GiB stack: an
+    /// unoptimized build's frames are large, and the native recursion
+    /// between two suspensions is `NAT_STRIDE` frames deep.
+    fn on_gib_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn")
+            .join()
+            .expect("test thread panicked");
+    }
+
+    /// The comparisons below run on the eager path even under `KIOTA_NBE=1`
+    /// (`with_forced_eager_defeq`), where the driver lives; NbE evaluates a
+    /// 20,000-deep chain its own way.
+    fn deep_nat_checker_parts() -> (Environment, Vec<std::rc::Rc<String>>) {
+        (
+            regression_432_nat_arithmetic_env(),
+            test_names(&["Nat", "Nat.zero", "Nat.succ", "Nat.rec", "Nat.add",
+                         "Nat.mul", "Nat.pred", "Nat.sub"]),
+        )
+    }
+
+    /// 20,000 nested additions are more than twice `CONV_DEPTH`: evaluated by
+    /// native recursion they decline at the cap. The driver evaluates them
+    /// with suspensions, and the value is right both ways round.
+    #[test]
+    fn a_closed_nat_twice_the_depth_cap_deep_is_evaluated_by_suspensions() {
+        on_gib_stack(|| {
+            let (env, names) = deep_nat_checker_parts();
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let deep = nested_additions(expr::lit_nat(0u32.into()), 20_000);
+            let before = nat_suspensions();
+            assert!(tc.with_forced_eager_defeq(|| tc.is_def_eq(&Ctx::new(), &deep, &expr::lit_nat(20_000u32.into()))).unwrap());
+            assert!(nat_suspensions() > before, "the spine was evaluated by suspensions");
+            assert!(!cut_short(), "nothing was cut short");
+            let tc = Checker::new(&env, &names, Some(0), None);
+            assert!(!tc.with_forced_eager_defeq(|| tc.is_def_eq(&Ctx::new(), &deep, &expr::lit_nat(20_001u32.into()))).unwrap());
+            assert!(!cut_short(), "the inequality is conclusive");
+        });
+    }
+
+    /// A suspension only ever goes to the driver from below it: the depth of
+    /// every function stays under the cap between two suspension points.
+    #[test]
+    fn closed_nat_evaluation_keeps_every_function_under_the_depth_cap() {
+        on_gib_stack(|| {
+            let (env, names) = deep_nat_checker_parts();
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let deep = nested_additions(expr::lit_nat(0u32.into()), 3 * CONV_DEPTH);
+            let hits = limit_hits();
+            let v = tc.whnf(&Ctx::new(), &deep).unwrap();
+            assert_eq!(nat::as_lit(&v), Some(&BigUint::from(3 * CONV_DEPTH)));
+            assert_eq!(limit_hits(), hits, "no depth cap was reached");
+        });
+    }
+
+    /// A chain that ends in a stuck term (an axiom) has no literal value; its
+    /// arguments' weak head normal forms are memoized by the driver itself,
+    /// so the retry finds them and the evaluation completes.
+    #[test]
+    fn a_deep_closed_chain_over_an_axiom_completes() {
+        on_gib_stack(|| {
+            let (mut env, mut names) = deep_nat_checker_parts();
+            env.insert(8, ConstantInfo::Axiom {
+                level_params: vec![],
+                typ: expr::const_(0, vec![]),
+                is_unsafe: false,
+            });
+            names.push(std::rc::Rc::new("ax".into()));
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let deep = nested_additions(expr::const_(8, vec![]), 20_000);
+            let before = nat_suspensions();
+            let r = tc.whnf(&Ctx::new(), &deep);
+            assert!(r.is_ok(), "{r:?}");
+            assert!(nat_suspensions() > before, "the spine was evaluated by suspensions");
+            assert!(nat::as_lit(&r.unwrap()).is_none());
+        });
+    }
+
+    /// Past its budget the driver declines, and says the limit was reached:
+    /// it neither answers `false` nor runs on.
+    #[test]
+    fn a_closed_nat_past_the_evaluation_budget_declines() {
+        on_gib_stack(|| {
+            let (env, names) = deep_nat_checker_parts();
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let deep = nested_additions(expr::lit_nat(0u32.into()), 20_000);
+            NAT_PENDING_CAP.with(|c| c.set(4));
+            let hits = limit_hits();
+            let r = tc.with_forced_eager_defeq(|| tc.is_def_eq(&Ctx::new(), &deep, &expr::lit_nat(20_000u32.into())));
+            NAT_PENDING_CAP.with(|c| c.set(NAT_MAX_PENDING));
+            assert!(matches!(r, Err(TcError::Decline(_))), "{r:?}");
+            assert!(limit_hits() > hits, "the budget counts as a limit");
+            assert!(!NAT_DRIVER.with(Cell::get), "the driver ended");
+            assert!(NAT_SUSPENDED.with(|s| s.borrow().is_none()), "no suspension is left behind");
+        });
+    }
+
+    /// An open addition chain is not driven (its value is not a literal), so
+    /// it reaches the depth cap. Whatever the comparison answers then, it is
+    /// not a conclusive `false`.
+    #[test]
+    fn an_open_chain_cut_at_the_depth_cap_is_not_a_conclusive_false() {
+        on_gib_stack(|| {
+            let (env, names) = deep_nat_checker_parts();
+            let tc = Checker::new(&env, &names, Some(0), None);
+            let nat = expr::const_(0, vec![]);
+            let mut ctx = Ctx::new();
+            ctx.push(nat);
+            let deep = nested_additions(expr::bvar(0), 20_000);
+            let other = nested_additions(expr::bvar(0), 19_999);
+            CUT_SHORT.with(|c| c.set(false));
+            let r = tc.with_forced_eager_defeq(|| tc.is_def_eq(&ctx, &deep, &other));
+            assert!(
+                matches!(r, Err(TcError::Decline(_))) || (matches!(r, Ok(false)) && cut_short()),
+                "{r:?} cut_short={}",
+                cut_short()
+            );
+            CUT_SHORT.with(|c| c.set(false));
+        });
+    }
 }

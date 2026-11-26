@@ -2108,3 +2108,98 @@ fn an_abbrev_with_unequal_arguments_unfolds_on_both_sides() {
     assert_accept("abbrev-coe-of-comp.accept.ndjson");
     assert!(start.elapsed().as_secs() < 20, "took {:?}", start.elapsed());
 }
+
+/// The verdict on a fixture, on a thread with the release binary's 1 GiB
+/// stack: the closed-`Nat` driver lets native recursion go `NAT_STRIDE`
+/// frames below it, and an unoptimized build's frames are large.
+fn verdict_deep(name: &'static str) -> Result<(), TcError> {
+    std::thread::Builder::new()
+        .stack_size(1024 * 1024 * 1024)
+        .spawn(move || check_file(&fixture(name)))
+        .expect("spawn deep-stack test thread")
+        .join()
+        .expect("deep-stack test thread panicked")
+}
+
+fn expect_accept_deep(name: &'static str) {
+    let r = verdict_deep(name);
+    assert!(r.is_ok(), "{name} should accept, got {r:?}");
+}
+
+fn expect_reject_deep(name: &'static str) {
+    let r = verdict_deep(name);
+    assert!(matches!(r, Err(TcError::Reject(_))), "{name} should reject, got {r:?}");
+}
+
+/// 2^14 nested additions (`g 14 0`, `g (n+1) a = g n (g n a)`), twice the
+/// native depth cap: the arena's `unfold-before-literal-fallback` and `-bad`
+/// shapes, which need the value. They declined at the cap before the
+/// closed-`Nat` driver.
+#[test]
+fn a_closed_nat_twice_the_depth_cap_deep_is_evaluated() {
+    expect_accept_deep("deep-nat-sum.accept.ndjson");
+    expect_reject_deep("deep-nat-sum-wrong.reject.ndjson");
+}
+
+/// The same value under a structure projection, beside an axiom the
+/// addition is stuck on, and under `Nat.sub`, `Nat.ble` and `decide`.
+#[test]
+fn a_deep_closed_nat_is_evaluated_under_other_operations() {
+    expect_accept_deep("deep-nat-box-projection.accept.ndjson");
+    expect_reject_deep("deep-nat-box-projection-wrong.reject.ndjson");
+    expect_accept_deep("deep-nat-beside-axiom.accept.ndjson");
+    expect_reject_deep("deep-nat-beside-axiom-wrong.reject.ndjson");
+    expect_accept_deep("deep-nat-ble.accept.ndjson");
+    expect_reject_deep("deep-nat-sub-wrong.reject.ndjson");
+    expect_reject_deep("deep-nat-decide-wrong.reject.ndjson");
+}
+
+/// `(List.replicate 20000 ()).length + 0 = 20000`: the length's spine passes
+/// through a comparison at every element (structure eta of `brecOn`'s
+/// `PProd`). The checker rejected the true statement, because `whnf_core`
+/// at its depth cap returned the cut-short term as weak head normal.
+#[test]
+fn a_long_closed_list_length_is_evaluated() {
+    expect_accept_deep("deep-list-length.accept.ndjson");
+    expect_reject_deep("deep-list-length-wrong.reject.ndjson");
+}
+
+/// The same length over a variable element `u` is open, so it is not driven
+/// and still reaches the depth cap. A comparison that rests on the cut-short
+/// computation is not a rejection: the official checker accepts this one.
+#[test]
+fn a_comparison_cut_short_by_the_depth_cap_declines_rather_than_rejects() {
+    let r = verdict_deep("deep-list-length-open.accept.ndjson");
+    match r {
+        Err(TcError::Decline(msg)) => assert!(msg.contains("cut short"), "{msg}"),
+        other => panic!("deep-list-length-open should decline, got {other:?}"),
+    }
+}
+
+/// A K-like `Eq.rec` under `Nat.add`: the driver evaluates it, and the
+/// comparison that reduces it keeps its own depth cap. Raising the cap for
+/// everything inside the evaluation counted a literal of 2^29 down until the
+/// peel budget declined both. The wrong twin also checks that work cut short
+/// inside a successful reduction does not make an honest rejection a decline.
+#[test]
+fn a_k_like_eq_rec_under_nat_add_keeps_its_verdicts() {
+    expect_accept_deep("k-like-eq-rec-under-nat-add.accept.ndjson");
+    expect_reject_deep("k-like-eq-rec-under-nat-add.reject.ndjson");
+    // Without `Nat.add`: the countdown cut short inside the comparisons that
+    // only look for a cheap proof does not bear on the rejection.
+    expect_reject_deep("k-like-eq-rec.reject.ndjson");
+}
+
+/// The arena's four cases (2^19 nested additions; byte copies of the
+/// 2026-11-24 tarball). Release only: an unoptimized build takes minutes.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "minutes in an unoptimized build")]
+fn the_arena_deep_evaluation_cases_get_their_verdicts() {
+    expect_accept_deep("arena-unfold-before-literal.accept.ndjson");
+    expect_accept_deep("arena-unfold-before-literal-fallback.accept.ndjson");
+    expect_reject_deep("arena-unfold-before-literal-bad.reject.ndjson");
+    // NbE (`KIOTA_NBE=1`, opt-in) takes minutes to compare these structures.
+    if !kiota::nbe::nbe_enabled() {
+        expect_reject_deep("arena-proj-applied-struct-bad.reject.ndjson");
+    }
+}
