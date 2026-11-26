@@ -1757,7 +1757,8 @@ fn a_wrong_leaf_under_a_chain_filed_after_the_table_grew_rejects() {
 /// takes each field's recursor and minors from the declaration, never by
 /// matching the major's spelling (`[W.leaf] : List W` under `W.a`) against
 /// the auxiliaries' major premises. Lean's kernel computes 1 and 110; the
-/// false twins state 101 and 10 with the same `rfl` proof.
+/// false twins state 101 and 10 with the same `rfl` proof. Each twin's
+/// theorem is named by one component, `«bad_WR.x7_false101»`.
 #[test]
 fn nested_iota_convertible_auxiliaries_follow_the_declaration() {
     for case in ["x7", "x8", "fa1", "fa2", "fb1", "fb2"] {
@@ -1767,7 +1768,7 @@ fn nested_iota_convertible_auxiliaries_follow_the_declaration() {
         assert_reject_exact(
             &format!("nested-iota-wrap-{case}-false.reject.ndjson"),
             &format!(
-                "[bad_WR.{case}_false{}] theorem 161: value type does not match declared type",
+                "[«bad_WR.{case}_false{}»] theorem 161: value type does not match declared type",
                 if case == "x7" { "101" } else { "10" },
             ),
         );
