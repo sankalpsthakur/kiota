@@ -1,0 +1,46 @@
+name: remote-nestedproj-tb
+
+# The local arena tarball (sha256 b1dc6bf1..., committed under tarball/) on
+# snd/nested-proj 43d7dd0 and main f7c0960: every case, exit code per side.
+on:
+  push:
+    branches: ['remote/nestedproj-tb-2026112*']
+permissions:
+  contents: read
+env:
+  HEAD_SHA: 43d7dd009a4ada8d83c6262068c6c8a2fe9c416e
+  MAIN: f7c09605e8fe7dc7ddcb3b1650aeb259793ee3aa
+jobs:
+  tarball:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [head, main]
+        part: [perf, rest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.side == 'main' && env.MAIN || env.HEAD_SHA }}
+          path: src
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cd src && cargo build --release --locked
+      - name: Cases
+        env:
+          SIDE: ${{ matrix.side }}
+          PART: ${{ matrix.part }}
+        run: |
+          set +e
+          sha256sum harness/tarball/lean-arena-tests-b1dc6bf1.tar.gz
+          mkdir -p arena && tar -xzf harness/tarball/lean-arena-tests-b1dc6bf1.tar.gz -C arena
+          sha=$(git -C src rev-parse --short HEAD)
+          if [ "$PART" = perf ]; then sel=$(cd arena && find good bad -name '*.ndjson' -path '*/perf/*' | sort)
+          else sel=$(cd arena && find good bad -name '*.ndjson' -not -path '*/perf/*' | sort); fi
+          for f in $sel; do
+            timeout 1800 ./src/target/release/kiota "arena/$f" >/dev/null 2>err.txt; rc=$?
+            echo "TB side=$SIDE sha=$sha case=$f rc=$rc $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-160)" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
