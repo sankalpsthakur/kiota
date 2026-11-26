@@ -2051,6 +2051,28 @@ fn an_inductive_block_does_not_use_the_reserved_nested_prefix() {
     assert_accept("ind-reserved-nested-prefix-elsewhere.accept.ndjson");
 }
 
+/// The prefix is a name *component*: Lean's `is_prefix_of(g_nested, n)`
+/// compares components, and `«_nested.Tr2»` is the one component
+/// `"_nested.Tr2"`, though it prints like `_nested.Tr2`. Lean 4.36
+/// elaborates it and leanchecker accepts both genuine exports
+/// (`tests/fixtures/src/reserved-nested-quoted-name.lean`): the inductive
+/// itself, and `Esc2`, whose constructor takes a `«_nested.Tr2»`.
+///
+/// The hand-written twins declare both spellings side by side, the single
+/// component `«_nested.Foo»` and the two components `_nested`, `Foo`, and
+/// differ only in which one the axiom and the constructor type use: the
+/// check reads the constant's own name index, not the printed name.
+#[test]
+fn a_single_name_component_spelled_with_the_nested_prefix_is_not_reserved() {
+    assert_accept("reserved-nested-quoted-name.accept.ndjson");
+    assert_accept("reserved-nested-quoted-name-use.accept.ndjson");
+    assert_accept("ind-reserved-nested-single-component.accept.ndjson");
+    assert_reject_exact(
+        "ind-reserved-nested-beside-single-component.reject.ndjson",
+        "constructor type uses the reserved prefix `_nested`",
+    );
+}
+
 /// `CoeF.coe f (CoeF.coe f q) = CoeF.coe (f.comp f) q` by `rfl`
 /// (`tests/fixtures/src/abbrev-coe-of-comp.lean`). `CoeF.coe` is an abbrev
 /// whose arguments `f` and `f.comp f` differ; official unfolds it on both

@@ -147,6 +147,13 @@ pub struct Environment {
     /// fixed from the reconstructed recursor when the block is admitted.
     /// Only blocks with auxiliary members have an entry.
     pub nested_iota: FxHashMap<u32, FxHashMap<u32, NestedIotaRule>>,
+    /// Name indices whose root component is exactly `_nested`, the prefix
+    /// the official kernel reserves for nested auxiliaries
+    /// (`is_prefix_of(g_nested, n)` compares components). Filled by the
+    /// parser as names are read: names are kept as dotted strings, so the
+    /// single component `«_nested.T»` and the two components `_nested`,
+    /// `T` print alike and only the record structure tells them apart.
+    pub nested_root_names: rustc_hash::FxHashSet<u32>,
 }
 
 /// Iota for one constructor under one recursor of a nested block: the minor

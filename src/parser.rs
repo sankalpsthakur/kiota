@@ -254,6 +254,27 @@ impl Parser {
     }
 
     fn handle_name(&mut self, idx: u32, v: &Value) {
+        // Whether the root component is exactly `_nested`: index 0 is the
+        // anonymous name, and a longer name inherits its prefix's root.
+        let root = |env: &Environment, pre: u32| env.nested_root_names.contains(&pre);
+        let nested_root = if let Some(s) = v.get("str") {
+            let pre = Self::get_u32(s, "pre");
+            if pre == 0 {
+                Self::get_str(s, "str") == "_nested"
+            } else {
+                root(&self.env, pre)
+            }
+        } else if let Some(n) = v.get("num") {
+            let pre = Self::get_u32(n, "pre");
+            pre != 0 && root(&self.env, pre)
+        } else {
+            false
+        };
+        if nested_root {
+            self.env.nested_root_names.insert(idx);
+        } else {
+            self.env.nested_root_names.remove(&idx);
+        }
         let full = if let Some(s) = v.get("str") {
             let pre = Self::get_u32(s, "pre");
             let seg = Self::get_str(s, "str");

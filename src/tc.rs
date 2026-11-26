@@ -7346,10 +7346,12 @@ impl<'e> Checker<'e> {
 
     /// Whether a name lies under the root `_nested`, where the official
     /// kernel puts the auxiliary types of nested inductive elimination
-    /// (`is_prefix_of(g_nested, n)`).
+    /// (`is_prefix_of(g_nested, n)`). The test is on components, not on the
+    /// printed name: the single component `«_nested.T»` is an ordinary
+    /// name that Lean 4.36 elaborates and accepts, though it prints like
+    /// `_nested.T`. The parser records each name's root as it reads it.
     fn is_reserved_nested_name(&self, n: u32) -> bool {
-        let s = self.name_str(n);
-        s == "_nested" || s.starts_with("_nested.")
+        self.env.nested_root_names.contains(&n)
     }
 
     /// `check_no_nested_aux` (inductive.cpp, lean4#14616, in 4.36): whether
