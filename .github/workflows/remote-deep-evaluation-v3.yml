@@ -1,0 +1,62 @@
+name: remote-deep-evaluation-v3
+
+# fix/deep-evaluation-v3 (origin/main f7c0960 + fix/deep-evaluation-v2) beside
+# main f7c0960. Both refs are pinned by sha.
+# - tests: cargo test --release on the head.
+# - tarball: every case of the arena tarball on both sides (rc, user, rss).
+on:
+  push:
+    branches: ['remote/deep-evaluation-v3-20261127']
+permissions:
+  contents: read
+  actions: read
+env:
+  HEAD_SHA: 899b9e92a98afa738d2dfbe2f704b54977aa9979
+  MAIN: f7c09605e8fe7dc7ddcb3b1650aeb259793ee3aa
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD_SHA }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test --release
+        shell: bash
+        run: |
+          set +e
+          cargo test --release --locked --no-fail-fast > test.log 2>&1; trc=$?
+          grep -E '^test result:|panicked|^error|FAILED' test.log | head -60
+          failed=$(grep -E '^test .* FAILED$' test.log | awk '{print $2}' | tr '\n' ' ')
+          passed=$(grep -E '^test result:' test.log | awk '{s+=$4} END{print s}')
+          echo "TESTS sha=$(git rev-parse --short HEAD) rc=$trc passed=$passed failed=[$failed]" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit $trc
+
+  tarball:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [head, main]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.side == 'main' && env.MAIN || env.HEAD_SHA }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: Every tarball case
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set +e
+          sudo apt-get install -y time >/dev/null
+          mkdir -p arena && curl -sL https://arena.lean-lang.org/lean-arena-tests.tar.gz -o arena.tgz
+          sha256sum arena.tgz; tar -xzf arena.tgz -C arena
+          sha=$(git rev-parse --short HEAD)
+          for f in $(cd arena && find good bad -name '*.ndjson' | sort); do
+            /usr/bin/time -v -o time.txt timeout 900 ./target/release/kiota "arena/$f" >/dev/null 2>err.txt
+            rc=$?
+            echo "TB side=$SIDE sha=$sha case=$f rc=$rc user=$(grep 'User time' time.txt | awk '{print $NF}') maxrss_kb=$(grep 'Maximum resident' time.txt | awk '{print $NF}') $(grep -m1 -E '^(REJECT|DECLINE|ERROR)' err.txt | cut -c1-160)" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
