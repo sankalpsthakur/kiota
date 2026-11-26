@@ -2176,6 +2176,22 @@ fn a_comparison_cut_short_by_the_depth_cap_declines_rather_than_rejects() {
     }
 }
 
+/// `I u : Prop` with `mk : Same (I u) ((List.replicate 20000 u).length + 0)
+/// → I u` (`tests/fixtures/src/deep-ind.lean`), where `Same P n` is `P` after
+/// `n` iota steps. leanchecker 4.36 accepts it. The length is open, so it is
+/// not driven and its computation is cut at the depth cap; the field type is
+/// then left as a recursor application with `I u` among its arguments, which
+/// the positivity check rejects. That rejection rests on the cut-short
+/// computation, so inductive validation declines (main rejected it).
+#[test]
+fn an_inductive_rejection_cut_short_by_the_depth_cap_declines() {
+    let r = verdict_deep("deep-ind-open-length.accept.ndjson");
+    match r {
+        Err(TcError::Decline(msg)) => assert!(msg.contains("cut short"), "{msg}"),
+        other => panic!("deep-ind-open-length should decline, got {other:?}"),
+    }
+}
+
 /// A K-like `Eq.rec` under `Nat.add`: the driver evaluates it, and the
 /// comparison that reduces it keeps its own depth cap. Raising the cap for
 /// everything inside the evaluation counted a literal of 2^29 down until the
